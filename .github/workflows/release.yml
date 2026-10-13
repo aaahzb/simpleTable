@@ -72,13 +72,17 @@ jobs:
       - name: Build .app
         run: pyinstaller --noconfirm --onefile --windowed --name simpleTable main.py
 
-      - name: Zip .app
-        run: ditto -c -k --sequesterRsrc --keepParent dist/simpleTable.app dist/simpleTable-macos-arm64.zip
+      - name: Create DMG
+        run: |
+          mkdir -p dist/dmg
+          cp -R dist/simpleTable.app dist/dmg/
+          ln -s /Applications dist/dmg/Applications
+          hdiutil create -volname simpleTable -srcfolder dist/dmg -ov -format UDZO dist/simpleTable-macos-arm64.dmg
 
       - uses: actions/upload-artifact@v4
         with:
           name: simpleTable-macos-arm64
-          path: dist/simpleTable-macos-arm64.zip
+          path: dist/simpleTable-macos-arm64.dmg
 
   release:
     name: GitHub Release
@@ -96,14 +100,14 @@ jobs:
           name: simpleTable ${{ github.ref_name }}
           generate_release_notes: true
           body: |
-            个人自用的极简桌面表格工具：CSV 表格的查看、编辑、筛选、排序，键位与剪贴板行为对齐 Excel。
+            个人自用的极简桌面表格工具：格子永不变形，带换行的长文也能塞进一个格子并方便阅读。CSV 查看、编辑、筛选、排序，键位与剪贴板行为对齐 Excel。
 
             ## 下载
 
             - **Windows (x64)**：`simpleTable-windows-x64.exe` 单文件免安装，下载即用。
-            - **macOS (Apple Silicon)**：`simpleTable-macos-arm64.zip`，解压得到 `simpleTable.app` 拖入"应用程序"。首次打开如提示无法验证开发者：右键 → 打开，或在终端执行 `xattr -cr /Applications/simpleTable.app`。
+            - **macOS (Apple Silicon)**：`simpleTable-macos-arm64.dmg`，双击打开后把 `simpleTable.app` 拖入"应用程序"。首次打开如提示无法验证开发者：右键 → 打开，或在终端执行 `xattr -cr /Applications/simpleTable.app`。
 
             ## 变更列表（自动生成）
           files: |
             artifacts/simpleTable-windows-x64/simpleTable-windows-x64.exe
-            artifacts/simpleTable-macos-arm64/simpleTable-macos-arm64.zip
+            artifacts/simpleTable-macos-arm64/simpleTable-macos-arm64.dmg

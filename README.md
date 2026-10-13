@@ -1,6 +1,8 @@
 # simpleTable
 
-个人自用的极简桌面表格工具：像 Excel 一样查看、编辑、筛选、排序 CSV 表格，没有多余功能。数据就是 CSV 文件本身——纯文本、可 diff、可版本管理、与 Excel/WPS 双向兼容。
+**痛点：要把一段带换行的文字（每日行程、长备注……）放进一个格子，又不想把行高列宽撑变形，还想随时看清全文。** simpleTable 的答案：格子永远不变形——换行在格内显示为空格、超长自动省略；点选单元格，右侧编辑窗格同步显示完整内容，可直接阅读和编辑；格内编辑时编辑器自动加高、行高不变。
+
+在此之上，它是个人自用的极简桌面表格工具：像 Excel 一样查看、编辑、筛选、排序 CSV 表格，没有多余功能。数据就是 CSV 文件本身——纯文本、可 diff、可版本管理、与 Excel/WPS 双向兼容。
 
 适合任何"一张表 + 若干文本列"的整理工作。比如一张旅行计划表：目的地、月份、预算、评分、攻略链接、每日行程（多行长文本）……列自定义，内容随意。
 
@@ -9,7 +11,7 @@
 在 Releases 页面下载最新版：
 
 - **Windows (x64)**：`simpleTable-windows-x64.exe`，单文件，双击即用。
-- **macOS (Apple Silicon)**：`simpleTable-macos-arm64.zip`，解压得到 `simpleTable.app`。首次打开如提示"无法验证开发者"：右键 → 打开，或在终端执行 `xattr -cr /Applications/simpleTable.app`。
+- **macOS (Apple Silicon)**：`simpleTable-macos-arm64.dmg`，双击打开后把 `simpleTable.app` 拖进“应用程序”。首次打开如提示"无法验证开发者"：右键 → 打开，或在终端执行 `xattr -cr /Applications/simpleTable.app`。
 
 ## 功能
 
