@@ -655,9 +655,12 @@ class MainWindow(QMainWindow):
         self.view.setSortingEnabled(False)  # 排序走对话框，不用表头点击排序
         self.view.setWordWrap(False)        # 单元格不换行：内容再多也不变形
         self.view.setItemDelegate(CellEditorDelegate(self.view))
-        # 编辑触发：双击 / F2；明确禁用 AnyKeyPressed，保证 Enter/Tab 键位确定
+        # 编辑触发：双击 / F2 / 打字即输入（Excel 式 AnyKeyPressed）。
+        # Enter/Tab/Del/Ctrl+C/Ctrl+V 已在视图层 event/keyPressEvent 拦截，
+        # 不会到达 AnyKeyPressed 逻辑，键位行为不受影响。
         self.view.setEditTriggers(QAbstractItemView.DoubleClicked
-                                  | QAbstractItemView.EditKeyPressed)
+                                  | QAbstractItemView.EditKeyPressed
+                                  | QAbstractItemView.AnyKeyPressed)
         # 单元格快捷键经视图信号分发（按键只在表格聚焦时到达视图，
         # 不影响格内编辑器与右侧编辑窗格）
         self.view.copyRequested.connect(self._copy_selection)

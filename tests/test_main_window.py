@@ -322,6 +322,37 @@ class TestExcelKeys:
         window.view.edit(idx)
         return window.view.viewport().findChild(_CellEditor)
 
+    def test_typing_starts_edit_replacing_content(self, window) -> None:
+        """打字即编辑（Excel 式）：编辑器打开且旧内容被新输入替换。"""
+        window.model.load(["A"], [["hello"]])
+        window.view.setCurrentIndex(window.proxy.index(0, 0))
+        QTest.keyClick(window.view, Qt.Key_A)
+        ed = window.view.viewport().findChild(_CellEditor)
+        assert ed is not None
+        assert ed.toPlainText() == "a"
+
+    def test_typing_then_enter_commits_and_moves_down(self, window) -> None:
+        """打字后 Enter：替换内容提交到模型，光标下移一行。"""
+        window.model.load(["A"], [["hello"], ["x"]])
+        window.view.setCurrentIndex(window.proxy.index(0, 0))
+        QTest.keyClick(window.view, Qt.Key_A)
+        ed = window.view.viewport().findChild(_CellEditor)
+        assert ed is not None
+        QTest.keyClick(ed, Qt.Key_Return)
+        QApplication.processEvents()  # 让 QTimer.singleShot(0) 的移动生效
+        assert window.model.raw_data(0, 0) == "a"
+        assert window.view.currentIndex().row() == 1
+
+    def test_f2_edit_keeps_existing_content(self, window) -> None:
+        """F2 维持旧行为：打开编辑器并保留原文（全选）。"""
+        window.model.load(["A"], [["hello"]])
+        idx = window.proxy.index(0, 0)
+        window.view.setCurrentIndex(idx)
+        QTest.keyClick(window.view, Qt.Key_F2)
+        ed = window.view.viewport().findChild(_CellEditor)
+        assert ed is not None
+        assert ed.toPlainText() == "hello"
+
     def test_enter_moves_selection_down(self, window) -> None:
         window.model.load(["A"], [["1"], ["2"], ["3"]])
         window.view.setCurrentIndex(window.proxy.index(0, 0))
