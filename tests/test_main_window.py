@@ -2,7 +2,7 @@
 import re
 
 import pytest
-from PySide6.QtCore import QMimeData, Qt, QUrl
+from PySide6.QtCore import QMimeData, QPoint, Qt, QUrl
 from PySide6.QtGui import QGuiApplication, QTextOption
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
@@ -300,6 +300,51 @@ class TestRowColumnOps:
         window._insert_columns(0, 1)
         assert window.proxy.active_count() == 0
         assert window.model.headers() == ["新列", "A", "B"]
+
+
+class TestFilterRowAlignment:
+    """筛选行输入框与表格列的水平对齐（含行号列宽、滚动、行号变宽）。"""
+
+    @staticmethod
+    def _expected_x(window: MainWindow, col: int) -> int:
+        """计算某列输入框在筛选行坐标系中的期望 x。
+
+        Args:
+            window: 主窗口。
+            col: 列号。
+
+        Returns:
+            int: 期望 x 坐标（表头视口原点映射 + 列视口位置）。
+        """
+        header = window.view.horizontalHeader()
+        off = header.viewport().mapTo(window.filter_row, QPoint(0, 0)).x()
+        return off + header.sectionViewportPosition(col)
+
+    def test_edits_align_with_columns(self, window) -> None:
+        window.model.load(["A", "B", "C"], [["1", "2", "3"]] * 5)
+        window.show()
+        QApplication.processEvents()
+        for col, edit in enumerate(window.filter_row._edits):
+            assert edit.x() == self._expected_x(window, col)
+
+    def test_edits_follow_horizontal_scroll(self, window) -> None:
+        window.model.load(["c%d" % i for i in range(10)],
+                          [[str(i)] * 10 for i in range(50)])
+        window.resize(500, 400)
+        window.show()
+        QApplication.processEvents()
+        window.view.horizontalScrollBar().setValue(300)
+        QApplication.processEvents()
+        for col, edit in enumerate(window.filter_row._edits):
+            assert edit.x() == self._expected_x(window, col)
+
+    def test_edits_align_when_row_header_widens(self, window) -> None:
+        # 200 行：行号变三位数、行号列变宽，偏移随之变化
+        window.model.load(["A", "B"], [["1", "2"]] * 200)
+        window.show()
+        QApplication.processEvents()
+        for col, edit in enumerate(window.filter_row._edits):
+            assert edit.x() == self._expected_x(window, col)
 
 
 class TestExcelKeys:

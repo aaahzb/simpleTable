@@ -256,6 +256,7 @@ class FilterRow(QWidget):
         header.sectionResized.connect(self.refresh_geometry)
         header.sectionMoved.connect(self.refresh_geometry)
         view.horizontalScrollBar().valueChanged.connect(self.refresh_geometry)
+        view.verticalHeader().geometriesChanged.connect(self.refresh_geometry)
         proxy.modelReset.connect(self.rebuild)
         proxy.columnsInserted.connect(self.rebuild)
         proxy.columnsRemoved.connect(self.rebuild)
@@ -278,14 +279,26 @@ class FilterRow(QWidget):
             if old:
                 edit.setText(old)
         self.refresh_geometry()
+        # 行号列宽等布局要到下一事件循环才稳定（如行数位数跳变），延迟再校准一次
+        QTimer.singleShot(0, self.refresh_geometry)
 
     def refresh_geometry(self, *args: Any) -> None:
-        """按表头各节位置对齐输入框（列宽变化/滚动时触发）。"""
+        """按表头各节位置对齐输入框（列宽变化/滚动/行号列宽变化时触发）。
+
+        sectionViewportPosition 是相对表头视口的坐标，必须先映射到
+        本控件坐标系（中间隔着行号列与边框），否则输入框整体错位，
+        且行号列变宽（行数过百）时错位加剧。
+
+        Args:
+            *args: 兼容信号附带的参数（忽略）。
+        """
         header = self._view.horizontalHeader()
+        # 表头视口原点在本控件坐标系中的 x：行号列宽 + 边框
+        base_x = header.viewport().mapTo(self, QPoint(0, 0)).x()
         for col, edit in enumerate(self._edits):
             if col >= header.count():
                 break
-            x = header.sectionViewportPosition(col)
+            x = base_x + header.sectionViewportPosition(col)
             edit.setGeometry(x, 1, header.sectionSize(col), self._row_h - 2)
 
     def clear(self) -> None:
