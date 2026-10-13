@@ -78,3 +78,7 @@ make_version.py  打包辅助：生成 _build_info.py（不入库）
 tests/           pytest 单元/集成测试
 .github/workflows/release.yml   GitHub Actions 发布流水线
 ```
+
+## 许可证
+
+[MIT](LICENSE)
