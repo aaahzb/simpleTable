@@ -2,13 +2,13 @@
 import re
 
 import pytest
-from PySide6.QtCore import QMimeData, QPoint, Qt, QUrl
+from PySide6.QtCore import QMimeData, Qt, QUrl
 from PySide6.QtGui import QGuiApplication, QTextOption
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 import csv_io
-from main_window import (CellEditorDelegate, FilterRow, MainWindow,
+from main_window import (CellEditorDelegate, FilterHeaderView, MainWindow,
                          _CellEditor)
 
 
@@ -115,10 +115,14 @@ class TestZoom:
         assert window.cell_edit.zoom_factor() == 2.0  # 编辑窗格不受影响
 
     def test_filter_row_follows_view_zoom(self, window) -> None:
+        window.model.load(["A", "B"], [["1", "2"]])
         window.view.set_zoom(1.5)
-        expected = int(FilterRow.BASE_HEIGHT * 1.5)
-        assert window.filter_row._row_h == expected
-        assert window.filter_row.maximumHeight() == expected
+        header = window.view.horizontalHeader()
+        expected = max(16, int(FilterHeaderView.FILTER_BAND * 1.5))
+        assert window.filter_row._filter_band_h() == expected
+        # 表头总高 = 列名文字带 + 筛选带，固定高度已应用
+        assert header.sizeHint().height() == header._text_band_h() + expected
+        assert header.maximumHeight() == header._text_band_h() + expected
 
 
 class TestSaveLoad:
@@ -171,10 +175,12 @@ class TestZoomHeaderFix:
         assert header.sectionSize(0) == pytest.approx(w0, abs=2)
 
     def test_header_height_follows_font(self, window) -> None:
-        # 回归：表头高度按当前字体实时重算，能容纳列名行高
+        # 回归：表头加高容纳内嵌筛选带后，仍能容纳列名行高
         window.view.set_zoom(2.0)
         header = window.view.horizontalHeader()
-        assert header.maximumHeight() >= header.fontMetrics().height()
+        assert (header.sizeHint().height()
+                >= header.fontMetrics().height()
+                + FilterHeaderView.FILTER_BAND)
 
 
 class TestDragDrop:
@@ -303,29 +309,24 @@ class TestRowColumnOps:
 
 
 class TestFilterRowAlignment:
-    """筛选行输入框与表格列的水平对齐（含行号列宽、滚动、行号变宽）。"""
+    """筛选输入框内嵌在水平表头里：与列共用同一坐标系，天然对齐。"""
 
-    @staticmethod
-    def _expected_x(window: MainWindow, col: int) -> int:
-        """计算某列输入框在筛选行坐标系中的期望 x。
-
-        Args:
-            window: 主窗口。
-            col: 列号。
-
-        Returns:
-            int: 期望 x 坐标（表头视口原点映射 + 列视口位置）。
-        """
+    def test_filter_boxes_live_inside_header(self, window) -> None:
+        # 筛选行不是独立控件，就是表头本身（同一个元素）
         header = window.view.horizontalHeader()
-        off = header.viewport().mapTo(window.filter_row, QPoint(0, 0)).x()
-        return off + header.sectionViewportPosition(col)
+        assert window.filter_row is header
+        window.model.load(["A", "B"], [["1", "2"]])
+        for edit in window.filter_row._edits:
+            assert edit.parentWidget() is header.viewport()
 
     def test_edits_align_with_columns(self, window) -> None:
         window.model.load(["A", "B", "C"], [["1", "2", "3"]] * 5)
         window.show()
         QApplication.processEvents()
+        header = window.view.horizontalHeader()
         for col, edit in enumerate(window.filter_row._edits):
-            assert edit.x() == self._expected_x(window, col)
+            assert edit.x() == header.sectionViewportPosition(col)
+            assert edit.width() == header.sectionSize(col)
 
     def test_edits_follow_horizontal_scroll(self, window) -> None:
         window.model.load(["c%d" % i for i in range(10)],
@@ -335,16 +336,42 @@ class TestFilterRowAlignment:
         QApplication.processEvents()
         window.view.horizontalScrollBar().setValue(300)
         QApplication.processEvents()
+        header = window.view.horizontalHeader()
         for col, edit in enumerate(window.filter_row._edits):
-            assert edit.x() == self._expected_x(window, col)
+            assert edit.x() == header.sectionViewportPosition(col)
 
     def test_edits_align_when_row_header_widens(self, window) -> None:
-        # 200 行：行号变三位数、行号列变宽，偏移随之变化
+        # 200 行：行号变三位数、行号列变宽——同一控件内天然无错位
         window.model.load(["A", "B"], [["1", "2"]] * 200)
         window.show()
         QApplication.processEvents()
+        header = window.view.horizontalHeader()
         for col, edit in enumerate(window.filter_row._edits):
-            assert edit.x() == self._expected_x(window, col)
+            assert edit.x() == header.sectionViewportPosition(col)
+
+    def test_edits_follow_column_resize(self, window) -> None:
+        window.model.load(["A", "B", "C"], [["1", "2", "3"]])
+        window.show()
+        QApplication.processEvents()
+        header = window.view.horizontalHeader()
+        header.resizeSection(0, 260)
+        assert window.filter_row._edits[0].width() == header.sectionSize(0)
+        assert (window.filter_row._edits[1].x()
+                == header.sectionViewportPosition(1))
+
+    def test_edits_follow_window_resize(self, window) -> None:
+        window.model.load(["A", "B", "C"], [["1", "2", "3"]] * 30)
+        window.show()
+        QApplication.processEvents()
+        header = window.view.horizontalHeader()
+        window.resize(1400, 800)
+        QApplication.processEvents()
+        for col, edit in enumerate(window.filter_row._edits):
+            assert edit.x() == header.sectionViewportPosition(col)
+        window.resize(500, 400)
+        QApplication.processEvents()
+        for col, edit in enumerate(window.filter_row._edits):
+            assert edit.x() == header.sectionViewportPosition(col)
 
 
 class TestExcelKeys:

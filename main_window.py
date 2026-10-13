@@ -1,4 +1,4 @@
-"""主窗口模块：对话框组件、筛选行、格内编辑委托、主窗口。"""
+"""主窗口模块：对话框组件、筛选表头、格内编辑委托、主窗口。"""
 from __future__ import annotations
 
 import csv
@@ -7,14 +7,15 @@ from typing import Any
 
 from PySide6.QtCore import (QAbstractItemModel, QEvent, QItemSelection,
                             QItemSelectionModel, QMimeData, QModelIndex,
-                            QPoint, Qt, QTimer, Signal)
+                            QPoint, QRect, QSize, Qt, QTimer, Signal)
 from PySide6.QtGui import (QAction, QCloseEvent, QCursor, QDragEnterEvent,
                            QDropEvent, QGuiApplication, QKeyEvent,
-                           QKeySequence, QTextOption, QWheelEvent)
+                           QKeySequence, QPainter, QTextOption, QWheelEvent)
 from PySide6.QtWidgets import (QAbstractItemDelegate, QAbstractItemView,
                                QComboBox, QDialog,
                                QDialogButtonBox, QDockWidget, QFileDialog,
-                               QFormLayout, QHBoxLayout, QInputDialog, QLabel,
+                               QFormLayout, QHBoxLayout, QHeaderView,
+                               QInputDialog, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem,
                                QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
                                QPushButton, QStatusBar, QStyledItemDelegate,
@@ -229,45 +230,109 @@ class NewTableDialog(QDialog):
         return result
 
 
-class FilterRow(QWidget):
-    """表头下方的常驻筛选行：每列一个输入框，几何位置与表头同步。"""
+class FilterHeaderView(QHeaderView):
+    """内嵌筛选行的水平表头：筛选输入框是表头视口的子控件。
 
-    BASE_HEIGHT = 28
+    表头加高为上下两条带：上半是列名文字带，下半每列一个筛选输入框。
+    输入框与列共用表头视口坐标系，列宽变化、列拖动、滚动、窗口缩放
+    时由表头自身的几何机制同步，天然对齐，不存在跨控件坐标换算。
+    """
 
-    def __init__(self, view: QTableView, proxy: FilterProxy,
-                 parent: QWidget) -> None:
-        """初始化筛选行。
+    FILTER_BAND = 26  # 筛选带基准高度（随缩放）
+
+    _zoom_factor = 1.0  # 类级默认值：Qt 初始化期间 sizeHint 可能被提前调用
+
+    def __init__(self, proxy: FilterProxy,
+                 parent: QWidget | None = None) -> None:
+        """初始化筛选表头。
 
         Args:
-            view: 绑定的表格视图。
             proxy: 筛选代理（输入直接写入代理）。
-            parent: 父控件（与视图同一中央容器）。
+            parent: 父控件（一般是表格视图）。
         """
-        super().__init__(parent)
-        self._view = view
+        super().__init__(Qt.Horizontal, parent)
         self._proxy = proxy
         self._edits: list[QLineEdit] = []
         self._zoom_factor = 1.0
-        self._row_h = self.BASE_HEIGHT
         self._base_font_size = self.font().pointSizeF()
-        self.setFixedHeight(self.BASE_HEIGHT)
 
-        header = view.horizontalHeader()
-        header.sectionResized.connect(self.refresh_geometry)
-        header.sectionMoved.connect(self.refresh_geometry)
-        view.horizontalScrollBar().valueChanged.connect(self.refresh_geometry)
-        view.verticalHeader().geometriesChanged.connect(self.refresh_geometry)
         proxy.modelReset.connect(self.rebuild)
         proxy.columnsInserted.connect(self.rebuild)
         proxy.columnsRemoved.connect(self.rebuild)
+        # 列宽变化/列拖动时同步跟随（不等下一次布局）
+        self.sectionResized.connect(self._position_edits)
+        self.sectionMoved.connect(self._position_edits)
+        self.rebuild()
+        self.setFixedHeight(self._text_band_h() + self._filter_band_h())
 
+    # ---- 几何：列名文字带 + 筛选带 ----
+    def _text_band_h(self) -> int:
+        """列名文字带高度（随表头字体行高）。
+
+        Returns:
+            int: 高度像素值。
+        """
+        return self.fontMetrics().height() + 10
+
+    def _filter_band_h(self) -> int:
+        """筛选带高度（基准高度随缩放）。
+
+        Returns:
+            int: 高度像素值。
+        """
+        return max(16, int(self.FILTER_BAND * self._zoom_factor))
+
+    def sizeHint(self) -> QSize:
+        """表头总高 = 文字带 + 筛选带（表格布局据此分配表头区域）。
+
+        Returns:
+            QSize: 建议尺寸。
+        """
+        hint = super().sizeHint()
+        return QSize(hint.width(),
+                     self._text_band_h() + self._filter_band_h())
+
+    def paintSection(self, painter: QPainter, rect: QRect,
+                     logicalIndex: int) -> None:
+        """列名只绘制在上半文字带，下半留给筛选输入框。
+
+        Args:
+            painter: 画笔。
+            rect: 节矩形（全高传入，这里截到文字带）。
+            logicalIndex: 逻辑列号。
+        """
+        super().paintSection(painter,
+                             QRect(rect.x(), rect.y(), rect.width(),
+                                   self._text_band_h()),
+                             logicalIndex)
+
+    def updateGeometries(self) -> None:
+        """滚动/尺寸/字体等几何变化后重排输入框。"""
+        super().updateGeometries()
+        self._position_edits()
+
+    def _position_edits(self, *args: Any) -> None:
+        """把每个输入框贴到对应列的正下方（同一视口坐标系，无需换算）。
+
+        Args:
+            *args: 兼容信号附带的参数（忽略）。
+        """
+        y = self._text_band_h()
+        h = self._filter_band_h()
+        for col, edit in enumerate(getattr(self, "_edits", [])):
+            if col >= self.count():
+                break
+            edit.setGeometry(self.sectionViewportPosition(col), y + 1,
+                             self.sectionSize(col), h - 2)
+
+    # ---- 输入框生命周期 ----
     def rebuild(self) -> None:
         """按当前列数重建输入框，并从代理恢复已有筛选文本。"""
         for edit in self._edits:
             edit.deleteLater()
         self._edits = []
         for col in range(self._proxy.columnCount()):
-            edit = QLineEdit(self)
+            edit = QLineEdit(self.viewport())
             edit.setPlaceholderText("筛选…")
             edit.textChanged.connect(
                 lambda text, c=col: self._proxy.set_filter(c, text))
@@ -278,28 +343,7 @@ class FilterRow(QWidget):
             old = self._proxy.get_filter(col)
             if old:
                 edit.setText(old)
-        self.refresh_geometry()
-        # 行号列宽等布局要到下一事件循环才稳定（如行数位数跳变），延迟再校准一次
-        QTimer.singleShot(0, self.refresh_geometry)
-
-    def refresh_geometry(self, *args: Any) -> None:
-        """按表头各节位置对齐输入框（列宽变化/滚动/行号列宽变化时触发）。
-
-        sectionViewportPosition 是相对表头视口的坐标，必须先映射到
-        本控件坐标系（中间隔着行号列与边框），否则输入框整体错位，
-        且行号列变宽（行数过百）时错位加剧。
-
-        Args:
-            *args: 兼容信号附带的参数（忽略）。
-        """
-        header = self._view.horizontalHeader()
-        # 表头视口原点在本控件坐标系中的 x：行号列宽 + 边框
-        base_x = header.viewport().mapTo(self, QPoint(0, 0)).x()
-        for col, edit in enumerate(self._edits):
-            if col >= header.count():
-                break
-            x = base_x + header.sectionViewportPosition(col)
-            edit.setGeometry(x, 1, header.sectionSize(col), self._row_h - 2)
+        self._position_edits()
 
     def clear(self) -> None:
         """清空全部输入框（textChanged 会连带清空代理筛选条件）。"""
@@ -314,18 +358,18 @@ class FilterRow(QWidget):
         """
         return len(self._edits)
 
+    # ---- 缩放 ----
     def set_zoom(self, factor: float) -> None:
-        """设置缩放因子：行高与输入框字体随表格同步缩放。
+        """设置缩放因子：筛选带高度与输入框字体随表格同步缩放。
 
         Args:
             factor: 缩放因子（与表格视图一致）。
         """
         self._zoom_factor = factor
-        self._row_h = max(16, int(self.BASE_HEIGHT * factor))
-        self.setFixedHeight(self._row_h)
         for edit in self._edits:
             self._apply_zoom(edit)
-        self.refresh_geometry()
+        self.setFixedHeight(self._text_band_h() + self._filter_band_h())
+        self._position_edits()
 
     def _apply_zoom(self, edit: QLineEdit) -> None:
         """把当前缩放因子应用到单个输入框字体。
@@ -430,10 +474,14 @@ class ZoomableTableView(_FontZoomMixin, QTableView):
         for col in range(header.count()):
             header.resizeSection(
                 col, max(24, int(header.sectionSize(col) * ratio)))
-        # 行高与表头高度随字体缩放；表头高度按当前字体行高加边距实时重算
+        # 行高随字体缩放；筛选表头高度由自身 set_zoom 重算（文字带+筛选带），
+        # 普通表头保持旧的固定高度算法
         self.verticalHeader().setDefaultSectionSize(
             max(10, int(self._base_row_h * self._zoom)))
-        header.setFixedHeight(max(10, header.fontMetrics().height() + 10))
+        if isinstance(header, FilterHeaderView):
+            header.set_zoom(self._zoom)
+        else:
+            header.setFixedHeight(max(10, header.fontMetrics().height() + 10))
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         """Ctrl+滚轮缩放，其余保持默认滚动。
@@ -686,19 +734,18 @@ class MainWindow(QMainWindow):
         vh = self.view.verticalHeader()
         vh.setContextMenuPolicy(Qt.CustomContextMenu)
         vh.customContextMenuRequested.connect(self._on_row_header_menu)
-        hh = self.view.horizontalHeader()
-        hh.setContextMenuPolicy(Qt.CustomContextMenu)
-        hh.customContextMenuRequested.connect(self._on_col_header_menu)
+        # 筛选表头：筛选输入框内嵌在水平表头里，与列共用同一坐标系
+        self.filter_row = FilterHeaderView(self.proxy, self.view)
+        self.view.setHorizontalHeader(self.filter_row)
+        # 水平滚动时输入框同步跟随（与表头同控件，坐标无需换算）
+        self.view.horizontalScrollBar().valueChanged.connect(
+            self.filter_row._position_edits)
+        self.filter_row.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.filter_row.customContextMenuRequested.connect(
+            self._on_col_header_menu)
 
-        # 中央区域：筛选行在上，表格在下
-        central = QWidget()
-        vbox = QVBoxLayout(central)
-        vbox.setContentsMargins(0, 0, 0, 0)
-        vbox.setSpacing(0)
-        self.filter_row = FilterRow(self.view, self.proxy, central)
-        vbox.addWidget(self.filter_row)
-        vbox.addWidget(self.view)
-        self.setCentralWidget(central)
+        # 中央区域就是表格本身（筛选行已并入表头，不再是独立控件）
+        self.setCentralWidget(self.view)
 
         # 右侧编辑窗格 Dock：随选中单元格同步，可编辑任意单元格
         self.dock = QDockWidget("编辑窗格", self)
