@@ -1,3 +1,3 @@
-PySide6>=6.6
+PySide6>=6.6,<6.12  # 6.12.0 在销毁 QApplication 时间歇崩溃（进程退出时 access violation），会导致 CI 测试步骤误判失败、打包应用退出时闪退；上游修复并验证后再放开
 pytest>=8.0
 pyinstaller>=6.0
