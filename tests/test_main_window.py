@@ -1,10 +1,10 @@
 """主窗口集成测试（离屏 Qt）。"""
 import re
+import sys
 
 import pytest
-from PySide6.QtCore import QMimeData, QEvent, Qt, QUrl
-from PySide6.QtGui import (QGuiApplication, QKeyEvent,
-                         QTextOption)
+from PySide6.QtCore import QMimeData, Qt, QUrl
+from PySide6.QtGui import QGuiApplication, QTextOption
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -416,16 +416,16 @@ class TestExcelKeys:
         assert window.model.raw_data(0, 0) == "a"
         assert window.view.currentIndex().row() == 1
 
+    @pytest.mark.skipif(sys.platform == "darwin",
+                        reason="Qt macOS 源码无 F2 编辑触发器"
+                               "（#ifdef Q_OS_MACOS 改为 Enter，且本应用"
+                               " Enter 用于下移），F2 仅 Windows/Linux")
     def test_f2_edit_keeps_existing_content(self, window) -> None:
         """F2 维持旧行为：打开编辑器并保留原文（全选）。"""
         window.model.load(["A"], [["hello"]])
         idx = window.proxy.index(0, 0)
         window.view.setCurrentIndex(idx)
-        # macOS 平台层无法把 F2 合成为按键事件（系统 Fn/功能键映射），
-        # QTest.keyClick 在 macOS runner 上收不到 Key_F2；直接构造事件
-        # 送达视图，测的是 EditKeyPressed 触发逻辑本身（F2 → 打开编辑器）
-        ev = QKeyEvent(QEvent.KeyPress, Qt.Key_F2, Qt.NoModifier)
-        QApplication.sendEvent(window.view, ev)
+        QTest.keyClick(window.view, Qt.Key_F2)
         ed = window.view.viewport().findChild(_CellEditor)
         assert ed is not None
         assert ed.toPlainText() == "hello"
