@@ -2,8 +2,9 @@
 import re
 
 import pytest
-from PySide6.QtCore import QMimeData, Qt, QUrl
-from PySide6.QtGui import QGuiApplication, QTextOption
+from PySide6.QtCore import QMimeData, QEvent, Qt, QUrl
+from PySide6.QtGui import (QGuiApplication, QKeyEvent,
+                         QTextOption)
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -420,7 +421,11 @@ class TestExcelKeys:
         window.model.load(["A"], [["hello"]])
         idx = window.proxy.index(0, 0)
         window.view.setCurrentIndex(idx)
-        QTest.keyClick(window.view, Qt.Key_F2)
+        # macOS 平台层无法把 F2 合成为按键事件（系统 Fn/功能键映射），
+        # QTest.keyClick 在 macOS runner 上收不到 Key_F2；直接构造事件
+        # 送达视图，测的是 EditKeyPressed 触发逻辑本身（F2 → 打开编辑器）
+        ev = QKeyEvent(QEvent.KeyPress, Qt.Key_F2, Qt.NoModifier)
+        QApplication.sendEvent(window.view, ev)
         ed = window.view.viewport().findChild(_CellEditor)
         assert ed is not None
         assert ed.toPlainText() == "hello"
