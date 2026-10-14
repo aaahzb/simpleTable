@@ -41,12 +41,23 @@ fn is_smoke() -> bool {
 /// - `report`: 自检报告全文（UTF-8）。
 /// - `code`: 进程退出码（0 = 全部通过）。
 ///
+/// 冒烟报告路径：环境变量 `SMOKE_REPORT_PATH` 优先（CI 显式指定），
+/// 否则取系统临时目录（本机默认）。
+fn smoke_report_path() -> std::path::PathBuf {
+    std::env::var("SMOKE_REPORT_PATH").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+        std::env::temp_dir().join("simpletable_smoke_report.txt")
+    })
+}
+
 /// # Returns
 /// 不返回（进程退出）。
 #[tauri::command]
 fn finish_smoke(report: String, code: i32) {
-    let path = std::env::temp_dir().join("simpletable_smoke_report.txt");
-    let _ = fs::write(&path, report);
+    let path = smoke_report_path();
+    if let Err(e) = fs::write(&path, report) {
+        // 写失败必须出声（CI 依赖该文件），否则无声挂死难排查
+        eprintln!("[smoke] 报告写入失败 {path:?}: {e}");
+    }
     eprintln!("[smoke] 报告已写入 {path:?}，退出码 {code}");
     std::process::exit(code);
 }

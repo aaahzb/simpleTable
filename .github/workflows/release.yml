@@ -36,16 +36,20 @@ jobs:
         run: cargo build
         working-directory: src-tauri
 
-      - name: 冒烟自检（52 项断言）
-        run: .\target\debug\simpletable.exe --smoke
+      - name: 冒烟自检（52 项断言，报告打在日志里）
         working-directory: src-tauri
+        env:
+          SMOKE_REPORT_PATH: ${{ github.workspace }}/smoke-report.txt
+        run: |
+          .\target\debug\simpletable.exe --smoke
+          Get-Content "${{ github.workspace }}/smoke-report.txt"
 
       - name: 上传冒烟报告（无论成败）
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: smoke-report
-          path: ${{ runner.temp }}/simpletable_smoke_report.txt
+          path: smoke-report.txt
           if-no-files-found: error
 
   windows-x64:
