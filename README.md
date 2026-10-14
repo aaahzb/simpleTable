@@ -64,7 +64,7 @@ node --test tests_js/
 ## CI 与发布
 
 - 推 `main` / PR → 自动构建自检：Windows 完整冒烟（52 项断言），macOS arm64 编译检查。
-- 推 `v*` tag → 自动构建 Windows x64 exe 与 macOS arm64 dmg 并发布 GitHub Release；Release 说明取 `RELEASE_NOTES.md` 里该 tag 的段落（缺段落则发布失败），版本号由 `build.rs` 从 tag 注入。Actions 里也可手动触发 Release 流水线（只构建不发布，发版前验证用）。
+- 推 `v*` tag → 自动构建 Windows x64 exe 与 macOS arm64 dmg 并发布 GitHub Release；Release 说明取 `RELEASE_NOTES.md` 的「即将发布」节（与 tag 名解耦，缺节则发布失败），版本号由 `build.rs` 从 tag 注入。Actions 里也可手动触发 Release 流水线（只构建不发布，发版前验证用）。
 - 本地打包：`src-tauri` 下 `cargo build --release`，产物 `target/release/simpletable.exe`。
 
 ## 项目结构

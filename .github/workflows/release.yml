@@ -113,14 +113,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 组装 Release 正文（固定头 + 本 tag 的变化段落）
+      - name: 组装 Release 正文（固定头 + 「即将发布」节）
         id: notes
-        env:
-          TAG: ${{ github.ref_name }}
         run: |
           HEADER=$(awk '/<!-- HEADER:BEGIN -->/{f=1;next} /<!-- HEADER:END -->/{f=0} f' RELEASE_NOTES.md)
-          SECTION=$(awk -v tag="## ${TAG}" '$0==tag{f=1;next} /^## /{f=0} f' RELEASE_NOTES.md)
-          grep -q '[^[:space:]]' <<<"$SECTION" || { echo "RELEASE_NOTES.md 缺少 ${TAG} 段落，发布中止" >&2; exit 1; }
+          # 取 HEADER 块之外的第一个 ## 节（即「即将发布」），与 tag 名解耦
+          SECTION=$(awk '/<!-- HEADER:BEGIN -->/{skip=1;next} /<!-- HEADER:END -->/{skip=0;next} skip{next} /^## /{if(f)exit; f=1;next} f' RELEASE_NOTES.md)
+          grep -q '[^[:space:]]' <<<"$SECTION" || { echo "RELEASE_NOTES.md 缺少「即将发布」节，发布中止" >&2; exit 1; }
           {
             echo "body<<NOTES_EOF"
             printf '%s\n\n## 本次变更（相对上一版）\n%s\n' "$HEADER" "$SECTION"
