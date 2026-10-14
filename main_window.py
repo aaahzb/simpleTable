@@ -758,6 +758,8 @@ class MainWindow(QMainWindow):
         self.cell_edit.setAcceptDrops(False)
 
         self._build_toolbar()
+        self.model.undoStackChanged.connect(self._update_undo_actions)
+        self._update_undo_actions()
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         # 状态栏右侧常驻版本号（打包注入 release，开发环境 beta+commit）
@@ -813,6 +815,12 @@ class MainWindow(QMainWindow):
         self.save_action = act("保存", self.save_file, "Ctrl+S")
         act("另存为", self.save_file_as)
         tb.addSeparator()
+        self.undo_action = act("撤销", self.undo, "Ctrl+Z")
+        self.redo_action = act("重做", self.redo)
+        self.redo_action.setShortcuts(["Ctrl+Y", "Ctrl+Shift+Z"])
+        self.undo_action.setEnabled(False)
+        self.redo_action.setEnabled(False)
+        tb.addSeparator()
         act("排序…", self.open_sort_dialog)
         act("清除筛选", self.clear_filters)
         tb.addSeparator()
@@ -820,6 +828,30 @@ class MainWindow(QMainWindow):
             "显示符号", self._toggle_show_symbols, checkable=True)
         self.show_symbols_action.setToolTip(
             "在编辑窗格显示空格(·)、Tab(→)、换行符(¶)，类似 Notepad++")
+
+    # ---- 撤销/重做 ----
+    def undo(self) -> None:
+        """撤销一步表格改动（Ctrl+Z）。
+
+        格内编辑器/编辑窗格聚焦时 Ctrl+Z 由控件原生文本撤销处理
+        （ShortcutOverride），不会触发本动作。
+        """
+        if self.model.undo():
+            self.view.clearSelection()
+            self._clear_dock()
+            self._mark_dirty()
+
+    def redo(self) -> None:
+        """重做一步表格改动（Ctrl+Y / Ctrl+Shift+Z）。"""
+        if self.model.redo():
+            self.view.clearSelection()
+            self._clear_dock()
+            self._mark_dirty()
+
+    def _update_undo_actions(self) -> None:
+        """按撤销/重做栈状态刷新工具栏按钮可用性。"""
+        self.undo_action.setEnabled(self.model.can_undo())
+        self.redo_action.setEnabled(self.model.can_redo())
 
     # ---- 单元格剪贴板与 Del 键（Excel 互通 TSV）----
     def _copy_selection(self) -> None:
@@ -860,16 +892,19 @@ class MainWindow(QMainWindow):
             return
         src = self.proxy.mapToSource(start)
         r0, c0 = src.row(), src.column()
-        # 超出当前范围时自动扩展行列（Excel 行为）
-        need_rows = r0 + len(rows) - self.model.rowCount()
-        if need_rows > 0:
-            self.model.insert_rows(self.model.rowCount(), need_rows)
-        need_cols = c0 + max(len(r) for r in rows) - self.model.columnCount()
-        if need_cols > 0:
-            self.model.insert_columns(self.model.columnCount(), need_cols)
-        for i, row in enumerate(rows):
-            for j, val in enumerate(row):
-                self.model.setData(self.model.index(r0 + i, c0 + j), val)
+        # 扩展行列 + 逐格写入合并为一步撤销（Excel：粘贴是单个操作）
+        with self.model.batch():
+            # 超出当前范围时自动扩展行列（Excel 行为）
+            need_rows = r0 + len(rows) - self.model.rowCount()
+            if need_rows > 0:
+                self.model.insert_rows(self.model.rowCount(), need_rows)
+            need_cols = (c0 + max(len(r) for r in rows)
+                         - self.model.columnCount())
+            if need_cols > 0:
+                self.model.insert_columns(self.model.columnCount(), need_cols)
+            for i, row in enumerate(rows):
+                for j, val in enumerate(row):
+                    self.model.setData(self.model.index(r0 + i, c0 + j), val)
         # 选中刚粘贴的区域（Excel 行为）
         top = self.proxy.mapFromSource(self.model.index(r0, c0))
         bottom = self.proxy.mapFromSource(self.model.index(
@@ -1034,7 +1069,7 @@ class MainWindow(QMainWindow):
             rows: 源模型行号列表。
         """
         if rows and self._confirm(
-                f"确定删除选中的 {len(rows)} 行？此操作不可撤销。"):
+                f"确定删除选中的 {len(rows)} 行？（可用 Ctrl+Z 撤销）"):
             self.model.remove_rows(rows)
 
     def _clear_rows(self, rows: list[int]) -> None:
@@ -1064,7 +1099,7 @@ class MainWindow(QMainWindow):
             cols: 列号列表。
         """
         if cols and self._confirm(
-                f"确定删除选中的 {len(cols)} 列及其全部数据？此操作不可撤销。"):
+                f"确定删除选中的 {len(cols)} 列及其全部数据？（可用 Ctrl+Z 撤销）"):
             self.model.remove_columns(cols)
             self.clear_filters()
 
@@ -1147,8 +1182,9 @@ class MainWindow(QMainWindow):
             row, col = self._current_cell
             self._dock_origin = True
             try:
-                self.model.setData(self.model.index(row, col),
-                                   self.cell_edit.toPlainText())
+                # 同格连续击键合并为一步撤销
+                self.model.set_data_merged(self.model.index(row, col),
+                                           self.cell_edit.toPlainText())
             finally:
                 self._dock_origin = False
 

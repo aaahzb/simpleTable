@@ -1,14 +1,17 @@
 """表格数据模型。
 
 持有表头与二维字符串数据，负责显示扁平化与物理优先级排序。
+内置快照式撤销/重做：所有改动方法在变更前自动存档。
 所有单元格地位相同：均可格内编辑，也可在右侧编辑窗格编辑。
 """
 from __future__ import annotations
 
 import functools
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
 
 
 def _to_float(text: str) -> float | None:
@@ -32,10 +35,20 @@ class TableModel(QAbstractTableModel):
     SORT_TEXT = "text"
     SORT_NUMERIC = "numeric"
 
+    MAX_UNDO = 100  # 撤销栈上限（超出丢弃最旧快照）
+
+    undoStackChanged = Signal()  # 撤销/重做栈状态变化（供按钮置灰）
+
     def __init__(self, parent: Any = None) -> None:
         super().__init__(parent)
         self._headers: list[str] = []
         self._rows: list[list[str]] = []
+        # 撤销/重做：改动前的 (表头, 行数据) 快照栈；batch 块合并为一步；
+        # _merge_cell 记录编辑窗格击键合并的目标格
+        self._undo_stack: list[tuple[list[str], list[list[str]]]] = []
+        self._redo_stack: list[tuple[list[str], list[list[str]]]] = []
+        self._batch_depth = 0
+        self._merge_cell: tuple[int, int] | None = None
 
     # ---- 数据装载与读取 ----
     def load(self, headers: list[str], rows: list[list[str]]) -> None:
@@ -49,6 +62,11 @@ class TableModel(QAbstractTableModel):
         self._headers = list(headers)
         self._rows = [list(r) for r in rows]
         self.endResetModel()
+        # 打开/新建文件 = 新的编辑会话：清空撤销历史（与 Excel 一致）
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._merge_cell = None
+        self.undoStackChanged.emit()
 
     def headers(self) -> list[str]:
         """返回表头副本。
@@ -65,6 +83,120 @@ class TableModel(QAbstractTableModel):
             list[list[str]]: 数据行列表。
         """
         return [list(r) for r in self._rows]
+
+    # ---- 撤销/重做（快照式：改动前自动存档）----
+    def _snapshot(self) -> tuple[list[str], list[list[str]]]:
+        """生成当前数据快照（逐行浅拷贝，字符串不可变故安全）。
+
+        Returns:
+            tuple[list[str], list[list[str]]]: (表头副本, 行数据副本)。
+        """
+        return list(self._headers), [list(r) for r in self._rows]
+
+    def _checkpoint(self, merge_key: tuple[int, int] | None = None) -> None:
+        """数据改动前压入撤销快照（所有改动方法在变更前调用）。
+
+        新改动使重做失效（清空重做栈）；batch 块内不重复压栈；
+        merge_key 相同（编辑窗格同格连续击键）时合并为一步。
+
+        Args:
+            merge_key: 可合并改动的目标格 (行, 列)，None 表示不可合并。
+        """
+        had_redo = bool(self._redo_stack)
+        self._redo_stack.clear()
+        pushed = False
+        if self._batch_depth > 0:
+            pass  # batch() 进入时已压过快照
+        elif merge_key is not None and merge_key == self._merge_cell:
+            pass  # 同格连续击键：快照已存在，合并为一步
+        else:
+            self._undo_stack.append(self._snapshot())
+            if len(self._undo_stack) > self.MAX_UNDO:
+                self._undo_stack.pop(0)
+            self._merge_cell = merge_key
+            pushed = True
+        if pushed or had_redo:
+            self.undoStackChanged.emit()
+
+    @contextmanager
+    def batch(self) -> Iterator[None]:
+        """批量改动上下文：整个 with 块合并为一步撤销（如粘贴一片区域）。"""
+        if self._batch_depth == 0:
+            self._checkpoint()
+        self._batch_depth += 1
+        try:
+            yield
+        finally:
+            self._batch_depth -= 1
+
+    def set_data_merged(self, index: QModelIndex, value: Any) -> bool:
+        """写入单元格并把同格连续写入合并为一步撤销（编辑窗格击键用）。
+
+        Args:
+            index: 目标单元格。
+            value: 新文本。
+
+        Returns:
+            bool: 写入成功为 True。
+        """
+        if index.isValid():
+            self._checkpoint(merge_key=(index.row(), index.column()))
+            self._rows[index.row()][index.column()] = str(value)
+            self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
+            return True
+        return False
+
+    def can_undo(self) -> bool:
+        """是否有可撤销的改动。
+
+        Returns:
+            bool: 撤销栈非空。
+        """
+        return bool(self._undo_stack)
+
+    def can_redo(self) -> bool:
+        """是否有可重做的改动。
+
+        Returns:
+            bool: 重做栈非空。
+        """
+        return bool(self._redo_stack)
+
+    def undo(self) -> bool:
+        """撤销一步改动。
+
+        Returns:
+            bool: 有改动被撤销为 True。
+        """
+        if not self._undo_stack:
+            return False
+        self._redo_stack.append(self._snapshot())
+        self._restore(self._undo_stack.pop())
+        return True
+
+    def redo(self) -> bool:
+        """重做一步改动。
+
+        Returns:
+            bool: 有改动被重做为 True。
+        """
+        if not self._redo_stack:
+            return False
+        self._undo_stack.append(self._snapshot())
+        self._restore(self._redo_stack.pop())
+        return True
+
+    def _restore(self, snapshot: tuple[list[str], list[list[str]]]) -> None:
+        """用快照整体替换当前数据（整体重置视图，选择随之清空）。
+
+        Args:
+            snapshot: (表头, 行数据) 快照（所有权转移给模型）。
+        """
+        self.beginResetModel()
+        self._headers, self._rows = snapshot
+        self._merge_cell = None
+        self.endResetModel()
+        self.undoStackChanged.emit()
 
     # ---- Qt 模型接口 ----
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
@@ -106,6 +238,7 @@ class TableModel(QAbstractTableModel):
     def setData(self, index: QModelIndex, value: Any,
                 role: int = Qt.EditRole) -> bool:
         if role == Qt.EditRole and index.isValid():
+            self._checkpoint()
             self._rows[index.row()][index.column()] = str(value)
             self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
             return True
@@ -128,6 +261,7 @@ class TableModel(QAbstractTableModel):
         """
         if count <= 0 or not self._headers:
             return
+        self._checkpoint()
         first = len(self._rows)
         self.beginInsertRows(QModelIndex(), first, first + count - 1)
         for _ in range(count):
@@ -140,6 +274,7 @@ class TableModel(QAbstractTableModel):
         Args:
             rows: 源模型行号列表。
         """
+        self._checkpoint()
         for r in sorted(set(rows), reverse=True):
             if 0 <= r < len(self._rows):
                 self.beginRemoveRows(QModelIndex(), r, r)
@@ -156,6 +291,7 @@ class TableModel(QAbstractTableModel):
         if count <= 0 or not self._headers:
             return
         row = max(0, min(row, len(self._rows)))
+        self._checkpoint()
         self.beginInsertRows(QModelIndex(), row, row + count - 1)
         for _ in range(count):
             self._rows.insert(row, [""] * len(self._headers))
@@ -168,6 +304,7 @@ class TableModel(QAbstractTableModel):
             name: 列名。
         """
         col = len(self._headers)
+        self._checkpoint()
         self.beginInsertColumns(QModelIndex(), col, col)
         self._headers.append(name)
         for row in self._rows:
@@ -184,6 +321,7 @@ class TableModel(QAbstractTableModel):
         if count <= 0:
             return
         col = max(0, min(col, len(self._headers)))
+        self._checkpoint()
         self.beginInsertColumns(QModelIndex(), col, col + count - 1)
         for i in range(count):
             self._headers.insert(col + i, self._unique_column_name("新列"))
@@ -215,6 +353,7 @@ class TableModel(QAbstractTableModel):
         """
         if not 0 <= col < len(self._headers):
             return
+        self._checkpoint()
         self.beginRemoveColumns(QModelIndex(), col, col)
         del self._headers[col]
         for row in self._rows:
@@ -227,8 +366,12 @@ class TableModel(QAbstractTableModel):
         Args:
             cols: 列号列表（自动去重，从大到小逐个删除）。
         """
-        for col in sorted(set(cols), reverse=True):
-            self.remove_column(col)
+        cols = sorted(set(cols))
+        if not cols:
+            return
+        with self.batch():  # 批量删列合并为一步撤销
+            for col in reversed(cols):
+                self.remove_column(col)
 
     def rename_column(self, col: int, name: str) -> None:
         """重命名列。
@@ -237,6 +380,7 @@ class TableModel(QAbstractTableModel):
             col: 列号。
             name: 新列名。
         """
+        self._checkpoint()
         self._headers[col] = name
         self.headerDataChanged.emit(Qt.Horizontal, col, col)
 
@@ -249,6 +393,7 @@ class TableModel(QAbstractTableModel):
         valid = [r for r in set(rows) if 0 <= r < len(self._rows)]
         if not valid or not self._headers:
             return
+        self._checkpoint()
         for r in valid:
             self._rows[r] = [""] * len(self._headers)
         self.dataChanged.emit(self.index(min(valid), 0),
@@ -264,6 +409,7 @@ class TableModel(QAbstractTableModel):
         valid = [c for c in set(cols) if 0 <= c < len(self._headers)]
         if not valid or not self._rows:
             return
+        self._checkpoint()
         for row in self._rows:
             for c in valid:
                 row[c] = ""
@@ -282,6 +428,7 @@ class TableModel(QAbstractTableModel):
                  and 0 <= c < len(self._headers)}
         if not valid:
             return
+        self._checkpoint()
         for r, c in valid:
             self._rows[r][c] = ""
         rows = [r for r, _ in valid]
@@ -320,6 +467,7 @@ class TableModel(QAbstractTableModel):
                         return (-1 if a < b else 1) * (1 if asc else -1)
             return 0
 
+        self._checkpoint()
         # 用 layoutChanged 而非 beginResetModel：避免代理重建筛选行、丢失筛选状态
         self.layoutAboutToBeChanged.emit()
         self._rows.sort(key=functools.cmp_to_key(cmp))

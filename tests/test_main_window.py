@@ -522,3 +522,44 @@ class TestExcelKeys:
         window._paste_from_clipboard()
         assert window.model.raw_data(0, 0) == "1"
         assert window.model.raw_data(1, 1) == "y"
+
+class TestUndo:
+    """撤销/重做与主窗口整合：工具栏按钮、粘贴合并、窗格击键合并。"""
+
+    def test_toolbar_undo_redo_enabled_state(self, window) -> None:
+        window.model.load(["A"], [["1"]])
+        assert not window.undo_action.isEnabled()  # load 清空撤销栈
+        assert not window.redo_action.isEnabled()
+        window.model.setData(window.model.index(0, 0), "2")
+        assert window.undo_action.isEnabled()
+        window.undo_action.trigger()
+        assert not window.undo_action.isEnabled()
+        assert window.redo_action.isEnabled()
+
+    def test_paste_is_single_undo_step(self, window) -> None:
+        window.model.load(["A", "B"], [["1", "2"], ["3", "4"]])
+        window.view.setCurrentIndex(window.proxy.index(0, 0))
+        QGuiApplication.clipboard().setText("x\ty\nz\tw")
+        window._paste_from_clipboard()
+        assert window.model.raw_data(1, 1) == "w"
+        window.undo_action.trigger()
+        assert window.model.raw_data(0, 0) == "1"
+        assert window.model.raw_data(1, 1) == "4"
+        assert not window.model.can_undo()  # 整块粘贴只是一步
+
+    def test_dock_typing_merges_to_one_step(self, window) -> None:
+        window.model.load(["A"], [["hello"]])
+        window.view.setCurrentIndex(window.proxy.index(0, 0))
+        window.cell_edit.setPlainText("h")
+        window.cell_edit.setPlainText("he")
+        window.undo_action.trigger()
+        assert window.model.raw_data(0, 0) == "hello"
+        assert not window.model.can_undo()
+
+    def test_undo_marks_dirty(self, window) -> None:
+        window.model.load(["A"], [["1"]])
+        window.model.setData(window.model.index(0, 0), "2")
+        window._dirty = False  # 模拟已保存状态
+        window.undo_action.trigger()
+        assert window._dirty is True
+        assert window.model.raw_data(0, 0) == "1"

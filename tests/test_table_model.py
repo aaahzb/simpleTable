@@ -122,3 +122,91 @@ class TestSort:
         m.sort_rows([(0, TableModel.SORT_TEXT, True),
                      (1, TableModel.SORT_NUMERIC, True)])
         assert [m.raw_data(r, 1) for r in range(3)] == ["1", "2", "10"]
+
+class TestUndo:
+    """快照式撤销/重做：所有模型改动自动可撤销。"""
+
+    def test_set_data_undo_redo(self, model) -> None:
+        model.setData(model.index(0, 0), "昆明")
+        assert model.can_undo()
+        assert model.undo()
+        assert model.raw_data(0, 0) == "大理"
+        assert model.can_redo()
+        assert model.redo()
+        assert model.raw_data(0, 0) == "昆明"
+
+    def test_new_edit_clears_redo(self, model) -> None:
+        model.setData(model.index(0, 0), "昆明")
+        model.undo()
+        model.setData(model.index(0, 0), "成都")
+        assert not model.can_redo()
+
+    def test_undo_stack_capped(self, model) -> None:
+        for i in range(TableModel.MAX_UNDO + 5):
+            model.setData(model.index(0, 0), str(i))
+        assert len(model._undo_stack) == TableModel.MAX_UNDO
+
+    def test_merged_same_cell_is_one_step(self, model) -> None:
+        # 编辑窗格同格连续击键：三次写入合并为一步撤销
+        model.set_data_merged(model.index(0, 0), "昆")
+        model.set_data_merged(model.index(0, 0), "昆明")
+        model.set_data_merged(model.index(0, 0), "昆明市")
+        model.undo()
+        assert model.raw_data(0, 0) == "大理"
+        assert not model.can_undo()
+
+    def test_merged_other_cell_is_new_step(self, model) -> None:
+        model.set_data_merged(model.index(0, 0), "昆明")
+        model.set_data_merged(model.index(1, 0), "成都")
+        model.undo()
+        assert model.raw_data(1, 0) == "丽江"
+        assert model.can_undo()  # 第一格的改动仍可撤销
+
+    def test_batch_is_one_step(self, model) -> None:
+        with model.batch():
+            model.insert_rows(model.rowCount(), 1)
+            model.setData(model.index(3, 0), "香格里拉")
+        model.undo()
+        assert model.rowCount() == 3
+        assert not model.can_undo()
+
+    def test_remove_columns_is_one_step(self, model) -> None:
+        model.remove_columns([0, 1, 2])
+        assert model.columnCount() == 0
+        model.undo()
+        assert model.headers() == ["目的地", "评分", "备注"]
+        assert model.raw_data(0, 0) == "大理"
+
+    def test_sort_undo_restores_order(self, model) -> None:
+        model.sort_rows([(1, TableModel.SORT_NUMERIC, False)])
+        assert model.raw_data(0, 0) == "丽江"
+        model.undo()
+        assert ([model.raw_data(r, 0) for r in range(3)]
+                == ["大理", "丽江", "黄山"])
+
+    def test_structure_ops_undo(self, model) -> None:
+        model.remove_rows([1])
+        model.undo()
+        assert model.raw_data(1, 0) == "丽江"
+        model.insert_columns(1, 2)
+        model.undo()
+        assert model.headers() == ["目的地", "评分", "备注"]
+        model.rename_column(0, "城市")
+        model.undo()
+        assert model.headers()[0] == "目的地"
+
+    def test_clear_cells_undo(self, model) -> None:
+        model.clear_cells({(0, 0), (1, 1)})
+        model.undo()
+        assert model.raw_data(0, 0) == "大理"
+        assert model.raw_data(1, 1) == "10"
+
+    def test_load_clears_stacks(self, model) -> None:
+        model.setData(model.index(0, 0), "昆明")
+        model.load(["X"], [["1"]])
+        assert not model.can_undo()
+        assert not model.can_redo()
+
+    def test_undo_on_empty_stack(self, model) -> None:
+        assert not model.undo()
+        assert not model.redo()
