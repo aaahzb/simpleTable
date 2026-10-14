@@ -44,14 +44,6 @@ jobs:
           .\target\debug\simpletable.exe --smoke
           Get-Content "${{ github.workspace }}/smoke-report.txt"
 
-      - name: 上传冒烟报告（无论成败）
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: smoke-report
-          path: smoke-report.txt
-          if-no-files-found: error
-
   windows-x64:
     name: 构建 Windows x64
     needs: test
@@ -71,13 +63,13 @@ jobs:
 
       - name: 规整产物名
         shell: pwsh
-        run: Copy-Item src-tauri\target\release\simpletable.exe dist-ci-simpletable-windows-x64.exe
+        run: Copy-Item src-tauri\target\release\simpletable.exe simpleTable-windows-x64.exe
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: windows-x64
-          path: dist-ci-simpletable-windows-x64.exe
+          path: simpleTable-windows-x64.exe
 
   macos-arm64:
     name: 构建 macOS arm64 (dmg)
@@ -105,13 +97,13 @@ jobs:
         working-directory: src-tauri
 
       - name: 规整产物名
-        run: cp src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg dist-ci-simpletable-macos-arm64.dmg
+        run: cp src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg simpleTable-macos-arm64.dmg
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: macos-arm64
-          path: dist-ci-simpletable-macos-arm64.dmg
+          path: simpleTable-macos-arm64.dmg
 
   publish:
     name: 发布 GitHub Release
@@ -119,6 +111,22 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - name: 组装 Release 正文（固定头 + 本 tag 的变化段落）
+        id: notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          HEADER=$(awk '/<!-- HEADER:BEGIN -->/{f=1;next} /<!-- HEADER:END -->/{f=0} f' RELEASE_NOTES.md)
+          SECTION=$(awk -v tag="## ${TAG}" '$0==tag{f=1;next} /^## /{f=0} f' RELEASE_NOTES.md)
+          grep -q '[^[:space:]]' <<<"$SECTION" || { echo "RELEASE_NOTES.md 缺少 ${TAG} 段落，发布中止" >&2; exit 1; }
+          {
+            echo "body<<NOTES_EOF"
+            printf '%s\n\n## 本次变更（相对上一版）\n%s\n' "$HEADER" "$SECTION"
+            echo "NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: 下载全部产物
         uses: actions/download-artifact@v4
         with:
@@ -128,6 +136,7 @@ jobs:
       - name: 创建 Release 并上传
         uses: softprops/action-gh-release@v2
         with:
+          name: simpleTable ${{ github.ref_name }}
           files: release-assets/*
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          body: ${{ steps.notes.outputs.body }}
