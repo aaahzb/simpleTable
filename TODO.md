@@ -59,6 +59,20 @@
 - [x] H2. cargo tauri build → 单文件 exe；检查体积/启动速度；启动截图目检对比 Qt 版截图
 - [x] H3. README/TODO 更新；分支提交（不合并，等用户手测）
 
+## 开发日志（2026-10-14，第五轮：CI 首跑失败 → 冒烟报告路径钉死）
+
+- GitHub Actions 首跑失败：Windows job 的 upload-artifact 找不到
+  `simpletable_smoke_report.txt`。根因不确定——`std::env::temp_dir()` 在
+  runner 上解析与预期不符，或写失败被 `let _ =` 静默吞掉。
+- 修复（不再赌运行器环境）：
+  - lib.rs `finish_smoke` 支持 `SMOKE_REPORT_PATH` 环境变量覆盖报告路径，
+    CI 显式钉到 `${{ github.workspace }}/smoke-report.txt`；写失败现在
+    eprintln 出声（CI 步骤日志可见），不再无声挂死。
+  - ci.yml / release.yml 冒烟步骤直接 `Get-Content` 把报告全文进步骤日志，
+    以后失败无需下载产物即可在浏览器看全部断言结果。
+- 验证：本机双路径（默认临时目录 + 显式覆盖）均退出码 0、52/52 全绿；
+  release exe 重编。
+
 ## 开发日志（2026-10-14，第四轮：显示符号吞换行）
 
 - 用户手测反馈：开启"显示符号"后，¶ 把换行替换掉了——4 个换行的文本
