@@ -1,0 +1,63 @@
+# 持续集成：推送 main、提 PR 或手动触发时自动构建 + 自检。
+# Windows 跑完整冒烟自检（真实 WebView2，52 项断言）；macOS 做 arm64 交叉编译检查。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows 构建 + 冒烟自检
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # build.rs 需要完整 tag 历史计算版本号
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 前端逻辑单测（node:test）
+        run: node --test "tests_js/*.test.mjs"
+
+      - name: 编译 debug 构建
+        run: cargo build
+        working-directory: src-tauri
+
+      - name: 冒烟自检（真实 WebView 端到端断言，失败看报告）
+        run: .\target\debug\simpletable.exe --smoke
+        working-directory: src-tauri
+
+      - name: 上传冒烟报告（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-report
+          path: ${{ runner.temp }}/simpletable_smoke_report.txt
+          if-no-files-found: error
+
+  macos:
+    name: macOS (arm64) 编译检查
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 编译（aarch64-apple-darwin）
+        run: cargo build --target aarch64-apple-darwin
+        working-directory: src-tauri

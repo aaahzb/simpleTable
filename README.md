@@ -63,15 +63,23 @@ node --test tests_js/
 
 ## 打包与发布
 
-本地打包（Windows x64）：
+- **CI（推送即触发）**：推送到 `main` 或提 PR 自动构建并自检——Windows 跑完整冒烟（52 项断言），macOS 做 arm64 编译检查。见 `.github/workflows/ci.yml`。
+- **发布**：推送 `v` 开头 tag，自动构建 **Windows x64 exe** 与 **macOS arm64 dmg** 并发布到 GitHub Releases：
 
-```bash
-cd src-tauri
-cargo build --release
-# 产物：src-tauri\target\release\simpletable.exe（单文件，可直接分发）
-```
+  ```bash
+  git tag v1.0.0
+  git push origin v1.0.0
+  ```
 
-发布新版本：在发布 commit 上打 `v` 开头 tag 再构建，状态栏即显示 `release <tag>`。
+  版本号由 `src-tauri/build.rs` 从 git tag 注入（HEAD 命中 tag 显示 `release <tag>`）。也可以在 Actions 页面手动触发 Release 流水线——只构建并保留产物，不创建 Release（用于发版前验证）。
+
+- **本地打包**：
+
+  ```bash
+  cd src-tauri
+  cargo build --release
+  # 产物：src-tauri\target\release\simpletable.exe（单文件，可直接分发）
+  ```
 
 ## 项目结构
 
