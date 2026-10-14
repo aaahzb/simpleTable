@@ -11,10 +11,12 @@ import { ZOOM_MAX, ZOOM_MIN, ZOOM_STEP } from "./grid.js";
  * 把原始文本转为显示符号文本（仅展示用）。
  *
  * @param {string} raw - 原文。
- * @returns {string} 转换后的文本（空格→·，Tab→→，换行→¶）。
+ * @returns {string} 转换后的文本（空格→·，Tab→→，换行→¶；
+ *   ¶ 追加在换行之前，换行本身保留——镜像层是 pre，靠真实换行断行，
+ *   若用 ¶ 替换换行，多行文本会塌成一行只剩符号）。
  */
 export function toSymbols(raw) {
-  return raw.replace(/ /g, "·").replace(/\t/g, "→").replace(/\n/g, "¶");
+  return raw.replace(/ /g, "·").replace(/\t/g, "→").replace(/\n/g, "¶\n");
 }
 
 /**

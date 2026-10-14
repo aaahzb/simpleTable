@@ -638,6 +638,18 @@ export async function runSmoke({ model, grid, pane, invoke }) {
     m.setData(r, c, text.replace(/\r\n/g, "\n").replace(/[\r\n]+$/, ""));
   }
 
+  check("显示符号：¶ 在行尾且换行保留（行结构不塌）", () => {
+    const text = "a\nb\n\nc";
+    pane.setText(text);
+    pane.setSymbols(true);
+    const mirror = document.getElementById("pane-mirror");
+    assert(mirror.textContent === "a¶\nb¶\n¶\nc",
+      `镜像应为 "a¶⏎b¶⏎¶⏎c"，实际 ${JSON.stringify(mirror.textContent)}`);
+    assert(document.getElementById("pane-edit").value === text,
+      "编辑层原文不应被符号污染");
+    pane.setSymbols(false);
+  });
+
   // ---- 几何自检：画布无意外滚动条（末列拉伸后应与视口齐平） ----
   check("画布无意外横向溢出（无幽灵滚动条）", () => {
     loadBasic();

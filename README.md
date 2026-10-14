@@ -19,7 +19,7 @@ Tauri（Rust 外壳 + 系统 WebView 前端）：启动快、体积小、UI 用 
 
 - `frontend/` 纯 HTML/CSS/JS，无构建步骤、无框架：自绘虚拟滚动网格、两带式表头、模态对话框、右键菜单。
 - `src-tauri/` Rust 侧只做 OS 能力：文件对话框、CSV 读写（UTF-8 BOM / GBK 识别）、窗口标题、版本注入、`--smoke` 自检通道。
-- 行为逐项对齐 Qt 版（main_window.py）；`frontend/js/smoke.js` 为对抗自检套件（51 项），`--smoke` 运行后写报告退出。
+- 行为逐项对齐 Qt 版（main_window.py）；`frontend/js/smoke.js` 为对抗自检套件（52 项），`--smoke` 运行后写报告退出。
 - 运行要求：Windows 10+（自带 WebView2 运行时；LTSC/老系统需装 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)）。
 
 ## 功能
@@ -58,7 +58,7 @@ cd src-tauri
 cargo build
 ./target/debug/simpletable.exe
 
-# 对抗自检：51 项断言，写 %TEMP%\simpletable_smoke_report.txt 后退出
+# 对抗自检：52 项断言，写 %TEMP%\simpletable_smoke_report.txt 后退出
 ./target/debug/simpletable.exe --smoke
 ```
 
@@ -121,7 +121,7 @@ frontend/js/csv.js     CSV 解析/生成 RFC4180（对齐 csv_io.py）
 frontend/js/pane.js    编辑窗格（符号镜像层、独立缩放）
 frontend/js/dialogs.js 模态对话框（新建/排序/列/确认/数字输入）
 frontend/js/menu.js    右键上下文菜单
-frontend/js/smoke.js   --smoke 对抗自检套件（51 项）
+frontend/js/smoke.js   --smoke 对抗自检套件（52 项）
 tests_js/              node:test 逻辑层单测（csv/model）
 src-tauri/src/lib.rs   Rust 命令层（文件对话框/读写/标题/版本/冒烟通道）
 src-tauri/build.rs     版本注入 + 前端资产变更触发重编译
