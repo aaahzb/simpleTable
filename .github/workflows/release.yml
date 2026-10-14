@@ -92,10 +92,8 @@ jobs:
         with:
           node-version: 22
 
-      # tauri CLI 走 npm 预编译二进制（比 cargo install 快一个数量级）
-      - name: 安装 Tauri CLI
-        run: npm install -g @tauri-apps/cli@2
-
+      # npm 版 CLI 只有 `tauri` 命令（没有 cargo-tauri 子命令），
+      # 故构建步用 npx 直接调，免去全局安装与 PATH 问题
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
@@ -103,7 +101,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: 构建 dmg（aarch64-apple-darwin）
-        run: cargo tauri build --target aarch64-apple-darwin
+        run: npx --yes @tauri-apps/cli@2 build --target aarch64-apple-darwin
         working-directory: src-tauri
 
       - name: 规整产物名
