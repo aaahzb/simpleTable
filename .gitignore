@@ -7,3 +7,9 @@ dist/
 .pytest_cache/
 _build_info.py
 build.log
+
+# Tauri 版（tauri-port）
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+shot_*.png

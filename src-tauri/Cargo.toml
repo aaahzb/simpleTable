@@ -1,0 +1,20 @@
+[package]
+name = "simpletable"
+version = "0.1.0"
+description = "simpleTable - 极速 CSV 表格工具（Tauri 版）"
+authors = ["aaahzb"]
+edition = "2021"
+
+[lib]
+name = "simpletable_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+encoding_rs = "0.8"
+rfd = "0.15"

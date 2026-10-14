@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<script>
+// 早期错误捕获（模块加载失败也算）：冒烟模式写报告退出，避免无声挂死
+(function () {
+  let reported = false;
+  function fatal(msg) {
+    if (reported) return;
+    reported = true;
+    try {
+      window.__TAURI__.core.invoke("finish_smoke", { report: "[fatal] " + msg, code: 1 });
+    } catch (e) { /* 无 Tauri 环境（纯浏览器调试）忽略 */ }
+  }
+  window.addEventListener("error", (e) => {
+    // ResizeObserver 循环通知是无害告警，不视为致命
+    if (e.message && e.message.includes("ResizeObserver")) return;
+    fatal(e.message + " @ " + (e.filename || "") + ":" + (e.lineno || 0));
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    fatal("unhandledrejection: " + (e.reason && (e.reason.stack || e.reason)));
+  });
+  // 诊断：冒烟模式下 6 秒后若未收尾，把状态写进窗口标题（外部可读）；正常运行不干扰标题
+  function armDiag() {
+    setTimeout(() => {
+      if (reported) return;
+      const last = window.__lastError || "";
+      document.title = "DIAG browser loc=" + location.href + " err=" + last;
+    }, 6000);
+  }
+  try {
+    window.__TAURI__.core.invoke("is_smoke").then((smoke) => {
+      if (!smoke) { armDiag(); return; } // 纯浏览器调试无 is_smoke 命令：留 DOM 标题诊断
+      setTimeout(() => {
+        if (reported) return;
+        const last = window.__lastError || "";
+        let geo = "";
+        try {
+          const sc = document.getElementById("grid-scroll");
+          const cv = document.getElementById("grid-canvas");
+          const rows = [...document.querySelectorAll("#rows .row")]
+            .map((r) => (r.dataset.row ?? "?") + "@" + r.style.top).join("|");
+          geo = " st=" + sc.scrollTop + " sl=" + sc.scrollLeft +
+            " ch=" + sc.clientHeight + " cw=" + sc.clientWidth +
+            " cvh=" + cv.style.height + " cvw=" + cv.style.width +
+            " rows=" + rows;
+        } catch (e) { geo = " geoerr=" + e.message; }
+        const diag = "DIAG tauri=" + (window.__TAURI__ ? "ok" : "none") +
+          " app=" + (window.__app ? "ok" : "none") +
+          " loc=" + location.href + " err=" + last + geo;
+        document.title = diag; // 浏览器调试时看 DOM 标题
+        try {
+          window.__TAURI__.core.invoke("set_title", { title: diag }); // 真机读窗口标题
+        } catch (e) { /* 忽略 */ }
+      }, 6000);
+    }).catch(() => armDiag()); // invoke 失败（无 Tauri）：留 DOM 标题诊断
+  } catch (e) { armDiag(); } // __TAURI__ 未注入（无 Tauri）：留 DOM 标题诊断
+  window.addEventListener("error", (e) => {
+    window.__lastError = e.message + " @ " + (e.filename || "").split("/").pop() + ":" + (e.lineno || 0);
+  });
+})();
+</script>
+<title>simpleTable</title>
+<style>
+/* ========== 全局 ========== */
+:root {
+  --grid-zoom: 1;            /* 表格整体缩放（C/G5）：em 全跟随 */
+  --pane-zoom: 1;            /* 编辑窗格独立缩放（E3） */
+  --row-header-w: 3.2em;     /* 行号列宽 */
+  --header-text-band: 1.9em; /* 列名文字带高（Qt: fontMetrics.height()+10） */
+  --filter-band: 2em;        /* 筛选带高（Qt FILTER_BAND=26 ≈ 2em@13px） */
+  --row-h: 1.8em;            /* 行高基准（自定义行高时行内联覆盖） */
+  --border: #c8c8c8;
+  --header-bg: #f0f0f0;
+  --accent: #2d6a9f;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; overflow: hidden; }
+body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; }
+#app { display: flex; flex-direction: column; height: 100vh; }
+
+/* ========== 工具栏（E4） ========== */
+#toolbar {
+  display: flex; align-items: center; gap: 2px; flex: 0 0 auto;
+  padding: 3px 6px; background: #fafafa; border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+#toolbar button {
+  font: inherit; padding: 4px 10px; border: 1px solid transparent;
+  background: transparent; border-radius: 3px; cursor: pointer; color: #222;
+}
+#toolbar button:hover:not(:disabled) { background: #e5e5e5; border-color: #d0d0d0; }
+#toolbar button:disabled { color: #aaa; cursor: default; }
+#toolbar button.on { background: #dce6f0; border-color: var(--accent); color: var(--accent); }
+#toolbar .sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+
+/* ========== 主行：网格 + 分隔条 + 编辑窗格 ========== */
+#main-row { display: flex; flex: 1 1 auto; min-height: 0; }
+#grid-area {
+  flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column;
+  font-size: calc(13px * var(--grid-zoom)); /* 网格内全部尺寸用 em，随缩放 */
+}
+#splitter {
+  flex: 0 0 5px; cursor: col-resize; background: #e8e8e8;
+  border-left: 1px solid var(--border); border-right: 1px solid var(--border);
+}
+#splitter:hover { background: var(--accent); }
+
+/* ---- 网格滚动区 ---- */
+#grid-scroll {
+  flex: 1 1 auto; overflow: auto; position: relative; outline: none;
+  background: #fff;
+}
+/* overflow-x: clip 裁掉列宽拖拽手柄超出画布右缘的悬垂（不建滚动容器，吸顶表头不受影响） */
+#grid-canvas { position: relative; overflow-x: clip; }
+/* 行容器：作为 .row 绝对定位的参照（相对列头之下），否则行会画进吸顶表头下面 */
+#rows { position: relative; }
+
+/* ---- 列头（两带：列名 + 筛选）D1 ---- */
+#col-header {
+  position: sticky; top: 0; z-index: 5; display: flex;
+  background: var(--header-bg); border-bottom: 1px solid #a0a0a0;
+  font-size: 1em;
+}
+#corner {
+  flex: 0 0 var(--row-header-w); position: sticky; left: 0; z-index: 7;
+  background: var(--header-bg); border-right: 1px solid #a0a0a0;
+}
+.col-head-cell {
+  flex: 0 0 auto; position: relative; overflow: visible;
+  border-right: 1px solid var(--border);
+}
+.col-name {
+  height: var(--header-text-band); display: flex; align-items: center;
+  padding: 0 0.4em; overflow: hidden; white-space: nowrap;
+  text-overflow: ellipsis; cursor: default; user-select: none;
+}
+.col-filter { height: var(--filter-band); padding: 0 1px; }
+.col-filter input {
+  width: 100%; height: calc(100% - 2px); margin-top: 1px;
+  font: inherit; font-size: 0.92em; padding: 0 0.3em;
+  border: 1px solid #d0d0d0; border-radius: 2px; background: #fff;
+}
+.col-filter input:focus { border-color: var(--accent); outline: none; }
+.col-resize {
+  position: absolute; top: 0; right: -3px; width: 7px; height: 100%;
+  cursor: col-resize; z-index: 8;
+}
+.col-head-cell.col-drag-over .col-name { background: #cfe0ef; }
+
+/* ---- 行与单元格 ---- */
+.row { position: absolute; left: 0; display: flex; }
+.row-head {
+  flex: 0 0 var(--row-header-w); position: sticky; left: 0; z-index: 3;
+  background: var(--header-bg); border-right: 1px solid #a0a0a0;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  color: #555; font-size: 0.92em; user-select: none;
+}
+.row-resize {
+  position: absolute; left: 0; bottom: -3px; height: 7px; width: 100%;
+  cursor: row-resize; z-index: 4;
+}
+.cell {
+  flex: 0 0 auto; overflow: hidden; white-space: nowrap;
+  text-overflow: ellipsis;             /* C2 省略号截断 */
+  padding: 0 0.35em; display: flex; align-items: center;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: #fff; cursor: cell;
+}
+.cell.sel { background: #cfe0ef; }
+.cell.cur {
+  outline: 2px solid var(--accent); outline-offset: -2px; z-index: 2;
+}
+.cell.row-full-sel, .cell.col-full-sel { background: #dbe9f5; }
+
+/* ---- 格内编辑器浮层（C5） ---- */
+#cell-editor {
+  position: absolute; z-index: 10; display: none;
+  font: inherit; padding: 0 0.3em; border: 2px solid var(--accent);
+  outline: none; resize: none; overflow: hidden; background: #fff;
+  line-height: 1.45em; white-space: pre-wrap; word-break: break-all;
+}
+
+/* ========== 编辑窗格（E1–E3） ========== */
+#pane { flex: 0 0 auto; width: 280px; display: flex; flex-direction: column; min-width: 120px; }
+#pane-title {
+  flex: 0 0 auto; padding: 5px 8px; font-weight: bold; background: #f0f0f0;
+  border-bottom: 1px solid var(--border); user-select: none;
+}
+#pane-wrap { position: relative; flex: 1 1 auto; min-height: 0; font-size: calc(13px * var(--pane-zoom)); }
+#pane-edit, #pane-mirror {
+  font: inherit; font-size: 1em; line-height: 1.5; padding: 6px;
+  border: none; margin: 0; white-space: pre-wrap; word-break: break-word;
+  width: 100%; height: 100%;
+}
+#pane-wrap { overflow: hidden; }
+#pane-edit {
+  position: absolute; inset: 0; resize: none; outline: none;
+  background: transparent; overflow: auto;
+}
+#pane-mirror {
+  position: absolute; inset: 0; overflow: hidden; pointer-events: none;
+  color: #222; background: #fff;
+}
+#pane.symbols #pane-edit { color: transparent; caret-color: #222; }
+#pane.symbols #pane-edit::selection { background: rgba(45,106,159,.35); color: transparent; }
+#pane-mirror { display: none; }
+#pane.symbols #pane-mirror { display: block; }
+#pane-mirror .sp { color: #b060b0; }
+
+/* ========== 状态栏（E5） ========== */
+#statusbar {
+  flex: 0 0 auto; display: flex; align-items: center;
+  border-top: 1px solid var(--border); background: #f7f7f7;
+  padding: 2px 8px; min-height: 24px; user-select: none;
+}
+#status-text { flex: 1 1 auto; color: #333; }
+#status-version { color: gray; }
+
+/* ========== 模态对话框 ========== */
+.modal-mask {
+  position: fixed; inset: 0; background: rgba(0,0,0,.25); z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+}
+.modal {
+  background: #fff; border: 1px solid #999; border-radius: 4px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.25); min-width: 340px; max-width: 80vw;
+  max-height: 80vh; display: flex; flex-direction: column;
+}
+.modal-title {
+  padding: 8px 12px; font-weight: bold; border-bottom: 1px solid var(--border);
+  background: #f0f0f0; user-select: none;
+}
+.modal-body { padding: 12px; overflow: auto; }
+.modal-buttons {
+  display: flex; justify-content: flex-end; gap: 8px;
+  padding: 10px 12px; border-top: 1px solid var(--border);
+}
+.modal-buttons button { font: inherit; padding: 4px 16px; min-width: 72px; cursor: pointer; }
+.modal label { display: block; margin: 6px 0 2px; color: #444; }
+.modal select, .modal input[type=text], .modal input[type=number] {
+  font: inherit; padding: 3px 6px; width: 100%; border: 1px solid #bbb; border-radius: 2px;
+}
+#sort-levels { list-style: none; margin: 0; padding: 0; border: 1px solid #ccc; min-height: 120px; min-width: 220px; }
+#sort-levels li { padding: 4px 8px; cursor: default; }
+#sort-levels li.sel { background: var(--accent); color: #fff; }
+#newtable-cols { list-style: none; margin: 0 0 8px; padding: 0; }
+#newtable-cols li { display: flex; gap: 6px; margin-bottom: 4px; }
+#newtable-cols li input { flex: 1; }
+
+/* ========== 右键菜单（F6） ========== */
+.ctx-menu {
+  position: fixed; z-index: 200; background: #fff; border: 1px solid #999;
+  box-shadow: 2px 2px 8px rgba(0,0,0,.2); padding: 2px 0; min-width: 200px;
+  user-select: none; font-size: 13px;
+}
+.ctx-menu .mi { padding: 5px 18px; cursor: default; white-space: nowrap; }
+.ctx-menu .mi:hover:not(.disabled) { background: var(--accent); color: #fff; }
+.ctx-menu .mi.disabled { color: #aaa; }
+.ctx-menu .msep { height: 1px; background: var(--border); margin: 3px 0; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="toolbar"></div>
+  <div id="main-row">
+    <div id="grid-area">
+      <div id="grid-scroll" tabindex="0">
+        <div id="grid-canvas">
+          <div id="col-header"><div id="corner"></div></div>
+          <div id="rows"></div>
+          <textarea id="cell-editor"></textarea>
+        </div>
+      </div>
+    </div>
+    <div id="splitter"></div>
+    <div id="pane">
+      <div id="pane-title">编辑窗格</div>
+      <div id="pane-wrap">
+        <pre id="pane-mirror"></pre>
+        <textarea id="pane-edit" spellcheck="false"></textarea>
+      </div>
+    </div>
+  </div>
+  <div id="statusbar">
+    <span id="status-text"></span>
+    <span id="status-version"></span>
+  </div>
+</div>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
