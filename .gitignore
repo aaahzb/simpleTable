@@ -1,15 +1,10 @@
-venv/
-__pycache__/
-*.pyc
-build/
-dist/
-*.spec
-.pytest_cache/
-_build_info.py
-build.log
-
-# Tauri 版（tauri-port）
-node_modules/
+# Rust 构建产物
 src-tauri/target/
 src-tauri/gen/
+
+# 截图巡检临时产物
 shot_*.png
+
+# 系统/编辑器杂项
+Thumbs.db
+.DS_Store
