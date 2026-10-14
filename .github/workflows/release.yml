@@ -112,17 +112,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 需要 tag 对象本体（附注说明）
 
-      - name: 组装 Release 正文（固定头 + 「即将发布」节）
+      - name: 组装 Release 正文（固定头 + tag 附注说明）
         id: notes
         run: |
-          HEADER=$(awk '/<!-- HEADER:BEGIN -->/{f=1;next} /<!-- HEADER:END -->/{f=0} f' RELEASE_NOTES.md)
-          # 取 HEADER 块之外的第一个 ## 节（即「即将发布」），与 tag 名解耦
-          SECTION=$(awk '/<!-- HEADER:BEGIN -->/{skip=1;next} /<!-- HEADER:END -->/{skip=0;next} skip{next} /^## /{if(f)exit; f=1;next} f' RELEASE_NOTES.md)
-          grep -q '[^[:space:]]' <<<"$SECTION" || { echo "RELEASE_NOTES.md 缺少「即将发布」节，发布中止" >&2; exit 1; }
+          HEADER='个人自用的极简桌面表格工具：格子永不变形，带换行的长文也能塞进一个格子并方便阅读。CSV 查看、编辑、筛选、排序，键位与剪贴板行为对齐 Excel。
+
+          ## 下载
+
+          - **Windows (x64)**：`simpleTable-windows-x64.exe`，单文件免安装，下载即用。
+          - **macOS (Apple Silicon)**：`simpleTable-macos-arm64.dmg`，双击打开后把 app 拖入"应用程序"。首次打开如提示无法验证开发者：右键 → 打开。'
+          # Release 说明取自 tag 附注（git tag -a -m "..." 写入），与仓库文件零耦合；
+          # 轻量 tag 的 %(contents) 会是 commit message，必须用对象类型区分
+          OBJ_TYPE=$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(objecttype)')
+          TAG_BODY=$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)')
+          if [ "$OBJ_TYPE" != "tag" ]; then
+            echo "tag ${GITHUB_REF_NAME} 没有附注说明。请改用 git tag -a ${GITHUB_REF_NAME} -m \"说明...\" 后重推。" >&2
+            exit 1
+          fi
           {
             echo "body<<NOTES_EOF"
-            printf '%s\n\n## 本次变更（相对上一版）\n%s\n' "$HEADER" "$SECTION"
+            printf '%s\n\n## 本次变更（相对上一版）\n%s\n' "$HEADER" "$TAG_BODY"
             echo "NOTES_EOF"
           } >> "$GITHUB_OUTPUT"
 
