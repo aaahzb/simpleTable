@@ -27,6 +27,9 @@ from filter_proxy import FilterProxy
 from table_model import TableModel
 from version import get_version
 
+# 私有剪贴板格式：本软件复制时附加，粘贴方据此强制按 TSV 区域解析
+_MIME_REGION = "application/x-simpletable-tsv"
+
 
 class SortDialog(QDialog):
     """组内优先级排序对话框：层级列表自上而下为优先级。"""
@@ -872,16 +875,38 @@ class MainWindow(QMainWindow):
                 text = idx.data(Qt.EditRole) if sel.isSelected(idx) else ""
                 line.append(text or "")
             writer.writerow(line)
-        QGuiApplication.clipboard().setText(buf.getvalue())
+        text = buf.getvalue()
+        mime = QMimeData()
+        mime.setText(text)
+        # 私有标记：单列复制出来也是无 Tab 文本，粘贴方凭标记仍按区域解析
+        mime.setData(_MIME_REGION, b"1")
+        QGuiApplication.clipboard().setMimeData(mime)
         self.status.showMessage(f"已复制 {len(idxs)} 个单元格", 2000)
 
-    def _paste_from_clipboard(self) -> None:
-        """从当前单元格起粘贴 TSV 文本（与 Excel 互通），超范围自动扩展行列。"""
-        text = QGuiApplication.clipboard().text()
+    def _paste_from_clipboard(self, force_split: bool = False) -> None:
+        """从当前单元格起粘贴（与 Excel 互通），超范围自动扩展行列。
+
+        三级判据：本软件复制的（带私有 MIME 标记）或含 Tab 的文本按 TSV
+        区域解析；其余纯文本（如带换行的长文）整段进入当前单元格。
+
+        Args:
+            force_split: True 时无条件按区域解析（右键菜单"按行拆分粘贴"）。
+        """
+        cb = QGuiApplication.clipboard()
+        text = cb.text()
         if not text:
             return
         start = self.view.selectionModel().currentIndex()
         if not start.isValid():
+            return
+        src = self.proxy.mapToSource(start)
+        r0, c0 = src.row(), src.column()
+        internal = cb.mimeData().hasFormat(_MIME_REGION)
+        if not force_split and not internal and "\t" not in text:
+            # 外部无 Tab 纯文本：整段进当前格（长文粘贴），换行保留
+            self.model.setData(self.model.index(r0, c0),
+                               text.replace("\r\n", "\n").rstrip("\r\n"))
+            self.status.showMessage("已粘贴到当前单元格", 2000)
             return
         try:
             rows = list(csv.reader(io.StringIO(text), delimiter="\t"))
@@ -890,8 +915,6 @@ class MainWindow(QMainWindow):
             return
         if not rows:
             return
-        src = self.proxy.mapToSource(start)
-        r0, c0 = src.row(), src.column()
         # 扩展行列 + 逐格写入合并为一步撤销（Excel：粘贴是单个操作）
         with self.model.batch():
             # 超出当前范围时自动扩展行列（Excel 行为）
@@ -1037,6 +1060,8 @@ class MainWindow(QMainWindow):
         cols = self._selected_source_cols()
         cell_count = len(self.view.selectionModel().selectedIndexes())
         menu = QMenu(self)
+        act_paste_split = menu.addAction("按行拆分粘贴")
+        menu.addSeparator()
         act_ins_row = menu.addAction(f"在上方插入 {len(rows)} 行")
         act_ins_col = menu.addAction(f"在左侧插入 {len(cols)} 列")
         menu.addSeparator()
@@ -1044,7 +1069,9 @@ class MainWindow(QMainWindow):
         act_del_col = menu.addAction(f"删除选区跨越的 {len(cols)} 列…")
         act_clear = menu.addAction(f"清除选区 {cell_count} 个单元格内容…")
         chosen = menu.exec(QCursor.pos())
-        if chosen is act_ins_row:
+        if chosen is act_paste_split:
+            self._paste_from_clipboard(force_split=True)
+        elif chosen is act_ins_row:
             self.model.insert_rows(min(rows), len(rows))
         elif chosen is act_ins_col:
             self._insert_columns(min(cols), len(cols))

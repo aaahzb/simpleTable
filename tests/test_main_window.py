@@ -522,6 +522,51 @@ class TestExcelKeys:
         window._paste_from_clipboard()
         assert window.model.raw_data(0, 0) == "1"
         assert window.model.raw_data(1, 1) == "y"
+class TestPastePlainText:
+    """无 Tab 纯文本整段进单格；内部复制带私有标记仍按区域解析。"""
+
+    def test_plain_multiline_goes_to_single_cell(self, window) -> None:
+        window.model.load(["A", "B"], [["1", "2"], ["3", "4"]])
+        window.view.setCurrentIndex(window.proxy.index(0, 1))
+        QGuiApplication.clipboard().setText("第一行\n第二行\r\n第三行\n")
+        window._paste_from_clipboard()
+        assert window.model.raw_data(0, 1) == "第一行\n第二行\n第三行"
+        assert window.model.rowCount() == 2    # 未摊开
+        assert window.model.columnCount() == 2  # 未扩展
+        window.undo_action.trigger()
+        assert window.model.raw_data(0, 1) == "2"  # 单格粘贴一步撤销
+
+    def test_tsv_still_pastes_as_region(self, window) -> None:
+        window.model.load(["A", "B"], [["1", "2"], ["3", "4"]])
+        window.view.setCurrentIndex(window.proxy.index(0, 0))
+        QGuiApplication.clipboard().setText("x\ty\nz\tw")
+        window._paste_from_clipboard()
+        assert window.model.raw_data(1, 1) == "w"
+
+    def test_internal_copy_carries_region_marker(self, window) -> None:
+        window.model.load(["A"], [["1"]])
+        window.view.selectAll()
+        window._copy_selection()
+        mime = QGuiApplication.clipboard().mimeData()
+        assert mime.hasFormat("application/x-simpletable-tsv")
+
+    def test_internal_column_pastes_as_region(self, window) -> None:
+        # 本软件复制一列（无 Tab 文本），贴回仍是一列而非塌进一格
+        window.model.load(["A", "B"], [["1", ""], ["2", ""], ["3", ""]])
+        window.view.selectColumn(0)
+        window._copy_selection()
+        window.view.setCurrentIndex(window.proxy.index(0, 1))
+        window._paste_from_clipboard()
+        assert ([window.model.raw_data(r, 1) for r in range(3)]
+                == ["1", "2", "3"])
+
+    def test_force_split_pastes_as_rows(self, window) -> None:
+        window.model.load(["A"], [["1"]])
+        window.view.setCurrentIndex(window.proxy.index(0, 0))
+        QGuiApplication.clipboard().setText("a\nb\nc")
+        window._paste_from_clipboard(force_split=True)
+        assert ([window.model.raw_data(r, 0) for r in range(3)]
+                == ["a", "b", "c"])
 
 class TestUndo:
     """撤销/重做与主窗口整合：工具栏按钮、粘贴合并、窗格击键合并。"""
