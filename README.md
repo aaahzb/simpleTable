@@ -19,14 +19,14 @@ Tauri（Rust 外壳 + 系统 WebView 前端）：启动快、体积小、UI 用 
 
 - `frontend/` 纯 HTML/CSS/JS，无构建步骤、无框架：自绘虚拟滚动网格、两带式表头、模态对话框、右键菜单。
 - `src-tauri/` Rust 侧只做 OS 能力：文件对话框、CSV 读写（UTF-8 BOM / GBK 识别）、窗口标题、版本注入、`--smoke` 自检通道。
-- 行为逐项对齐 Qt 版（main_window.py）；`frontend/js/smoke.js` 为对抗自检套件（49 项），`--smoke` 运行后写报告退出。
+- 行为逐项对齐 Qt 版（main_window.py）；`frontend/js/smoke.js` 为对抗自检套件（51 项），`--smoke` 运行后写报告退出。
 - 运行要求：Windows 10+（自带 WebView2 运行时；LTSC/老系统需装 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)）。
 
 ## 功能
 
 - **格内编辑（Excel 键位）**：打字即进入编辑（新内容替换旧内容），双击或 `F2`（macOS 仅双击，Qt 在该平台无 F2 编辑键）在原文基础上编辑；`Enter` 提交并下移、`Shift+Enter` 上移、`Tab` 右移、`Shift+Tab` 左移、`Alt+Enter` 格内换行、`Esc` 取消；多行内容时编辑器自动加高（不改行高）。
 - **编辑窗格**：单击选中任意单元格，右侧编辑窗格同步显示完整内容，可直接编辑（支持回车、空格、Tab），实时写回；格内编辑也会同步到窗格。工具栏"显示符号"开关可像 Notepad++ 一样显示空格（·）、Tab（→）、换行符（¶）。
-- **单元格显示**：内容里的换行/Tab 在格内显示为空格，超出列宽自动省略——内容再多单元格也不变形。
+- **单元格显示**：内容里的换行/Tab 在格内显示为空格，超出列宽自动省略——内容再多单元格也不变形。`Esc` 取消选定（清空选区、保留当前格，对齐 Qt 表格行为）；在筛选框打字永远是筛选，不会被当成"打字即编辑"。
 - **缩放**：表格区与编辑窗格各自支持 `Ctrl+滚轮` 整体缩放（0.5x–3.0x，互不影响），表格的行高、列宽、表头与内嵌筛选框随字体同步缩放；缩放时状态栏短暂提示当前比例。
 - **拖放打开 / 命令行打开**：把 CSV 文件直接拖进窗口即可打开（拖入多个时取第一个）；也可用 `simpletable.exe 文件.csv` 启动即打开（可做文件关联），两者共用同一编码识别与脏检查流程。
 - **行列操作（Excel 式）**：左键点行号/列名选中整行/整列（支持 Ctrl/Shift 多选）；在行号、列名或单元格选区上**右键**弹出菜单——插入（数量=选中数量）、"在末尾添加 N 行"、删除、清除内容、重命名列。删除与清除均有二次确认（误操作可用 Ctrl+Z 撤销）；清除只清内容、保留行列结构；新列自动命名"新列N"；列插入/删除后自动清空筛选（防止列号错位误筛）。
@@ -58,7 +58,7 @@ cd src-tauri
 cargo build
 ./target/debug/simpletable.exe
 
-# 对抗自检：49 项断言，写 %TEMP%\simpletable_smoke_report.txt 后退出
+# 对抗自检：51 项断言，写 %TEMP%\simpletable_smoke_report.txt 后退出
 ./target/debug/simpletable.exe --smoke
 ```
 
@@ -121,7 +121,7 @@ frontend/js/csv.js     CSV 解析/生成 RFC4180（对齐 csv_io.py）
 frontend/js/pane.js    编辑窗格（符号镜像层、独立缩放）
 frontend/js/dialogs.js 模态对话框（新建/排序/列/确认/数字输入）
 frontend/js/menu.js    右键上下文菜单
-frontend/js/smoke.js   --smoke 对抗自检套件（49 项）
+frontend/js/smoke.js   --smoke 对抗自检套件（51 项）
 tests_js/              node:test 逻辑层单测（csv/model）
 src-tauri/src/lib.rs   Rust 命令层（文件对话框/读写/标题/版本/冒烟通道）
 src-tauri/build.rs     版本注入 + 前端资产变更触发重编译

@@ -165,6 +165,27 @@ export async function runSmoke({ model, grid, pane, invoke }) {
     assert(grid.selectedSet.size === 3, `整列应选中 3 格，实际 ${grid.selectedSet.size}`);
   });
 
+  check("Esc 清空选区但保留当前格（对齐 Qt）", () => {
+    loadBasic();
+    grid.selectRow(1);
+    assert(grid.selectedSet.size === 3, `选中整行应 3 格，实际 ${grid.selectedSet.size}`);
+    key(document.getElementById("grid-scroll"), "Escape");
+    assert(grid.selectedSet.size === 0 && grid.sel.blocks.length === 0,
+      "Esc 后选区应为空");
+    assert(cur(grid)?.[0] === 1, "Esc 后当前格应保留（对齐 Qt 表格 Escape 行为）");
+  });
+
+  check("筛选框聚焦打字不被劫持为格内编辑", () => {
+    loadBasic();
+    grid.select([0, 0]);
+    const input = document.querySelector("#col-header .col-filter input");
+    assert(input, "表头应有筛选输入框");
+    input.focus();
+    key(input, "x");
+    assert(!grid.editing, "筛选框打字不应打开格内编辑器");
+    assert(cur(grid)?.[0] === 0 && cur(grid)?.[1] === 0, "当前格不应被改动");
+  });
+
   check("方向键移动当前格", async () => {
     grid.select([0, 0]);
     const scroller = document.getElementById("grid-scroll");

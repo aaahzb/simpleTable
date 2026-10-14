@@ -394,6 +394,14 @@ export class Grid {
     this._renderRows();
   }
 
+  /** Esc：清空选区填充但保留当前格（对齐 Qt 表格视图的 Escape 行为） */
+  deselect() {
+    if (!this.sel.blocks.length) return;
+    this.sel.blocks = [];
+    this.selectedSet.clear();
+    this._renderRows();
+  }
+
   /** 选整行 */
   selectRow(r, opts = {}) {
     this.select([r, 0], { ...opts, silent: true });
@@ -698,6 +706,9 @@ export class Grid {
    */
   _onKeyDown(e) {
     if (this.editing) return; // 编辑器自行处理
+    // 筛选框等输入控件聚焦时键盘归控件自己，防"打字即编辑"劫持输入
+    const tag = e.target?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
     const cur = this.sel.current;
     const mods = e.ctrlKey || e.metaKey;
     if (mods && !e.shiftKey && (e.key === "c" || e.key === "C")) {
@@ -726,6 +737,11 @@ export class Grid {
     if (e.key === "Enter") {
       e.preventDefault();
       this._moveCurrent(e.shiftKey ? -1 : 1, 0);
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      this.deselect(); // 对齐 Qt 表格：Esc 取消选定
       return;
     }
     const arrows = {
