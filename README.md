@@ -61,25 +61,11 @@ node --test tests_js/
 ./src-tauri/target/debug/simpletable.exe --smoke
 ```
 
-## 打包与发布
+## CI 与发布
 
-- **CI（推送即触发）**：推送到 `main` 或提 PR 自动构建并自检——Windows 跑完整冒烟（52 项断言），macOS 做 arm64 编译检查。见 `.github/workflows/ci.yml`。
-- **发布**：推送 `v` 开头 tag，自动构建 **Windows x64 exe** 与 **macOS arm64 dmg** 并发布到 GitHub Releases：
-
-  ```bash
-  git tag v1.0.0
-  git push origin v1.0.0
-  ```
-
-  版本号由 `src-tauri/build.rs` 从 git tag 注入（HEAD 命中 tag 显示 `release <tag>`）。也可以在 Actions 页面手动触发 Release 流水线——只构建并保留产物，不创建 Release（用于发版前验证）。
-
-- **本地打包**：
-
-  ```bash
-  cd src-tauri
-  cargo build --release
-  # 产物：src-tauri\target\release\simpletable.exe（单文件，可直接分发）
-  ```
+- 推 `main` / PR → 自动构建自检：Windows 完整冒烟（52 项断言），macOS arm64 编译检查。
+- 推 `v*` tag → 自动构建 Windows x64 exe 与 macOS arm64 dmg 并发布 GitHub Release；版本号由 `build.rs` 从 tag 注入。Actions 里也可手动触发 Release 流水线（只构建不发布，发版前验证用）。
+- 本地打包：`src-tauri` 下 `cargo build --release`，产物 `target/release/simpletable.exe`。
 
 ## 项目结构
 
@@ -97,7 +83,6 @@ tests_js/              node:test 逻辑层单测（csv/model）
 src-tauri/src/lib.rs   Rust 命令层（文件对话框/读写/标题/版本/冒烟通道/启动参数）
 src-tauri/build.rs     版本注入 + 前端资产变更触发重编译
 scripts/               截图巡检脚本（PrintWindow 无头截屏，开发用）
-TODO.md                开发日志（需求清单 + 每轮修复记录）
 ```
 
 ## 许可证
