@@ -8,6 +8,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /** 真机大文件（用户报告的复现文件，2.2GB / 1553 万行） */
 const BIG = "D:/SVN_Cursor/simpleTable-public/price_j8888.csv";
 
+/** 删列实验对象：recovered 文件的副本（真机 2.16GB，不动用户数据） */
+const DELCOL = "park_delcol.csv";
+
 /**
  * 渲染现场诊断快照：滚动位置/画布高/渲染窗口/容器 transform。
  *
@@ -259,6 +262,45 @@ export async function runPark({ invoke, grid, mode }) {
       }
     }
     await mark(invoke, dir, "paneflicker_log", log.join("\n"));
+    await mark(invoke, dir, "done");
+    return;
+  }
+
+  if (mode === "delcol") {
+    // 真机删列实验（不动用户数据）：打开 recovered 副本（2.16GB，天然大模式），
+    // 删最后一列 → 执行列操作（物理重写，与保存共用流式重写+换名链路），
+    // 采样列数/行数/耗时/文件大小与深行渲染，验证大文件删列全链路。
+    const p = `${await invoke("smoke_tmp_dir")}/${DELCOL}`;
+    const fsize = async () => {
+      try { return Number(await invoke("file_size", { path: p })); }
+      catch { return -1; }
+    };
+    await window.__app.openPath(p);
+    const bm = window.__app.model;
+    const noop = () => invoke("path_exists", { path: `${dir}/__noop` });
+    for (let i = 0; i < 1200; i += 1) { // 2.16GB 索引可能要几分钟
+      if (window.__app.isBigMode() && bm.rowCount() > 0) break;
+      await noop();
+    }
+    const before = { rows: bm.rowCount(), cols: bm.columnCount(), bytes: await fsize() };
+    await mark(invoke, dir, "delcol_before", JSON.stringify(before));
+    const t0 = performance.now();
+    await bm.removeColumns([before.cols - 1]); // 预览（pending）
+    const pendingCols = bm.columnCount();
+    await bm.applyColOps(); // 物理重写（流式重写 + replace_with_retry 换名）
+    const ms = Math.round(performance.now() - t0);
+    const after = { rows: bm.rowCount(), cols: bm.columnCount(), bytes: await fsize() };
+    // 渲染验证：跳到 3,900,143 行附近（userpos 深度）再取诊断
+    grid.setZoom(1);
+    await sleep(400);
+    const oy = grid._originY();
+    const h = grid._uniformRowH;
+    sc.scrollTop = Math.round(oy + (3900143 * h) / grid._yScale);
+    await sleep(600);
+    sc.scrollTop = Math.round(oy + (3900143 * h) / grid._yScale);
+    await sleep(250);
+    await mark(invoke, dir, "delcol_after", JSON.stringify({ ...after, pendingCols, ms }));
+    await mark(invoke, dir, "delcol_diag", diag(grid, sc));
     await mark(invoke, dir, "done");
     return;
   }
