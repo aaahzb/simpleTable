@@ -1,6 +1,7 @@
 /**
  * 编辑窗格（E1–E3）：右侧多行编辑器，随选中单元格双向同步；
  * "显示符号"用叠加镜像层实现（空格→·、Tab→→、换行→¶），
+ * 符号绝对定位叠加在真实占位字符上，排版与编辑域逐像素一致（光标不串位）；
  * 编辑始终作用于原文，不会像文本替换方案那样污染含 · 的中文内容。
  * Ctrl+滚轮独立缩放，与表格互不影响。
  */
@@ -8,15 +9,44 @@
 import { ZOOM_MAX, ZOOM_MIN, ZOOM_STEP } from "./grid.js";
 
 /**
- * 把原始文本转为显示符号文本（仅展示用）。
+ * 把原始文本转为镜像层片段（仅展示用）：换行→¶+真实换行；
+ * 空格/制表符保留原字符占位（宽度与编辑域逐像素一致），符号以绝对定位叠加。
+ * 不能直接替换字符：YaHei 中 · 比空格窄、→ 为全宽，而制表符按 8 停位进距，
+ * 替换会让镜像排版偏离编辑域，光标与符号逐位串位。
  *
  * @param {string} raw - 原文。
- * @returns {string} 转换后的文本（空格→·，Tab→→，换行→¶；
- *   ¶ 追加在换行之前，换行本身保留——镜像层是 pre，靠真实换行断行，
- *   若用 ¶ 替换换行，多行文本会塌成一行只剩符号）。
+ * @param {Document} [doc] - 目标文档（默认当前文档，便于测试注入）。
+ * @returns {DocumentFragment} 镜像层内容片段。
  */
-export function toSymbols(raw) {
-  return raw.replace(/ /g, "·").replace(/\t/g, "→").replace(/\n/g, "¶\n");
+export function toSymbolsFrag(raw, doc = document) {
+  const frag = doc.createDocumentFragment();
+  let run = doc.createTextNode("");
+  /** 把累积的普通文本段刷入片段 */
+  const flush = () => {
+    if (run.data) {
+      frag.appendChild(run);
+      run = doc.createTextNode("");
+    }
+  };
+  for (const ch of raw) {
+    if (ch === " " || ch === "\t") {
+      flush();
+      const box = doc.createElement("span");
+      box.className = ch === " " ? "sp" : "tab";
+      box.textContent = ch; // 真实占位字符：排版与编辑域一致
+      const glyph = doc.createElement("span");
+      glyph.className = "g";
+      glyph.textContent = ch === " " ? "·" : "→";
+      box.appendChild(glyph); // 绝对定位叠加，不参与排版
+      frag.appendChild(box);
+    } else if (ch === "\n") {
+      run.data += "¶\n"; // ¶ 在行尾（换行之前），换行本身保留——镜像层靠真实换行断行
+    } else {
+      run.data += ch;
+    }
+  }
+  flush();
+  return frag;
 }
 
 /**
@@ -52,6 +82,12 @@ export class EditPane {
       if (e.key !== "Tab" || this._loading) return;
       e.preventDefault();
       const el = this.editEl;
+      // 优先走原生插入管线：保留文本域撤销栈（手动赋值 value 会清空它，导致 Ctrl+Z 失效），
+      // 且连续输入参与原生撤销步合并；原生管线会自动触发 input 事件完成回写
+      if (document.execCommand("insertText", false, "\t")) {
+        return;
+      }
+      // 原生插入不可用时退回手动插入（代价：清空撤销栈，退化为无法 Ctrl+Z 撤销本次 Tab）
       const s = el.selectionStart ?? el.value.length;
       const t = el.selectionEnd ?? el.value.length;
       el.value = el.value.slice(0, s) + "\t" + el.value.slice(t);
@@ -114,7 +150,7 @@ export class EditPane {
   /** 符号开启时刷新镜像层内容 */
   _syncMirror() {
     if (!this.symbols) return;
-    this.mirrorEl.textContent = toSymbols(this.editEl.value);
+    this.mirrorEl.replaceChildren(toSymbolsFrag(this.editEl.value));
     this._syncScroll();
   }
 

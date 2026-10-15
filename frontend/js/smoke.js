@@ -408,7 +408,7 @@ export async function runSmoke({ model, grid, pane, invoke }) {
     assert(model._undoStack.length === steps, "同格连续击键应合并为一步");
   });
 
-  check("窗格 Tab 键入制表符且焦点不逃离", async () => {
+  check("窗格 Tab 键入制表符且焦点不逃离（可 Ctrl+Z 撤销）", async () => {
     const pe = document.getElementById("pane-edit");
     pe.focus();
     pe.selectionStart = pe.selectionEnd = pe.value.length;
@@ -416,16 +416,77 @@ export async function runSmoke({ model, grid, pane, invoke }) {
     key(pe, "Tab");
     assert(pe.value === before + "\t", "Tab 应作为字符输入窗格内容");
     assert(document.activeElement === pe, "焦点应留在窗格，不被 Tab 导航抢走");
+    // Tab 走原生插入管线：撤销栈保留，Ctrl+Z 可撤销本次 Tab
+    assert(document.queryCommandEnabled("undo"), "Tab 插入后原生撤销栈应有内容");
+    document.execCommand("undo");
+    assert(pe.value === before, "Ctrl+Z 应撤销 Tab 插入");
+    document.execCommand("redo");
+    assert(pe.value === before + "\t", "重做应恢复 Tab");
+    document.execCommand("undo");
+    assert(pe.value === before, "收尾再撤销，恢复检查前状态");
+  });
+
+  check("编辑窗格 Ctrl+Z 撤销输入（原生撤销栈不被回写打断）", async () => {
+    loadBasic();
+    const pe = document.getElementById("pane-edit");
+    clickCell(grid, 0, 2);
+    pe.focus();
+    // execCommand 走原生输入管线（合成按键不触发默认动作），产生真实撤销步；
+    // 同时断言输入事件全链路（onEdit→模型→网格重渲染）不写回编辑域 value，
+    // 因为程序化赋值会清空 Chromium 文本域的原生撤销栈
+    const proto = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value");
+    let spyStack = null;
+    Object.defineProperty(pe, "value", {
+      get: proto.get,
+      set(v) { spyStack = new Error("程序化写入 pane-edit.value").stack; proto.set.call(this, v); },
+      configurable: true,
+    });
+    let inserted = false;
+    try {
+      inserted = document.execCommand("insertText", false, "ab");
+    } finally {
+      delete pe.value; // 移除间谍，恢复原型行为
+    }
+    assert(inserted && pe.value.endsWith("ab"), "原生插入应生效并到达窗格");
+    assert(spyStack === null, `输入链路不应写回 value（会清空撤销栈）：\n${spyStack ?? ""}`);
+    assert(document.queryCommandEnabled("undo"), "原生撤销栈应有内容");
+    document.execCommand("undo");
+    assert(!pe.value.endsWith("ab"), "Ctrl+Z 应撤销输入");
+    document.execCommand("redo");
+    assert(pe.value.endsWith("ab"), "重做应恢复输入");
+  });
+
+  check("显示符号/工具栏按钮点击不抢走窗格焦点（Ctrl+Z 路由保持）", async () => {
+    const pe = document.getElementById("pane-edit");
+    pe.focus();
+    const head = document.getElementById("pane-head");
+    const sym = head.querySelector("button");
+    sym.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    sym.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    sym.click();
+    assert(document.activeElement === pe,
+      "点击显示符号后焦点应留在窗格，Ctrl+Z 仍走原生撤销");
+    sym.click(); // 还原符号模式
+    const multi = [...document.querySelectorAll("#toolbar button")]
+      .find((b) => b.textContent === "多重筛选");
+    multi.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    assert(document.activeElement === pe, "按下工具栏按钮也不应抢焦点");
+    multi.click(); // 开（会显式聚焦输入框）
+    assert(document.activeElement?.id === "multi-filter-input",
+      "多重筛选开启应显式聚焦输入框");
+    multi.click(); // 关
   });
 
   check("显示符号：镜像层显示 · 与 ¶，编辑域保持原文", async () => {
+    pane.setText("a b\nc");
     pane.setSymbols(true);
     const mirror = document.getElementById("pane-mirror");
     assert(mirror.textContent.includes("·") || mirror.textContent.includes("¶"),
       "镜像层应包含符号");
-    assert(document.getElementById("pane-edit").value.includes("\n"),
-      "编辑域应保留原文换行");
+    assert(document.getElementById("pane-edit").value === "a b\nc",
+      "编辑域应保留原文（含空格与换行）");
     pane.setSymbols(false);
+    pane.clear();
   });
 
   // ========== 工具栏/状态栏/标题 ==========
@@ -738,6 +799,62 @@ export async function runSmoke({ model, grid, pane, invoke }) {
     assert(document.getElementById("pane-edit").value === text,
       "编辑层原文不应被符号污染");
     pane.setSymbols(false);
+  });
+
+  check("显示符号：Tab/空格符号占位与编辑域逐位对齐（镜像不串位）", () => {
+    const text = "\ta b\tcd e";
+    pane.setText(text);
+    pane.setSymbols(true);
+    const pe = document.getElementById("pane-edit");
+    const mirror = document.getElementById("pane-mirror");
+    // 探针：与编辑域同样式（同字体/内边距/换行规则/内容宽）的原文渲染参照，
+    // 镜像渲染必须与其逐位一致，光标（编辑域排版）才对得上符号
+    const probe = document.createElement("div");
+    const cs = getComputedStyle(pe);
+    probe.style.cssText = "position:absolute;left:-99999px;top:0;visibility:hidden;" +
+      `font:${cs.font};padding:${cs.padding};white-space:${cs.whiteSpace};` +
+      `word-break:${cs.wordBreak};line-height:${cs.lineHeight};` +
+      `width:${pe.clientWidth}px;border:none;margin:0;`;
+    probe.textContent = text;
+    document.getElementById("pane-wrap").appendChild(probe);
+    try {
+      /**
+       * 在元素内按文本查找锚点段落的几何矩形（相对元素盒原点）。
+       *
+       * @param {HTMLElement} root - 查找范围。
+       * @param {string} needle - 锚点文本。
+       * @returns {{left: number, top: number}} 锚点矩形（相对盒原点）。
+       */
+      const anchorRect = (root, needle) => {
+        const walker2 = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        let node = null;
+        let t2;
+        while ((t2 = walker2.nextNode())) {
+          if (t2.textContent.includes(needle)) { node = t2; break; }
+        }
+        assert(node, `${root.id || "probe"} 中应找到锚点 ${needle}`);
+        const r = document.createRange();
+        const off = node.textContent.indexOf(needle);
+        r.setStart(node, off);
+        r.setEnd(node, off + needle.length);
+        const rect = r.getBoundingClientRect();
+        const box = root.getBoundingClientRect();
+        return { left: rect.left - box.left, top: rect.top - box.top };
+      };
+      const pA = anchorRect(probe, "cd");
+      const mA = anchorRect(mirror, "cd");
+      // "e" 在空格盒之后：两锚点同时校验，空格占位宽度错误必然导致 "e" 漂移
+      const pB = anchorRect(probe, "e");
+      const mB = anchorRect(mirror, "e");
+      const dA = Math.max(Math.abs(mA.left - pA.left), Math.abs(mA.top - pA.top));
+      const dB = Math.max(Math.abs(mB.left - pB.left), Math.abs(mB.top - pB.top));
+      assert(dA <= 1 && dB <= 1,
+        `tab/空格符号后文本应逐位对齐：锚点cd Δ=${dA.toFixed(2)}px，` +
+        `锚点e Δ=${dB.toFixed(2)}px`);
+    } finally {
+      probe.remove();
+      pane.setSymbols(false);
+    }
   });
 
   // ---- 几何自检：画布无意外滚动条（末列拉伸后应与视口齐平） ----

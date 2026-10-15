@@ -164,6 +164,8 @@ for (const spec of [
   const b = document.createElement("button");
   b.textContent = text;
   b.addEventListener("click", fn);
+  // 对齐 Qt 工具栏：点击不抢走键盘焦点，焦点留在窗格/网格，Ctrl+Z 等键位路由不乱
+  b.addEventListener("mousedown", (e) => e.preventDefault());
   toolbar.appendChild(b);
   tb[key] = b;
 }
@@ -185,6 +187,8 @@ btnSymbols.addEventListener("click", () => {
   btnSymbols.classList.toggle("on");
   pane.setSymbols(btnSymbols.classList.contains("on"));
 });
+// 同样不抢焦点：符号模式常配合窗格编辑使用，点击后 Ctrl+Z 仍作用于窗格
+btnSymbols.addEventListener("mousedown", (e) => e.preventDefault());
 document.getElementById("pane-head").appendChild(btnSymbols);
 tb.symbols = btnSymbols;
 tb.symbols.title = "在编辑窗格显示空格(·)、Tab(→)、换行符(¶)，类似 Notepad++";

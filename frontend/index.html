@@ -222,7 +222,9 @@ body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; 
 #pane.symbols #pane-edit::selection { background: rgba(45,106,159,.35); color: transparent; }
 #pane-mirror { display: none; }
 #pane.symbols #pane-mirror { display: block; }
-#pane-mirror .sp { color: #b060b0; }
+/* 符号叠加：占位用真实空格/制表符（宽度与编辑域逐像素一致），符号绝对定位在上层 */
+#pane-mirror .sp, #pane-mirror .tab { position: relative; color: #b060b0; }
+#pane-mirror .g { position: absolute; left: 0; top: 0; }
 
 /* ========== 状态栏（E5） ========== */
 #statusbar {

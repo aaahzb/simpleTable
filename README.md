@@ -17,7 +17,7 @@ Tauri（Rust 外壳 + 系统 WebView 前端）：启动快（冷启动约 80ms�
 ## 功能
 
 - **格内编辑（Excel 键位）**：打字即进入编辑（新内容替换旧内容），双击或 `F2`（macOS 仅双击）在原文基础上编辑；`Enter` 提交并下移、`Shift+Enter` 上移、`Tab` 右移、`Shift+Tab` 左移、`Alt+Enter` 格内换行、`Esc` 取消；多行内容时编辑器自动加高（不改行高）。
-- **编辑窗格**：单击选中任意单元格，右侧编辑窗格同步显示完整内容，可直接编辑（支持回车、空格、Tab），实时写回；格内编辑也会同步到窗格。窗格标题右侧"显示符号"开关可像 Notepad++ 一样显示空格（·）、Tab（→）、换行符（¶）。
+- **编辑窗格**：单击选中任意单元格，右侧编辑窗格同步显示完整内容，可直接编辑（支持回车、空格、Tab），实时写回；格内编辑也会同步到窗格；窗格内 `Ctrl+Z` / `Ctrl+Y` 按原生文本撤销/重做（含 Tab 键入）。窗格标题右侧"显示符号"开关可像 Notepad++ 一样显示空格（·）、Tab（→）、换行符（¶），符号与光标逐位对齐。
 - **单元格显示**：内容里的换行/Tab 在格内显示为空格，超出列宽自动省略——内容再多单元格也不变形。`Esc` 取消选定（清空选区、保留当前格）；在筛选框打字永远是筛选，不会被当成"打字即编辑"。
 - **缩放**：表格区与编辑窗格各自支持 `Ctrl+滚轮` 整体缩放（0.5x–3.0x，互不影响），表格的行高、列宽、表头与内嵌筛选框随字体同步缩放；缩放时状态栏短暂提示当前比例。
 - **拖放打开 / 命令行打开**：把 CSV 文件直接拖进窗口即可打开（拖入多个时取第一个）；也可用 `simpletable.exe 文件.csv` 启动即打开（可做文件关联），两者共用同一编码识别与脏检查流程。
@@ -49,7 +49,7 @@ cd src-tauri
 cargo build
 ./target/debug/simpletable.exe
 
-# 对抗自检：59 项断言，写 %TEMP%\simpletable_smoke_report.txt 后退出
+# 对抗自检：62 项断言，写 %TEMP%\simpletable_smoke_report.txt 后退出
 ./target/debug/simpletable.exe --smoke
 ```
 
@@ -63,7 +63,7 @@ node --test tests_js/*.test.mjs
 
 ## CI 与发布
 
-- 推 `main` / PR → 自动构建自检：Windows 完整冒烟（59 项断言），macOS arm64 编译检查。
+- 推 `main` / PR → 自动构建自检：Windows 完整冒烟（62 项断言），macOS arm64 编译检查。
 - 推 `v*` tag → 自动构建 Windows x64 exe 与 macOS arm64 dmg 并发布 GitHub Release；Release 说明由流水线自动生成（上一 tag 至今的提交列表 + 版本对比链接，附固定简介/下载头），标题取 tag 名，版本号由 `build.rs` 从 tag 注入。Actions 里也可手动触发 Release 流水线（只构建不发布，发版前验证用）。
 - 本地打包：`src-tauri` 下 `cargo build --release`，产物 `target/release/simpletable.exe`。
 
@@ -78,7 +78,7 @@ frontend/js/csv.js     CSV 解析/生成 RFC4180
 frontend/js/pane.js    编辑窗格（符号镜像层、独立缩放）
 frontend/js/dialogs.js 模态对话框（新建/排序/列/确认/数字输入）
 frontend/js/menu.js    右键上下文菜单
-frontend/js/smoke.js   --smoke 对抗自检套件（59 项）
+frontend/js/smoke.js   --smoke 对抗自检套件（62 项）
 tests_js/              node:test 逻辑层单测（csv/model）
 src-tauri/src/lib.rs   Rust 命令层（文件对话框/读写/标题/版本/冒烟通道/启动参数）
 src-tauri/build.rs     版本注入 + 前端资产变更触发重编译
