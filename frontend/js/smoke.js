@@ -952,6 +952,32 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(window.__app.isDirty() === false, "再次取页落定后仍应为干净");
   });
 
+  check("大模式：取页落定即重绘（不依赖后续滚动事件）", async () => {
+    // 回归：滚动/拖动时新页未命中缓存先渲染空白占位，异步落定后必须立即重绘，
+    // 否则空白要等到下一次滚动事件才填上——连续拖动表现为整屏空白/有内容逐帧
+    // 交替（疯狂频闪），松手停在新页上还残留空白
+    const sc = document.getElementById("grid-scroll");
+    const oy = grid._originY();
+    const h = grid._uniformRowH;
+    let renders = 0;
+    const orig = grid._renderRows.bind(grid);
+    grid._renderRows = () => { renders += 1; orig(); };
+    try {
+      sc.scrollTop = Math.round(oy + (4999 * h) / grid._yScale);
+      grid._renderRows(); // 同步渲染：新页未命中，格子空白占位并调度拉取
+      const before = renders;
+      // 落定与重绘同等待：rawData 命中缓存后，renders 必须因落定通知而增加——
+      // 快照在渲染前取，避免"落定→重绘→快照"竞态造成假败
+      await waitFor(() =>
+        bigM().rawData(4999, 0) === "大理" && renders > before, "远页落定并重绘");
+      assert(
+        document.querySelector('.cell[data-row="4999"][data-col="0"]')?.textContent === "大理",
+        "取页落定后格子仍空白");
+    } finally {
+      grid._renderRows = orig;
+    }
+  });
+
   check("大模式：单元格编辑 + 撤销/重做", async () => {
     const bm = bigM();
     grid.ensureVisible(0, 0); // 滚回首屏：编辑断言经窗口缓存读回，须先把缓存锚回首页
