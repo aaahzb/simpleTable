@@ -42,6 +42,9 @@ fn main() {
     let version = compute_version();
     println!("cargo:rustc-env=BUILD_VERSION={version}");
     println!("cargo:rerun-if-env-changed=BUILD_VERSION");
+    // 版本号跟随提交：HEAD（分支指针/游离哈希）与 refs/heads 下引用文件内容变化即重算
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    track_dir("../.git/refs/heads");
     // 前端资产嵌入式打包：目录级 rerun-if-changed 不递归文件内容，
     // 必须逐文件声明（frontend/* 与 frontend/js/* 两层覆盖当前全部资产）。
     println!("cargo:rerun-if-changed=../frontend");

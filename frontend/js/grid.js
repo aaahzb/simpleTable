@@ -254,36 +254,35 @@ export class Grid {
    * 行顶 y（行区坐标，不含吸顶表头偏移）。
    *
    * 非等行高（手动调过行高）：走前缀和数组 visTops。
-   * 等行高且未缩放：行顶 = 行号×行高（精确、逐像素平滑）。
-   * 等行高且缩放（_yScale>1）：以当前滚动位置为锚——锚点行对齐视口顶，
-   * 窗口内按真实行高排布，滚动条坐标经 _yScale 压缩。全部交互（命中测试、
-   * 编辑器定位、ensureVisible）都经由本函数与 _rowAt 的同一公式，任意时刻自洽。
+   * 等行高：vi×行高/_yScale（_yScale 只是把坐标压进 Y_CLAMP，映射全局精确；
+   * 未缩放时退化为 vi×行高，逐像素平滑）。
    *
-   * @param {number} vi - 可见行序号。 @returns {number} 行顶 px。
+   * 注意：返回值可远超 2^22（WebView2 实测：绝对定位子元素偏移 ~4.2M px 即不绘制）。
+   * 行元素自身绝不直接用它定位——_renderRows 做窗口局部化（行内偏移 ≤ 视口高），
+   * 大偏移只经 #rows 容器的 transform 表达。
+   *
+   * @param {number} vi - 可见行序号。 @returns {number} 行顶 px（行区全局坐标）。
    */
   _rowTop(vi) {
     if (!this._yUniform) return this.visTops[vi];
-    const h = this._uniformRowH;
-    if (this._yScale === 1) return vi * h;
-    const sv = Math.max(0, this.scrollEl.scrollTop - this._originY());
-    const anchor = Math.round((sv * this._yScale) / h);
-    return sv + (vi - anchor) * h;
+    return (vi * this._uniformRowH) / this._yScale;
   }
 
   /**
    * 行区 y 坐标 → 可见行序号（夹取）。
    *
-   * 与 _rowTop 使用同一锚点公式，保证 _rowAt(_rowTop(vi)) === vi。
+   * 等行高：按渲染锚点换算——行以真实行高连续画在画布上、锚点行对齐视口顶，
+   * 而滚动条坐标经 _yScale 压缩（1 滚动条 px ≈ scale 真实 px），
+   * 必须经锚点还原才与 _renderRows 的画法一致（全局逆映射 floor(y·scale/h)
+   * 会把窗口拉成 ~视口×scale/h 行、且与真实行高渲染重叠）。
+   * 非等行高：前缀和数组 visTops 二分（_yScale 恒 1）。
    *
    * @param {number} y - 行区 y 坐标。 @returns {number} 可见行序号（夹取）。
    */
   _rowAt(y) {
     if (this._yUniform) {
+      const { sv, anchor, h } = this._yAnchor();
       const n = this.visCount();
-      const h = this._uniformRowH;
-      if (this._yScale === 1) return Math.min(n - 1, Math.max(0, Math.floor(y / h)));
-      const sv = Math.max(0, this.scrollEl.scrollTop - this._originY());
-      const anchor = Math.round((sv * this._yScale) / h);
       return Math.max(0, Math.min(n - 1, anchor + Math.floor((y - sv) / h)));
     }
     const tops = this.visTops;
@@ -293,6 +292,37 @@ export class Grid {
       if (tops[mid] <= y) lo = mid; else hi = mid - 1;
     }
     return lo;
+  }
+
+  /**
+   * 当前滚动位置的渲染锚点（仅等行高路径用）。
+   *
+   * 行以真实行高连续排布、锚点行对齐视口顶；滚动条坐标经 _yScale 压缩，
+   * 锚点 = round(行区滚动位置×_yScale/行高)。_renderRows/_rowAt/_paintTop 共用，
+   * 保证渲染、命中测试、编辑器定位同一几何。
+   *
+   * @returns {{sv: number, anchor: number, h: number}} 行区滚动位置/锚点行/行高。
+   */
+  _yAnchor() {
+    const h = this._uniformRowH;
+    const sv = Math.max(0, this.scrollEl.scrollTop - this._originY());
+    const n = this.visCount();
+    const anchor = Math.max(0, Math.min(n - 1, Math.round((sv * this._yScale) / h)));
+    return { sv, anchor, h };
+  }
+
+  /**
+   * 行 vi 实际画在画布上的 y（含表头偏移；等行高真实几何，锚点语义）。
+   *
+   * 渲染几何（真实行高）与滚动条坐标系（_yScale 压缩）不同，
+   * 编辑器定位等"画在哪"场景必须用本函数，不能用全局虚拟的 _rowTop。
+   *
+   * @param {number} vi - 可见行序号。 @returns {number} 画布 y px。
+   */
+  _paintTop(vi) {
+    if (!this._yUniform) return this._originY() + this.visTops[vi];
+    const { sv, anchor, h } = this._yAnchor();
+    return this._originY() + sv + (vi - anchor) * h;
   }
 
   /**
@@ -375,31 +405,56 @@ export class Grid {
     });
   }
 
-  /** 重绘可视行（虚拟滚动，上下各 overscan 5 行） */
+  /**
+   * 重绘可视行（虚拟滚动，上下各 overscan 5 行）。
+   *
+   * 行内偏移一律窗口局部化（行顶 ≤ 视口高 + 10 行），#rows 容器经 transform
+   * 平移到全局坐标——WebView2 实测绝对定位子元素偏移 ~2^22 px（4.2M）即不再绘制，
+   * 行元素自身不得携带大偏移（translateY 走合成器，无此限制）。
+   */
   _renderRows() {
     const host = this.rowsEl;
     host.textContent = "";
     const n = this.visCount();
-    if (!n || !this.model.columnCount()) return;
+    if (!n || !this.model.columnCount()) { host.style.transform = ""; return; }
     const viewH = this.scrollEl.clientHeight;
     const top = this.scrollEl.scrollTop;
-    // 行画在吸顶表头之下：视口 y 换算成行区坐标再取窗口
+    // 行画在吸顶表头之下；窗口与基准分两套几何：
+    // - 等行高：锚点窗口——行以真实行高连续排布、锚点行对齐视口顶，base 为行区滚动位置
+    //   加首行与锚点的真实行高差（渲染几何，非全局虚拟坐标）；
+    // - 非等行高（_yScale 恒 1）：视口上下沿取窗口，base 为首行前缀和。
     const oy = this._originY();
-    const y0 = Math.max(0, top - oy);
-    const y1 = Math.max(0, top + viewH - oy);
-    const first = Math.max(0, this._rowAt(y0) - 5);
-    const last = Math.min(n - 1, this._rowAt(y1) + 5);
+    let first;
+    let last;
+    let base;
+    let topAt;
+    if (this._yUniform) {
+      const { sv, anchor, h } = this._yAnchor();
+      first = Math.max(0, anchor - 5);
+      last = Math.min(n - 1, anchor + Math.ceil(viewH / h) + 5);
+      base = sv + (first - anchor) * h;
+      topAt = (vi) => (vi - first) * h;
+    } else {
+      const y0 = Math.max(0, top - oy);
+      const y1 = Math.max(0, top + viewH - oy);
+      first = Math.max(0, this._rowAt(y0) - 5);
+      last = Math.min(n - 1, this._rowAt(y1) + 5);
+      base = this.visTops[first];
+      topAt = (vi) => this.visTops[vi] - base;
+    }
     // 大模式：滚动渲染前预热窗口缓存（±2 屏预取由 BigModel 调度）
     this.model.prefetchRange?.(this.visAt(first), this.visAt(last));
     const widths = this._effWidthsCache;
     const cc = this.model.columnCount();
+    // 行内偏移 = 全局坐标 - 基准（≤ 窗口高 + 10 行，不过 2^22），大偏移由容器 transform 承担
+    host.style.transform = `translateY(${base}px)`;
     const frag = document.createDocumentFragment();
     for (let vi = first; vi <= last; vi += 1) {
       const r = this.visAt(vi);
       const row = document.createElement("div");
       row.className = "row";
-      // .row 的包含块是 #rows（其顶边已在吸顶表头之下），行内坐标即行区坐标
-      row.style.top = `${this._rowTop(vi)}px`;
+      // .row 的包含块是 #rows（其顶边已在吸顶表头之下），行内坐标即行区坐标（窗口局部）
+      row.style.top = `${topAt(vi)}px`;
       row.style.height = `${this._rowH(r)}px`;
       row.style.width = `${this._rowHeadW() + widths.reduce((a, b) => a + b, 0)}px`;
       const head = document.createElement("div");
@@ -1031,18 +1086,19 @@ export class Grid {
     const viewTop = this.scrollEl.scrollTop;
     const viewH = this.scrollEl.clientHeight;
     if (this._yUniform && this._yScale > 1) {
-      // 缩放坐标系：滚动位置按行换算（与 _rowTop/_rowAt 同一锚点公式）
+      // 缩放渲染几何：行以真实行高画在锚点窗口内，"虚拟底部对齐"会落到视口外；
+      // 行不可见时统一顶对齐——锚点取 行序号-表头遮挡行数，使目标行完整露在表头下
       const h = this._uniformRowH;
-      const sv = Math.max(0, viewTop - oy);
-      const anchor = Math.round((sv * this._yScale) / h);
+      const { anchor } = this._yAnchor();
       const rowsInView = Math.max(1, Math.floor((viewH - oy) / h));
-      if (vi < anchor) this.scrollEl.scrollTop = oy + (vi * h) / this._yScale;
-      else if (vi > anchor + rowsInView - 1) {
-        this.scrollEl.scrollTop = oy + ((vi - rowsInView + 1) * h) / this._yScale;
+      if (vi < anchor || vi > anchor + rowsInView - 1) {
+        const headRows = Math.max(1, Math.ceil(oy / h));
+        const target = Math.max(0, vi - headRows);
+        this.scrollEl.scrollTop = oy + (target * h) / this._yScale;
       }
     } else {
       const top = oy + this._rowTop(vi);
-      const h = this._rowH(r);
+      const h = this._yUniform ? this._uniformRowH : this._rowH(r);
       if (top < viewTop) this.scrollEl.scrollTop = top;
       else if (top + h > viewTop + viewH) this.scrollEl.scrollTop = top + h - viewH;
     }
@@ -1076,7 +1132,10 @@ export class Grid {
     el.style.display = "block";
     el.style.left = `${x}px`;
     const vi = this.visibleIndexOf(r);
-    el.style.top = `${vi >= 0 ? this._originY() + this._rowTop(vi) : 0}px`;
+    // 纵坐标走 transform + 真实渲染几何（_paintTop）：top 大偏移会超 2^22 不绘制，
+    // 全局虚拟 _rowTop 与锚点窗口的画法不一致，编辑器会飘离目标行
+    el.style.top = "0px";
+    el.style.transform = `translateY(${vi >= 0 ? this._paintTop(vi) : 0}px)`;
     el.style.width = `${Math.max(widths[pos], MIN_COL_W)}px`;
     el.style.height = `${Math.max(this._rowH(r), this._lineH())}px`;
     el.value = initial !== undefined ? initial : this.model.rawData(r, c);

@@ -1086,6 +1086,9 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     grid._renderRows();
     const kids = grid.rowsEl.children;
     assert(kids.length > 0, "滚动到底后应有渲染行（回归空白缺陷）");
+    // 窗口局部化不变量：行元素自身偏移永不超 2^22（WebView2 绝对定位绘制上限）
+    const maxOff = Math.max(...[...kids].map((k) => k.offsetTop));
+    assert(maxOff < 4194304, `行内偏移应窗口局部化，maxOff=${maxOff}`);
     const firstRow = Number(kids[0].querySelector(".row-head")?.dataset.row);
     assert(firstRow > n - 10000, `底部首渲染行 ${firstRow} 应接近末行 ${n}`);
     // 命中测试与渲染一致：视口顶命中锚点行（= 首渲染行 + overscan 5，容差 1 行）
@@ -1093,6 +1096,13 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const hit = grid._hitTest(rect.left + 150, rect.top + 2);
     assert(hit && hit[0] >= firstRow + 4 && hit[0] <= firstRow + 6,
       `命中 ${hit?.[0]} 应≈首渲染行+5 ${firstRow + 5}`);
+    // 回归 2^22 绘制上限（滚动条拖到 ~25% / 行 390 万+ 处逐行空白）：
+    // 中段渲染行的屏幕矩形必须落在视口内（transform 容器 + 窗口局部偏移的几何不变量）
+    const scRect = sc.getBoundingClientRect();
+    const midKids = kids[Math.floor(kids.length / 2)];
+    const midR = midKids.getBoundingClientRect();
+    assert(midR.bottom > scRect.top && midR.top < scRect.bottom,
+      `底部中段行屏幕矩形 ${Math.round(midR.top)}..${Math.round(midR.bottom)} 应在视口内`);
     await invoke("smoke_set_force_big", { v: false });
   });
 
