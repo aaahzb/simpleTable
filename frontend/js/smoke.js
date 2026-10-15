@@ -941,6 +941,17 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       "末行渲染");
   });
 
+  check("大模式：异步取页落定不误标脏", async () => {
+    // 回归：BigModel 预取页落定经 onData 重绘，不得触发 markDirty（打开即脏/滚动即脏）
+    assert(window.__app.isDirty() === false, "跳远页取页落定后应为干净");
+    grid.ensureVisible(2500, 0);
+    grid._renderRows();
+    await waitFor(() =>
+      document.querySelector('.cell[data-row="2500"][data-col="0"]')?.textContent === "大理",
+      "中行渲染");
+    assert(window.__app.isDirty() === false, "再次取页落定后仍应为干净");
+  });
+
   check("大模式：单元格编辑 + 撤销/重做", async () => {
     const bm = bigM();
     grid.ensureVisible(0, 0); // 滚回首屏：编辑断言经窗口缓存读回，须先把缓存锚回首页

@@ -443,6 +443,33 @@ fn get_startup_path(state: tauri::State<StartupArgs>) -> Option<String> {
     state.open_path.clone()
 }
 
+/// 截屏诊断模式：启动参数 `--park <mode>` 时返回 mode 字符串，否则 None。
+///
+/// 窗口停在指定渲染场景待命（进程不退出），供外部截屏工具读像素、
+/// 验证 WebView2 真实绘制结果（DOM 探针看不到绘制级缺陷）。
+#[tauri::command]
+fn is_park() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--park" {
+            return args.next();
+        }
+    }
+    None
+}
+
+/// 截屏诊断辅助：探测路径是否存在（--park 模式与外部截屏工具握手用）。
+///
+/// # Parameters
+/// - `path`: 待查路径。
+///
+/// # Returns
+/// 存在 true，否则 false。
+#[tauri::command]
+fn path_exists(path: String) -> bool {
+    std::path::Path::new(&path).exists()
+}
+
 /// 应用入口：注册命令、接管线外拖放事件、运行事件循环。
 ///
 /// # Returns
@@ -472,6 +499,8 @@ pub fn run() {
             get_version,
             get_startup_path,
             is_smoke,
+            is_park,
+            path_exists,
             smoke_force_big,
             smoke_set_force_big,
             finish_smoke,

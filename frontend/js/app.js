@@ -350,9 +350,10 @@ function bindModelEvents(m) {
     updateStatusText();
     grid.resetScroll(); // WebView2 会话记忆滚动位置，装载须回顶（对齐 Qt）
   });
-  m.onData((structural) => {
+  m.onData((structural, origin) => {
     if (resetPending) resetPending = false;
-    else markDirty();
+    // 大模式预取页落定是纯重绘（origin="fetch"），打开/滚动不得误标脏
+    else if (!(m.isBig && origin === "fetch")) markDirty();
     if (m.isBig) refreshBigUi();
     if (currentCell === null) return;
     const [r, c] = currentCell;
@@ -809,6 +810,23 @@ document.addEventListener("keydown", (e) => {
     } catch (err) {
       await invoke("finish_smoke", { report: `[fatal] 冒烟套件异常: ${err.stack}`, code: 1 });
     }
+  }
+  const parkMode = await invoke("is_park");
+  if (parkMode) {
+    // 截屏诊断：停在指定渲染场景待命（进程不退出），供 park_capture.ps1 读像素。
+    // catch 里错误标记尽力而为（嵌套 try 包住 invoke，失败不再级联）
+    const { runPark } = await import("./park.js");
+    runPark({ model, grid, pane, invoke, statusMsg, mode: parkMode }).catch(async (err) => {
+      try { console.error("park error", err); } catch (_) { /* ignore */ }
+      try {
+        document.title = "PARK-ERR " + (err && err.message || err);
+        const dir = await invoke("smoke_tmp_dir");
+        await invoke("smoke_write_bytes", {
+          path: `${dir}/park_err.txt`,
+          bytes: [...new TextEncoder().encode(String((err && err.stack) || err))],
+        });
+      } catch (_) { /* 尽力而为 */ }
+    });
   }
 })();
 

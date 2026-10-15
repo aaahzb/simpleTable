@@ -149,8 +149,16 @@ export class BigModel {
     return this._listen("big-progress", (e) => cb(e.payload[0], e.payload[1]));
   }
 
-  _emitData(structural = false) {
-    for (const cb of this._dataCbs) cb(structural);
+  /**
+   * 触发数据变化回调。
+   *
+   * @param {boolean} [structural] - 是否结构变化（行列增删/筛选切换）。
+   * @param {string} [origin] - 来源："fetch"=预取页落定（纯重绘，不应标脏）；
+   *   其余（编辑/撤销等数据变化）照常标脏。
+   * @returns {void}
+   */
+  _emitData(structural = false, origin = "edit") {
+    for (const cb of this._dataCbs) cb(structural, origin);
   }
 
   _emitUndo() {
@@ -276,7 +284,7 @@ export class BigModel {
       if (gen === this._gen && this._key(page) === key) {
         this._cache.set(key, rows);
         this._trim(page);
-        this._emitData(false);
+        this._emitData(false, "fetch"); // 纯预取落定：重绘即可，不得标脏
       }
     }).catch(() => {
       // 拉取失败静默：下次渲染重试（编辑冲突另有错误通道）
