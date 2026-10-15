@@ -128,7 +128,9 @@ const grid = new Grid({
 /** 按大模式状态刷新专属按钮显隐与可用态 */
 function refreshBigUi() {
   const big = !!model.isBig;
-  tb.sort.classList.toggle("hidden", big); // 大模式不支持排序
+  // 大模式不支持排序：按钮置灰 + 悬停提示（保持位置稳定，不隐藏）
+  tb.sort.disabled = big;
+  tb.sort.title = big ? "大文件模式暂不支持排序" : "";
   tb.execFilter.classList.toggle("hidden", !big);
   if (big) {
     const hasCond = grid.filters.size > 0 || !!grid.multi.text;

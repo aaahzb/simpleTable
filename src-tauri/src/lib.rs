@@ -126,10 +126,13 @@ fn smoke_write_repeat(path: String, line: String, times: u32, append: bool) -> R
     } else {
         fs::File::create(&path)
     };
-    let mut f = f.map_err(|e| io_err(&path, &e))?;
+    let f = f.map_err(|e| io_err(&path, &e))?;
+    // 行数可达百万级，逐行直写是百万次小写入系统调用，加缓冲一次性落盘
+    let mut w = std::io::BufWriter::new(f);
     for _ in 0..times {
-        f.write_all(line.as_bytes()).map_err(|e| io_err(&path, &e))?;
+        w.write_all(line.as_bytes()).map_err(|e| io_err(&path, &e))?;
     }
+    w.flush().map_err(|e| io_err(&path, &e))?;
     Ok(())
 }
 

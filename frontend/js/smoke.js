@@ -1067,6 +1067,34 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(window.__app.isBigMode() === false, "关开关后应回到小文件模式");
     assert(window.__app.model.rowCount() === 1, `小模型行数 ${window.__app.model.rowCount()}`);
   });
+  check("大模式：超高行数虚拟缩放（滚动到底不空白）", async () => {
+    // 回归：元素/滚动高 16,777,214px 上限曾致大文件滚动后视口空白。
+    // 100 万数据行 × ~20px ≈ 2000 万 px，超过 Y_CLAMP 触发纵向虚拟缩放。
+    const p = `${TMP}/tall.csv`;
+    await invoke("smoke_write_repeat", { path: p, line: "a,b,c,d,e\n", times: 1000001, append: false });
+    await invoke("smoke_set_force_big", { v: true });
+    await window.__app.openPath(p);
+    const n = grid.visCount();
+    assert(n > 999000, `行数 ${n}`);
+    assert(grid._yScale > 1, `yScale=${grid._yScale} 应已启用虚拟缩放`);
+    const sc = document.getElementById("grid-scroll");
+    const cv = sc.firstElementChild;
+    const styleH = parseFloat(cv.style.height);
+    assert(styleH < 16800000, `画布 style 高 ${styleH} 应压到上限以内`);
+    // 滚到底：锚点应落在末尾窗口，渲染行非空且接近末行
+    sc.scrollTop = sc.scrollHeight;
+    grid._renderRows();
+    const kids = grid.rowsEl.children;
+    assert(kids.length > 0, "滚动到底后应有渲染行（回归空白缺陷）");
+    const firstRow = Number(kids[0].querySelector(".row-head")?.dataset.row);
+    assert(firstRow > n - 10000, `底部首渲染行 ${firstRow} 应接近末行 ${n}`);
+    // 命中测试与渲染一致：视口顶命中锚点行（= 首渲染行 + overscan 5，容差 1 行）
+    const rect = sc.getBoundingClientRect();
+    const hit = grid._hitTest(rect.left + 150, rect.top + 2);
+    assert(hit && hit[0] >= firstRow + 4 && hit[0] <= firstRow + 6,
+      `命中 ${hit?.[0]} 应≈首渲染行+5 ${firstRow + 5}`);
+    await invoke("smoke_set_force_big", { v: false });
+  });
 
   // ---- 执行（看门狗：整体超时强制收尾，防挂死） ----
   const watchdog = setTimeout(async () => {

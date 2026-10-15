@@ -34,11 +34,11 @@ Tauri（Rust 外壳 + 系统 WebView 前端）：启动快（冷启动约 80ms�
 打开 CSV 时按文件大小自动路由：**≤ 50 MiB** 走内存模型（全部功能，键入即筛）；**> 50 MiB**（或冒烟强制开关）进入大文件模式——任意大小秒开查看，不再整读进内存。
 
 - **为什么需要它**：内存模型要把整份 CSV 变成 JS 字符串 + 格子数组，内存约文件的 3~5 倍，还受 WebView 字符串/堆上限约束（数百 MB 起变慢，GB 级直接闪退）。大文件模式用 Rust 引擎（memmap 只读映射 + 记录感知行索引 + 窗口化按页解码），常驻内存只随行数线性增长（3000 万行 ≈ 240 MB 索引），与文件大小无关。
-- **查看/翻页**：任意跳转即时可取（200 行/页窗口缓存，±2 屏预取）。
+- **查看/翻页**：任意跳转即时可取（200 行/页窗口缓存，±2 屏预取）；超高行数（总行高超 16.7M px 的 WebView2 元素高度上限）自动启用纵向虚拟缩放滚动，滚到底不空白，滚轮按行推进。
 - **筛选**：条件输入框只记录条件，点工具栏"执行筛选"（或筛选框内回车）启动一次整表并行扫描，状态栏报命中数与用时；清除筛选即回全量。
 - **编辑/撤销/保存**：单元格编辑、行插入/删除即时生效（覆盖层 + 插入块 + 删除位图，逆操作日志撤销）；保存为流式重写（进度条），原子换名，编码随原文件（GBK 原样回写）。
 - **列操作（插入/删除/重命名列）**：只做渲染预览并出现"执行列操作"按钮，确认后物理重写整个文件（进度条），完成后不可撤销；行操作无此限制。
-- **边界**：大文件模式暂不支持排序；粘贴不可超出已有列宽（可先用列操作加列）；窗口重新聚焦时检测外部改动并提示重载。
+- **边界**：大文件模式暂不支持排序（排序按钮置灰并悬停提示）；粘贴不可超出已有列宽（可先用列操作加列）；窗口重新聚焦时检测外部改动并提示重载。
 - **阈值依据**：本机实测 100 MB 装载约 1.5 s / 筛选 352 ms，500 MB 撞 WebView 堆上限OOM；50 MiB 下筛选 ≤175 ms、内存 <1 GB，逐键筛选依然跟手。小文件（≤50 MiB）行为与旧版完全一致。
 
 ## CSV 约定
@@ -61,7 +61,7 @@ cd src-tauri
 cargo build
 ./target/debug/simpletable.exe
 
-# 对抗自检：77 项断言，写 %TEMP%\simpletable_smoke_report.txt 后退出
+# 对抗自检：78 项断言，写 %TEMP%\simpletable_smoke_report.txt 后退出
 ./target/debug/simpletable.exe --smoke
 ```
 
@@ -75,7 +75,7 @@ node --test tests_js/*.test.mjs
 
 ## CI 与发布
 
-- 推 `main` / PR → 自动构建自检：Windows 完整冒烟（77 项断言），macOS arm64 编译检查。
+- 推 `main` / PR → 自动构建自检：Windows 完整冒烟（78 项断言），macOS arm64 编译检查。
 - 推 `v*` tag → 自动构建 Windows x64 exe 与 macOS arm64 dmg 并发布 GitHub Release；Release 说明由流水线自动生成（上一 tag 至今的提交列表 + 版本对比链接，附固定简介/下载头），标题取 tag 名，版本号由 `build.rs` 从 tag 注入。Actions 里也可手动触发 Release 流水线（只构建不发布，发版前验证用）。
 - 本地打包：`src-tauri` 下 `cargo build --release`，产物 `target/release/simpletable.exe`。
 
@@ -90,7 +90,7 @@ frontend/js/csv.js     CSV 解析/生成 RFC4180
 frontend/js/pane.js    编辑窗格（符号镜像层、独立缩放）
 frontend/js/dialogs.js 模态对话框（新建/排序/列/确认/数字输入）
 frontend/js/menu.js    右键上下文菜单
-frontend/js/smoke.js   --smoke 对抗自检套件（77 项）
+frontend/js/smoke.js   --smoke 对抗自检套件（78 项）
 frontend/js/bigmodel.js 大文件模式模型（窗口缓存/乐观编辑/列操作 pending）
 tests_js/              node:test 逻辑层单测（csv/model/bigmodel）
 src-tauri/src/lib.rs   Rust 命令层（文件对话框/读写/标题/版本/冒烟通道/启动参数/大文件命令）

@@ -23,6 +23,12 @@ const MIN_COL_W = 24;
 const MIN_ROW_H = 10;
 /** 行数超过此值时筛选输入防抖（每击键全表扫描代价高） */
 const FILTER_DEBOUNCE_ROWS = 50000;
+/**
+ * WebView2/Chromium 元素高度与滚动范围实测上限 16,777,214px（2^24-2）。
+ * 画布超出会被钳制，scrollTop 与行位置错位导致滚动后视口空白；
+ * 超过此安全阈值时启用纵向虚拟缩放（见 _yScale）。
+ */
+const Y_CLAMP = 16_700_000;
 
 /**
  * 网格视图类。
@@ -65,8 +71,16 @@ export class Grid {
     this.colW = [];
     /** @type {number[]} 每行高度（当前缩放下 px） */
     this.rowH = [];
-    /** @type {number[]} 可见行行顶前缀和（px，筛选后重算） */
+    /** @type {number[]} 可见行行顶前缀和（px，筛选后重算；等行高模式下为 null，走 O(1) 公式） */
     this.visTops = [0];
+    /**
+     * 纵向虚拟缩放：画布真实总行高超过 Y_CLAMP 时为 真实行高/压缩后行高，否则为 1。
+     * 压缩后滚动条坐标 = 真实坐标 / _yScale，行位置以当前滚动位置锚定（见 _rowTop/_rowAt）。
+     * @type {number}
+     */
+    this._yScale = 1;
+    /** @type {boolean} 等行高模式（大模式恒为 true；小模式行高未被手动调整时为 true） */
+    this._yUniform = false;
     /** @type {number[]} 列顺序（源列号数组，位置即显示顺序） */
     this.colOrder = [];
     /** @type {Map<number, string>} 列号 → 筛选关键字 */
@@ -180,21 +194,40 @@ export class Grid {
     return this.model.isBig ? this._uniformRowH : (this.rowH[r] ?? this._uniformRowH);
   }
 
-  /** 重算可见行前缀和与画布尺寸（筛选后画布只含可见行，无空隙） */
+  /**
+   * 重算可见行布局与画布尺寸（筛选后画布只含可见行，无空隙）。
+   *
+   * 等行高模式（大文件模式，或小模式行高未被手动调整）：跳过 O(n) 前缀和数组，
+   * 直接按 行数×行高 计算；真实总行高超过 Y_CLAMP 时启用纵向虚拟缩放，
+   * 把画布高度压到上限以内（等行高保证缩放映射精确，无累积误差）。
+   * 非等行高（用户手动调过行高）：维持前缀和路径。
+   */
   _layout() {
+    const n = this.visCount();
+    const oy = this._originY();
+    const totalW = this._rowHeadW() + this._effWidths().reduce((a, b) => a + b, 0);
+    this.canvasEl.style.width = `${Math.max(totalW, this.scrollEl.clientWidth)}px`;
+    const h = this._uniformRowH;
+    this._yUniform = this.model.isBig || this.rowH.every((v) => v === h);
+    if (this._yUniform) {
+      const real = n * h;
+      this._yScale = real > Y_CLAMP ? real / Y_CLAMP : 1;
+      this.visTops = null;
+      // 画布高 = 吸顶表头 + 全部行（行是 #rows 内绝对定位，#rows 紧随表头之后）
+      this.canvasEl.style.height =
+        `${Math.max(oy + real / this._yScale, this.scrollEl.clientHeight)}px`;
+      return;
+    }
+    this._yScale = 1;
     const tops = [0];
     let t = 0;
-    const n = this.visCount();
     for (let vi = 0; vi < n; vi += 1) {
       t += this._rowH(this.visAt(vi));
       tops.push(t);
     }
     this.visTops = tops;
-    const totalW = this._rowHeadW() + this._effWidths().reduce((a, b) => a + b, 0);
-    this.canvasEl.style.width = `${Math.max(totalW, this.scrollEl.clientWidth)}px`;
-    // 画布高 = 吸顶表头 + 全部行（行是 #rows 内绝对定位，#rows 紧随表头之后）
     this.canvasEl.style.height =
-      `${Math.max(this._originY() + t, this.scrollEl.clientHeight)}px`;
+      `${Math.max(oy + t, this.scrollEl.clientHeight)}px`;
   }
 
   /** @returns {number} 行区起始 y（吸顶列头高度，行坐标系与画布坐标系的偏移）。 */
@@ -217,13 +250,42 @@ export class Grid {
     return widths;
   }
 
-  /** @param {number} vi - 可见行序号。 @returns {number} 行顶 px。 */
-  _rowTop(vi) { return this.visTops[vi]; }
+  /**
+   * 行顶 y（行区坐标，不含吸顶表头偏移）。
+   *
+   * 非等行高（手动调过行高）：走前缀和数组 visTops。
+   * 等行高且未缩放：行顶 = 行号×行高（精确、逐像素平滑）。
+   * 等行高且缩放（_yScale>1）：以当前滚动位置为锚——锚点行对齐视口顶，
+   * 窗口内按真实行高排布，滚动条坐标经 _yScale 压缩。全部交互（命中测试、
+   * 编辑器定位、ensureVisible）都经由本函数与 _rowAt 的同一公式，任意时刻自洽。
+   *
+   * @param {number} vi - 可见行序号。 @returns {number} 行顶 px。
+   */
+  _rowTop(vi) {
+    if (!this._yUniform) return this.visTops[vi];
+    const h = this._uniformRowH;
+    if (this._yScale === 1) return vi * h;
+    const sv = Math.max(0, this.scrollEl.scrollTop - this._originY());
+    const anchor = Math.round((sv * this._yScale) / h);
+    return sv + (vi - anchor) * h;
+  }
 
   /**
-   * @param {number} y - 画布 y 坐标。 @returns {number} 可见行序号（夹取）。
+   * 行区 y 坐标 → 可见行序号（夹取）。
+   *
+   * 与 _rowTop 使用同一锚点公式，保证 _rowAt(_rowTop(vi)) === vi。
+   *
+   * @param {number} y - 行区 y 坐标。 @returns {number} 可见行序号（夹取）。
    */
   _rowAt(y) {
+    if (this._yUniform) {
+      const n = this.visCount();
+      const h = this._uniformRowH;
+      if (this._yScale === 1) return Math.min(n - 1, Math.max(0, Math.floor(y / h)));
+      const sv = Math.max(0, this.scrollEl.scrollTop - this._originY());
+      const anchor = Math.round((sv * this._yScale) / h);
+      return Math.max(0, Math.min(n - 1, anchor + Math.floor((y - sv) / h)));
+    }
     const tops = this.visTops;
     let lo = 0, hi = Math.max(0, tops.length - 2);
     while (lo < hi) {
@@ -822,6 +884,17 @@ export class Grid {
     // ---- 键盘 ----
     scroll.addEventListener("keydown", (e) => this._onKeyDown(e));
 
+    // ---- 超大行数滚轮：按行滚动（滚动条坐标经 _yScale 压缩，原生像素滚动会一次跳几百行） ----
+    scroll.addEventListener("wheel", (e) => {
+      if (e.ctrlKey || this._yScale === 1) return;
+      e.preventDefault();
+      const h = this._uniformRowH;
+      this._wheelAcc = (this._wheelAcc || 0) + e.deltaY;
+      const rows = Math.trunc(this._wheelAcc / h);
+      this._wheelAcc -= rows * h;
+      if (rows) this.scrollEl.scrollTop += (rows * h) / this._yScale;
+    }, { passive: false });
+
     // ---- Ctrl+滚轮缩放 ----
     scroll.addEventListener("wheel", (e) => {
       if (!e.ctrlKey) return;
@@ -954,12 +1027,25 @@ export class Grid {
   ensureVisible(r, c) {
     const vi = this.visibleIndexOf(r);
     if (vi < 0) return;
-    const top = this._originY() + this._rowTop(vi);
-    const h = this._rowH(r);
+    const oy = this._originY();
     const viewTop = this.scrollEl.scrollTop;
     const viewH = this.scrollEl.clientHeight;
-    if (top < viewTop) this.scrollEl.scrollTop = top;
-    else if (top + h > viewTop + viewH) this.scrollEl.scrollTop = top + h - viewH;
+    if (this._yUniform && this._yScale > 1) {
+      // 缩放坐标系：滚动位置按行换算（与 _rowTop/_rowAt 同一锚点公式）
+      const h = this._uniformRowH;
+      const sv = Math.max(0, viewTop - oy);
+      const anchor = Math.round((sv * this._yScale) / h);
+      const rowsInView = Math.max(1, Math.floor((viewH - oy) / h));
+      if (vi < anchor) this.scrollEl.scrollTop = oy + (vi * h) / this._yScale;
+      else if (vi > anchor + rowsInView - 1) {
+        this.scrollEl.scrollTop = oy + ((vi - rowsInView + 1) * h) / this._yScale;
+      }
+    } else {
+      const top = oy + this._rowTop(vi);
+      const h = this._rowH(r);
+      if (top < viewTop) this.scrollEl.scrollTop = top;
+      else if (top + h > viewTop + viewH) this.scrollEl.scrollTop = top + h - viewH;
+    }
     const x = this._colLeft(this.colOrder.indexOf(c));
     const w = this.colW[c];
     const viewL = this.scrollEl.scrollLeft;
