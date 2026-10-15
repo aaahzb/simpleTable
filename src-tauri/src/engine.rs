@@ -720,6 +720,53 @@ mod tests {
         assert!(bf.stale(), "mtime/大小变化后应判脏");
         fs::remove_file(&p).ok();
     }
+
+    /// Windows：外部程序独占打开原文件（share_mode=0，如 Excel/预览窗格/杀软扫描中的句柄）
+    /// 时换名必然失败——错误必须告知临时文件位置（新内容未丢），且会话映回原文件继续可用。
+    #[cfg(windows)]
+    #[test]
+    fn save_rename_blocked_keeps_tmp_and_session_usable() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let p = tmp_csv("saveblock", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "Bob".into()).unwrap();
+        // 模拟外部程序占用：读共享但拒绝删除共享（FILE_SHARE_READ|WRITE=0x3，
+        // 同 Excel/资源管理器预览类句柄），rename 必失败（os error 32）
+        let lock = fs::OpenOptions::new().read(true).share_mode(0x3).open(&p).unwrap();
+        let err = bf.save(|_, _| {}).unwrap_err();
+        drop(lock);
+        assert!(err.contains("临时文件"), "错误应告知临时文件位置: {err}");
+        let tmp = tmp_path_for(&p);
+        assert!(tmp.exists(), "写好的新文件必须保留");
+        assert!(fs::metadata(&tmp).unwrap().len() > 0);
+        // 会话必须仍可用：覆盖层/撤销栈未丢，读路径已映回原文件
+        assert_eq!(bf.rows(0, 1)[0][0], "Bob");
+        assert!(bf.undo(), "撤销栈应保留");
+        assert_eq!(bf.rows(0, 1)[0][0], "Alice");
+        fs::remove_file(&tmp).ok();
+        fs::remove_file(&p).ok();
+    }
+
+    /// Windows：占用是瞬时的情况下（杀软/索引器），重试应能等到锁释放并成功换名。
+    #[cfg(windows)]
+    #[test]
+    fn save_rename_recovers_when_lock_released() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let p = tmp_csv("saveretry", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "Bob".into()).unwrap();
+        // 读共享占用 400ms 后释放；rename 重试窗口（5 次 × 200ms）应覆盖到
+        let lock = fs::OpenOptions::new().read(true).share_mode(0x3).open(&p).unwrap();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            drop(lock);
+        });
+        bf.save(|_, _| {}).unwrap();
+        t.join().unwrap();
+        let bf2 = BigFile::open(&p).unwrap();
+        assert_eq!(bf2.rows(0, 1)[0][0], "Bob", "新文件应落盘生效");
+        fs::remove_file(&p).ok();
+    }
 }
 
 // ============================================================
@@ -1706,7 +1753,7 @@ impl BigFile {
         w.flush().map_err(|e| e.to_string())?;
         drop(w);
         progress(total, total); // 收尾必发一次，前端进度条归零前显示 100%
-        fs::rename(&tmp, &self.path).map_err(|e| format!("替换原文件失败：{e}"))?;
+        self.replace_with_retry(&tmp)?;
         self.reopen_after_write()?;
         Ok(())
     }
@@ -1781,7 +1828,7 @@ impl BigFile {
         w.flush().map_err(|e| e.to_string())?;
         drop(w);
         progress(total, total); // 收尾必发一次，前端进度条归零前显示 100%
-        fs::rename(&tmp, &self.path).map_err(|e| format!("替换原文件失败：{e}"))?;
+        self.replace_with_retry(&tmp)?;
 
         // 全量重建：列结构变化，编辑层与撤销历史一并失效
         let mut fresh = Self::open(&self.path)?;
@@ -1789,6 +1836,56 @@ impl BigFile {
         fresh.base_ncols = ncols as usize;
         *self = fresh;
         Ok(())
+    }
+
+    /// 重新映射原文件并重建行索引（不动 Segment/覆盖层/撤销栈）。
+    /// 用于保存换名失败后的读路径恢复。
+    fn remap(&mut self) -> Result<(), String> {
+        let file = fs::File::open(&self.path).map_err(|e| e.to_string())?;
+        let mmap = unsafe {
+            memmap2::MmapOptions::new().map(&file).map_err(|e| e.to_string())?
+        };
+        self.idx = build_index(&mmap);
+        self.mmap = mmap;
+        Ok(())
+    }
+
+    /// 用写好的临时文件替换原文件。
+    ///
+    /// 换名前先摘除本进程的映射句柄（自己的只读句柄不挡换名，也不给
+    /// 错误排查添变量），失败按 200ms 间隔重试 5 次（覆盖杀软/索引器等
+    /// 瞬时占用）；仍失败则映回原文件保持会话可用（编辑层/撤销栈不动），
+    /// 临时文件原样保留，错误信息给出路径供手动恢复。
+    fn replace_with_retry(&mut self, tmp: &Path) -> Result<(), String> {
+        // 占位匿名映射：mmap 字段不留空，1 字节开销
+        let dummy = memmap2::MmapMut::map_anon(1)
+            .and_then(|m| m.make_read_only())
+            .map_err(|e| e.to_string())?;
+        drop(std::mem::replace(&mut self.mmap, dummy)); // 旧映射解除、文件句柄关闭
+        let mut last: Option<std::io::Error> = None;
+        for _ in 0..5 {
+            match fs::rename(tmp, &self.path) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        }
+        // 换名失败：映回原文件恢复读路径（seg/覆盖层/撤销栈原样保留）
+        if let Err(re) = self.remap() {
+            return Err(format!(
+                "替换原文件失败：{}\n且原文件重新映射失败：{}",
+                last.map(|e| e.to_string()).unwrap_or_default(),
+                re
+            ));
+        }
+        Err(format!(
+            "替换原文件失败：{}\n新文件已完整写在临时文件里（数据未丢失）：{}\n\
+             可关闭占用原文件的程序后重试保存，或手动把该临时文件改名为原文件。",
+            last.map(|e| e.to_string()).unwrap_or_default(),
+            tmp.display()
+        ))
     }
 
     /// 写盘后重建 mmap/索引；编辑层已落盘故清空，撤销栈保留。
