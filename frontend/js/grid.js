@@ -610,7 +610,10 @@ export class Grid {
     if (this.model.isBig) {
       this.visibleRows = null;
       if (!hasCond && this.model.filterActive()) {
-        // 条件清空 → 自动回全量（fire-and-forget；落定后 onData 再收敛）
+        // 条件清空 → 自动回全量（fire-and-forget；落定后 onData 再收敛）。
+        // 先回顶再切视图：坐标系从命中画布切回全量画布（可能启用压缩），
+        // 旧 scrollTop 在新坐标系无意义（锚点反推自锁，见 runBigFilter 注释）。
+        this.resetScroll();
         Promise.resolve(this.model.clearFilter()).catch(() => {});
       }
       this.hooks.bigFilterStatus?.(hasCond);

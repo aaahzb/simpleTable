@@ -102,6 +102,7 @@ export function progressDialog(title) {
   box.append(head, body);
   mask.appendChild(box);
   document.body.appendChild(mask);
+  let lastTotal = 1;
   return {
     /**
      * 更新进度。
@@ -111,9 +112,24 @@ export function progressDialog(title) {
      */
     set(done, total) {
       const t = Math.max(1, total);
+      lastTotal = t;
       bar.max = t;
       bar.value = done;
       label.textContent = `${Math.round((done / t) * 100)}%（${done} / ${total} 行）`;
+    },
+    /**
+     * 完成帧：置 100% 短暂停留再关闭。
+     * 重写期间磁盘 IO（杀软实时扫描等）可能饿死渲染管线，屏幕停在中间旧帧，
+     * 弹窗一关就像"进度条卡住没走完"——完成帧保证"走完"被看到。
+     *
+     * @returns {Promise<void>}
+     */
+    async finish() {
+      bar.max = lastTotal;
+      bar.value = lastTotal;
+      label.textContent = "100%（完成）";
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      mask.remove();
     },
     /** 关闭并移除模态。 */
     close() {

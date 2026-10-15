@@ -305,6 +305,64 @@ export async function runPark({ invoke, grid, mode }) {
     return;
   }
 
+  if (mode === "filterscroll") {
+    // 复现"筛选后仅显示底部几行 + 滚动条跳回"：20 万行夹具（force_big），
+    // 压深滚动 → 执行筛选（40 命中）→ 采样滚动位置/渲染窗口/手动拖滚动条是否回弹。
+    // 筛选切换坐标系（压缩画布→自然画布），旧 scrollTop 在新坐标系无意义。
+    const p = `${await invoke("smoke_tmp_dir")}/park_filter.csv`;
+    await invoke("smoke_write_repeat", { path: p, line: "h1,h2,h3,h4,h5\n", times: 1, append: false });
+    await invoke("smoke_write_repeat", { path: p, line: "大理,b,c,d,e\n", times: 1, append: true });
+    await invoke("smoke_write_repeat", { path: p, line: "a,b,c,d,e\n", times: 4999, append: true });
+    for (let i = 0; i < 39; i += 1) {
+      await invoke("smoke_write_repeat", { path: p, line: "大理,b,c,d,e\n", times: 1, append: true });
+      await invoke("smoke_write_repeat", { path: p, line: "a,b,c,d,e\n", times: 4999, append: true });
+    }
+    await invoke("smoke_set_force_big", { v: true });
+    await window.__app.openPath(p);
+    const bm = window.__app.model;
+    const noop = () => invoke("path_exists", { path: `${dir}/__noop` });
+    for (let i = 0; i < 1200; i += 1) {
+      if (window.__app.isBigMode() && bm.rowCount() > 0) break;
+      await noop();
+    }
+    // 压深到 ~97.5%（195,000/200,000 行）
+    const oy = grid._originY();
+    const h = grid._uniformRowH;
+    sc.scrollTop = Math.round(oy + (195000 * h) / grid._yScale);
+    await sleep(500);
+    sc.scrollTop = Math.round(oy + (195000 * h) / grid._yScale);
+    await sleep(300);
+    await mark(invoke, dir, "diag_0", diag(grid, sc));
+    await mark(invoke, dir, "ready_0", String(Math.round(sc.scrollTop)));
+    await waitGo(invoke, dir, "go_0");
+    // 执行筛选（40 命中），等浏览器夹取滚动位置 + scroll 事件落定
+    grid.filters.set(0, "大理");
+    const t0 = performance.now();
+    const hits = await window.__app.runBigFilter();
+    await sleep(600);
+    await mark(invoke, dir, "filter_ms", String(Math.round(performance.now() - t0)));
+    await mark(invoke, dir, "diag_1", diag(grid, sc));
+    await mark(invoke, dir, "ready_1", `hits=${hits} st=${Math.round(sc.scrollTop)}`);
+    await waitGo(invoke, dir, "go_1");
+    // 手动拖滚动条到顶/到中：观察是否"跳回来"
+    sc.scrollTop = 0;
+    await sleep(400);
+    await mark(invoke, dir, "diag_2", diag(grid, sc));
+    await mark(invoke, dir, "ready_2", `set0 st=${Math.round(sc.scrollTop)}`);
+    await waitGo(invoke, dir, "go_2");
+    sc.scrollTop = 300;
+    await sleep(400);
+    await mark(invoke, dir, "diag_3", diag(grid, sc));
+    await mark(invoke, dir, "ready_3", `set300 st=${Math.round(sc.scrollTop)}`);
+    await waitGo(invoke, dir, "go_3");
+    // 清除筛选回全量：反向坐标系切换
+    grid.clearFilters();
+    await sleep(600);
+    await mark(invoke, dir, "diag_4", diag(grid, sc));
+    await mark(invoke, dir, "done");
+    return;
+  }
+
   if (mode === "flicker2") {
     // 带绘制版：可见窗口下跑同样的扫动，计数 renderAll/renderRows/rAF/DOM 变动。
     // 若存在"ResizeObserver→renderAll→尺寸变化→ResizeObserver"逐帧自激，

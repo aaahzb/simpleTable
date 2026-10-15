@@ -162,6 +162,11 @@ async function runBigFilter() {
   try {
     const t0 = performance.now();
     const n = await model.runFilter(kws, mCols, mKw);
+    // 筛选切换了滚动坐标系（全量压缩画布 → 命中自然画布）：旧 scrollTop 在新
+    // 坐标系无意义——渲染锚点由 scrollTop 反推，旧值会把锚点夹到末行、transform
+    // 把 #rows 推到画布外且回灌 scrollHeight 自锁（视口只剩末几行、滚动条跳回）。
+    // 回顶后一次重绘落定，同任务内完成不出现中间帧。
+    grid.resetScroll();
     lastFilterMs = performance.now() - t0;
     statusMsg(`匹配 ${n} 行 · 用时 ${(lastFilterMs / 1000).toFixed(1)} 秒`, 4000);
     updateStatusText();
@@ -177,14 +182,24 @@ async function applyColOps() {
   if (!model.isBig || !model.colOpsPending()) return;
   const dlg = progressDialog("执行列操作…");
   const un = await model.onProgress((done, total) => dlg.set(done, total));
+  let ok = false;
   try {
     await model.applyColOps();
+    // 物理重写已把内存状态（含覆盖层编辑/插删行）落盘：文件与内存一致。
+    // applyColOps 的 _emitData 经 onData 标了脏，此处复位——否则保存会再做
+    // 一次全量流式重写（用户看到的"莫名其妙第二根进度条"）。
+    dirty = false;
+    updateTitle();
     statusMsg("列操作已完成（物理重写，撤销历史已清空）", 4000);
+    ok = true;
   } catch (err) {
     await errorDialog("列操作失败", String(err?.message ?? err));
   } finally {
     un();
-    dlg.close();
+    // 完成帧短暂停留再关闭：重写期间磁盘 IO 可能饿死渲染管线，进度停在
+    // 中间的旧帧上——保证"100% 完成"被看到，而不是"卡住后消失"。
+    if (ok) await dlg.finish();
+    else dlg.close();
     refreshBigUi();
   }
 }
@@ -518,7 +533,9 @@ async function saveFile() {
       return;
     }
     un();
-    dlg.close();
+    // 完成帧短暂停留再关闭：重写期间磁盘 IO 可能饿死渲染管线，屏幕停在
+    // 中间的旧帧——保证"100% 完成"被看到，而不是"卡住后消失"。
+    await dlg.finish();
     dirty = false;
     updateTitle();
     statusMsg("已保存（大文件模式：流式重写完成）", 3000);

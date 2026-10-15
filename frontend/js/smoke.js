@@ -1124,6 +1124,8 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(saw[1] > 0 && saw[0] === saw[1], `进度收尾应到满：${saw}`);
     assert(bm.colOpsPending() === false, "执行后不应再有 pending");
     assert(bm.canUndo() === false, "物理重写后撤销栈应清空");
+    assert(window.__app.isDirty() === false,
+      "物理重写后文件与内存已一致，必须为干净（保存不得再全盘重写）");
     // 物理生效验证：引擎直读行应有 4 列，表头含新列
     const rows = await invoke("big_rows", { from: 0, count: 1 });
     assert(rows[0].length === 4, `物理行宽 ${rows[0].length}`);
@@ -1151,6 +1153,41 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(parsed.rows[0][0] === "昆明", `保存后首格 ${parsed.rows[0][0]}`);
     // 列操作后行已变为 4 列：["大理","","3","古城"]
     assert(parsed.rows[4999][3] === "古城", `末行内容应不变：${parsed.rows[4999]}`);
+  });
+
+  check("大模式：筛选后回顶显示结果（旧滚动位置不串坐标系）", async () => {
+    // 回归：筛选把坐标系从全量画布切到命中画布，旧 scrollTop 在新坐标系无意义。
+    // 渲染锚点由 scrollTop 反推——旧值把锚点夹到末行、transform 把 #rows 推到画布
+    // 外，且 transform 回灌 scrollHeight 自锁（滚动条拖不动/跳回、视口只剩末几行、
+    // 上部空白）。筛选切换必须像装载一样回顶。
+    const p = `${TMP}/big_fscroll.csv`;
+    await invoke("smoke_write_repeat", { path: p, line: "目的地,评分,备注\r\n", times: 1, append: false });
+    await invoke("smoke_write_repeat", { path: p, line: "大理,3,古城\r\n", times: 100, append: true });
+    for (let i = 0; i < 19; i += 1) {
+      await invoke("smoke_write_repeat", { path: p, line: "昆明,4,新城\r\n", times: 1000, append: true });
+    }
+    await invoke("smoke_set_force_big", { v: true });
+    await window.__app.openPath(p);
+    assert(window.__app.isBigMode() === true, "夹具应路由到大模式");
+    const sc = document.getElementById("grid-scroll");
+    const oy = grid._originY();
+    const h = grid._uniformRowH;
+    sc.scrollTop = Math.round(oy + (19100 * h) / grid._yScale); // 压深 ~99%
+    grid._renderRows();
+    grid.filters.set(0, "大理");
+    await window.__app.runBigFilter();
+    await sleep(250); // 等浏览器夹取 scrollTop 与 scroll 事件落定
+    assert(Math.round(sc.scrollTop) <= 1,
+      `筛选后应回顶，实际 scrollTop=${Math.round(sc.scrollTop)}`);
+    assert(sc.scrollHeight < 10000,
+      `筛选后画布应只含命中行高，实际 scrollHeight=${sc.scrollHeight}`);
+    await waitFor(() =>
+      document.querySelector('.cell[data-row="0"][data-col="0"]')?.textContent === "大理",
+      "筛选结果首行渲染");
+    grid.clearFilters();
+    await sleep(250);
+    assert(Math.round(sc.scrollTop) <= 1, "清除筛选回全量后也应回顶");
+    await invoke("smoke_set_force_big", { v: false });
   });
 
   check("大模式：关闭开关后重新打开小文件回小模式", async () => {

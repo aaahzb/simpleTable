@@ -134,7 +134,7 @@ function Wait-Marker($name, $secs) {
   return $null
 }
 
-$shotCounts = @{ "scan" = 8; "fixh" = 2; "wall4m" = 4; "verify" = 4 }
+$shotCounts = @{ "scan" = 8; "fixh" = 2; "wall4m" = 4; "verify" = 4; "filterscroll" = 4 }
 if ($shotCounts.ContainsKey($mode)) {
   for ($i = 0; $i -lt $shotCounts[$mode]; $i += 1) {
     $tag = Wait-Marker "ready_$i" 120
