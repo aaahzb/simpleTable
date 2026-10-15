@@ -127,19 +127,17 @@ jobs:
           ## 下载
 
           - **Windows (x64)**：`simpleTable-windows-x64.exe`，单文件免安装，下载即用。
-          - **macOS (Apple Silicon)**：`simpleTable-macos-arm64.dmg`，双击打开后把 app 拖入"应用程序"。首次打开如提示无法验证开发者：右键 → 打开。'
+          - **macOS (Apple Silicon)**：`simpleTable-macos-arm64.dmg`，双击打开后把 `simpleTable.app` 拖入"应用程序"。首次打开如提示无法验证开发者：右键 → 打开，或在终端执行 `xattr -cr /Applications/SimpleTable.app`。'
           if [ -n "$PREV" ]; then
             LOG=$(git log --no-merges --pretty=format:'- %s' "${PREV}..${CUR}")
-            RANGE="${PREV} → ${CUR}"
             LINK=$(printf '\n\n**Full Changelog**: https://github.com/%s/compare/%s...%s' "${GITHUB_REPOSITORY}" "${PREV}" "${CUR}")
           else
             LOG="- 首个版本"
-            RANGE="${CUR}"
             LINK=""
           fi
           {
             echo "body<<NOTES_EOF"
-            printf '%s\n\n## 本次变更（%s）\n\n%s%s\n' "$HEADER" "$RANGE" "$LOG" "$LINK"
+            printf '%s\n\n## 变更列表（自动生成）\n\n%s%s\n' "$HEADER" "$LOG" "$LINK"
             echo "NOTES_EOF"
           } >> "$GITHUB_OUTPUT"
 

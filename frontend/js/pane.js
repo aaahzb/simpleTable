@@ -47,6 +47,18 @@ export class EditPane {
       this._syncMirror();
       this.onEdit(this.editEl.value);
     });
+    // Tab 是窗格内的输入字符（对齐 Qt 编辑窗格），不能交给浏览器做焦点导航
+    this.editEl.addEventListener("keydown", (e) => {
+      if (e.key !== "Tab" || this._loading) return;
+      e.preventDefault();
+      const el = this.editEl;
+      const s = el.selectionStart ?? el.value.length;
+      const t = el.selectionEnd ?? el.value.length;
+      el.value = el.value.slice(0, s) + "\t" + el.value.slice(t);
+      el.selectionStart = el.selectionEnd = s + 1;
+      this._syncMirror();
+      this.onEdit(el.value);
+    });
     this.editEl.addEventListener("scroll", () => this._syncScroll());
     this.editEl.addEventListener("wheel", (e) => {
       if (!e.ctrlKey) return;

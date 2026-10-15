@@ -345,6 +345,16 @@ export async function runSmoke({ model, grid, pane, invoke }) {
     assert(model._undoStack.length === steps, "同格连续击键应合并为一步");
   });
 
+  check("窗格 Tab 键入制表符且焦点不逃离", async () => {
+    const pe = document.getElementById("pane-edit");
+    pe.focus();
+    pe.selectionStart = pe.selectionEnd = pe.value.length;
+    const before = pe.value;
+    key(pe, "Tab");
+    assert(pe.value === before + "\t", "Tab 应作为字符输入窗格内容");
+    assert(document.activeElement === pe, "焦点应留在窗格，不被 Tab 导航抢走");
+  });
+
   check("显示符号：镜像层显示 · 与 ¶，编辑域保持原文", async () => {
     pane.setSymbols(true);
     const mirror = document.getElementById("pane-mirror");
