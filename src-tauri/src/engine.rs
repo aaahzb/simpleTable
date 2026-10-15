@@ -19,6 +19,94 @@ use std::path::{Path, PathBuf};
 
 use memchr::{memchr, memchr_iter};
 use rayon::prelude::*;
+use std::time::{Duration, Instant};
+
+// ============================================================
+// 长操作友好度：低优先级守卫 + 进度节流
+// ============================================================
+
+/// 进度回调最小发送间隔：重写期间每 65536 行回调一次，1550 万行 ≈ 237 次
+/// IPC 事件；磁盘 IO 被拖慢时前端会被进度事件淹没、渲染管线反而饿死。
+/// 限速到 ~12 次/秒，肉眼看仍是连续走动，IPC 压力降到 1/50 以下。
+const PROGRESS_MIN_GAP: Duration = Duration::from_millis(80);
+
+/// 距上次发送是否已满最小间隔（首次调用恒放行）。
+///
+/// # Parameters
+/// - `last`: 上次发送时刻（None = 从未发送，恒放行并记录）。
+/// - `gap`: 最小间隔。
+///
+/// # Returns
+/// 本次是否应发送进度。
+fn progress_gate(last: &mut Option<Instant>, gap: Duration) -> bool {
+    let now = Instant::now();
+    match last {
+        Some(t) if now.saturating_duration_since(*t) < gap => false,
+        _ => {
+            *last = Some(now);
+            true
+        }
+    }
+}
+
+/// 整表重写（保存/执行列操作）期间的低优先级守卫：把**当前线程**降到
+/// BELOW_NORMAL，让出 UI 渲染/系统服务的调度优先级；进程内其它线程
+/// （界面消息泵、进度转发线程）保持原优先级。曾用进程级
+/// PROCESS_MODE_BACKGROUND_BEGIN 实测重写耗时翻倍——内存优先级随进程
+/// 整体下调，流式写盘被拖慢；线程级只降调度优先级，无该副作用。
+/// 离开作用域时恢复进入前的优先级。
+#[cfg(windows)]
+mod bg {
+    use std::ffi::c_void;
+
+    type Handle = *mut c_void;
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+
+    extern "system" {
+        fn GetCurrentThread() -> Handle;
+        fn SetThreadPriority(h: Handle, priority: i32) -> i32;
+        fn GetThreadPriority(h: Handle) -> i32;
+    }
+
+    /// 进入即降低当前线程优先级，Drop 时恢复到进入前的值。
+    pub struct BackgroundGuard {
+        handle: Handle,
+        prev: i32,
+    }
+
+    impl BackgroundGuard {
+        /// 降低当前线程优先级；返回持有即保持、析构即恢复的守卫。
+        pub fn enter() -> Self {
+            unsafe {
+                let handle = GetCurrentThread();
+                let prev = GetThreadPriority(handle);
+                SetThreadPriority(handle, THREAD_PRIORITY_BELOW_NORMAL);
+                BackgroundGuard { handle, prev }
+            }
+        }
+    }
+
+    impl Drop for BackgroundGuard {
+        fn drop(&mut self) {
+            unsafe {
+                SetThreadPriority(self.handle, self.prev);
+            }
+        }
+    }
+}
+
+/// 非 Windows 平台：守卫为空结构（Tauri 前端与引擎逻辑跨平台一致，
+/// 优先级隔离仅 Windows 需要——macOS 的 QoS 由 GCD 自动处理）。
+#[cfg(not(windows))]
+mod bg {
+    pub struct BackgroundGuard;
+
+    impl BackgroundGuard {
+        pub fn enter() -> Self {
+            BackgroundGuard
+        }
+    }
+}
 
 // ============================================================
 // CSV 方言（frontend/js/csv.js parseCsv 的逐字节移植）
@@ -276,6 +364,52 @@ pub fn build_index(bytes: &[u8]) -> RawIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 进度节流：大间隔时首次放行、紧接着的突发调用全部被压住，
+    /// 零间隔（不节流路径）行为不受影响。
+    #[test]
+    fn progress_gate_throttles_bursts() {
+        let mut last: Option<Instant> = None;
+        assert!(progress_gate(&mut last, Duration::from_secs(3600)));
+        assert!(!progress_gate(&mut last, Duration::from_secs(3600)));
+        assert!(!progress_gate(&mut last, Duration::from_secs(3600)));
+        let mut always: Option<Instant> = None;
+        assert!(progress_gate(&mut always, Duration::from_millis(0)));
+        assert!(progress_gate(&mut always, Duration::from_millis(0)));
+    }
+
+    /// 进度节流：间隔过后重新放行。
+    #[test]
+    fn progress_gate_reopens_after_gap() {
+        let mut last: Option<Instant> = None;
+        assert!(progress_gate(&mut last, Duration::from_millis(20)));
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(progress_gate(&mut last, Duration::from_millis(20)));
+    }
+
+    /// 低优先级守卫：进入后当前线程优先级变为 BELOW_NORMAL，drop 后
+    /// 必须恢复到进入前的值——优先级泄漏会让后续无关任务长期低优先级运行。
+    #[cfg(windows)]
+    #[test]
+    fn background_guard_roundtrip() {
+        use std::ffi::c_void;
+        type Handle = *mut c_void;
+        extern "system" {
+            fn GetCurrentThread() -> Handle;
+            fn GetThreadPriority(h: Handle) -> i32;
+        }
+        unsafe {
+            let h = GetCurrentThread();
+            let before = GetThreadPriority(h);
+            {
+                let _g = bg::BackgroundGuard::enter();
+                let during = GetThreadPriority(h);
+                assert_eq!(during, -1, "进入后应为 BELOW_NORMAL(-1)，实际 {during}");
+            }
+            let after = GetThreadPriority(h);
+            assert_eq!(after, before, "drop 后必须恢复进入前的优先级 {before}，实际 {after}");
+        }
+    }
 
     /// 嗅探头部截断在多字节字符中间时仍应判 UTF-8（65536 边界恰好切分
     /// 3 字节字符的回归：from_utf8 报 incomplete → 曾误判 GBK 全表乱码）。
@@ -1705,6 +1839,8 @@ impl BigFile {
     /// 保存后重建 mmap 与索引；撤销栈保留（操作按稳定记录号寻址，仍有效）。
     pub fn save<F: FnMut(u64, u64)>(&mut self, mut progress: F) -> Result<(), String> {
         self.require_editable()?;
+        // 整表重写数十秒：本线程降为背景优先级，让出 UI/系统调度。
+        let _bg = bg::BackgroundGuard::enter();
         let tmp = tmp_path_for(&self.path);
         let out = fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
         let mut w = BufWriter::new(out);
@@ -1716,6 +1852,7 @@ impl BigFile {
             .map_err(|e| e.to_string())?;
         let total = self.seg.vrow_count();
         let mut done = 0u64;
+        let mut last_emit: Option<Instant> = None;
         for s in &self.seg.segs {
             match s.kind {
                 SegKind::Src { start, len } => {
@@ -1724,7 +1861,7 @@ impl BigFile {
                         w.write_all(&encode_record(&f, b',', self.enc))
                             .map_err(|e| e.to_string())?;
                         done += 1;
-                        if done % 65536 == 0 {
+                        if done % 65536 == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
                             progress(done, total);
                         }
                     }
@@ -1767,6 +1904,8 @@ impl BigFile {
         if self.pending_cols.is_empty() {
             return Ok(());
         }
+        // 整表物理重写数十秒：本线程降为背景优先级，让出 UI/系统调度。
+        let _bg = bg::BackgroundGuard::enter();
         let new_headers = self.view_headers();
         // 视图→物理映射（apply 后 view == 物理，映射只是本次重写用）
         let ncols = self.view_ncols();
@@ -1782,6 +1921,7 @@ impl BigFile {
             .map_err(|e| e.to_string())?;
         let total = self.seg.vrow_count();
         let mut done = 0u64;
+        let mut last_emit: Option<Instant> = None;
         for s in &self.seg.segs {
             match s.kind {
                 SegKind::Src { start, len } => {
@@ -1797,7 +1937,7 @@ impl BigFile {
                         w.write_all(&encode_record(&mapped, b',', self.enc))
                             .map_err(|e| e.to_string())?;
                         done += 1;
-                        if done % 65536 == 0 {
+                        if done % 65536 == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
                             progress(done, total);
                         }
                     }

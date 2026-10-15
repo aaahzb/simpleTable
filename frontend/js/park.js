@@ -270,6 +270,7 @@ export async function runPark({ invoke, grid, mode }) {
     // 真机删列实验（不动用户数据）：打开 recovered 副本（2.16GB，天然大模式），
     // 删最后一列 → 执行列操作（物理重写，与保存共用流式重写+换名链路），
     // 采样列数/行数/耗时/文件大小与深行渲染，验证大文件删列全链路。
+    // 重写期间按 5% 步进写 progress 标记——配合外部采样器关联"未响应"时间线。
     const p = `${await invoke("smoke_tmp_dir")}/${DELCOL}`;
     const fsize = async () => {
       try { return Number(await invoke("file_size", { path: p })); }
@@ -287,8 +288,19 @@ export async function runPark({ invoke, grid, mode }) {
     const t0 = performance.now();
     await bm.removeColumns([before.cols - 1]); // 预览（pending）
     const pendingCols = bm.columnCount();
+    await mark(invoke, dir, "delcol_applying", String(Math.round(t0)));
+    let lastPct = -5;
+    const un = await bm.onProgress((done, total) => {
+      const pct = Math.floor((done / Math.max(1, total)) * 20) * 5; // 5% 步进
+      if (pct !== lastPct) {
+        lastPct = pct;
+        mark(invoke, dir, `prog_${pct}`, `${Math.round(performance.now() - t0)}`);
+      }
+    });
     await bm.applyColOps(); // 物理重写（流式重写 + replace_with_retry 换名）
+    un();
     const ms = Math.round(performance.now() - t0);
+    await mark(invoke, dir, "delcol_applied", String(ms));
     const after = { rows: bm.rowCount(), cols: bm.columnCount(), bytes: await fsize() };
     // 渲染验证：跳到 3,900,143 行附近（userpos 深度）再取诊断
     grid.setZoom(1);

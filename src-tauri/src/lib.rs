@@ -252,16 +252,15 @@ struct StartupArgs {
 }
 
 /// 大文件会话状态：一次只开一个（打开新文件先关旧）。
-struct BigState {
-    file: Mutex<Option<BigFile>>,
-}
+/// Arc 托管以便长命令把会话搬进 spawn_blocking（离开 tauri::State 借用）。
+type BigShared = std::sync::Arc<Mutex<Option<BigFile>>>;
 
 /// 取大文件会话锁，未打开时返回统一错误串。
 fn with_big<T>(
-    state: &tauri::State<BigState>,
+    state: &BigShared,
     f: impl FnOnce(&mut BigFile) -> Result<T, String>,
 ) -> Result<T, String> {
-    let mut guard = state.file.lock().map_err(|e| e.to_string())?;
+    let mut guard = state.lock().map_err(|e| e.to_string())?;
     let bf = guard.as_mut().ok_or("大文件会话未打开")?;
     f(bf)
 }
@@ -275,42 +274,42 @@ fn file_size(path: String) -> Result<u64, String> {
 
 /// 打开大文件会话（mmap + 行索引，秒开）。
 #[tauri::command]
-fn big_open(path: String, state: tauri::State<BigState>) -> Result<BigMeta, String> {
-    let mut guard = state.file.lock().map_err(|e| e.to_string())?;
+fn big_open(path: String, state: tauri::State<BigShared>) -> Result<BigMeta, String> {
+    let mut guard = state.lock().map_err(|e| e.to_string())?;
     *guard = Some(BigFile::open(std::path::Path::new(&path))?);
     Ok(guard.as_ref().unwrap().meta())
 }
 
 /// 关闭大文件会话。
 #[tauri::command]
-fn big_close(state: tauri::State<BigState>) {
-    if let Ok(mut guard) = state.file.lock() {
+fn big_close(state: tauri::State<BigShared>) {
+    if let Ok(mut guard) = state.lock() {
         *guard = None;
     }
 }
 
 /// 元数据（行/列/表头/编码/待执行列操作/撤销栈状态）。
 #[tauri::command]
-fn big_meta(state: tauri::State<BigState>) -> Result<BigMeta, String> {
+fn big_meta(state: tauri::State<BigShared>) -> Result<BigMeta, String> {
     with_big(&state, |bf| Ok(bf.meta()))
 }
 
 /// 外部程序是否改动过文件（focus 时前端拉取）。
 #[tauri::command]
-fn big_stale(state: tauri::State<BigState>) -> Result<bool, String> {
+fn big_stale(state: tauri::State<BigShared>) -> Result<bool, String> {
     with_big(&state, |bf| Ok(bf.stale()))
 }
 
 /// 窗口取行（含覆盖层/插入块/删除位图的视图行）。
 #[tauri::command]
-fn big_rows(state: tauri::State<BigState>, from: u64, count: u32) -> Result<Vec<Vec<String>>, String> {
+fn big_rows(state: tauri::State<BigShared>, from: u64, count: u32) -> Result<Vec<Vec<String>>, String> {
     with_big(&state, |bf| Ok(bf.rows(from, count)))
 }
 
 /// 编辑单元格（源行进覆盖层，插入行直写）。
 #[tauri::command]
 fn big_set_cell(
-    state: tauri::State<BigState>,
+    state: tauri::State<BigShared>,
     vrow: u64,
     col: u32,
     value: String,
@@ -321,7 +320,7 @@ fn big_set_cell(
 /// 在 vpos 处插入行（rows 为 null 时插 count 行空行）。
 #[tauri::command]
 fn big_insert_rows(
-    state: tauri::State<BigState>,
+    state: tauri::State<BigShared>,
     vpos: u64,
     rows: Option<Vec<Vec<String>>>,
     count: u32,
@@ -331,34 +330,34 @@ fn big_insert_rows(
 
 /// 删除一组 vrow（升序传入），返回删除行数。
 #[tauri::command]
-fn big_remove_rows(state: tauri::State<BigState>, vrows: Vec<u64>) -> Result<u32, String> {
+fn big_remove_rows(state: tauri::State<BigShared>, vrows: Vec<u64>) -> Result<u32, String> {
     with_big(&state, |bf| bf.remove_rows(vrows))
 }
 
 #[tauri::command]
-fn big_undo(state: tauri::State<BigState>) -> Result<bool, String> {
+fn big_undo(state: tauri::State<BigShared>) -> Result<bool, String> {
     with_big(&state, |bf| Ok(bf.undo()))
 }
 
 #[tauri::command]
-fn big_redo(state: tauri::State<BigState>) -> Result<bool, String> {
+fn big_redo(state: tauri::State<BigShared>) -> Result<bool, String> {
     with_big(&state, |bf| Ok(bf.redo()))
 }
 
 /// 执行一次筛选（rayon 并行扫描），返回命中数。
 #[tauri::command]
-fn big_filter(state: tauri::State<BigState>, spec: FilterSpec) -> Result<u32, String> {
+fn big_filter(state: tauri::State<BigShared>, spec: FilterSpec) -> Result<u32, String> {
     with_big(&state, |bf| bf.run_filter(&spec))
 }
 
 #[tauri::command]
-fn big_filter_count(state: tauri::State<BigState>) -> Result<u32, String> {
+fn big_filter_count(state: tauri::State<BigShared>) -> Result<u32, String> {
     with_big(&state, |bf| Ok(if bf.has_filter() { bf.filter_len() } else { 0 }))
 }
 
 #[tauri::command]
 fn big_filter_page(
-    state: tauri::State<BigState>,
+    state: tauri::State<BigShared>,
     from: u32,
     count: u32,
 ) -> Result<Vec<Vec<String>>, String> {
@@ -366,7 +365,7 @@ fn big_filter_page(
 }
 
 #[tauri::command]
-fn big_clear_filter(state: tauri::State<BigState>) -> Result<(), String> {
+fn big_clear_filter(state: tauri::State<BigShared>) -> Result<(), String> {
     with_big(&state, |bf| {
         bf.clear_filter();
         Ok(())
@@ -376,7 +375,7 @@ fn big_clear_filter(state: tauri::State<BigState>) -> Result<(), String> {
 /// 大选区复制（TSV，\r\n 行尾）。
 #[tauri::command]
 fn big_copy(
-    state: tauri::State<BigState>,
+    state: tauri::State<BigShared>,
     r0: u64,
     r1: u64,
     c0: u32,
@@ -386,19 +385,38 @@ fn big_copy(
 }
 
 /// 保存（流式重写 + 原子换名），进度经 "big-progress" 事件推送。
+///
+/// 长操作走 spawn_blocking（独立 OS 线程，不占 tokio worker），进度经
+/// 专用转发线程 emit——重写线程全程不触碰 WebView2 COM。v4 采样实证：
+/// 重写期间主线程被挂起（Wait/WrSuspended）、进度事件挤压到命令结束才
+/// 到达渲染进程，用户看到"进度条卡住 + 窗口未响应"。
 #[tauri::command]
-fn big_save(window: tauri::Window, state: tauri::State<BigState>) -> Result<(), String> {
-    with_big(&state, |bf| {
-        bf.save(|done, total| {
-            let _ = window.emit("big-progress", (done, total));
-        })
+async fn big_save(window: tauri::Window, state: tauri::State<'_, BigShared>) -> Result<(), String> {
+    let shared = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, u64)>();
+        let emitter = std::thread::spawn(move || {
+            while let Ok((done, total)) = rx.recv() {
+                let _ = window.emit("big-progress", (done, total));
+            }
+        });
+        let result = with_big(&shared, |bf| {
+            bf.save(move |done, total| {
+                let _ = tx.send((done, total));
+            })
+        });
+        // save 返回后进度闭包随 tx 一并释放，emit 线程 recv 出错即退出。
+        emitter.join().map_err(|e| format!("进度转发线程异常：{e:?}"))?;
+        result
     })
+    .await
+    .map_err(|e| format!("保存任务被取消：{e}"))?
 }
 
 // ---- 列操作：pending 预览 → 执行物理重写 ----
 
 #[tauri::command]
-fn big_col_push(state: tauri::State<BigState>, op: ColOp) -> Result<(), String> {
+fn big_col_push(state: tauri::State<BigShared>, op: ColOp) -> Result<(), String> {
     with_big(&state, |bf| {
         bf.push_col_op(op);
         Ok(())
@@ -406,7 +424,7 @@ fn big_col_push(state: tauri::State<BigState>, op: ColOp) -> Result<(), String> 
 }
 
 #[tauri::command]
-fn big_col_pop(state: tauri::State<BigState>) -> Result<(), String> {
+fn big_col_pop(state: tauri::State<BigShared>) -> Result<(), String> {
     with_big(&state, |bf| {
         bf.pop_col_op();
         Ok(())
@@ -414,7 +432,7 @@ fn big_col_pop(state: tauri::State<BigState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn big_col_clear(state: tauri::State<BigState>) -> Result<(), String> {
+fn big_col_clear(state: tauri::State<BigShared>) -> Result<(), String> {
     with_big(&state, |bf| {
         bf.clear_col_ops();
         Ok(())
@@ -422,13 +440,27 @@ fn big_col_clear(state: tauri::State<BigState>) -> Result<(), String> {
 }
 
 /// 执行待处理的列操作（物理重写整个文件，带进度事件）。
+/// 同 big_save：spawn_blocking + 专用 emit 转发线程（见 big_save 注释）。
 #[tauri::command]
-fn big_col_apply(window: tauri::Window, state: tauri::State<BigState>) -> Result<(), String> {
-    with_big(&state, |bf| {
-        bf.apply_col_ops(|done, total| {
-            let _ = window.emit("big-progress", (done, total));
-        })
+async fn big_col_apply(window: tauri::Window, state: tauri::State<'_, BigShared>) -> Result<(), String> {
+    let shared = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, u64)>();
+        let emitter = std::thread::spawn(move || {
+            while let Ok((done, total)) = rx.recv() {
+                let _ = window.emit("big-progress", (done, total));
+            }
+        });
+        let result = with_big(&shared, |bf| {
+            bf.apply_col_ops(move |done, total| {
+                let _ = tx.send((done, total));
+            })
+        });
+        emitter.join().map_err(|e| format!("进度转发线程异常：{e:?}"))?;
+        result
     })
+    .await
+    .map_err(|e| format!("列操作任务被取消：{e}"))?
 }
 
 /// 取命令行第一个 .csv 路径（启动时由前端拉取并打开）。
@@ -482,7 +514,7 @@ pub fn run() {
                 .skip(1)
                 .find(|a| a.to_lowercase().ends_with(".csv"));
             app.manage(StartupArgs { open_path });
-            app.manage(BigState { file: Mutex::new(None) });
+            app.manage(BigShared::new(Mutex::new(None)));
             // 关闭请求转发给前端做"未保存确认"，确认后由 quit_app 命令真正退出
             if let Some(window) = app.get_webview_window("main") {
                 let handle = window.clone();
