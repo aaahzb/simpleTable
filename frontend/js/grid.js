@@ -66,6 +66,8 @@ export class Grid {
     this.colOrder = [];
     /** @type {Map<number, string>} 列号 → 筛选关键字 */
     this.filters = new Map();
+    /** 多重筛选状态：on 闩锁（长期选中）；text 关键字；cols 参与"或"匹配的源列号集合 */
+    this.multi = { on: false, text: "", cols: new Set() };
     /** @type {number[]} 可见源行号（筛选后） */
     this.visibleRows = [];
     /** @type {{current: [number, number]|null, anchor: [number, number]|null,
@@ -108,6 +110,8 @@ export class Grid {
     this.rowH = Array.from({ length: rows }, (_, i) =>
       i < keptH.length ? keptH[i] : base);
     this._rebuildFilterInputs();
+    // 列结构变化：多重筛选的勾选列重置为全勾（默认勾选，对齐普通筛选清空的策略）
+    this.multi.cols = new Set(this.colOrder);
     this._refilter();
     this._clampSelection();
     this.renderAll();
@@ -214,7 +218,22 @@ export class Grid {
       cell.dataset.col = String(srcCol);
       const name = document.createElement("div");
       name.className = "col-name";
-      name.textContent = this.model.headers()[srcCol] ?? "";
+      if (this.multi.on) {
+        // 多重筛选选中态：列名前出现复选框（默认勾选），勾选列按"或"参与匹配
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.className = "col-multi";
+        cb.checked = this.multi.cols.has(srcCol);
+        cb.dataset.col = String(srcCol);
+        cb.title = "多重筛选：本列是否参与匹配";
+        // 复选框交互不触发列选择/拖拽
+        cb.addEventListener("mousedown", (e) => e.stopPropagation());
+        name.appendChild(cb);
+      }
+      const nameText = document.createElement("span");
+      nameText.className = "col-name-text";
+      nameText.textContent = this.model.headers()[srcCol] ?? "";
+      name.appendChild(nameText);
       const filter = document.createElement("div");
       filter.className = "col-filter";
       const input = document.createElement("input");
@@ -301,9 +320,19 @@ export class Grid {
     for (const [col, kw] of this.filters) {
       if (col < cc && kw) kws.push([col, kw.toLowerCase()]);
     }
+    // 多重筛选：关键字在勾选列中命中任意一列即通过（列间"或"），
+    // 与各列自身筛选框（列间"并且"）叠加——先过多重，再过逐列。
+    const mKw = this.multi.on && this.multi.text
+      ? this.multi.text.toLowerCase() : "";
+    const mCols = mKw
+      ? [...this.multi.cols].filter((c) => c < cc) : [];
     const vis = [];
     for (let r = 0; r < this.model.rowCount(); r += 1) {
       let ok = true;
+      if (mKw && !mCols.some((c) =>
+        this.model.rawData(r, c).toLowerCase().includes(mKw))) {
+        ok = false;
+      }
       for (const [col, kw] of kws) {
         if (!this.model.rawData(r, col).toLowerCase().includes(kw)) {
           ok = false;
@@ -627,6 +656,15 @@ export class Grid {
       const col = Number(input.dataset.col);
       const v = input.value;
       if (v) this.filters.set(col, v); else this.filters.delete(col);
+      this._refilter();
+    });
+
+    // ---- 多重筛选列勾选 ----
+    this.headerEl.addEventListener("change", (e) => {
+      const cb = e.target.closest(".col-multi");
+      if (!cb) return;
+      const col = Number(cb.dataset.col);
+      if (cb.checked) this.multi.cols.add(col); else this.multi.cols.delete(col);
       this._refilter();
     });
 
@@ -1008,14 +1046,39 @@ export class Grid {
 
   // ============ 筛选（D2/D3） ============
 
-  /** 清空全部筛选条件与输入框 */
+  /** 清空全部筛选条件与输入框（含多重筛选关键字；多重筛选开关状态保留） */
   clearFilters() {
     this.filters.clear();
+    this.multi.text = "";
     this._suppressFilterInput = true;
     for (const input of this.headerEl.querySelectorAll(".col-filter input")) {
       input.value = "";
     }
     this._suppressFilterInput = false;
+    this._refilter();
+  }
+
+  /**
+   * 多重筛选开关（闩锁，长期选中）。开启时列名前出现复选框（默认全勾）。
+   *
+   * @param {boolean} on - 是否开启。
+   */
+  setMultiOn(on) {
+    this.multi.on = on;
+    if (on && this.multi.cols.size === 0 && this.colOrder.length) {
+      this.multi.cols = new Set(this.colOrder);
+    }
+    this._renderHeader();
+    this._refilter();
+  }
+
+  /**
+   * 设置多重筛选关键字（勾选列间按"或"匹配，忽略大小写）。
+   *
+   * @param {string} text - 关键字；空串即不生效。
+   */
+  setMultiText(text) {
+    this.multi.text = text;
     this._refilter();
   }
 

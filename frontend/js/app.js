@@ -143,11 +143,15 @@ for (const spec of [
   ["redo", "重做", () => redo()],
   "|",
   ["sort", "排序…", () => openSortDialog()],
-  ["clearFilter", "清除筛选", () => grid.clearFilters()],
-  "|",
-  ["symbols", "显示符号", (e) => {
+  ["clearFilter", "清除筛选", () => {
+    grid.clearFilters();
+    multiInput.value = "";
+  }],
+  ["multiFilter", "多重筛选", (e) => {
     const on = e.currentTarget.classList.toggle("on");
-    pane.setSymbols(on);
+    grid.setMultiOn(on);
+    multiWrap.classList.toggle("hidden", !on);
+    if (on) multiInput.focus();
   }],
 ]) {
   if (spec === "|") {
@@ -163,6 +167,26 @@ for (const spec of [
   toolbar.appendChild(b);
   tb[key] = b;
 }
+// 多重筛选输入框（紧随按钮，仅选中态显示）
+const multiWrap = document.createElement("span");
+multiWrap.id = "multi-filter-wrap";
+multiWrap.className = "hidden";
+const multiInput = document.createElement("input");
+multiInput.id = "multi-filter-input";
+multiInput.placeholder = "在勾选列中匹配（或）…";
+multiInput.addEventListener("input", () => grid.setMultiText(multiInput.value));
+multiWrap.appendChild(multiInput);
+tb.multiFilter.after(multiWrap);
+
+// 显示符号开关：位于「编辑窗格」标题右侧（功能不变）
+const btnSymbols = document.createElement("button");
+btnSymbols.textContent = "显示符号";
+btnSymbols.addEventListener("click", () => {
+  btnSymbols.classList.toggle("on");
+  pane.setSymbols(btnSymbols.classList.contains("on"));
+});
+document.getElementById("pane-head").appendChild(btnSymbols);
+tb.symbols = btnSymbols;
 tb.symbols.title = "在编辑窗格显示空格(·)、Tab(→)、换行符(¶)，类似 Notepad++";
 tb.undo.disabled = true;
 tb.redo.disabled = true;

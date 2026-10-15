@@ -321,6 +321,69 @@ export async function runSmoke({ model, grid, pane, invoke }) {
     assert(model.rawData(grid.visibleRows[0], 0) === "丽江");
   });
 
+  // ========== 多重筛选 ==========
+
+  check("多重筛选：按钮在清除筛选右侧，开启出现输入框与默认勾选的列复选框", async () => {
+    loadBasic();
+    const names = [...document.querySelectorAll("#toolbar button")].map((b) => b.textContent);
+    const iClear = names.indexOf("清除筛选");
+    const iMulti = names.indexOf("多重筛选");
+    assert(iClear >= 0 && iMulti === iClear + 1, "多重筛选应紧邻清除筛选右侧");
+    const btn = [...document.querySelectorAll("#toolbar button")].find((b) => b.textContent === "多重筛选");
+    assert(btn && !btn.classList.contains("on"), "初始应为未选中态");
+    assert(document.getElementById("multi-filter-wrap").classList.contains("hidden"),
+      "未选中时输入框应隐藏");
+    btn.click();
+    assert(btn.classList.contains("on"), "点击后应呈选中态（可长期选中）");
+    assert(!document.getElementById("multi-filter-wrap").classList.contains("hidden"),
+      "选中态应显示输入框");
+    const cbs = [...document.querySelectorAll(".col-multi")];
+    assert(cbs.length === 3 && cbs.every((cb) => cb.checked), "每个列名前应有默认勾选的复选框");
+  });
+
+  check("多重筛选：勾选列按或逻辑匹配，取消勾选即剔除该列", async () => {
+    model.setData(2, 0, "观山"); // 洱海→观山：与丽江"雪山"分处两列
+    grid.setMultiText("山");
+    assert(grid.visibleRows.length === 2, "或逻辑应命中两列各一行");
+    const cb0 = document.querySelector('.col-multi[data-col="0"]');
+    assert(cb0 && cb0.checked, "列0复选框应存在且勾选");
+    cb0.checked = false;
+    cb0.dispatchEvent(new Event("change", { bubbles: true }));
+    assert(grid.visibleRows.length === 1, "取消列0勾选后只应剩备注列命中行");
+    assert(model.rawData(grid.visibleRows[0], 0) === "丽江");
+  });
+
+  check("多重筛选结果可再被列筛选框叠加过滤", async () => {
+    grid.filters.set(1, "10");
+    grid._refilter();
+    assert(grid.visibleRows.length === 1, "多重结果应再按列筛选二次过滤");
+    assert(model.rawData(grid.visibleRows[0], 0) === "丽江");
+  });
+
+  check("多重筛选关闭后恢复：输入框隐藏、复选框移除", async () => {
+    grid.clearFilters(); // 清掉上一步的列筛选
+    const btn = [...document.querySelectorAll("#toolbar button")].find((b) => b.textContent === "多重筛选");
+    btn.click(); // 关
+    assert(!btn.classList.contains("on"), "再次点击应回到未选中态");
+    assert(document.getElementById("multi-filter-wrap").classList.contains("hidden"),
+      "关闭应隐藏输入框");
+    assert(document.querySelectorAll(".col-multi").length === 0, "关闭应移除列名前复选框");
+    assert(grid.visibleRows.length === 3, "关闭后应显示全部行");
+  });
+
+  check("清除筛选连带清空多重筛选关键字但保留开关", async () => {
+    const btn = [...document.querySelectorAll("#toolbar button")].find((b) => b.textContent === "多重筛选");
+    btn.click(); // 开
+    grid.setMultiText("山");
+    grid.filters.set(1, "10");
+    grid.clearFilters();
+    assert(grid.multi.text === "" && grid.filters.size === 0, "清除筛选应清空全部条件");
+    assert(grid.visibleRows.length === 3, "清除后应显示全部行");
+    assert(grid.multi.on, "开关状态应保留");
+    btn.click(); // 关，恢复默认状态供后续用例
+    grid.clearFilters();
+  });
+
   // ========== 编辑窗格 ==========
 
   check("选中变化同步窗格完整内容", async () => {
@@ -369,7 +432,7 @@ export async function runSmoke({ model, grid, pane, invoke }) {
 
   check("工具栏按钮齐全且撤销/重做随栈置灰", async () => {
     const texts = [...document.querySelectorAll("#toolbar button")].map((b) => b.textContent);
-    for (const t of ["新建", "打开", "保存", "另存为", "撤销", "重做", "排序…", "清除筛选", "显示符号"]) {
+    for (const t of ["新建", "打开", "保存", "另存为", "撤销", "重做", "排序…", "清除筛选", "多重筛选"]) {
       assert(texts.includes(t), `工具栏缺少 ${t}`);
     }
     loadBasic(); // load 清空撤销栈
@@ -379,6 +442,23 @@ export async function runSmoke({ model, grid, pane, invoke }) {
     assert(undoB.disabled && redoB.disabled, "load 后撤销/重做应置灰");
     model.setData(0, 0, "x");
     assert(!undoB.disabled, "改动后撤销应可用");
+  });
+
+  check("显示符号按钮位于编辑窗格标题右侧（工具栏不再有）", async () => {
+    const head = document.getElementById("pane-head");
+    assert(head, "窗格标题行存在");
+    const btns = [...head.querySelectorAll("button")];
+    assert(btns.length === 1 && btns[0].textContent === "显示符号",
+      "编辑窗格标题右侧应有且仅有显示符号按钮");
+    assert(![...document.querySelectorAll("#toolbar button")].some((b) => b.textContent === "显示符号"),
+      "工具栏不应再含显示符号");
+    const before = document.getElementById("pane").classList.contains("symbols");
+    btns[0].click();
+    assert(document.getElementById("pane").classList.contains("symbols") === !before,
+      "点击应切换符号模式");
+    btns[0].click();
+    assert(document.getElementById("pane").classList.contains("symbols") === before,
+      "再次点击应还原");
   });
 
   check("格内编辑后标题带脏标记星号", async () => {

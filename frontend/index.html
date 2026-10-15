@@ -94,6 +94,9 @@ body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; 
 #toolbar button:disabled { color: #aaa; cursor: default; }
 #toolbar button.on { background: #dce6f0; border-color: var(--accent); color: var(--accent); }
 #toolbar .sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+/* 多重筛选输入框（按钮常驻，框仅选中态显示） */
+#multi-filter-wrap.hidden { display: none; }
+#multi-filter-input { font: inherit; padding: 2px 6px; width: 12em; border: 1px solid #bbb; border-radius: 2px; }
 
 /* ========== 主行：网格 + 分隔条 + 编辑窗格 ========== */
 #main-row { display: flex; flex: 1 1 auto; min-height: 0; }
@@ -136,6 +139,8 @@ body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; 
   padding: 0 0.4em; overflow: hidden; white-space: nowrap;
   text-overflow: ellipsis; cursor: default; user-select: none;
 }
+.col-multi { flex: 0 0 auto; margin-right: 0.35em; cursor: pointer; }
+.col-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .col-filter { height: var(--filter-band); padding: 0 1px; }
 .col-filter input {
   width: 100%; height: calc(100% - 2px); margin-top: 1px;
@@ -186,10 +191,18 @@ body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; 
 
 /* ========== 编辑窗格（E1–E3） ========== */
 #pane { flex: 0 0 auto; width: 280px; display: flex; flex-direction: column; min-width: 120px; }
-#pane-title {
-  flex: 0 0 auto; padding: 5px 8px; font-weight: bold; background: #f0f0f0;
+#pane-head {
+  flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+  padding: 2px 4px 2px 8px; font-weight: bold; background: #f0f0f0;
   border-bottom: 1px solid var(--border); user-select: none;
 }
+#pane-head button {
+  font: inherit; font-weight: normal; padding: 2px 8px; border: 1px solid transparent;
+  background: transparent; border-radius: 3px; cursor: pointer; color: #222;
+}
+#pane-head button:hover { background: #e5e5e5; border-color: #d0d0d0; }
+#pane-head button.on { background: #dce6f0; border-color: var(--accent); color: var(--accent); }
+#pane-head #pane-title { font-weight: bold; }
 #pane-wrap { position: relative; flex: 1 1 auto; min-height: 0; font-size: calc(13px * var(--pane-zoom)); }
 #pane-edit, #pane-mirror {
   font: inherit; font-size: 1em; line-height: 1.5; padding: 6px;
@@ -278,7 +291,7 @@ body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; 
     </div>
     <div id="splitter"></div>
     <div id="pane">
-      <div id="pane-title">编辑窗格</div>
+      <div id="pane-head"><span id="pane-title">编辑窗格</span></div>
       <div id="pane-wrap">
         <pre id="pane-mirror"></pre>
         <textarea id="pane-edit" spellcheck="false"></textarea>
