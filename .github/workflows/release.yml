@@ -113,28 +113,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 需要 tag 对象本体（附注说明）
+          fetch-depth: 0 # git describe/log 需要完整历史与全部 tag
 
-      - name: 组装 Release 正文（固定头 + tag 附注说明）
+      - name: 组装 Release 正文（固定头 + 自动生成的版本差异）
         id: notes
         run: |
+          # 说明全部由流水线生成：取上一 tag 至本 tag 的提交列表 + 对比链接。
+          # 不依赖任何人工维护的笔记文件，也不要求 tag 带附注。
+          CUR="${GITHUB_REF_NAME}"
+          PREV=$(git describe --tags --abbrev=0 "${CUR}^" 2>/dev/null || true)
           HEADER='个人自用的极简桌面表格工具：格子永不变形，带换行的长文也能塞进一个格子并方便阅读。CSV 查看、编辑、筛选、排序，键位与剪贴板行为对齐 Excel。
 
           ## 下载
 
           - **Windows (x64)**：`simpleTable-windows-x64.exe`，单文件免安装，下载即用。
           - **macOS (Apple Silicon)**：`simpleTable-macos-arm64.dmg`，双击打开后把 app 拖入"应用程序"。首次打开如提示无法验证开发者：右键 → 打开。'
-          # Release 说明取自 tag 附注（git tag -a -m "..." 写入），与仓库文件零耦合；
-          # 轻量 tag 的 %(contents) 会是 commit message，必须用对象类型区分
-          OBJ_TYPE=$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(objecttype)')
-          TAG_BODY=$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)')
-          if [ "$OBJ_TYPE" != "tag" ]; then
-            echo "tag ${GITHUB_REF_NAME} 没有附注说明。请改用 git tag -a ${GITHUB_REF_NAME} -m \"说明...\" 后重推。" >&2
-            exit 1
+          if [ -n "$PREV" ]; then
+            LOG=$(git log --no-merges --pretty=format:'- %s' "${PREV}..${CUR}")
+            RANGE="${PREV} → ${CUR}"
+            LINK=$(printf '\n\n**Full Changelog**: https://github.com/%s/compare/%s...%s' "${GITHUB_REPOSITORY}" "${PREV}" "${CUR}")
+          else
+            LOG="- 首个版本"
+            RANGE="${CUR}"
+            LINK=""
           fi
           {
             echo "body<<NOTES_EOF"
-            printf '%s\n\n## 本次变更（相对上一版）\n%s\n' "$HEADER" "$TAG_BODY"
+            printf '%s\n\n## 本次变更（%s）\n\n%s%s\n' "$HEADER" "$RANGE" "$LOG" "$LINK"
             echo "NOTES_EOF"
           } >> "$GITHUB_OUTPUT"
 
