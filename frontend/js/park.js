@@ -219,6 +219,50 @@ export async function runPark({ invoke, grid, mode }) {
     return;
   }
 
+  if (mode === "paneflicker") {
+    // 复现 smoke"取页落定不换空编辑窗格"的等待超时：5000 行夹具、force_big，
+    // select(0,0) 后跳 3000，采样 cache/inflight/pane/落定数——观察页 14/15 的
+    // 调度与落定到底发生了什么（smoke 现场无法看内部状态）
+    const p = `${await invoke("smoke_tmp_dir")}/park5k.csv`;
+    await invoke("smoke_write_repeat", { path: p, line: "a,b\r\n", times: 1, append: false });
+    await invoke("smoke_write_repeat", { path: p, line: "x,y\r\n", times: 5000, append: true });
+    await invoke("smoke_set_force_big", { v: true });
+    await window.__app.openPath(p);
+    const bm = window.__app.model;
+    const noop = () => invoke("path_exists", { path: `${dir}/__noop` });
+    for (let i = 0; i < 600; i += 1) {
+      if (window.__app.isBigMode() && bm.rowCount() > 0) break;
+      await noop();
+    }
+    const log = [];
+    const pane = window.__app.pane;
+    grid.select([0, 0]);
+    log.push(`selected pane=${JSON.stringify(pane.editEl.value)}`);
+    const oy3 = grid._originY();
+    const h3 = grid._uniformRowH;
+    sc.scrollTop = Math.round(oy3 + (3000 * h3) / grid._yScale);
+    grid._renderRows();
+    const t0 = performance.now();
+    let last = t0;
+    let n = 0;
+    while (performance.now() - t0 < 6000) {
+      await noop();
+      if (performance.now() - last >= 200) {
+        n += 1;
+        // 注意：rawData 未命中会调度拉取（与 smoke 探针同行为）
+        const rd = bm.rawData(3000, 0);
+        log.push(`s${n} t=${Math.round(performance.now())} rd3000=${JSON.stringify(rd)}` +
+          ` cache=${bm._cache.size} inflight=${bm._inflight.size}` +
+          ` keys=${[...bm._cache.keys()].join("/")} in=${[...bm._inflight].join("/")}` +
+          ` pane=${JSON.stringify(pane.editEl.value)}`);
+        last = performance.now();
+      }
+    }
+    await mark(invoke, dir, "paneflicker_log", log.join("\n"));
+    await mark(invoke, dir, "done");
+    return;
+  }
+
   if (mode === "flicker2") {
     // 带绘制版：可见窗口下跑同样的扫动，计数 renderAll/renderRows/rAF/DOM 变动。
     // 若存在"ResizeObserver→renderAll→尺寸变化→ResizeObserver"逐帧自激，

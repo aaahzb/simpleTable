@@ -360,13 +360,19 @@ function bindModelEvents(m) {
     if (structural) {
       // 行列增删/排序：越界清空，否则重载内容
       if (r >= m.rowCount() || c >= m.columnCount()) clearDock();
-      else pane.setText(m.rawData(r, c));
+      else {
+        // 大模式未命中（页被换出）保留窗格旧内容，数据到齐再收敛
+        const t = m.isBig && m.peekData ? (m.peekData(r, c) ?? null) : m.rawData(r, c);
+        if (t !== null) pane.setText(t);
+      }
       return;
     }
     // 编辑窗格自己发起的写回不再回灌（避免光标跳动）
     if (dockOrigin) return;
-    const newText = m.rawData(r, c);
-    if (pane.editEl.value !== newText) pane.setText(newText);
+    // 大模式：当前格页被换出时 rawData 会读成空串、还顺手重拉该页——与缓存
+    // trim 形成乒乓驱逐循环，且把窗格刷空造成频闪。peekData 未命中时保留旧内容。
+    const newText = m.isBig && m.peekData ? (m.peekData(r, c) ?? null) : m.rawData(r, c);
+    if (newText !== null && pane.editEl.value !== newText) pane.setText(newText);
   });
   m.onUndoStack(updateUndoButtons);
   // 大表撤销降级：状态栏提示一次（小模型专属；BigModel 无此方法）

@@ -233,6 +233,23 @@ export class BigModel {
     return !!rows?.[row % BIG_PAGE];
   }
 
+  /**
+   * 只读探测缓存（不触发拉取）：编辑窗格在取页落定瞬间判读当前格——rawData 未
+   * 命中会返回空串并调度重拉，与 trim 驱逐形成乒乓循环、还把窗格刷空（频闪根因）；
+   * 未命中返回 undefined，调用方保留旧内容。
+   *
+   * @param {number} row - 视图行号。
+   * @param {number} col - 视图列号。
+   * @returns {string | undefined} 命中返回值（可为空串），未命中返回 undefined。
+   */
+  peekData(row, col) {
+    if (!this._meta) return undefined;
+    const rows = this._cache.get(this._key(Math.floor(row / BIG_PAGE)));
+    if (!rows) return undefined;
+    const cells = rows[row % BIG_PAGE];
+    return cells ? (cells[col] ?? "") : undefined;
+  }
+
   // ---- 窗口缓存 ----
 
   /**

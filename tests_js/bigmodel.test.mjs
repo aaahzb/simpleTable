@@ -124,6 +124,17 @@ test("hasData：仅页已缓存且该行存在时为真（grid 键控复用判�
   assert.equal(model.hasData(4999, 0), false); // 越界行同样为假
 });
 
+test("peekData：命中返回值、未命中 undefined 且不触发拉取", async () => {
+  const { model } = makeFakeEngine({ rows: 500, cols: 2 });
+  await model.open("/x.csv");
+  assert.equal(model.peekData(10, 1), undefined); // 未命中 → undefined（窗格保留旧内容判据）
+  model.prefetchRange(0, 199); // 只拉第 0 页
+  await tick();
+  assert.equal(model.peekData(10, 1), "r10c1");
+  assert.equal(model.peekData(200, 0), undefined); // 第 1 页未拉
+  assert.equal(model.peekData(4999, 0), undefined); // 越界行
+});
+
 test("prefetchRange 拉齐范围覆盖的页", async () => {
   const { model } = makeFakeEngine({ rows: 10 * BIG_PAGE, cols: 1 });
   await model.open("/x.csv");

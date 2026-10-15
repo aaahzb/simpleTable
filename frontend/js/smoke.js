@@ -999,6 +999,28 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       "缓存未命中时格子应为旧内容而非空白");
   });
 
+  check("大模式：取页落定不换空编辑窗格（防窗格频闪）", async () => {
+    // 回归：拖动滚动条时当前格的页被 trim 换出，落定瞬间 onData 经 rawData 读到
+    // 空串会把编辑窗格刷空、页回灌又填满——窗格逐帧闪烁。未命中必须保留旧内容。
+    grid.select([0, 0]);
+    await waitFor(() => window.__app.pane.editEl.value === "大理", "窗格载入首格");
+    const rec = [];
+    const origSet = window.__app.pane.setText.bind(window.__app.pane);
+    window.__app.pane.setText = (t) => { rec.push(String(t)); origSet(t); };
+    try {
+      const sc2 = document.getElementById("grid-scroll");
+      const oy2 = grid._originY();
+      const h2 = grid._uniformRowH;
+      sc2.scrollTop = Math.round(oy2 + (3000 * h2) / grid._yScale);
+      grid._renderRows();
+      await waitFor(() => bigM().rawData(3000, 0) === "大理", "远页落定");
+      await sleep(250); // 给页 0 回灌落定的机会：即便回灌，"刷空"这一笔也必须不存在
+      assert(!rec.includes(""), `落定期间窗格被刷空（setText 记录：${rec.join("|")}）`);
+    } finally {
+      window.__app.pane.setText = origSet;
+    }
+  });
+
   check("大模式：单元格编辑 + 撤销/重做", async () => {
     const bm = bigM();
     grid.ensureVisible(0, 0); // 滚回首屏：编辑断言经窗口缓存读回，须先把缓存锚回首页
