@@ -12,7 +12,7 @@ import { Grid } from "./grid.js";
 import { EditPane } from "./pane.js";
 import { showMenu } from "./menu.js";
 import {
-  columnDialog, confirmDialog, confirmDiscardDialog, errorDialog,
+  busyDialog, columnDialog, confirmDialog, confirmDiscardDialog, errorDialog,
   infoDialog, intDialog, newTableDialog, progressDialog, sortDialog,
 } from "./dialogs.js";
 
@@ -157,6 +157,8 @@ async function runBigFilter() {
   }
   const mKw = grid.multi.on ? grid.multi.text : "";
   const mCols = mKw ? [...grid.multi.cols].filter((c) => c < cc) : [];
+  // 整表扫描要几秒到几十秒：先弹不确定进度模态，避免界面看似卡死
+  const busy = busyDialog("正在筛选大文件…");
   try {
     const t0 = performance.now();
     const n = await model.runFilter(kws, mCols, mKw);
@@ -165,6 +167,8 @@ async function runBigFilter() {
     updateStatusText();
   } catch (err) {
     await errorDialog("筛选失败", String(err?.message ?? err));
+  } finally {
+    busy.close();
   }
 }
 

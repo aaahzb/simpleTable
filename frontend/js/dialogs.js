@@ -123,6 +123,45 @@ export function progressDialog(title) {
 }
 
 /**
+ * 未确定进度模态（大文件筛选等无行级进度的长操作）：旋转指示 + 已用秒数。
+ * 非阻塞：返回句柄由调用方 close。
+ *
+ * @param {string} title - 标题文本。
+ * @returns {{close: () => void}}
+ */
+export function busyDialog(title) {
+  const mask = document.createElement("div");
+  mask.className = "modal-mask";
+  const box = document.createElement("div");
+  box.className = "modal";
+  const head = document.createElement("div");
+  head.className = "modal-title";
+  head.textContent = title;
+  const body = document.createElement("div");
+  body.className = "modal-body busy-body";
+  const spin = document.createElement("div");
+  spin.className = "busy-spinner";
+  const label = document.createElement("div");
+  label.className = "progress-label";
+  const t0 = performance.now();
+  label.textContent = "已用 0.0 秒";
+  const timer = setInterval(() => {
+    label.textContent = `已用 ${((performance.now() - t0) / 1000).toFixed(1)} 秒`;
+  }, 100);
+  body.append(spin, label);
+  box.append(head, body);
+  mask.appendChild(box);
+  document.body.appendChild(mask);
+  return {
+    /** 关闭并移除模态。 */
+    close() {
+      clearInterval(timer);
+      mask.remove();
+    },
+  };
+}
+
+/**
  * 未保存修改三选（保存/放弃/取消），对齐 _confirm_discard。
  *
  * @returns {Promise<"save" | "discard" | "cancel">} 用户选择。

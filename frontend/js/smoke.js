@@ -1051,6 +1051,18 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(bm.filterActive() === false, "清除筛选后应回全量");
   });
 
+  check("大模式：执行筛选显示进行中弹窗（防界面看似卡死）", async () => {
+    grid.filters.set(0, "大理");
+    const p = window.__app.runBigFilter(); // 不 await：弹窗须在同步阶段挂上
+    const mask = document.querySelector(".modal-mask");
+    assert(mask !== null && mask.textContent.includes("筛选"),
+      "筛选期间应显示进行中弹窗");
+    await p; // 等待完成
+    assert(document.querySelector(".modal-mask") === null, "完成后弹窗应消失");
+    grid.clearFilters();
+    await sleep(150);
+  });
+
   check("大模式：筛选结果分页取行", async () => {
     const bm = bigM();
     grid.filters.set(0, "大理");
