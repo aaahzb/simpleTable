@@ -56,6 +56,21 @@ test("撤销栈上限 100（超出丢最旧）", () => {
   assert.equal(m._undoStack.length, 100);
 });
 
+test("大表（字符超预算）撤销上限降为 20 且只提示一次", () => {
+  const m = makeModel();
+  // 3,000,000 字符预算：250 行 × 25 列 × 500 字符/格 = 3,125,000 字符
+  const bigCell = "x".repeat(500);
+  m.load(["h"], Array.from({ length: 250 },
+    () => Array.from({ length: 25 }, () => bigCell)));
+  let notices = 0;
+  m.onUndoCap?.(() => { notices += 1; });
+  for (let i = 0; i < 25; i += 1) {
+    m.setData(0, 0, `v${i}`);
+  }
+  assert.equal(m._undoStack.length, 20);
+  assert.equal(notices, 1, "撤销降级应恰好提示一次");
+});
+
 test("setDataMerged 同格连续 = 一步；换格 = 新一步", () => {
   const m = makeModel();
   m.setDataMerged(0, 0, "昆");

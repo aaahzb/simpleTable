@@ -6,9 +6,17 @@
 
 use std::fs;
 use std::io::ErrorKind;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 冒烟自检强制大模式（运行期开关，供 smoke 大文件段在小夹具上路由大模式）。
+static FORCE_BIG: AtomicBool = AtomicBool::new(false);
 
 use serde::Serialize;
 use tauri::{Emitter, Manager};
+
+mod engine;
+use engine::{BigFile, BigMeta, ColOp, FilterSpec};
 
 /// 读文件结果：解码后的纯文本 + 实际使用的编码名（供状态栏展示）。
 #[derive(Serialize)]
@@ -33,6 +41,24 @@ fn get_version() -> String {
 #[tauri::command]
 fn is_smoke() -> bool {
     std::env::var_os("SIMPLE_TABLE_SMOKE").is_some()
+}
+
+/// 冒烟自检是否强制走大文件模式（SIMPLE_TABLE_FORCE_BIG 置位或运行期开启）。
+///
+/// # Returns
+/// 环境变量 `SIMPLE_TABLE_FORCE_BIG` 存在或 smoke 运行期开启时为 true。
+#[tauri::command]
+fn smoke_force_big() -> bool {
+    std::env::var_os("SIMPLE_TABLE_FORCE_BIG").is_some() || FORCE_BIG.load(Ordering::Relaxed)
+}
+
+/// 冒烟自检辅助：运行期开关强制大模式（SIMPLE_TABLE_FORCE_BIG 的环境量等价物）。
+///
+/// # Parameters
+/// - `v`: 是否强制。
+#[tauri::command]
+fn smoke_set_force_big(v: bool) {
+    FORCE_BIG.store(v, Ordering::Relaxed);
 }
 
 /// 冒烟自检结束：写报告文件并退出进程。
@@ -76,6 +102,35 @@ fn finish_smoke(report: String, code: i32) {
 #[tauri::command]
 fn smoke_write_bytes(path: String, bytes: Vec<u8>) -> Result<(), String> {
     fs::write(&path, bytes).map_err(|e| io_err(&path, &e))
+}
+
+/// 冒烟自检辅助：把一行文本重复写入文件若干次（大文件夹具用；
+/// 避免巨量字节经 IPC 传输）。UTF-8 编码，调用方自行带 \r\n。
+///
+/// # Parameters
+/// - `path`: 目标路径。
+/// - `line`: 单行文本（可含行尾）。
+/// - `times`: 重复次数。
+/// - `append`: true 追加写；false 覆盖写。
+///
+/// # Returns
+/// 空元组表示成功。
+///
+/// # Errors
+/// 写入失败返回错误串。
+#[tauri::command]
+fn smoke_write_repeat(path: String, line: String, times: u32, append: bool) -> Result<(), String> {
+    use std::io::Write;
+    let f = if append {
+        fs::OpenOptions::new().append(true).open(&path)
+    } else {
+        fs::File::create(&path)
+    };
+    let mut f = f.map_err(|e| io_err(&path, &e))?;
+    for _ in 0..times {
+        f.write_all(line.as_bytes()).map_err(|e| io_err(&path, &e))?;
+    }
+    Ok(())
 }
 
 /// 冒烟自检辅助：返回临时目录路径（前端构造夹具文件用）。
@@ -193,6 +248,186 @@ struct StartupArgs {
     open_path: Option<String>,
 }
 
+/// 大文件会话状态：一次只开一个（打开新文件先关旧）。
+struct BigState {
+    file: Mutex<Option<BigFile>>,
+}
+
+/// 取大文件会话锁，未打开时返回统一错误串。
+fn with_big<T>(
+    state: &tauri::State<BigState>,
+    f: impl FnOnce(&mut BigFile) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut guard = state.file.lock().map_err(|e| e.to_string())?;
+    let bf = guard.as_mut().ok_or("大文件会话未打开")?;
+    f(bf)
+}
+
+/// 查询文件大小（字节），打开路径路由用：≥ 阈值走大文件模式。
+#[tauri::command]
+fn file_size(path: String) -> Result<u64, String> {
+    let meta = fs::metadata(&path).map_err(|e| io_err(&path, &e))?;
+    Ok(meta.len())
+}
+
+/// 打开大文件会话（mmap + 行索引，秒开）。
+#[tauri::command]
+fn big_open(path: String, state: tauri::State<BigState>) -> Result<BigMeta, String> {
+    let mut guard = state.file.lock().map_err(|e| e.to_string())?;
+    *guard = Some(BigFile::open(std::path::Path::new(&path))?);
+    Ok(guard.as_ref().unwrap().meta())
+}
+
+/// 关闭大文件会话。
+#[tauri::command]
+fn big_close(state: tauri::State<BigState>) {
+    if let Ok(mut guard) = state.file.lock() {
+        *guard = None;
+    }
+}
+
+/// 元数据（行/列/表头/编码/待执行列操作/撤销栈状态）。
+#[tauri::command]
+fn big_meta(state: tauri::State<BigState>) -> Result<BigMeta, String> {
+    with_big(&state, |bf| Ok(bf.meta()))
+}
+
+/// 外部程序是否改动过文件（focus 时前端拉取）。
+#[tauri::command]
+fn big_stale(state: tauri::State<BigState>) -> Result<bool, String> {
+    with_big(&state, |bf| Ok(bf.stale()))
+}
+
+/// 窗口取行（含覆盖层/插入块/删除位图的视图行）。
+#[tauri::command]
+fn big_rows(state: tauri::State<BigState>, from: u64, count: u32) -> Result<Vec<Vec<String>>, String> {
+    with_big(&state, |bf| Ok(bf.rows(from, count)))
+}
+
+/// 编辑单元格（源行进覆盖层，插入行直写）。
+#[tauri::command]
+fn big_set_cell(
+    state: tauri::State<BigState>,
+    vrow: u64,
+    col: u32,
+    value: String,
+) -> Result<(), String> {
+    with_big(&state, |bf| bf.set_cell(vrow, col, value))
+}
+
+/// 在 vpos 处插入行（rows 为 null 时插 count 行空行）。
+#[tauri::command]
+fn big_insert_rows(
+    state: tauri::State<BigState>,
+    vpos: u64,
+    rows: Option<Vec<Vec<String>>>,
+    count: u32,
+) -> Result<(), String> {
+    with_big(&state, |bf| bf.insert_rows(vpos, rows, count))
+}
+
+/// 删除一组 vrow（升序传入），返回删除行数。
+#[tauri::command]
+fn big_remove_rows(state: tauri::State<BigState>, vrows: Vec<u64>) -> Result<u32, String> {
+    with_big(&state, |bf| bf.remove_rows(vrows))
+}
+
+#[tauri::command]
+fn big_undo(state: tauri::State<BigState>) -> Result<bool, String> {
+    with_big(&state, |bf| Ok(bf.undo()))
+}
+
+#[tauri::command]
+fn big_redo(state: tauri::State<BigState>) -> Result<bool, String> {
+    with_big(&state, |bf| Ok(bf.redo()))
+}
+
+/// 执行一次筛选（rayon 并行扫描），返回命中数。
+#[tauri::command]
+fn big_filter(state: tauri::State<BigState>, spec: FilterSpec) -> Result<u32, String> {
+    with_big(&state, |bf| bf.run_filter(&spec))
+}
+
+#[tauri::command]
+fn big_filter_count(state: tauri::State<BigState>) -> Result<u32, String> {
+    with_big(&state, |bf| Ok(if bf.has_filter() { bf.filter_len() } else { 0 }))
+}
+
+#[tauri::command]
+fn big_filter_page(
+    state: tauri::State<BigState>,
+    from: u32,
+    count: u32,
+) -> Result<Vec<Vec<String>>, String> {
+    with_big(&state, |bf| Ok(bf.filter_page(from, count)))
+}
+
+#[tauri::command]
+fn big_clear_filter(state: tauri::State<BigState>) -> Result<(), String> {
+    with_big(&state, |bf| {
+        bf.clear_filter();
+        Ok(())
+    })
+}
+
+/// 大选区复制（TSV，\r\n 行尾）。
+#[tauri::command]
+fn big_copy(
+    state: tauri::State<BigState>,
+    r0: u64,
+    r1: u64,
+    c0: u32,
+    c1: u32,
+) -> Result<String, String> {
+    with_big(&state, |bf| bf.copy_tsv(r0, r1, c0, c1))
+}
+
+/// 保存（流式重写 + 原子换名），进度经 "big-progress" 事件推送。
+#[tauri::command]
+fn big_save(window: tauri::Window, state: tauri::State<BigState>) -> Result<(), String> {
+    with_big(&state, |bf| {
+        bf.save(|done, total| {
+            let _ = window.emit("big-progress", (done, total));
+        })
+    })
+}
+
+// ---- 列操作：pending 预览 → 执行物理重写 ----
+
+#[tauri::command]
+fn big_col_push(state: tauri::State<BigState>, op: ColOp) -> Result<(), String> {
+    with_big(&state, |bf| {
+        bf.push_col_op(op);
+        Ok(())
+    })
+}
+
+#[tauri::command]
+fn big_col_pop(state: tauri::State<BigState>) -> Result<(), String> {
+    with_big(&state, |bf| {
+        bf.pop_col_op();
+        Ok(())
+    })
+}
+
+#[tauri::command]
+fn big_col_clear(state: tauri::State<BigState>) -> Result<(), String> {
+    with_big(&state, |bf| {
+        bf.clear_col_ops();
+        Ok(())
+    })
+}
+
+/// 执行待处理的列操作（物理重写整个文件，带进度事件）。
+#[tauri::command]
+fn big_col_apply(window: tauri::Window, state: tauri::State<BigState>) -> Result<(), String> {
+    with_big(&state, |bf| {
+        bf.apply_col_ops(|done, total| {
+            let _ = window.emit("big-progress", (done, total));
+        })
+    })
+}
+
 /// 取命令行第一个 .csv 路径（启动时由前端拉取并打开）。
 ///
 /// # Parameters
@@ -217,6 +452,7 @@ pub fn run() {
                 .skip(1)
                 .find(|a| a.to_lowercase().ends_with(".csv"));
             app.manage(StartupArgs { open_path });
+            app.manage(BigState { file: Mutex::new(None) });
             // 关闭请求转发给前端做"未保存确认"，确认后由 quit_app 命令真正退出
             if let Some(window) = app.get_webview_window("main") {
                 let handle = window.clone();
@@ -233,8 +469,11 @@ pub fn run() {
             get_version,
             get_startup_path,
             is_smoke,
+            smoke_force_big,
+            smoke_set_force_big,
             finish_smoke,
             smoke_write_bytes,
+            smoke_write_repeat,
             smoke_tmp_dir,
             read_csv_file,
             write_csv_file,
@@ -242,6 +481,27 @@ pub fn run() {
             pick_save_path,
             set_title,
             quit_app,
+            file_size,
+            big_open,
+            big_close,
+            big_meta,
+            big_stale,
+            big_rows,
+            big_set_cell,
+            big_insert_rows,
+            big_remove_rows,
+            big_undo,
+            big_redo,
+            big_filter,
+            big_filter_count,
+            big_filter_page,
+            big_clear_filter,
+            big_copy,
+            big_save,
+            big_col_push,
+            big_col_pop,
+            big_col_clear,
+            big_col_apply,
         ])
         .build(tauri::generate_context!())
         .expect("error while building simpleTable")

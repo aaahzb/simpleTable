@@ -3,7 +3,8 @@
  *
  * 覆盖：Rust 命令层（版本/编码/BOM）、网格渲染与虚拟滚动、选区模型、
  * 格内编辑器键位、筛选、编辑窗格、工具栏、剪贴板三级判据、撤销合并、
- * 右键菜单文案、列宽/行高/列拖动、缩放夹取。
+ * 右键菜单文案、列宽/行高/列拖动、缩放夹取、大文件模式
+ * （路由/翻页取数/编辑撤销重做/筛选/行插删/列操作 pending→执行/保存比对）。
  * 结果写入 simpletable_smoke_report.txt 并以退出码上报（0 = 全过）。
  */
 
@@ -58,10 +59,20 @@ const cur = (grid) => grid.sel.current;
  * @param {import("./pane.js").EditPane} ctx.pane - 编辑窗格。
  * @param {(cmd: string, args?: object) => Promise<any>} ctx.invoke - Tauri invoke。
  */
-export async function runSmoke({ model, grid, pane, invoke }) {
+export async function runSmoke({ model: _model, grid, pane, invoke }) {
   const lines = [];
   let failed = 0;
   const TMP = (await invoke("smoke_tmp_dir"));
+
+  // openPath/newFile 会热交换全局模型（大文件模式）：放弃入参快照，
+  // 改经实时代理访问当前模型，避免"断言打在被替换的旧模型上"的假败。
+  const model = new Proxy(/** @type {any} */ ({}), {
+    get: (_t, k) => {
+      const v = window.__app.model[k];
+      return typeof v === "function" ? v.bind(window.__app.model) : v;
+    },
+    set: (_t, k, val) => { window.__app.model[k] = val; return true; },
+  });
 
   // ---- 基础数据 ----
   const headers = ["目的地", "评分", "备注"];
@@ -293,7 +304,7 @@ export async function runSmoke({ model, grid, pane, invoke }) {
     loadBasic();
     grid.filters.set(0, "洱");
     grid._refilter();
-    assert(grid.visibleRows.length === 1, `可见行应为 1，实际 ${grid.visibleRows.length}`);
+    assert(grid.visCount() === 1, `可见行应为 1，实际 ${grid.visCount()}`);
     assert(document.getElementById("status-text").textContent.includes("显示 1 / 共 3 行"),
       "状态栏应显示 显示 1 / 共 3 行");
   });
@@ -309,7 +320,7 @@ export async function runSmoke({ model, grid, pane, invoke }) {
     model.insertColumns(0, 1);
     grid.clearFilters();
     assert(grid.filters.size === 0, "筛选应已清空");
-    assert(grid.visibleRows.length === 3, "清空后应显示全部行");
+    assert(grid.visCount() === 3, "清空后应显示全部行");
   });
 
   check("多列筛选为 AND 关系", async () => {
@@ -317,8 +328,8 @@ export async function runSmoke({ model, grid, pane, invoke }) {
     grid.filters.set(1, "1");
     grid.filters.set(0, "丽");
     grid._refilter();
-    assert(grid.visibleRows.length === 1, "AND 后应只剩丽江");
-    assert(model.rawData(grid.visibleRows[0], 0) === "丽江");
+    assert(grid.visCount() === 1, "AND 后应只剩丽江");
+    assert(model.rawData(grid.visAt(0), 0) === "丽江");
   });
 
   // ========== 多重筛选 ==========
@@ -344,20 +355,20 @@ export async function runSmoke({ model, grid, pane, invoke }) {
   check("多重筛选：勾选列按或逻辑匹配，取消勾选即剔除该列", async () => {
     model.setData(2, 0, "观山"); // 洱海→观山：与丽江"雪山"分处两列
     grid.setMultiText("山");
-    assert(grid.visibleRows.length === 2, "或逻辑应命中两列各一行");
+    assert(grid.visCount() === 2, "或逻辑应命中两列各一行");
     const cb0 = document.querySelector('.col-multi[data-col="0"]');
     assert(cb0 && cb0.checked, "列0复选框应存在且勾选");
     cb0.checked = false;
     cb0.dispatchEvent(new Event("change", { bubbles: true }));
-    assert(grid.visibleRows.length === 1, "取消列0勾选后只应剩备注列命中行");
-    assert(model.rawData(grid.visibleRows[0], 0) === "丽江");
+    assert(grid.visCount() === 1, "取消列0勾选后只应剩备注列命中行");
+    assert(model.rawData(grid.visAt(0), 0) === "丽江");
   });
 
   check("多重筛选结果可再被列筛选框叠加过滤", async () => {
     grid.filters.set(1, "10");
     grid._refilter();
-    assert(grid.visibleRows.length === 1, "多重结果应再按列筛选二次过滤");
-    assert(model.rawData(grid.visibleRows[0], 0) === "丽江");
+    assert(grid.visCount() === 1, "多重结果应再按列筛选二次过滤");
+    assert(model.rawData(grid.visAt(0), 0) === "丽江");
   });
 
   check("多重筛选关闭后恢复：输入框隐藏、复选框移除", async () => {
@@ -368,7 +379,7 @@ export async function runSmoke({ model, grid, pane, invoke }) {
     assert(document.getElementById("multi-filter-wrap").classList.contains("hidden"),
       "关闭应隐藏输入框");
     assert(document.querySelectorAll(".col-multi").length === 0, "关闭应移除列名前复选框");
-    assert(grid.visibleRows.length === 3, "关闭后应显示全部行");
+    assert(grid.visCount() === 3, "关闭后应显示全部行");
   });
 
   check("清除筛选连带清空多重筛选关键字但保留开关", async () => {
@@ -378,7 +389,7 @@ export async function runSmoke({ model, grid, pane, invoke }) {
     grid.filters.set(1, "10");
     grid.clearFilters();
     assert(grid.multi.text === "" && grid.filters.size === 0, "清除筛选应清空全部条件");
-    assert(grid.visibleRows.length === 3, "清除后应显示全部行");
+    assert(grid.visCount() === 3, "清除后应显示全部行");
     assert(grid.multi.on, "开关状态应保留");
     btn.click(); // 关，恢复默认状态供后续用例
     grid.clearFilters();
@@ -473,7 +484,7 @@ export async function runSmoke({ model, grid, pane, invoke }) {
     assert(document.activeElement === pe, "按下工具栏按钮也不应抢焦点");
     multi.click(); // 开（会显式聚焦输入框）
     assert(document.activeElement?.id === "multi-filter-input",
-      "多重筛选开启应显式聚焦输入框");
+      `多重筛选开启应显式聚焦输入框（实际 ${document.activeElement?.id ?? document.activeElement?.tagName}）`);
     multi.click(); // 关
   });
 
@@ -868,6 +879,193 @@ export async function runSmoke({ model, grid, pane, invoke }) {
       `横向溢出 ${over}px（scrollWidth=${sc.scrollWidth} clientWidth=${sc.clientWidth}` +
       ` canvas=${sc.firstElementChild.style.width}）纵向溢出 ${overV}px`,
     );
+  });
+
+  // ========== 大文件模式（运行期强制开关 + 重复行夹具） ==========
+  // 本段位于套件末尾：先把小夹具强制路由进大模式测全套链路，
+  // 最后一项关开关并重新打开小文件，确认回到小模式。
+
+  /** 轮询等待条件成真（大模式取数异步落定），超时抛错 */
+  async function waitFor(fn, what, timeout = 10000) {
+    const t0 = performance.now();
+    for (;;) {
+      try { if (await fn()) return; } catch { /* 落定前读越界等异常都算未就绪 */ }
+      if (performance.now() - t0 > timeout) throw new Error(`等待超时: ${what}`);
+      await sleep(50);
+    }
+  }
+
+  /** 当前大模型（app.js 热交换后的实时模型） */
+  const bigM = () => window.__app.model;
+
+  const BIG_CSV = `${TMP}/big.csv`;
+
+  check("大模式：强制开关 + 生成重复行夹具", async () => {
+    await invoke("smoke_set_force_big", { v: true });
+    await invoke("smoke_write_repeat",
+      { path: BIG_CSV, line: "目的地,评分,备注\r\n", times: 1, append: false });
+    await invoke("smoke_write_repeat",
+      { path: BIG_CSV, line: "大理,3,古城\r\n", times: 5000, append: true });
+    const sz = await invoke("file_size", { path: BIG_CSV });
+    assert(sz > 0 && sz < 50 * 1024 * 1024,
+      `夹具应小于大模式阈值（靠强制开关路由），实际 ${sz} 字节`);
+    // 夹具 sanity：回读编码必须为 utf-8（引擎 GBK 误判会污染后续全部断言）
+    const back = await invoke("read_csv_file", { path: BIG_CSV });
+    assert(back.encoding === "utf-8",
+      `夹具编码应为 utf-8，实际 ${back.encoding}，前 20 字：${back.text.slice(0, 20)}`);
+    assert(back.text.startsWith("目的地"), `夹具表头异常：${back.text.slice(0, 20)}`);
+  });
+
+  check("大模式：openPath 路由到大模型（mmap 秒开）", async () => {
+    await window.__app.openPath(BIG_CSV);
+    assert(window.__app.isBigMode() === true, "应进入大文件模式");
+    const bm = bigM();
+    assert(bm.rowCount() === 5000, `数据行数 ${bm.rowCount()}`);
+    assert(bm.columnCount() === 3, `列数 ${bm.columnCount()}`);
+    assert(JSON.stringify(bm.headers()) === JSON.stringify(["目的地", "评分", "备注"]),
+      `表头 ${bm.headers()}`);
+    assert(bm.meta().encoding === "utf-8", `编码 ${bm.meta().encoding}`);
+  });
+
+  check("大模式：首屏行异步落定并渲染", async () => {
+    await waitFor(() =>
+      document.querySelector('.cell[data-row="0"][data-col="0"]')?.textContent === "大理",
+      "首屏行渲染");
+  });
+
+  check("大模式：跳远页（窗口缓存未命中→拉取→渲染）", async () => {
+    grid.ensureVisible(4999, 0);
+    grid._renderRows();
+    await waitFor(() =>
+      document.querySelector('.cell[data-row="4999"][data-col="0"]')?.textContent === "大理",
+      "末行渲染");
+  });
+
+  check("大模式：单元格编辑 + 撤销/重做", async () => {
+    const bm = bigM();
+    grid.ensureVisible(0, 0); // 滚回首屏：编辑断言经窗口缓存读回，须先把缓存锚回首页
+    grid._renderRows();
+    await waitFor(() => bm.rawData(0, 0) === "大理", "首屏缓存回锚");
+    await bm.setData(0, 1, "99");
+    await waitFor(() => bm.rawData(0, 1) === "99", "编辑落定");
+    assert(bm.canUndo() === true, "编辑后应可撤销");
+    assert(await bm.undo() === true, "undo 应成功");
+    await waitFor(() => bm.rawData(0, 1) === "3", "撤销复原");
+    assert(await bm.redo() === true, "redo 应成功");
+    await waitFor(() => bm.rawData(0, 1) === "99", "重做恢复");
+    await bm.undo(); // 还原，避免影响后续计数
+    await waitFor(() => bm.rawData(0, 1) === "3", "二次撤销复原");
+  });
+
+  check("大模式：执行筛选（引擎整表扫描）与命中数", async () => {
+    const bm = bigM();
+    grid.filters.set(0, "大理"); // 与真实交互同路径：条件进 grid，点执行筛选
+    await window.__app.runBigFilter();
+    assert(bm.filterActive() === true, "筛选应处于激活态");
+    assert(await invoke("big_filter_count") === 5000, "引擎侧命中数不一致");
+    grid.filters.set(0, "不存在xyz");
+    await window.__app.runBigFilter();
+    assert(await invoke("big_filter_count") === 0, "零命中应返回 0");
+    grid.clearFilters(); // 条件清空 → 视图自动回全量（fire-and-forget）
+    await sleep(150);
+    assert(bm.filterActive() === false, "清除筛选后应回全量");
+  });
+
+  check("大模式：筛选结果分页取行", async () => {
+    const bm = bigM();
+    grid.filters.set(0, "大理");
+    await window.__app.runBigFilter();
+    const page = await invoke("big_filter_page", { from: 0, count: 5 });
+    assert(page.length === 5, `筛选页行数 ${page.length}`);
+    assert(page[4][0] === "大理" && page[4][1] === "3", `筛选页内容 ${page[4]}`);
+    grid.clearFilters();
+    await sleep(150);
+    assert(bm.filterActive() === false, "清除筛选后应回全量");
+  });
+
+  check("大模式：插入行即时生效", async () => {
+    const bm = bigM();
+    const before = bm.rowCount();
+    await bm.insertRows(1, 2);
+    assert(bm.rowCount() === before + 2, `插行后行数 ${bm.rowCount()}`);
+    // 插入点之后的数据行整体后移：原第 1 行"大理"现在应位于第 3 行
+    await waitFor(() => bm.rawData(3, 0) === "大理", "插行后移位渲染");
+  });
+
+  check("大模式：删除行（含插入行）即时生效", async () => {
+    const bm = bigM();
+    const before = bm.rowCount();
+    await bm.removeRows([1, 2]);
+    assert(bm.rowCount() === before - 2, `删行后行数 ${bm.rowCount()}`);
+    await waitFor(() => bm.rawData(1, 0) === "大理", "删行后复位渲染");
+  });
+
+  check("大模式：大选区复制委派引擎（TSV）", async () => {
+    const tsv = await bigM().copyRows(0, 2, 0, 3); // 半开区间：2 行 × 3 列
+    const lines = tsv.split("\r\n").filter((l) => l.length > 0); // 末行带行尾
+    assert(lines.length === 2, `TSV 行数 ${lines.length}：${tsv.slice(0, 40)}`);
+    assert(lines[0].split("\t").length === 3, `TSV 列数 ${lines[0].split("\t").length}`);
+    assert(lines[0] === "大理\t3\t古城", `TSV 首行 ${lines[0]}`);
+  });
+
+  check("大模式：列操作仅 pending 预览，期间编辑被拒", async () => {
+    const bm = bigM();
+    await bm.insertColumns(1, 1);
+    assert(bm.columnCount() === 4, `pending 后视图像素列数 ${bm.columnCount()}`);
+    assert(bm.headers()[1] === "列4", `新列名 ${bm.headers()[1]}`);
+    assert(bm.colOpsPending() === true, "应处于列操作 pending 态");
+    let rejected = false;
+    try { await bm.setData(0, 0, "昆明"); } catch { rejected = true; }
+    assert(rejected, "列操作 pending 期间编辑应被引擎拒绝");
+  });
+
+  check("大模式：执行列操作（物理重写 + 进度事件 + 清空撤销）", async () => {
+    const bm = bigM();
+    let saw = null;
+    const un = await bm.onProgress((done, total) => { saw = [done, total]; });
+    try {
+      await window.__app.applyColOps();
+    } finally {
+      un();
+    }
+    assert(saw !== null, "应收到至少一次进度事件");
+    assert(saw[1] > 0 && saw[0] === saw[1], `进度收尾应到满：${saw}`);
+    assert(bm.colOpsPending() === false, "执行后不应再有 pending");
+    assert(bm.canUndo() === false, "物理重写后撤销栈应清空");
+    // 物理生效验证：引擎直读行应有 4 列，表头含新列
+    const rows = await invoke("big_rows", { from: 0, count: 1 });
+    assert(rows[0].length === 4, `物理行宽 ${rows[0].length}`);
+    assert(bm.headers()[1] === "列4", `物理表头 ${bm.headers()}`);
+  });
+
+  check("大模式：放弃列操作预览恢复原结构", async () => {
+    const bm = bigM();
+    await bm.removeColumns([3]);
+    assert(bm.columnCount() === 3, `pending 删除后列数 ${bm.columnCount()}`);
+    await window.__app.cancelColOps();
+    assert(bm.columnCount() === 4, "放弃后应恢复 4 列");
+    assert(bm.colOpsPending() === false, "放弃后不应有 pending");
+  });
+
+  check("大模式：保存（流式重写）后重载比对", async () => {
+    const bm = bigM();
+    await bm.setData(0, 0, "昆明");
+    await bm.save();
+    const back = await invoke("read_csv_file", { path: BIG_CSV });
+    const parsed = parseCsv(back.text);
+    assert(parsed.headers.length === 4, `保存后表头列数 ${parsed.headers.length}`);
+    assert(parsed.headers[1] === "列4", `保存后新列表头 ${parsed.headers[1]}`);
+    assert(parsed.rows.length === 5000, `保存后行数 ${parsed.rows.length}`);
+    assert(parsed.rows[0][0] === "昆明", `保存后首格 ${parsed.rows[0][0]}`);
+    // 列操作后行已变为 4 列：["大理","","3","古城"]
+    assert(parsed.rows[4999][3] === "古城", `末行内容应不变：${parsed.rows[4999]}`);
+  });
+
+  check("大模式：关闭开关后重新打开小文件回小模式", async () => {
+    await invoke("smoke_set_force_big", { v: false });
+    await window.__app.openPath(`${TMP}/rt.csv`);
+    assert(window.__app.isBigMode() === false, "关开关后应回到小文件模式");
+    assert(window.__app.model.rowCount() === 1, `小模型行数 ${window.__app.model.rowCount()}`);
   });
 
   // ---- 执行（看门狗：整体超时强制收尾，防挂死） ----

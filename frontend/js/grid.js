@@ -9,6 +9,9 @@
  *   Alt+Enter 换行 / Esc 取消 / 打字即编辑（替换式）
  * - 缩放 0.5–3.0 步进 1.15：列宽按比缩放（最小 24），行高按比缩放（最小 10），
  *   表头/筛选带随 em 自动跟随
+ * - 大文件模式（model.isBig）：visibleRows 恒等快路径（null = 无筛选，不建数组）、
+ *   统一行高（行高数组不随总行数膨胀）、筛选改为按钮触发（引擎整表扫描）、
+ *   大选区复制/矩形选区大小设防（防 30M 行选整列卡死）
  */
 
 import { parseCsv, serializeRecords } from "./csv.js";
@@ -18,6 +21,8 @@ export const ZOOM_MAX = 3.0;
 export const ZOOM_STEP = 1.15;
 const MIN_COL_W = 24;
 const MIN_ROW_H = 10;
+/** 行数超过此值时筛选输入防抖（每击键全表扫描代价高） */
+const FILTER_DEBOUNCE_ROWS = 50000;
 
 /**
  * 网格视图类。
@@ -68,8 +73,12 @@ export class Grid {
     this.filters = new Map();
     /** 多重筛选状态：on 闩锁（长期选中）；text 关键字；cols 参与"或"匹配的源列号集合 */
     this.multi = { on: false, text: "", cols: new Set() };
-    /** @type {number[]} 可见源行号（筛选后） */
-    this.visibleRows = [];
+    /** @type {number[] | null} 可见源行号（筛选后）；null = 恒等快路径（无筛选） */
+    this.visibleRows = null;
+    /** @type {number} 大文件模式统一行高 px（rebuildStructure 计算） */
+    this._uniformRowH = 20;
+    /** @type {boolean} 选区截断提示已发（防抖） */
+    this._selCapNotified = false;
     /** @type {{current: [number, number]|null, anchor: [number, number]|null,
      *   blocks: number[][]}} 选区（源坐标，块为 [r1,c1,r2,c2] 已归一） */
     this.sel = { current: null, anchor: null, blocks: [] };
@@ -96,6 +105,20 @@ export class Grid {
     return Math.round(3.2 * fontPx);
   }
 
+  /**
+   * 热交换模型（小/大模式切换）：订阅新模型数据通知并重建设置。
+   * 旧模型随订阅一并废弃（其后再无改动来源，残留闭包无副作用）。
+   *
+   * @param {object} m - 新模型（TableModel / BigModel）。
+   * @returns {void}
+   */
+  setModel(m) {
+    this.model = m;
+    this.visibleRows = null;
+    m.onData((structural) => this._onModelData(structural));
+    this.rebuildStructure();
+  }
+
   /** 重算列顺序与默认列宽（结构重建时） */
   rebuildStructure() {
     const n = this.model.columnCount();
@@ -104,11 +127,15 @@ export class Grid {
     const kept = this.colW;
     this.colW = Array.from({ length: n }, (_, i) =>
       i < kept.length ? kept[i] : Math.round(100 * this.zoom));
-    const rows = this.model.rowCount();
-    const keptH = this.rowH;
-    const base = Math.round(1.8 * parseFloat(getComputedStyle(this.scrollEl).fontSize));
-    this.rowH = Array.from({ length: rows }, (_, i) =>
-      i < keptH.length ? keptH[i] : base);
+    // 大模式：行高数组不随总行数膨胀（30M 行 = 240MB 空数组），统一行高
+    this._uniformRowH = Math.max(
+      MIN_ROW_H, Math.round(1.8 * parseFloat(getComputedStyle(this.scrollEl).fontSize)));
+    if (!this.model.isBig) {
+      const rows = this.model.rowCount();
+      const keptH = this.rowH;
+      this.rowH = Array.from({ length: rows }, (_, i) =>
+        i < keptH.length ? keptH[i] : this._uniformRowH);
+    }
     this._rebuildFilterInputs();
     // 列结构变化：多重筛选的勾选列重置为全勾（默认勾选，对齐普通筛选清空的策略）
     this.multi.cols = new Set(this.colOrder);
@@ -117,12 +144,49 @@ export class Grid {
     this.renderAll();
   }
 
+  /** @returns {number} 可见行数（恒等快路径直接取模型行数） */
+  visCount() {
+    return this.visibleRows ? this.visibleRows.length : this.model.rowCount();
+  }
+
+  /**
+   * 可见行序号 → 源行号（恒等快路径 O(1) 直通）。
+   *
+   * @param {number} vi - 可见行序号。
+   * @returns {number} 源行号。
+   */
+  visAt(vi) {
+    return this.visibleRows ? this.visibleRows[vi] : vi;
+  }
+
+  /**
+   * 源行号 → 可见行序号（无筛选时恒等；越界 -1）。
+   *
+   * @param {number} r - 源行号。
+   * @returns {number} 可见行序号或 -1。
+   */
+  visibleIndexOf(r) {
+    if (this.visibleRows) return this.visibleRows.indexOf(r);
+    return r < this.model.rowCount() ? r : -1;
+  }
+
+  /**
+   * 行高（大文件模式统一行高；小模式按行查表）。
+   *
+   * @param {number} r - 源行号。
+   * @returns {number} 行高 px。
+   */
+  _rowH(r) {
+    return this.model.isBig ? this._uniformRowH : (this.rowH[r] ?? this._uniformRowH);
+  }
+
   /** 重算可见行前缀和与画布尺寸（筛选后画布只含可见行，无空隙） */
   _layout() {
     const tops = [0];
     let t = 0;
-    for (const r of this.visibleRows) {
-      t += this.rowH[r];
+    const n = this.visCount();
+    for (let vi = 0; vi < n; vi += 1) {
+      t += this._rowH(this.visAt(vi));
       tops.push(t);
     }
     this.visTops = tops;
@@ -253,7 +317,7 @@ export class Grid {
   _renderRows() {
     const host = this.rowsEl;
     host.textContent = "";
-    const n = this.visibleRows.length;
+    const n = this.visCount();
     if (!n || !this.model.columnCount()) return;
     const viewH = this.scrollEl.clientHeight;
     const top = this.scrollEl.scrollTop;
@@ -263,16 +327,18 @@ export class Grid {
     const y1 = Math.max(0, top + viewH - oy);
     const first = Math.max(0, this._rowAt(y0) - 5);
     const last = Math.min(n - 1, this._rowAt(y1) + 5);
+    // 大模式：滚动渲染前预热窗口缓存（±2 屏预取由 BigModel 调度）
+    this.model.prefetchRange?.(this.visAt(first), this.visAt(last));
     const widths = this._effWidthsCache;
     const cc = this.model.columnCount();
     const frag = document.createDocumentFragment();
     for (let vi = first; vi <= last; vi += 1) {
-      const r = this.visibleRows[vi];
+      const r = this.visAt(vi);
       const row = document.createElement("div");
       row.className = "row";
       // .row 的包含块是 #rows（其顶边已在吸顶表头之下），行内坐标即行区坐标
       row.style.top = `${this._rowTop(vi)}px`;
-      row.style.height = `${this.rowH[r]}px`;
+      row.style.height = `${this._rowH(r)}px`;
       row.style.width = `${this._rowHeadW() + widths.reduce((a, b) => a + b, 0)}px`;
       const head = document.createElement("div");
       head.className = "row-head";
@@ -326,6 +392,28 @@ export class Grid {
       ? this.multi.text.toLowerCase() : "";
     const mCols = mKw
       ? [...this.multi.cols].filter((c) => c < cc) : [];
+    const hasCond = kws.length > 0 || !!mKw;
+    // 大文件模式：整表扫描在 Rust 引擎（按钮/回车触发），前端只维护视图状态
+    if (this.model.isBig) {
+      this.visibleRows = null;
+      if (!hasCond && this.model.filterActive()) {
+        // 条件清空 → 自动回全量（fire-and-forget；落定后 onData 再收敛）
+        Promise.resolve(this.model.clearFilter()).catch(() => {});
+      }
+      this.hooks.bigFilterStatus?.(hasCond);
+      this._clampSelection();
+      this._renderRows();
+      this.hooks.countsChanged(this.visCount(), this.model.rowCount());
+      return;
+    }
+    // 无筛选：恒等快路径，不建 N 元素数组（680 万行也零开销）
+    if (!hasCond) {
+      this.visibleRows = null;
+      this._clampSelection();
+      this._renderRows();
+      this.hooks.countsChanged(this.visCount(), this.model.rowCount());
+      return;
+    }
     const vis = [];
     for (let r = 0; r < this.model.rowCount(); r += 1) {
       let ok = true;
@@ -354,12 +442,14 @@ export class Grid {
    */
   _onModelData(structural) {
     if (structural) {
-      const rows = this.model.rowCount();
-      if (rows !== this.rowH.length) {
-        // 行结构变化：补齐/截断行高（fontSize 已含缩放）
-        const base = Math.round(1.8 * parseFloat(getComputedStyle(this.scrollEl).fontSize));
-        const kept = this.rowH;
-        this.rowH = Array.from({ length: rows }, (_, i) => i < kept.length ? kept[i] : base);
+      if (!this.model.isBig) {
+        const rows = this.model.rowCount();
+        if (rows !== this.rowH.length) {
+          // 行结构变化：补齐/截断行高（fontSize 已含缩放）
+          const kept = this.rowH;
+          this.rowH = Array.from({ length: rows }, (_, i) =>
+            i < kept.length ? kept[i] : this._uniformRowH);
+        }
       }
       if (this.model.columnCount() !== this.colW.length) {
         this.rebuildStructure();
@@ -463,8 +553,17 @@ export class Grid {
   _rebuildSelectedSet() {
     const cc = this.model.columnCount();
     const set = new Set();
+    // 大模式：逐格集合爆炸上限（选整列 30M 行 × N 列会卡死 JS），
+    // 超限时按行截断到首个块（矩形语义不变，范围收敛）
+    const cap = this.model.isBig ? Math.max(1, Math.floor(200000 / Math.max(1, cc))) : Infinity;
     for (const [r1, c1, r2, c2] of this.sel.blocks) {
-      for (let r = Math.min(r1, r2); r <= Math.max(r1, r2); r += 1) {
+      const ra = Math.min(r1, r2);
+      const rb = Math.min(Math.max(r1, r2), ra + cap - 1);
+      if (rb < Math.max(r1, r2) && !this._selCapNotified) {
+        this._selCapNotified = true;
+        this.hooks.statusMsg(`大文件模式：选区已按前 ${cap} 行截断`, 3000);
+      }
+      for (let r = ra; r <= rb; r += 1) {
         for (let c = Math.min(c1, c2); c <= Math.max(c1, c2); c += 1) {
           set.add(r * cc + c);
         }
@@ -578,7 +677,7 @@ export class Grid {
         // 视口 y → 行区 y → 可见行序号 → 源行号（行区在吸顶表头之下，须减表头高）
         const y = e.clientY - this.scrollEl.getBoundingClientRect().top +
           this.scrollEl.scrollTop - this._originY();
-        const rr = this.visibleRows[this._rowAt(y)] ?? 0;
+        const rr = this.visAt(this._rowAt(y));
         this._drag.to = rr;
         this._extendTo([rr, this.model.columnCount() - 1]);
       } else if (this._drag.kind === "cols") {
@@ -641,6 +740,10 @@ export class Grid {
       }
       const rrz = e.target.closest(".row-resize");
       if (rrz) {
+        if (this.model.isBig) {
+          this.hooks.statusMsg("大文件模式不支持调整行高", 2000);
+          return;
+        }
         const row = Number(rrz.dataset.row);
         this._drag = { kind: "row-resize", row, startY: e.clientY, startH: this.rowH[row] };
         e.preventDefault();
@@ -649,6 +752,8 @@ export class Grid {
     }, true);
 
     // ---- 筛选输入 ----
+    // 小表即时筛选（手感优先，行数超阈值防抖）；大表只记录条件，
+    // 整表扫描在 Rust 引擎，由「执行筛选」按钮/回车触发
     this.headerEl.addEventListener("input", (e) => {
       if (this._suppressFilterInput) return;
       const input = e.target.closest(".col-filter input");
@@ -656,7 +761,25 @@ export class Grid {
       const col = Number(input.dataset.col);
       const v = input.value;
       if (v) this.filters.set(col, v); else this.filters.delete(col);
-      this._refilter();
+      if (this.model.isBig) {
+        this._refilter(); // 仅刷新"待执行"状态，不扫描
+        return;
+      }
+      clearTimeout(this._filterTimer);
+      if (this.model.rowCount() > FILTER_DEBOUNCE_ROWS) {
+        this._filterTimer = setTimeout(() => this._refilter(), 200);
+      } else {
+        this._refilter();
+      }
+    });
+
+    // 大模式：筛选框内回车 = 执行筛选（与「执行筛选」按钮同效）
+    this.headerEl.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" || !this.model.isBig) return;
+      if (e.target.closest(".col-filter input")) {
+        e.preventDefault();
+        this.hooks.bigFilterRun?.();
+      }
     });
 
     // ---- 多重筛选列勾选 ----
@@ -665,7 +788,7 @@ export class Grid {
       if (!cb) return;
       const col = Number(cb.dataset.col);
       if (cb.checked) this.multi.cols.add(col); else this.multi.cols.delete(col);
-      this._refilter();
+      this._refilter(); // 大模式仅记录条件（引擎按钮触发）
     });
 
     // ---- 右键菜单 ----
@@ -718,8 +841,8 @@ export class Grid {
     const rect = this.scrollEl.getBoundingClientRect();
     const x = clientX - rect.left + this.scrollEl.scrollLeft;
     const y = clientY - rect.top + this.scrollEl.scrollTop - this._originY();
-    if (x < this._rowHeadW() || !this.visibleRows.length) return null;
-    const r = this.visibleRows[this._rowAt(y)];
+    if (x < this._rowHeadW() || !this.visCount()) return null;
+    const r = this.visAt(this._rowAt(y));
     const pos = this._posAt(x);
     return [r, this.colOrder[pos]];
   }
@@ -829,10 +952,10 @@ export class Grid {
 
   /** 选中区域滚动到可视（编辑提交移动后调用） */
   ensureVisible(r, c) {
-    const vi = this.visibleRows.indexOf(r);
+    const vi = this.visibleIndexOf(r);
     if (vi < 0) return;
     const top = this._originY() + this._rowTop(vi);
-    const h = this.rowH[r];
+    const h = this._rowH(r);
     const viewTop = this.scrollEl.scrollTop;
     const viewH = this.scrollEl.clientHeight;
     if (top < viewTop) this.scrollEl.scrollTop = top;
@@ -866,10 +989,10 @@ export class Grid {
     for (let i = 0; i < pos; i += 1) x += widths[i];
     el.style.display = "block";
     el.style.left = `${x}px`;
-    const vi = this.visibleRows.indexOf(r);
+    const vi = this.visibleIndexOf(r);
     el.style.top = `${vi >= 0 ? this._originY() + this._rowTop(vi) : 0}px`;
     el.style.width = `${Math.max(widths[pos], MIN_COL_W)}px`;
-    el.style.height = `${Math.max(this.rowH[r], this._lineH())}px`;
+    el.style.height = `${Math.max(this._rowH(r), this._lineH())}px`;
     el.value = initial !== undefined ? initial : this.model.rawData(r, c);
     this.editing = { r, c };
     el.focus();
@@ -910,7 +1033,7 @@ export class Grid {
     const lineH = this._lineH();
     const lines = el.value.split("\n").length;
     const want = Math.min(lines + 1, 8) * lineH;
-    el.style.height = `${Math.max(this.rowH[this.editing?.r ?? 0] ?? lineH, want)}px`;
+    el.style.height = `${Math.max(this._rowH(this.editing?.r ?? 0), want)}px`;
   }
 
   /** @returns {number} 编辑器行高 px */
@@ -925,7 +1048,10 @@ export class Grid {
     const { r, c } = this.editing;
     const value = this.editorEl.value;
     this.closeEditor();
-    this.model.setData(r, c, value);
+    // 大模型写入是异步的：失败（如列操作 pending）转状态栏，避免未捕获拒绝
+    Promise.resolve(this.model.setData(r, c, value)).catch((err) => {
+      this.hooks.statusMsg(String(err?.message ?? err), 3000);
+    });
   }
 
   /** 取消编辑（不写回，对齐 Qt RevertModelCache） */
@@ -949,6 +1075,24 @@ export class Grid {
     const rows = this.selectedRows();
     const cols = this.selectedCols();
     const cc = this.model.columnCount();
+    // 大模式：完整矩形且超过逐格上限 → 引擎流式序列化（前端不取数）
+    const fullRect = this.selectedSet.size === rows.length * cols.length;
+    if (this.model.isBig && fullRect && this.selectedSet.size > 20000) {
+      Promise.resolve(this.model.copyRows(rows[0], rows[rows.length - 1] + 1,
+        cols[0], cols[cols.length - 1] + 1)).then((text) => {
+        this.lastCopiedText = text;
+        navigator.clipboard.writeText(text).then(() => {
+          this.hooks.statusMsg(`已复制 ${this.selectedSet.size} 个单元格`, 2000);
+        });
+      }).catch((err) => {
+        this.hooks.statusMsg(String(err?.message ?? err), 3000);
+      });
+      return;
+    }
+    if (this.model.isBig && !fullRect && this.selectedSet.size > 20000) {
+      this.hooks.statusMsg("大文件模式：大型选区仅支持完整矩形复制", 3000);
+      return;
+    }
     const data = [];
     for (const r of rows) {
       const line = [];
@@ -979,7 +1123,9 @@ export class Grid {
   deleteSelection(say = true) {
     if (!this.selectedSet.size) return;
     const n = this.selectedSet.size;
-    this.model.clearCells(this.selectedCells());
+    Promise.resolve(this.model.clearCells(this.selectedCells())).catch((err) => {
+      this.hooks.statusMsg(String(err?.message ?? err), 3000);
+    });
     if (say) this.hooks.statusMsg(`已清除 ${n} 个单元格的内容`, 2000);
   }
 
@@ -1007,7 +1153,9 @@ export class Grid {
        text.replace(/\r\n$/, "") === this.lastCopiedText.replace(/\r\n$/, ""));
     if (!forceSplit && !mine && !text.includes("\t")) {
       // 外部无 Tab 纯文本：整段进当前格（长文粘贴），换行保留
-      this.model.setData(r0, c0, text.replace(/\r\n/g, "\n").replace(/[\r\n]+$/, ""));
+      Promise.resolve(
+        this.model.setData(r0, c0, text.replace(/\r\n/g, "\n").replace(/[\r\n]+$/, "")),
+      ).catch((err) => this.hooks.statusMsg(String(err?.message ?? err), 3000));
       this.hooks.statusMsg("已粘贴到当前单元格", 2000);
       return;
     }
@@ -1017,6 +1165,16 @@ export class Grid {
       : (parsed.headers.length ? [parsed.headers] : []);
     if (!rows.length) return;
     const width = Math.max(...rows.map((row) => row.length));
+    if (this.model.isBig) {
+      // 大模式：粘贴不会自动扩列（列结构走 pending 列操作）；行可扩展。
+      // 逐格异步写引擎（块内并发由 BigModel 调度），顺序：先扩行再写格。
+      if (c0 + width > this.model.columnCount()) {
+        this.hooks.statusMsg("大文件模式：粘贴宽度超出现有列，已取消（可先用列操作加列）", 3000);
+        return;
+      }
+      this._pasteBig(r0, c0, rows, width);
+      return;
+    }
     // 扩展行列 + 逐格写入合并为一步撤销（Excel：粘贴是单个操作）
     this.model.batch(() => {
       const needRows = r0 + rows.length - this.model.rowCount();
@@ -1030,10 +1188,10 @@ export class Grid {
       });
     });
     // 选中刚粘贴的区域（Excel 行为；被筛掉的行不选）
-    const visSet = new Set(this.visibleRows);
+    const visSet = this.visibleRows ? new Set(this.visibleRows) : null;
     let selMade = false;
     for (let i = 0; i < rows.length; i += 1) {
-      if (visSet.has(r0 + i)) {
+      if (!visSet || visSet.has(r0 + i)) {
         this.select([r0, c0], { silent: true });
         this._extendTo([r0 + rows.length - 1, c0 + width - 1]);
         selMade = true;
@@ -1042,6 +1200,33 @@ export class Grid {
     }
     if (!selMade) this.select([r0, c0]);
     this.hooks.statusMsg(`已粘贴 ${rows.length} 行`, 2000);
+  }
+
+  /**
+   * 大文件模式粘贴：先扩行（引擎插入），再逐格写（BigModel 分块并发）。
+   *
+   * @param {number} r0 - 起始行。
+   * @param {number} c0 - 起始列。
+   * @param {string[][]} rows - 解析后的行数据。
+   * @param {number} width - 列宽。
+   * @returns {Promise<void>}
+   */
+  async _pasteBig(r0, c0, rows, width) {
+    try {
+      const needRows = r0 + rows.length - this.model.rowCount();
+      if (needRows > 0) await this.model.insertRows(this.model.rowCount(), needRows);
+      for (let i = 0; i < rows.length; i += 1) {
+        for (let j = 0; j < rows[i].length; j += 1) {
+          // eslint-disable-next-line no-await-in-loop
+          await this.model.setData(r0 + i, c0 + j, rows[i][j]);
+        }
+      }
+      this.select([r0, c0], { silent: true });
+      this._extendTo([r0 + rows.length - 1, c0 + width - 1]);
+      this.hooks.statusMsg(`已粘贴 ${rows.length} 行`, 2000);
+    } catch (err) {
+      this.hooks.statusMsg(String(err?.message ?? err), 3000);
+    }
   }
 
   // ============ 筛选（D2/D3） ============
@@ -1079,7 +1264,7 @@ export class Grid {
    */
   setMultiText(text) {
     this.multi.text = text;
-    this._refilter();
+    this._refilter(); // 大模式仅记录条件（引擎按钮触发）
   }
 
   /** @returns {number} 生效的筛选条件数 */
@@ -1098,7 +1283,11 @@ export class Grid {
     const ratio = factor / this.zoom;
     this.zoom = factor;
     this.colW = this.colW.map((w) => Math.max(MIN_COL_W, Math.round(w * ratio)));
-    this.rowH = this.rowH.map((h) => Math.max(MIN_ROW_H, Math.round(h * ratio)));
+    if (this.model.isBig) {
+      this._uniformRowH = Math.max(MIN_ROW_H, Math.round(this._uniformRowH * ratio));
+    } else {
+      this.rowH = this.rowH.map((h) => Math.max(MIN_ROW_H, Math.round(h * ratio)));
+    }
     document.getElementById("grid-area").style.setProperty("--grid-zoom", String(factor));
     this.renderAll();
     this.hooks.zoomed(factor);

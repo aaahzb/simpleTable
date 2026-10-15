@@ -75,6 +75,54 @@ export async function confirmDialog(text) {
 }
 
 /**
+ * 进度条模态（大文件保存/列操作物理重写）。
+ * 非阻塞：返回句柄由调用方驱动 set/close（进度经 big-progress 事件推送）。
+ *
+ * @param {string} title - 标题文本。
+ * @returns {{set: (done: number, total: number) => void, close: () => void}}
+ */
+export function progressDialog(title) {
+  const mask = document.createElement("div");
+  mask.className = "modal-mask";
+  const box = document.createElement("div");
+  box.className = "modal";
+  const head = document.createElement("div");
+  head.className = "modal-title";
+  head.textContent = title;
+  const body = document.createElement("div");
+  body.className = "modal-body";
+  const bar = document.createElement("progress");
+  bar.className = "progress-bar";
+  bar.max = 1;
+  bar.value = 0;
+  const label = document.createElement("div");
+  label.className = "progress-label";
+  label.textContent = "准备中…";
+  body.append(bar, label);
+  box.append(head, body);
+  mask.appendChild(box);
+  document.body.appendChild(mask);
+  return {
+    /**
+     * 更新进度。
+     *
+     * @param {number} done - 已完成行数。
+     * @param {number} total - 总行数。
+     */
+    set(done, total) {
+      const t = Math.max(1, total);
+      bar.max = t;
+      bar.value = done;
+      label.textContent = `${Math.round((done / t) * 100)}%（${done} / ${total} 行）`;
+    },
+    /** 关闭并移除模态。 */
+    close() {
+      mask.remove();
+    },
+  };
+}
+
+/**
  * 未保存修改三选（保存/放弃/取消），对齐 _confirm_discard。
  *
  * @returns {Promise<"save" | "discard" | "cancel">} 用户选择。

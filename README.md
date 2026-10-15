@@ -11,8 +11,8 @@
 Tauri（Rust 外壳 + 系统 WebView 前端）：启动快（冷启动约 80ms）、体积小（单文件 ~9MB）、UI 用 HTML/CSS 绘制、不监听任何端口、离线可用。
 
 - `frontend/` 纯 HTML/CSS/JS，无构建步骤、无框架：自绘虚拟滚动网格、两带式表头（列名 + 内嵌筛选）、模态对话框、右键菜单。
-- `src-tauri/` Rust 侧只做 OS 能力：文件对话框、CSV 读写（UTF-8 BOM / GBK 识别）、窗口标题、版本注入、`--smoke` 自检通道、命令行参数打开。
-- 运行要求：Windows 10+（自带 WebView2 运行时；LTSC/老系统需装 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)）。
+- `src-tauri/` Rust 侧做 OS 能力与大数据引擎：文件对话框、CSV 读写（UTF-8 BOM / GBK 识别）、窗口标题、版本注入、`--smoke` 自检通道、命令行参数打开；大文件模式的数据引擎（mmap + 行索引 + 覆盖层）也在这一层。
+- 运行要求：Windows 10+（自带 WebView2 运行时；LTSC/老系统需装 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)）。macOS 仅支持 Apple Silicon（arm64），Intel Mac 现版本不提供。
 
 ## 功能
 
@@ -28,6 +28,18 @@ Tauri（Rust 外壳 + 系统 WebView 前端）：启动快（冷启动约 80ms�
 - **排序**：工具栏"排序…"打开多层级对话框，每层选列、方式（字符/数字）、升降序，层级顺序即优先级；数字方式下非数字单元格排在该级最后。排序为物理排序（保存的 CSV 即排序后顺序）。
 - **文件**：新建（自定义初始列，生成 20 空行）/ 打开（文件对话框或拖入）/ 保存（支持快捷键 `Ctrl+S`）/ 另存为 CSV。
 - **版本号**：主窗口状态栏右侧常驻显示。打包时自动注入：HEAD 打了 `v` 开头的 tag（如 `v1.0.0`）→ 显示 `release v1.0.0`，否则显示 `beta+<commit哈希>`。
+
+## 大文件模式
+
+打开 CSV 时按文件大小自动路由：**≤ 50 MiB** 走内存模型（全部功能，键入即筛）；**> 50 MiB**（或冒烟强制开关）进入大文件模式——任意大小秒开查看，不再整读进内存。
+
+- **为什么需要它**：内存模型要把整份 CSV 变成 JS 字符串 + 格子数组，内存约文件的 3~5 倍，还受 WebView 字符串/堆上限约束（数百 MB 起变慢，GB 级直接闪退）。大文件模式用 Rust 引擎（memmap 只读映射 + 记录感知行索引 + 窗口化按页解码），常驻内存只随行数线性增长（3000 万行 ≈ 240 MB 索引），与文件大小无关。
+- **查看/翻页**：任意跳转即时可取（200 行/页窗口缓存，±2 屏预取）。
+- **筛选**：条件输入框只记录条件，点工具栏"执行筛选"（或筛选框内回车）启动一次整表并行扫描，状态栏报命中数与用时；清除筛选即回全量。
+- **编辑/撤销/保存**：单元格编辑、行插入/删除即时生效（覆盖层 + 插入块 + 删除位图，逆操作日志撤销）；保存为流式重写（进度条），原子换名，编码随原文件（GBK 原样回写）。
+- **列操作（插入/删除/重命名列）**：只做渲染预览并出现"执行列操作"按钮，确认后物理重写整个文件（进度条），完成后不可撤销；行操作无此限制。
+- **边界**：大文件模式暂不支持排序；粘贴不可超出已有列宽（可先用列操作加列）；窗口重新聚焦时检测外部改动并提示重载。
+- **阈值依据**：本机实测 100 MB 装载约 1.5 s / 筛选 352 ms，500 MB 撞 WebView 堆上限OOM；50 MiB 下筛选 ≤175 ms、内存 <1 GB，逐键筛选依然跟手。小文件（≤50 MiB）行为与旧版完全一致。
 
 ## CSV 约定
 
@@ -49,7 +61,7 @@ cd src-tauri
 cargo build
 ./target/debug/simpletable.exe
 
-# 对抗自检：62 项断言，写 %TEMP%\simpletable_smoke_report.txt 后退出
+# 对抗自检：77 项断言，写 %TEMP%\simpletable_smoke_report.txt 后退出
 ./target/debug/simpletable.exe --smoke
 ```
 
@@ -63,7 +75,7 @@ node --test tests_js/*.test.mjs
 
 ## CI 与发布
 
-- 推 `main` / PR → 自动构建自检：Windows 完整冒烟（62 项断言），macOS arm64 编译检查。
+- 推 `main` / PR → 自动构建自检：Windows 完整冒烟（77 项断言），macOS arm64 编译检查。
 - 推 `v*` tag → 自动构建 Windows x64 exe 与 macOS arm64 dmg 并发布 GitHub Release；Release 说明由流水线自动生成（上一 tag 至今的提交列表 + 版本对比链接，附固定简介/下载头），标题取 tag 名，版本号由 `build.rs` 从 tag 注入。Actions 里也可手动触发 Release 流水线（只构建不发布，发版前验证用）。
 - 本地打包：`src-tauri` 下 `cargo build --release`，产物 `target/release/simpletable.exe`。
 
@@ -78,9 +90,11 @@ frontend/js/csv.js     CSV 解析/生成 RFC4180
 frontend/js/pane.js    编辑窗格（符号镜像层、独立缩放）
 frontend/js/dialogs.js 模态对话框（新建/排序/列/确认/数字输入）
 frontend/js/menu.js    右键上下文菜单
-frontend/js/smoke.js   --smoke 对抗自检套件（62 项）
-tests_js/              node:test 逻辑层单测（csv/model）
-src-tauri/src/lib.rs   Rust 命令层（文件对话框/读写/标题/版本/冒烟通道/启动参数）
+frontend/js/smoke.js   --smoke 对抗自检套件（77 项）
+frontend/js/bigmodel.js 大文件模式模型（窗口缓存/乐观编辑/列操作 pending）
+tests_js/              node:test 逻辑层单测（csv/model/bigmodel）
+src-tauri/src/lib.rs   Rust 命令层（文件对话框/读写/标题/版本/冒烟通道/启动参数/大文件命令）
+src-tauri/src/engine.rs 大文件数据引擎（mmap 行索引/覆盖层/筛选/流式保存）
 src-tauri/build.rs     版本注入 + 前端资产变更触发重编译
 scripts/               截图巡检脚本（PrintWindow 无头截屏，开发用）
 ```

@@ -14,6 +14,11 @@ export const SORT_NUMERIC = "numeric";
 /** 撤销栈上限（超出丢弃最旧快照） */
 export const MAX_UNDO = 100;
 
+/** 大表字符预算：全表字符数超过则撤销上限降为 MAX_UNDO_LARGE（防内存爆涨） */
+const LARGE_CHARS = 3_000_000;
+/** 大表撤销上限 */
+const MAX_UNDO_LARGE = 20;
+
 /**
  * 尝试把字符串解析为浮点数。
  *
@@ -52,6 +57,22 @@ export class TableModel {
     this._undoCbs = new Set();
     /** @type {Set<Function>} 整体重置（load/撤销恢复）回调 */
     this._resetCbs = new Set();
+    /** @type {number | null} 动态撤销上限（null = 未测算） */
+    this._undoCap = null;
+    /** @type {boolean} 大表降级是否已提示（提示一次） */
+    this._undoCapNotified = false;
+    /** @type {Set<Function>} 撤销降级提示回调 */
+    this._undoCapCbs = new Set();
+  }
+
+  /**
+   * 订阅"大表撤销降级"提示（每装载只发一次）。
+   *
+   * @param {(cap: number) => void} cb - 回调，参数为实际生效的撤销上限。
+   * @returns {void}
+   */
+  onUndoCap(cb) {
+    this._undoCapCbs.add(cb);
   }
 
   /**
@@ -133,6 +154,8 @@ export class TableModel {
     this._undoStack = [];
     this._redoStack = [];
     this._mergeCell = null;
+    this._undoCap = null; // 重新测算动态撤销上限
+    this._undoCapNotified = false;
     this._emitReset();
     this._emitData(true);
     this._emitUndo();
@@ -209,6 +232,14 @@ export class TableModel {
   _checkpoint(mergeKey = null) {
     const hadRedo = this._redoStack.length > 0;
     this._redoStack = [];
+    // 大表动态降级：全表字符超预算时撤销上限收紧（首次压栈时测算一次）
+    if (this._undoCap === null) {
+      let chars = 0;
+      for (const r of this._rows) {
+        for (const c of r) chars += c.length;
+      }
+      this._undoCap = chars > LARGE_CHARS ? MAX_UNDO_LARGE : MAX_UNDO;
+    }
     let pushed = false;
     if (this._batchDepth > 0) {
       // batch() 进入时已压过快照
@@ -218,11 +249,15 @@ export class TableModel {
       // 同格连续击键：快照已存在，合并为一步
     } else {
       this._undoStack.push(this._snapshot());
-      if (this._undoStack.length > MAX_UNDO) {
+      while (this._undoStack.length > this._undoCap) {
         this._undoStack.shift();
       }
       this._mergeCell = mergeKey;
       pushed = true;
+      if (this._undoCap < MAX_UNDO && !this._undoCapNotified) {
+        this._undoCapNotified = true;
+        for (const cb of this._undoCapCbs) cb(this._undoCap);
+      }
     }
     if (pushed || hadRedo) {
       this._emitUndo();
