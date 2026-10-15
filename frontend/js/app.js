@@ -355,9 +355,6 @@ function bindModelEvents(m) {
     // 大模式预取页落定是纯重绘（origin="fetch"），打开/滚动不得误标脏
     else if (!(m.isBig && origin === "fetch")) markDirty();
     if (m.isBig) refreshBigUi();
-    // 预取页落定：立即重绘填上空白占位格——否则要等下一次滚动事件才重绘，
-    // 拖动滚动条时整屏空白/有内容逐帧交替（疯狂频闪），松手停在新页还残留空白
-    if (m.isBig && origin === "fetch" && !grid.editing) grid._renderRows();
     if (currentCell === null) return;
     const [r, c] = currentCell;
     if (structural) {

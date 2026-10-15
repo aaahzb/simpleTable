@@ -112,6 +112,18 @@ test("displayData 未命中缓存返回空串并调度拉页，落定后读到�
   assert.equal(model.displayData(10, 1), "r10c1"); // 页已落定
 });
 
+test("hasData：仅页已缓存且该行存在时为真（grid 键控复用判据）", async () => {
+  const { model } = makeFakeEngine({ rows: 500, cols: 2 });
+  await model.open("/x.csv");
+  assert.equal(model.hasData(10, 1), false); // 未拉取
+  model.prefetchRange(0, 199); // 只拉第 0 页
+  await tick();
+  assert.equal(model.hasData(10, 1), true);
+  assert.equal(model.hasData(199, 0), true);
+  assert.equal(model.hasData(200, 0), false); // 第 1 页未拉
+  assert.equal(model.hasData(4999, 0), false); // 越界行同样为假
+});
+
 test("prefetchRange 拉齐范围覆盖的页", async () => {
   const { model } = makeFakeEngine({ rows: 10 * BIG_PAGE, cols: 1 });
   await model.open("/x.csv");

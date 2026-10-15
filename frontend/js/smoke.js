@@ -978,6 +978,27 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     }
   });
 
+  check("大模式：缓存未命中保留旧内容（拖动不白闪）", async () => {
+    // 回归：被 trim 换出的页滚回时缓存未命中——渲染必须保留旧内容（stale-while-
+    // revalidate），不得整窗 tear-down 成空白占位，否则拖动滚动条每帧白闪（频闪根因）
+    const sc2 = document.getElementById("grid-scroll");
+    const oy2 = grid._originY();
+    const h2 = grid._uniformRowH;
+    const jump = (row) => {
+      sc2.scrollTop = Math.round(oy2 + (row * h2) / grid._yScale);
+      grid._renderRows();
+    };
+    jump(0);
+    await waitFor(() =>
+      document.querySelector('.cell[data-row="0"][data-col="0"]')?.textContent === "大理",
+      "首屏落定");
+    jump(3000); // 拉走缓存：此跳落定后 page0 被 trim 换出
+    await waitFor(() => bigM().rawData(3000, 0) === "大理", "远页落定");
+    jump(0); // 回旧行：同步渲染后立刻断言（无 await，落定来不及插足）
+    assert(document.querySelector('.cell[data-row="0"][data-col="0"]')?.textContent === "大理",
+      "缓存未命中时格子应为旧内容而非空白");
+  });
+
   check("大模式：单元格编辑 + 撤销/重做", async () => {
     const bm = bigM();
     grid.ensureVisible(0, 0); // 滚回首屏：编辑断言经窗口缓存读回，须先把缓存锚回首页

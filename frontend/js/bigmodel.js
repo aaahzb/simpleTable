@@ -220,6 +220,19 @@ export class BigModel {
     return this._cell(row, col);
   }
 
+  /**
+   * 单元格是否已在缓存（grid 键控复用判据：命中才刷新文本，未命中保留旧内容防白闪）。
+   *
+   * @param {number} row - 视图行号。
+   * @param {number} col - 视图列号。
+   * @returns {boolean} 页已缓存且该行存在。
+   */
+  hasData(row, col) {
+    if (!this._meta) return false;
+    const rows = this._cache.get(this._key(Math.floor(row / BIG_PAGE)));
+    return !!rows?.[row % BIG_PAGE];
+  }
+
   // ---- 窗口缓存 ----
 
   /**

@@ -106,6 +106,10 @@ export class Grid {
     this.selectedSet = new Set();
     /** @type {{r: number, c: number} | null} 编辑中的单元格 */
     this.editing = null;
+    /** @type {Map<number, string>} 等行高键控复用的旧内容兜底（stale-while-revalidate） */
+    this._staleText = new Map();
+    /** @type {string} 行结构形状键（列数/列序/列宽），变化即整窗重建 */
+    this._shapeKey = "";
     /** @type {string} 最近一次本软件复制的文本（内部分区粘贴判据） */
     this.lastCopiedText = "";
     this._suppressFilterInput = false;
@@ -135,6 +139,10 @@ export class Grid {
   setModel(m) {
     this.model = m;
     this.visibleRows = null;
+    // 旧模型的行元素与旧内容兜底不得复用到新模型（行号会撞）
+    this.rowsEl.textContent = "";
+    this._staleText.clear();
+    this._shapeKey = "";
     m.onData((structural) => this._onModelData(structural));
     this.rebuildStructure();
   }
@@ -420,9 +428,13 @@ export class Grid {
    */
   _renderRows() {
     const host = this.rowsEl;
-    host.textContent = "";
     const n = this.visCount();
-    if (!n || !this.model.columnCount()) { host.style.transform = ""; return; }
+    if (!n || !this.model.columnCount()) {
+      host.textContent = "";
+      host.style.transform = "";
+      this._staleText.clear();
+      return;
+    }
     const viewH = this.scrollEl.clientHeight;
     const top = this.scrollEl.scrollTop;
     // 行画在吸顶表头之下；窗口与基准分两套几何：
@@ -454,41 +466,119 @@ export class Grid {
     const cc = this.model.columnCount();
     // 行内偏移 = 全局坐标 - 基准（≤ 窗口高 + 10 行，不过 2^22），大偏移由容器 transform 承担
     host.style.transform = `translateY(${base}px)`;
-    const frag = document.createDocumentFragment();
+    if (!this._yUniform) {
+      // 非等行高（小文件）：数据全在内存，全量重建即可
+      host.textContent = "";
+      const frag = document.createDocumentFragment();
+      for (let vi = first; vi <= last; vi += 1) {
+        const r = this.visAt(vi);
+        const row = document.createElement("div");
+        row.className = "row";
+        // .row 的包含块是 #rows（其顶边已在吸顶表头之下），行内坐标即行区坐标（窗口局部）
+        row.style.top = `${topAt(vi)}px`;
+        row.style.height = `${this._rowH(r)}px`;
+        row.style.width = `${this._rowHeadW() + widths.reduce((a, b) => a + b, 0)}px`;
+        const head = document.createElement("div");
+        head.className = "row-head";
+        head.textContent = String(r + 1);
+        head.dataset.row = String(r);
+        const rz = document.createElement("div");
+        rz.className = "row-resize";
+        rz.dataset.row = String(r);
+        head.appendChild(rz);
+        row.appendChild(head);
+        this.colOrder.forEach((srcCol, pos) => {
+          const cell = document.createElement("div");
+          cell.className = "cell";
+          cell.style.width = `${widths[pos]}px`;
+          cell.dataset.row = String(r);
+          cell.dataset.col = String(srcCol);
+          const key = r * cc + srcCol;
+          if (this.selectedSet.has(key)) cell.classList.add("sel");
+          if (this.sel.current && this.sel.current[0] === r && this.sel.current[1] === srcCol) {
+            cell.classList.add("cur");
+          }
+          cell.textContent = this.model.displayData(r, srcCol);
+          row.appendChild(cell);
+        });
+        frag.appendChild(row);
+      }
+      host.appendChild(frag);
+      return;
+    }
+    // 等行高（含大模式虚拟缩放）：键控复用行元素。大模式页未命中时保留旧内容
+    // （stale-while-revalidate）——全部重建会把已填的格子刷成空白占位，拖动滚动条
+    // 每帧白闪（频闪根因）。列数/列序/列宽变化（shape 键）时整窗重建。
+    const shape = `${cc}|${this.colOrder.join(",")}|${widths.join(",")}`;
+    if (shape !== this._shapeKey) {
+      host.textContent = "";
+      this._shapeKey = shape;
+      this._staleText.clear();
+    }
+    const stale = this._staleText;
+    const byRow = new Map();
+    for (const el of host.children) byRow.set(Number(el.dataset.row), el);
+    const totalW = this._rowHeadW() + widths.reduce((a, b) => a + b, 0);
+    const has = this.model.hasData ?? null;
     for (let vi = first; vi <= last; vi += 1) {
       const r = this.visAt(vi);
-      const row = document.createElement("div");
-      row.className = "row";
-      // .row 的包含块是 #rows（其顶边已在吸顶表头之下），行内坐标即行区坐标（窗口局部）
+      let row = byRow.get(r) ?? null;
+      if (!row) {
+        row = document.createElement("div");
+        row.className = "row";
+        row.dataset.row = String(r);
+        const head = document.createElement("div");
+        head.className = "row-head";
+        head.dataset.row = String(r); // 行号列自身带行号（菜单/探针读它）
+        const rz = document.createElement("div");
+        rz.className = "row-resize";
+        rz.dataset.row = String(r);
+        head.appendChild(rz);
+        row.appendChild(head);
+        for (const srcCol of this.colOrder) {
+          const cell = document.createElement("div");
+          cell.className = "cell";
+          cell.dataset.row = String(r);
+          cell.dataset.col = String(srcCol);
+          row.appendChild(cell);
+        }
+        host.appendChild(row); // 绝对定位子元素，DOM 顺序不影响布局与绘制
+      }
+      byRow.delete(r);
       row.style.top = `${topAt(vi)}px`;
       row.style.height = `${this._rowH(r)}px`;
-      row.style.width = `${this._rowHeadW() + widths.reduce((a, b) => a + b, 0)}px`;
-      const head = document.createElement("div");
-      head.className = "row-head";
+      row.style.width = `${totalW}px`;
+      const head = row.firstChild;
+      const rz = head.lastElementChild; // textContent 赋值会清空子节点，把手先取出
       head.textContent = String(r + 1);
-      head.dataset.row = String(r);
-      const rz = document.createElement("div");
-      rz.className = "row-resize";
-      rz.dataset.row = String(r);
       head.appendChild(rz);
-      row.appendChild(head);
-      this.colOrder.forEach((srcCol, pos) => {
-        const cell = document.createElement("div");
-        cell.className = "cell";
+      const kids = row.children;
+      for (let pos = 0; pos < this.colOrder.length; pos += 1) {
+        const srcCol = this.colOrder[pos];
+        const cell = kids[pos + 1];
         cell.style.width = `${widths[pos]}px`;
-        cell.dataset.row = String(r);
-        cell.dataset.col = String(srcCol);
         const key = r * cc + srcCol;
-        if (this.selectedSet.has(key)) cell.classList.add("sel");
-        if (this.sel.current && this.sel.current[0] === r && this.sel.current[1] === srcCol) {
-          cell.classList.add("cur");
-        }
-        cell.textContent = this.model.displayData(r, srcCol);
-        row.appendChild(cell);
-      });
-      frag.appendChild(row);
+        cell.classList.toggle("sel", this.selectedSet.has(key));
+        cell.classList.toggle("cur",
+          !!this.sel.current && this.sel.current[0] === r && this.sel.current[1] === srcCol);
+        // 命中缓存才刷新文本；未命中保留上次显示值，数据落定后经 onData 重绘收敛
+        const t = (!has || has.call(this.model, r, srcCol))
+          ? this.model.displayData(r, srcCol)
+          : (stale.get(key) ?? "");
+        if (cell.textContent !== t) cell.textContent = t; // 同值跳过，避免无谓失效重绘
+        stale.set(key, t);
+      }
     }
-    host.appendChild(frag);
+    for (const el of byRow.values()) el.remove();
+    // 兜底表限界：只保留当前窗口 ±3000 行（防无限增长；滚出不久滚回仍有旧内容）
+    if (stale.size > 12000) {
+      const rLo = this.visAt(first) - 3000;
+      const rHi = this.visAt(last) + 3000;
+      for (const key of stale.keys()) {
+        const rr = Math.floor(key / cc);
+        if (rr < rLo || rr > rHi) stale.delete(key);
+      }
+    }
   }
 
   /** 重建筛选输入框（列结构变化后），保留已有条件文本 */

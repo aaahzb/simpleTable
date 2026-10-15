@@ -219,5 +219,65 @@ export async function runPark({ invoke, grid, mode }) {
     return;
   }
 
+  if (mode === "flicker2") {
+    // 带绘制版：可见窗口下跑同样的扫动，计数 renderAll/renderRows/rAF/DOM 变动。
+    // 若存在"ResizeObserver→renderAll→尺寸变化→ResizeObserver"逐帧自激，
+    // 只有真实出帧时才会转起来（无头/最小化时 rAF 停摆、循环隐身）。
+    await invoke("smoke_set_force_big", { v: true });
+    await window.__app.openPath(BIG);
+    const bm = window.__app.model;
+    const noop = () => invoke("path_exists", { path: `${dir}/__noop` });
+    for (let i = 0; i < 600; i += 1) {
+      if (window.__app.isBigMode() && bm.rowCount() > 0) break;
+      await noop();
+    }
+    grid.setZoom(2);
+    await sleep(300);
+    let renderAllN = 0;
+    let renderRowsN = 0;
+    let mutations = 0;
+    const origAll = grid.renderAll.bind(grid);
+    const origRows = grid._renderRows.bind(grid);
+    grid.renderAll = () => { renderAllN += 1; origAll(); };
+    grid._renderRows = () => { renderRowsN += 1; origRows(); };
+    new MutationObserver(() => { mutations += 1; })
+      .observe(grid.rowsEl, { childList: true });
+    let rafs = 0;
+    const rafLoop = () => { rafs += 1; requestAnimationFrame(rafLoop); };
+    requestAnimationFrame(rafLoop);
+    let visible = 0;
+    const visLoop = () => { if (!document.hidden) visible += 1; requestAnimationFrame(visLoop); };
+    requestAnimationFrame(visLoop);
+    const log = [];
+    const oy2 = grid._originY();
+    const h2 = grid._uniformRowH;
+    const n2 = grid.visCount();
+    const sample = (tag) => {
+      const cells = grid.rowsEl.querySelectorAll(".cell");
+      let blank = 0;
+      for (const el of cells) { if (el.textContent === "") blank += 1; }
+      log.push([tag, Math.round(performance.now()), renderAllN, renderRowsN,
+        rafs, visible, mutations, bm._cache.size, bm._inflight.size,
+        cells.length, blank, Math.round(sc.scrollTop)].join(","));
+    };
+    // 慢速扫动 ~2s（120 步，每步 IPC 连发拖时间），接近真实拖动的事件密度
+    for (let i = 0; i <= 120; i += 1) {
+      const row = Math.round(n2 * (0.005 + 0.6 * (i / 120)));
+      sc.scrollTop = Math.round(oy2 + (row * h2) / grid._yScale);
+      for (let k = 0; k < 40; k += 1) await noop();
+      if (i % 10 === 0) sample(`sweep${i}`);
+    }
+    sample("sweep-end");
+    const t0 = performance.now();
+    let last = t0;
+    while (performance.now() - t0 < 10000) {
+      await noop();
+      if (performance.now() - last >= 200) { sample("rest"); last = performance.now(); }
+    }
+    await mark(invoke, dir, "flicker2_log", log.join("\n"));
+    await mark(invoke, dir, "done");
+    return;
+  }
+
   await mark(invoke, dir, "error", `unknown mode ${mode}`);
 }
