@@ -42,7 +42,7 @@ Tauri（Rust 外壳 + 系统 WebView 前端）：启动快（冷启动约 80ms�
 
 ```bash
 # 前端逻辑单测（node:test，无需 Rust）
-node --test tests_js/
+node --test tests_js/*.test.mjs
 
 # 编译并运行
 cd src-tauri
@@ -57,7 +57,7 @@ cargo build
 
 ```bash
 # 逻辑层单测 + 真机冒烟自检（真实 WebView 环境跑端到端断言）
-node --test tests_js/
+node --test tests_js/*.test.mjs
 ./src-tauri/target/debug/simpletable.exe --smoke
 ```
 
