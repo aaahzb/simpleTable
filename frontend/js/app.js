@@ -181,7 +181,7 @@ async function runBigFilter() {
 async function applyColOps() {
   if (!model.isBig || !model.colOpsPending()) return;
   const dlg = progressDialog("执行列操作…");
-  const un = await model.onProgress((done, total) => dlg.set(done, total));
+  const un = await model.onProgress((done, total, phase, rows) => dlg.set(done, total, phase, rows));
   let ok = false;
   try {
     await model.applyColOps();
@@ -523,7 +523,7 @@ async function saveFile() {
   }
   if (model.isBig) {
     const dlg = progressDialog("保存大文件…");
-    const un = await model.onProgress((done, total) => dlg.set(done, total));
+    const un = await model.onProgress((done, total, phase, rows) => dlg.set(done, total, phase, rows));
     try {
       await model.save();
     } catch (err) {

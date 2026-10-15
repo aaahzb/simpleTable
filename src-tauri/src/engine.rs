@@ -25,9 +25,10 @@ use std::time::{Duration, Instant};
 // 长操作友好度：低优先级守卫 + 进度节流
 // ============================================================
 
-/// 进度回调最小发送间隔：重写期间每 65536 行回调一次，1550 万行 ≈ 237 次
-/// IPC 事件；磁盘 IO 被拖慢时前端会被进度事件淹没、渲染管线反而饿死。
-/// 限速到 ~12 次/秒，肉眼看仍是连续走动，IPC 压力降到 1/50 以下。
+/// 进度回调最小发送间隔：流式重写期间按 80ms 节拍节流（调用点每 16 行
+/// 过闸一次，开销可忽略），~12 次/秒肉眼看仍是连续走动，IPC 压力极低；
+/// 磁盘 IO 被拖慢（写缓存饱和/杀软扫描）时节拍不变、行号照走，进度条
+/// 不会长时间定住——旧 65536 行粒度在龟速段可能十分钟不刷新，看着像卡死。
 const PROGRESS_MIN_GAP: Duration = Duration::from_millis(80);
 
 /// 距上次发送是否已满最小间隔（首次调用恒放行）。
@@ -47,6 +48,35 @@ fn progress_gate(last: &mut Option<Instant>, gap: Duration) -> bool {
             true
         }
     }
+}
+
+// ---- 进度条分阶段配平 ----
+// 总体进度按千分比切给三个阶段：流式重写 0-700、冲刷落盘/换名 700-780、
+// 重建行索引 780-1000（索引本身秒级完成，进度条在阶段文字+秒数上体现，
+// 不再单独报点）。加权的目的是任何阶段都不出现"进度条长时间定住"：
+// 慢在重写时条在走，慢在落盘时条跳到 70%+ 并显示阶段文字，慢在索引时
+// 条停在 78% 但阶段文字与已用秒数持续刷新。
+
+/// 进度阶段：流式重写。
+pub const PHASE_STREAM: u8 = 0;
+/// 进度阶段：冲刷落盘与换名替换原文件。
+pub const PHASE_FLUSH: u8 = 1;
+/// 进度阶段：重建行索引（收尾，事件本身即"索引完成"）。
+pub const PHASE_REINDEX: u8 = 2;
+
+/// 流式阶段的加权进度：done 行 → 总体 0..70%。
+fn stream_weighted(done: u64) -> u64 {
+    done * 7 / 10
+}
+
+/// 冲刷完成点（总体 72%）。
+fn flushed_weighted(total: u64) -> u64 {
+    total * 72 / 100
+}
+
+/// 换名完成点（总体 78%，之后进入重建索引阶段）。
+fn renamed_weighted(total: u64) -> u64 {
+    total * 78 / 100
 }
 
 /// 整表重写（保存/执行列操作）期间的低优先级守卫：把**当前线程**降到
@@ -774,7 +804,8 @@ mod tests {
             .unwrap();
         bf.remove_rows(vec![3]).unwrap(); // 删 Carol（插入位移后 vrow 3）
         let mut prog = 0u32;
-        bf.save(|done, _total| prog = prog.max(done as u32)).unwrap();
+        bf.save(|done, _total, _phase, _rows| prog = prog.max(done as u32))
+            .unwrap();
         assert!(prog > 0, "进度回调应至少触发一次");
         assert!(bf.meta().can_undo, "保存后撤销栈保留（rec 稳定）");
         // 重开比对物理内容
@@ -799,7 +830,7 @@ mod tests {
         let mut bf = BigFile::open(&p).unwrap();
         assert_eq!(bf.meta().encoding, "gbk");
         bf.set_cell(0, 1, "上海".into()).unwrap();
-        bf.save(|_, _| {}).unwrap();
+        bf.save(|_, _, _, _| {}).unwrap();
         let bf2 = BigFile::open(&p).unwrap();
         assert_eq!(bf2.meta().encoding, "gbk");
         assert_eq!(bf2.rows(0, 1)[0], vec!["张三", "上海"]);
@@ -830,7 +861,7 @@ mod tests {
         bf.push_col_op(ColOp::Insert { pos: 1, name: "memo".into() });
         bf.push_col_op(ColOp::Rename { col: 0, name: "姓名".into() });
         bf.push_col_op(ColOp::Delete { col: 2 }); // 删原 age
-        bf.apply_col_ops(|_, _| {}).unwrap();
+        bf.apply_col_ops(|_, _, _, _| {}).unwrap();
         assert!(!bf.meta().pending_cols);
         assert_eq!(bf.meta().headers, vec!["姓名", "memo", "city"]);
         assert!(!bf.meta().can_undo, "列操作物理重写后清空撤销栈");
@@ -838,6 +869,34 @@ mod tests {
         let bf2 = BigFile::open(&p).unwrap();
         assert_eq!(bf2.meta().headers, vec!["姓名", "memo", "city"]);
         assert_eq!(bf2.rows(0, 1)[0], vec!["Alice", "", "Beijing"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_col_ops_progress_phased_monotonic() {
+        // 进度契约（进度条配平，治"中途定住像卡死"）：
+        // 阶段 0 流式重写按行推进（加权到 70%），阶段 1 落盘换名（70→78%），
+        // 阶段 2 重建索引完成后收尾必到满 (total,total)；序列单调不减。
+        let p = tmp_csv("colprog", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.push_col_op(ColOp::Delete { col: 2 });
+        let mut events: Vec<(u64, u64, u8, u64)> = Vec::new();
+        bf.apply_col_ops(|d, t, ph, rows| events.push((d, t, ph, rows)))
+            .unwrap();
+        assert!(!events.is_empty(), "至少应收到收尾进度事件");
+        for w in events.windows(2) {
+            assert!(w[1].0 >= w[0].0, "进度应单调不减：{:?} -> {:?}", w[0], w[1]);
+        }
+        assert_eq!(events[0].2, PHASE_STREAM, "首事件应为流式阶段：{:?}", events);
+        assert!(
+            events.iter().any(|e| e.2 == PHASE_FLUSH),
+            "应有落盘阶段事件：{:?}",
+            events
+        );
+        let last = events.last().unwrap();
+        assert_eq!(last.0, last.1, "收尾应到满：{:?}", last);
+        assert_eq!(last.2, PHASE_REINDEX, "收尾应标记索引阶段：{:?}", last);
+        assert!(last.3 > 0, "行计数应非零：{:?}", last);
         fs::remove_file(&p).ok();
     }
 
@@ -867,7 +926,7 @@ mod tests {
         // 模拟外部程序占用：读共享但拒绝删除共享（FILE_SHARE_READ|WRITE=0x3，
         // 同 Excel/资源管理器预览类句柄），rename 必失败（os error 32）
         let lock = fs::OpenOptions::new().read(true).share_mode(0x3).open(&p).unwrap();
-        let err = bf.save(|_, _| {}).unwrap_err();
+        let err = bf.save(|_, _, _, _| {}).unwrap_err();
         drop(lock);
         assert!(err.contains("临时文件"), "错误应告知临时文件位置: {err}");
         let tmp = tmp_path_for(&p);
@@ -895,7 +954,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(400));
             drop(lock);
         });
-        bf.save(|_, _| {}).unwrap();
+        bf.save(|_, _, _, _| {}).unwrap();
         t.join().unwrap();
         let bf2 = BigFile::open(&p).unwrap();
         assert_eq!(bf2.rows(0, 1)[0][0], "Bob", "新文件应落盘生效");
@@ -1835,9 +1894,11 @@ impl BigFile {
 
     // ---- 序列化与落盘 ----
 
-    /// 保存：流式重写原文件（覆盖层/插入/删除合并），进度回调 (done, total)。
+    /// 保存：流式重写原文件（覆盖层/插入/删除合并）。
+    /// 进度回调 `(加权done, total, 阶段, 行数)`：加权把总体进度切给
+    /// 流式 0-70% / 落盘 70-78% / 重建索引至 100%（见 PHASE_* 常量注释）。
     /// 保存后重建 mmap 与索引；撤销栈保留（操作按稳定记录号寻址，仍有效）。
-    pub fn save<F: FnMut(u64, u64)>(&mut self, mut progress: F) -> Result<(), String> {
+    pub fn save<F: FnMut(u64, u64, u8, u64)>(&mut self, mut progress: F) -> Result<(), String> {
         self.require_editable()?;
         // 整表重写数十秒：本线程降为背景优先级，让出 UI/系统调度。
         let _bg = bg::BackgroundGuard::enter();
@@ -1861,8 +1922,10 @@ impl BigFile {
                         w.write_all(&encode_record(&f, b',', self.enc))
                             .map_err(|e| e.to_string())?;
                         done += 1;
-                        if done % 65536 == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
-                            progress(done, total);
+                        // 16 行粒度过闸：磁盘拖慢时进度仍按 80ms 节拍更新
+                        // （旧 65536 行粒度在龟速段可能十分钟不刷新）。
+                        if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
+                            progress(stream_weighted(done), total, PHASE_STREAM, done);
                         }
                     }
                 }
@@ -1879,25 +1942,29 @@ impl BigFile {
                             w.write_all(&encode_record(&f, b',', self.enc))
                                 .map_err(|e| e.to_string())?;
                             done += 1;
-                            if done % 65536 == 0 {
-                                progress(done, total);
+                            if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
+                                progress(stream_weighted(done), total, PHASE_STREAM, done);
                             }
                         }
                     }
                 }
             }
         }
+        // 阶段交接无条件各发一次：小文件也保证契约完整（有阶段 0/1 事件）。
+        progress(stream_weighted(done), total, PHASE_STREAM, done);
         w.flush().map_err(|e| e.to_string())?;
         drop(w);
-        progress(total, total); // 收尾必发一次，前端进度条归零前显示 100%
+        progress(flushed_weighted(total), total, PHASE_FLUSH, done);
         self.replace_with_retry(&tmp)?;
+        progress(renamed_weighted(total), total, PHASE_FLUSH, done);
         self.reopen_after_write()?;
+        progress(total, total, PHASE_REINDEX, total); // 收尾必到满，前端进度条归零前显示 100%
         Ok(())
     }
 
     /// 执行待执行的列操作：流式重写（物理列映射），完成后重建会话。
-    /// 此操作不可撤销（撤销栈清空）。
-    pub fn apply_col_ops<F: FnMut(u64, u64)>(
+    /// 此操作不可撤销（撤销栈清空）。进度回调契约同 `save`。
+    pub fn apply_col_ops<F: FnMut(u64, u64, u8, u64)>(
         &mut self,
         mut progress: F,
     ) -> Result<(), String> {
@@ -1937,8 +2004,9 @@ impl BigFile {
                         w.write_all(&encode_record(&mapped, b',', self.enc))
                             .map_err(|e| e.to_string())?;
                         done += 1;
-                        if done % 65536 == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
-                            progress(done, total);
+                        // 16 行粒度过闸：磁盘拖慢时进度仍按 80ms 节拍更新。
+                        if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
+                            progress(stream_weighted(done), total, PHASE_STREAM, done);
                         }
                     }
                 }
@@ -1957,24 +2025,28 @@ impl BigFile {
                             w.write_all(&encode_record(&mapped, b',', self.enc))
                                 .map_err(|e| e.to_string())?;
                             done += 1;
-                            if done % 65536 == 0 {
-                                progress(done, total);
+                            if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
+                                progress(stream_weighted(done), total, PHASE_STREAM, done);
                             }
                         }
                     }
                 }
             }
         }
+        // 阶段交接无条件各发一次：小文件也保证契约完整（有阶段 0/1 事件）。
+        progress(stream_weighted(done), total, PHASE_STREAM, done);
         w.flush().map_err(|e| e.to_string())?;
         drop(w);
-        progress(total, total); // 收尾必发一次，前端进度条归零前显示 100%
+        progress(flushed_weighted(total), total, PHASE_FLUSH, done);
         self.replace_with_retry(&tmp)?;
+        progress(renamed_weighted(total), total, PHASE_FLUSH, done);
 
         // 全量重建：列结构变化，编辑层与撤销历史一并失效
         let mut fresh = Self::open(&self.path)?;
         fresh.base_headers = new_headers;
         fresh.base_ncols = ncols as usize;
         *self = fresh;
+        progress(total, total, PHASE_REINDEX, total); // 收尾必到满
         Ok(())
     }
 

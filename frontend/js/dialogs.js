@@ -77,11 +77,16 @@ export async function confirmDialog(text) {
 /**
  * 进度条模态（大文件保存/列操作物理重写）。
  * 非阻塞：返回句柄由调用方驱动 set/close（进度经 big-progress 事件推送）。
+ * 阶段文字 + 已用秒数走 UI 侧时钟（250ms 刷新）：即使引擎被写盘 IO 硬卡住
+ * 发不出事件，界面也在持续刷新，不会出现"进度条定住像死机"的观感。
  *
  * @param {string} title - 标题文本。
- * @returns {{set: (done: number, total: number) => void, close: () => void}}
+ * @returns {{set: (done: number, total: number, phase?: number, rows?: number) => void,
+ *            finish: () => Promise<void>, close: () => void}}
  */
 export function progressDialog(title) {
+  /** 阶段文字（与引擎 PHASE_* 常量对应）。 */
+  const PHASES = ["正在重写文件…", "正在落盘替换原文件…", "正在重建行索引…"];
   const mask = document.createElement("div");
   mask.className = "modal-mask";
   const box = document.createElement("div");
@@ -102,20 +107,41 @@ export function progressDialog(title) {
   box.append(head, body);
   mask.appendChild(box);
   document.body.appendChild(mask);
+
+  const t0 = performance.now();
+  let lastDone = 0;
   let lastTotal = 1;
+  let phase = 0;
+  let rows = 0;
+  /** 渲染标签：阶段文字 + 百分比 + 走表秒数（+ 流式阶段附行计数）。 */
+  const render = () => {
+    const sec = ((performance.now() - t0) / 1000).toFixed(1);
+    const pct = Math.round((lastDone / Math.max(1, lastTotal)) * 100);
+    const rowsTxt = phase === 0 && rows > 0
+      ? ` · 已处理 ${rows.toLocaleString()} 行` : "";
+    label.textContent =
+      `${PHASES[phase] ?? ""} ${pct}% · 已用 ${sec} 秒${rowsTxt}`;
+  };
+  const timer = setInterval(render, 250);
+
   return {
     /**
      * 更新进度。
      *
-     * @param {number} done - 已完成行数。
-     * @param {number} total - 总行数。
+     * @param {number} done - 已完成加权单位（总体进度的分子）。
+     * @param {number} total - 总单位（分母不变，加权后仍等于总行数）。
+     * @param {number} [ph] - 阶段（0 流式重写 / 1 落盘换名 / 2 重建索引）。
+     * @param {number} [rowCount] - 已处理行数（流式阶段显示用）。
      */
-    set(done, total) {
+    set(done, total, ph = 0, rowCount = 0) {
       const t = Math.max(1, total);
+      lastDone = done;
       lastTotal = t;
+      phase = ph;
+      rows = rowCount;
       bar.max = t;
       bar.value = done;
-      label.textContent = `${Math.round((done / t) * 100)}%（${done} / ${total} 行）`;
+      render();
     },
     /**
      * 完成帧：置 100% 短暂停留再关闭。
@@ -125,6 +151,7 @@ export function progressDialog(title) {
      * @returns {Promise<void>}
      */
     async finish() {
+      clearInterval(timer);
       bar.max = lastTotal;
       bar.value = lastTotal;
       label.textContent = "100%（完成）";
@@ -133,6 +160,7 @@ export function progressDialog(title) {
     },
     /** 关闭并移除模态。 */
     close() {
+      clearInterval(timer);
       mask.remove();
     },
   };

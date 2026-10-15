@@ -141,12 +141,15 @@ export class BigModel {
 
   /**
    * 订阅引擎进度事件（保存/列操作重写）。
+   * 事件载荷 `(加权done, total, 阶段, 行数)`：阶段 0 流式重写 / 1 落盘换名 /
+   * 2 重建索引；加权把总体进度切为 流式 0-70% / 落盘 70-78% / 索引至 100%。
    *
-   * @param {(done: number, total: number) => void} cb - 回调。
+   * @param {(done: number, total: number, phase: number, rows: number) => void} cb - 回调。
    * @returns {Promise<Function>} 取消监听函数。
    */
   async onProgress(cb) {
-    return this._listen("big-progress", (e) => cb(e.payload[0], e.payload[1]));
+    return this._listen("big-progress", (e) =>
+      cb(e.payload[0], e.payload[1], e.payload[2], e.payload[3]));
   }
 
   /**

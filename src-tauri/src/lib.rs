@@ -394,15 +394,16 @@ fn big_copy(
 async fn big_save(window: tauri::Window, state: tauri::State<'_, BigShared>) -> Result<(), String> {
     let shared = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let (tx, rx) = std::sync::mpsc::channel::<(u64, u64)>();
+        // (加权done, total, 阶段, 行数)：阶段 0 流式重写 / 1 落盘换名 / 2 重建索引。
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, u64, u8, u64)>();
         let emitter = std::thread::spawn(move || {
-            while let Ok((done, total)) = rx.recv() {
-                let _ = window.emit("big-progress", (done, total));
+            while let Ok((done, total, phase, rows)) = rx.recv() {
+                let _ = window.emit("big-progress", (done, total, phase, rows));
             }
         });
         let result = with_big(&shared, |bf| {
-            bf.save(move |done, total| {
-                let _ = tx.send((done, total));
+            bf.save(move |done, total, phase, rows| {
+                let _ = tx.send((done, total, phase, rows));
             })
         });
         // save 返回后进度闭包随 tx 一并释放，emit 线程 recv 出错即退出。
@@ -445,15 +446,15 @@ fn big_col_clear(state: tauri::State<BigShared>) -> Result<(), String> {
 async fn big_col_apply(window: tauri::Window, state: tauri::State<'_, BigShared>) -> Result<(), String> {
     let shared = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let (tx, rx) = std::sync::mpsc::channel::<(u64, u64)>();
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, u64, u8, u64)>();
         let emitter = std::thread::spawn(move || {
-            while let Ok((done, total)) = rx.recv() {
-                let _ = window.emit("big-progress", (done, total));
+            while let Ok((done, total, phase, rows)) = rx.recv() {
+                let _ = window.emit("big-progress", (done, total, phase, rows));
             }
         });
         let result = with_big(&shared, |bf| {
-            bf.apply_col_ops(move |done, total| {
-                let _ = tx.send((done, total));
+            bf.apply_col_ops(move |done, total, phase, rows| {
+                let _ = tx.send((done, total, phase, rows));
             })
         });
         emitter.join().map_err(|e| format!("进度转发线程异常：{e:?}"))?;
