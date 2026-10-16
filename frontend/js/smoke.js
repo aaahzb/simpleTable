@@ -910,6 +910,33 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await window.__app.activateTab(window.__app.tabs().find((x) => x.path === fa).id);
   });
 
+  check("分屏：拖 #vsplit 分隔条调整两侧宽度，关闭后复位", async () => {
+    const fa = `${TMP}/sv/a.csv`; const fb = `${TMP}/sv/b.csv`;
+    await window.__app.activateTab(window.__app.tabs().find((x) => x.path === fa).id);
+    const tb = window.__app.tabs().find((x) => x.path === fb);
+    await window.__app.openSplit(tb.id);
+    assert(window.__app.split().on === true, "分屏应建立");
+    const ga = document.getElementById("grid-area");
+    const gb = document.getElementById("grid-area2");
+    const vs = document.getElementById("vsplit");
+    const w0 = ga.offsetWidth;
+    assert(Math.abs(w0 - gb.offsetWidth) < 4, `初始应左右均分（${w0} vs ${gb.offsetWidth}）`);
+    // 模拟拖动分隔条：按住向右拖 120px，主侧应变宽、副侧吸收余量变窄
+    const r = vs.getBoundingClientRect();
+    const sx = r.left + 2;
+    mouse(vs, "mousedown", { clientX: sx, clientY: 200 });
+    mouse(document, "mousemove", { clientX: sx + 120, clientY: 200 });
+    mouse(document, "mouseup", { clientX: sx + 120, clientY: 200 });
+    const w1 = ga.offsetWidth;
+    assert(w1 >= w0 + 100 && w1 <= w0 + 140,
+      `拖右 120px 后主侧应变宽（${w0}→${w1}）`);
+    assert(gb.offsetWidth <= w0 - 80, `拖右后副侧应变窄（→${gb.offsetWidth}）`);
+    assert(sideCellText("A", 0, 0) === "甲A" && sideCellText("B", 0, 0) === "乙B",
+      "拖拽后两侧内容应稳定");
+    await window.__app.closeSplit();
+    assert(ga.style.flex === "", "关闭分屏应清掉主侧拖拽定宽（恢复弹性布局）");
+  });
+
   check("分屏：关闭分屏与关签联动", async () => {
     const fa = `${TMP}/sv/a.csv`; const fb = `${TMP}/sv/b.csv`;
     await window.__app.activateTab(window.__app.tabs().find((x) => x.path === fa).id);

@@ -70,7 +70,7 @@ cd src-tauri
 cargo build
 ./target/debug/simpletable.exe
 
-# 测试：Rust 引擎单测（29 项）+ 真机冒烟自检（真实 WebView2，101 项断言）
+# 测试：Rust 引擎单测（29 项）+ 真机冒烟自检（真实 WebView2，102 项断言）
 cargo test
 ./target/debug/simpletable.exe --smoke   # 报告写 %TEMP%\simpletable_smoke_report.txt
 ```
@@ -82,7 +82,7 @@ cargo test
 ```
 frontend/            纯 HTML/CSS/JS，无构建步骤：自绘虚拟滚动网格 + 编辑窗格 + 对话框
   js/bigmodel.js     大文件模式模型（窗口缓存/乐观编辑/列操作 pending）
-  js/smoke.js        --smoke 对抗自检套件（101 项）
+  js/smoke.js        --smoke 对抗自检套件（102 项）
 src-tauri/           Tauri 2 外壳 + Rust 大数据引擎（mmap/行索引/覆盖层/流式保存）
 tests_js/            node:test 逻辑层单测
 scripts/             截图/采样巡检脚本（开发用）

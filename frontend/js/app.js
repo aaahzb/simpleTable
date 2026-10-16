@@ -541,6 +541,7 @@ function resetToEmpty() {
   sideTab.B = null;
   focusedSide = "A";
   document.body.classList.remove("split");
+  document.getElementById("grid-area").style.flex = ""; // 清掉分屏拖拽残留的主侧定宽
   model = new TableModel();
   bindModelEvents(model);
   path = null;
@@ -729,6 +730,7 @@ function closeSplit() {
   sideTab.A = null;
   sideTab.B = null;
   document.body.classList.remove("split");
+  document.getElementById("grid-area").style.flex = ""; // 清掉分屏拖拽残留的主侧定宽
   if (focusedSide !== "A") {
     focusedSide = "A";
     if (activeTab()) applyViewState(gridA);
@@ -1456,6 +1458,30 @@ document.addEventListener("keydown", (e) => {
     const move = (ev) => {
       const w = Math.min(Math.max(startW - (ev.clientX - startX), 120), window.innerWidth - 300);
       paneEl.style.width = `${w}px`;
+    };
+    const up = () => {
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", up);
+    };
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
+  });
+})();
+
+// ========== 分屏分隔条拖拽（#vsplit：主/副网格之间） ==========
+
+(() => {
+  const vsplit = document.getElementById("vsplit");
+  const gridArea = document.getElementById("grid-area");
+  vsplit.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = gridArea.offsetWidth;
+    const move = (ev) => {
+      // 主侧改定宽、副侧弹性吸收余量；两侧各留最小宽度（含两条 5px 分隔条）
+      const maxW = window.innerWidth - document.getElementById("pane").offsetWidth - 240 - 10;
+      const w = Math.min(Math.max(startW + (ev.clientX - startX), 240), maxW);
+      gridArea.style.flex = `0 0 ${w}px`;
     };
     const up = () => {
       document.removeEventListener("mousemove", move);

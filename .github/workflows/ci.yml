@@ -1,5 +1,5 @@
 # 持续集成：推送 main、提 PR 或手动触发时自动构建 + 自检。
-# Windows：node 逻辑单测（39）+ Rust 引擎单测（29）+ 完整冒烟（真实 WebView2，101 项断言）；
+# Windows：node 逻辑单测（39）+ Rust 引擎单测（29）+ 完整冒烟（真实 WebView2，102 项断言）；
 # macOS：arm64 编译检查 + Rust 引擎单测（Apple Silicon 首个运行时验证，Windows 专属用例自动跳过）。
 name: CI
 
