@@ -150,6 +150,7 @@ function refreshBigUi() {
  * @returns {Promise<void>}
  */
 async function runBigFilter() {
+  if (!model.isBig) return; // 兜底：小模式此按钮隐藏，防御误触调用小模型不存在的 runFilter
   const cc = model.columnCount();
   const kws = [];
   for (const [col, kw] of grid.filters) {
@@ -206,6 +207,7 @@ async function applyColOps() {
 
 /** 撤销（放弃）全部 pending 列操作 */
 async function cancelColOps() {
+  if (!model.isBig) return; // 兜底：小模式此按钮隐藏，防御误触调用小模型不存在的 clearColOps
   try {
     await model.clearColOps();
     statusMsg("已放弃列操作预览，恢复原结构", 3000);

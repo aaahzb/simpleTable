@@ -93,6 +93,9 @@ body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; 
 #toolbar button:hover:not(:disabled) { background: #e5e5e5; border-color: #d0d0d0; }
 #toolbar button:disabled { color: #aaa; cursor: default; }
 #toolbar button.on { background: #dce6f0; border-color: var(--accent); color: var(--accent); }
+/* 模式专属按钮显隐（排序/执行筛选/执行列操作/撤销列操作预览）：
+   .hidden 类无通用规则，必须在此显式声明，否则类在但视觉不隐藏 */
+#toolbar button.hidden { display: none; }
 #toolbar .sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
 /* 多重筛选输入框（按钮常驻，框仅选中态显示） */
 #multi-filter-wrap.hidden { display: none; }
