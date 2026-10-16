@@ -32,7 +32,7 @@ export function toSymbolsFrag(raw, doc = document) {
     if (ch === " " || ch === "\t") {
       flush();
       const box = doc.createElement("span");
-      box.className = ch === " " ? "sp" : "tab";
+      box.className = ch === " " ? "sp" : "ptab"; // ptab：避免与页签条 .tab 同名撞样式
       box.textContent = ch; // 真实占位字符：排版与编辑域一致
       const glyph = doc.createElement("span");
       glyph.className = "g";

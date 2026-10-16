@@ -1383,7 +1383,12 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       await invoke("smoke_write_repeat", { path: p, line: "昆明,4,新城\r\n", times: 1000, append: true });
     }
     await invoke("smoke_set_force_big", { v: true });
-    await window.__app.openPath(p);
+    // 上一项（单格一对多填充）把大档签留在脏态；腾退换签会先弹 保存/放弃/取消，
+    // 与真实交互一致地点掉（放弃夹具编辑），否则 openPath 永远等模态
+    const pendingOpen = window.__app.openPath(p);
+    await sleep(150);
+    assert(clickDiscardDialog("放弃") === true, "腾退换签应先弹未保存确认");
+    await pendingOpen;
     assert(window.__app.isBigMode() === true, "夹具应路由到大模式");
     const sc = document.getElementById("grid-scroll");
     const oy = grid._originY();
@@ -1472,12 +1477,14 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(tb1.active === true && model.rowCount() === 1500, "首个大档应已激活");
     // 引擎腾退（b1 无脏，不弹窗）→ 重开 b2
     await window.__app.activateTab(tb2.id);
-    assert(model.rowCount() === 1500 && model.rawData(0, 0) === "乙", "第二大档内容");
+    assert(model.rowCount() === 1500, "第二大档行数");
+    // 首屏行异步落定：缓存未命中时 rawData 返回空串，须等拉取（同大模式段惯例）
+    await waitFor(() => model.rawData(0, 0) === "乙", "第二大档首行落定");
     // 回切 b1：引擎再次重开，数据来自磁盘原样
     await window.__app.activateTab(tb1.id);
-    assert(model.rawData(0, 0) === "甲", "重开第一大档内容应正确");
+    await waitFor(() => model.rawData(0, 0) === "甲", "重开第一大档首行落定");
     await window.__app.activateTab(tb2.id);
-    assert(model.rawData(0, 0) === "乙", "大小档再切换内容应正确");
+    await waitFor(() => model.rawData(0, 0) === "乙", "大小档再切换首行落定");
     await invoke("smoke_set_force_big", { v: false });
   });
 

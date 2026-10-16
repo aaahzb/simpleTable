@@ -127,6 +127,11 @@ fn smoke_write_bytes(path: String, bytes: Vec<u8>) -> Result<(), String> {
 #[tauri::command]
 fn smoke_write_repeat(path: String, line: String, times: u32, append: bool) -> Result<(), String> {
     use std::io::Write;
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| io_err(&path, &e))?;
+        }
+    }
     let f = if append {
         fs::OpenOptions::new().append(true).open(&path)
     } else {
