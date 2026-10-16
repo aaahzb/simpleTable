@@ -914,6 +914,10 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
   /** 当前大模型（app.js 热交换后的实时模型） */
   const bigM = () => window.__app.model;
 
+  /** 工具栏按钮查找（模式专属按钮始终存在于 DOM，靠 hidden 类显隐） */
+  const tbBtn = (t) =>
+    [...document.querySelectorAll("#toolbar button")].find((b) => b.textContent === t);
+
   const BIG_CSV = `${TMP}/big.csv`;
 
   check("大模式：强制开关 + 生成重复行夹具", async () => {
@@ -941,6 +945,12 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(JSON.stringify(bm.headers()) === JSON.stringify(["目的地", "评分", "备注"]),
       `表头 ${bm.headers()}`);
     assert(bm.meta().encoding === "utf-8", `编码 ${bm.meta().encoding}`);
+    // 模式专属工具栏显隐：大模式隐藏「排序…」、显示「执行筛选」；
+    // 列操作两按钮无 pending 时应隐藏（小模式从不依赖这三个大文件按钮）
+    assert(tbBtn("排序…").classList.contains("hidden"), "大模式应隐藏排序按钮");
+    assert(!tbBtn("执行筛选").classList.contains("hidden"), "大模式应显示执行筛选");
+    assert(tbBtn("执行列操作").classList.contains("hidden"), "无 pending 应隐藏执行列操作");
+    assert(tbBtn("撤销列操作预览").classList.contains("hidden"), "无 pending 应隐藏撤销列操作预览");
   });
 
   check("大模式：首屏行异步落定并渲染", async () => {
@@ -1211,6 +1221,11 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await window.__app.openPath(`${TMP}/rt.csv`);
     assert(window.__app.isBigMode() === false, "关开关后应回到小文件模式");
     assert(window.__app.model.rowCount() === 1, `小模型行数 ${window.__app.model.rowCount()}`);
+    // 模式专属工具栏显隐回到小模式态：排序恢复显示，三个大文件按钮隐藏
+    assert(!tbBtn("排序…").classList.contains("hidden"), "小模式应显示排序按钮");
+    assert(tbBtn("执行筛选").classList.contains("hidden"), "小模式应隐藏执行筛选");
+    assert(tbBtn("执行列操作").classList.contains("hidden"), "小模式应隐藏执行列操作");
+    assert(tbBtn("撤销列操作预览").classList.contains("hidden"), "小模式应隐藏撤销列操作预览");
   });
   check("大模式：超高行数虚拟缩放（滚动到底不空白）", async () => {
     // 回归：元素/滚动高 16,777,214px 上限曾致大文件滚动后视口空白。
