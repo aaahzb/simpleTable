@@ -12,3 +12,9 @@ Thumbs.db
 # 本地开发日志，不上库
 TODO.md
 /target/
+
+# 待删隔离区（调试验收后由用户手动删除，不入库）
+/tmpArchive/
+
+# 用户真实数据文件，绝不可入库
+/price_j8888.csv
