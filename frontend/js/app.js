@@ -671,16 +671,27 @@ function focusSide(side) {
 
 /**
  * 建立分屏：目标签上副侧（B 网格），焦点留在主侧。
- * 目标签不得为活动签；大档受引擎单例约束，双大档拒绝（提示并返回 false）。
+ * 目标签为活动签时同样允许（VS Code 行为）：主侧先换显右邻签，原活动签入副侧。
+ * 双大档（引擎单例约束）拒绝：提示并返回 false。
  *
  * @param {number} id - 目标页签 id。
  * @returns {Promise<boolean>} true = 分屏已建立。
  */
 async function openSplit(id) {
-  if (splitOn || id === activeId) return false;
+  if (splitOn) return false;
   const t = tabs.find((x) => x.id === id);
   if (!t) return false;
-  if (t.kind === "big" && model.isBig) {
+  if (id === activeId) {
+    // 活动签入分屏：主侧改显右邻签（末尾回卷首个），分屏签 = 原活动签
+    if (tabs.length < 2) return false;
+    const idx = tabs.indexOf(t);
+    const next = tabs[(idx + 1) % tabs.length];
+    if (t.kind === "big" && next.kind === "big") {
+      statusMsg("分屏不支持同时打开两个大文件", 3000);
+      return false;
+    }
+    if (!(await activateTab(next.id))) return false; // 主侧重绑邻签（引擎随档仲裁）
+  } else if (t.kind === "big" && model.isBig) {
     statusMsg("分屏不支持同时打开两个大文件", 3000);
     return false;
   }
@@ -726,8 +737,9 @@ function closeSplit() {
 }
 
 /**
- * 页签右键菜单：未分屏给「在分屏中打开」（活动签/双大档禁用）；
- * 分屏态点分屏签给「关闭分屏」；其余场景不出菜单。
+ * 页签右键菜单：未分屏给「在分屏中打开」（只有一个签时禁用；双大档由动作层
+ * 点击后拒绝并提示原因，避免灰着不给说法）；分屏态点分屏签给「关闭分屏」；
+ * 其余场景不出菜单。
  *
  * @param {DocTab} t - 目标页签。
  * @param {number} x - 菜单位置 x。
@@ -736,10 +748,9 @@ function closeSplit() {
  */
 function showTabMenu(t, x, y) {
   if (!splitOn) {
-    const bothBig = t.kind === "big" && model.isBig;
     showMenu(x, y, [{
       label: "在分屏中打开",
-      disabled: t.id === activeId || bothBig,
+      disabled: tabs.length < 2, // 单签无可对照档
       onClick: () => openSplit(t.id),
     }]);
     return;

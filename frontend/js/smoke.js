@@ -797,10 +797,39 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(sideCellText("B", 0, 0) === "乙B", "副侧应显示分屏签 b");
   });
 
+  check("分屏：活动签可直接入分屏——主侧自动切显邻签", async () => {
+    // 右键点【活动签】也应能分屏（VS Code 行为）：活动签移到副侧，主侧换显右邻签
+    await window.__app.closeSplit();
+    const fa = `${TMP}/sv/a.csv`; const fb = `${TMP}/sv/b.csv`;
+    const ta = window.__app.tabs().find((x) => x.path === fa);
+    const tb = window.__app.tabs().find((x) => x.path === fb);
+    assert(window.__app.tabs().find((x) => x.active)?.id === ta.id, "活动签应是 a");
+    const el = tabEl("a.csv");
+    assert(el, "应找到 a 签元素");
+    el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    const item = [...document.querySelectorAll(".ctx-menu .mi")]
+      .find((x) => x.textContent === "在分屏中打开");
+    assert(item && !item.classList.contains("disabled"), "活动签的「在分屏中打开」不应禁用");
+    item.click();
+    await sleep(80);
+    const sp = window.__app.split();
+    assert(sp.on === true && sp.splitTabId === ta.id && sp.focused === "A",
+      `活动签入分屏态应就绪 ${JSON.stringify(sp)}`);
+    assert(window.__app.tabs().find((x) => x.active)?.id === tb.id, "主侧应换显邻签 b");
+    assert(sideCellText("B", 0, 0) === "甲A", "副侧应显示原活动签 a");
+    assert(sideCellText("A", 0, 0) === "乙B", "主侧应显示邻签 b");
+    await window.__app.closeSplit();
+    await window.__app.activateTab(ta.id); // 还原：焦点回 a（单视图）
+  });
+
   check("分屏：点副侧焦点交换——内容稳定，编辑落副签", async () => {
     const fa = `${TMP}/sv/a.csv`; const fb = `${TMP}/sv/b.csv`;
     const ta = window.__app.tabs().find((x) => x.path === fa);
     const tb = window.__app.tabs().find((x) => x.path === fb);
+    // 自建分屏（a 主 b 副），不依赖前项的分屏残留态
+    await window.__app.activateTab(ta.id);
+    await window.__app.openSplit(tb.id);
+    assert(window.__app.split().on === true, "分屏应建立");
     // 点副侧首格：mousedown 先激活该侧，再处理选中
     const cell = document.querySelector('#grid-area2 .cell[data-row="0"][data-col="0"]');
     assert(cell, "副侧首格应在 DOM");
@@ -843,14 +872,18 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       await invoke("smoke_write_repeat", { path: p, line: "目的地\r\n", times: 1, append: false });
       await invoke("smoke_write_repeat", { path: p, line: `${name},1\r\n`, times: 800, append: true });
     }
-    // 活动签 = big1（首个）；右键 big2 → 双大档应禁用
+    // 活动签 = big1（首个）；右键 big2 → 双大档：项可点，动作层拒绝并状态栏提示原因
     await window.__app.openPathsAsTabs([b1, b2]);
     const el = tabEl("big2.csv");
     el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
     const item = [...document.querySelectorAll(".ctx-menu .mi")]
       .find((x) => x.textContent === "在分屏中打开");
-    assert(item?.classList.contains("disabled") === true, "双大档应禁止分屏");
-    document.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); // 收起菜单
+    assert(item && !item.classList.contains("disabled"), "双大档项可点击（由动作层拒绝）");
+    item.click(); // 拒绝路径同步执行：状态栏提示立即生效（大档取页落定会随后改写状态栏）
+    assert(document.getElementById("status-text").textContent === "分屏不支持同时打开两个大文件",
+      "应状态栏提示拒绝原因");
+    await sleep(80);
+    assert(window.__app.split().on === false, "双大档点击后不应建立分屏");
     // 切到小签 a 激活，再右键 big2 → 大小可分
     const fa = `${TMP}/sv/a.csv`;
     await window.__app.activateTab(window.__app.tabs().find((x) => x.path === fa).id);
