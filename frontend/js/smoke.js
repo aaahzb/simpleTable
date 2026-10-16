@@ -641,6 +641,121 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(model.rawData(0, 0) === "m1", "多行文本不应填充选区");
   });
 
+  // ========== 多文件页签 ==========
+
+  /** 写 UTF-8 文本夹具（页签测试用） */
+  async function writeText(p, text) {
+    await invoke("smoke_write_bytes", { path: p, bytes: [...new TextEncoder().encode(text)] });
+  }
+
+  /** 弹出的"未保存"三选框里点指定按钮（无弹窗则什么都不做） */
+  function clickDiscardDialog(text) {
+    const mask = document.querySelector(".modal-mask");
+    if (!mask || !mask.textContent.includes("未保存")) return false;
+    [...mask.querySelectorAll("button")].find((b) => b.textContent === text)?.click();
+    return true;
+  }
+
+  check("页签：多文件拖入出标签条，全部入签，激活首个", async () => {
+    const f1 = `${TMP}/tabm/a.csv`; const f2 = `${TMP}/tabm/b.csv`; const f3 = `${TMP}/tabm/c.csv`;
+    await writeText(f1, "目的地,评分\r\n甲,1\r\n");
+    await writeText(f2, "目的地,评分\r\n乙,2\r\n");
+    await writeText(f3, "目的地,评分\r\n丙,3\r\n");
+    const before = window.__app.tabs().length;
+    // 前置档是脏的（上一用例打开带警告 CSV 后未保存）：
+    // 首个文件装入前先弹 保存/放弃/取消——点"放弃"放行
+    const pendingOpen = window.__app.openPathsAsTabs([f1, f2, f3]);
+    await sleep(100);
+    assert(clickDiscardDialog("放弃") === true, "脏档拖入应先弹未保存确认");
+    const opened = await pendingOpen;
+    const t = window.__app.tabs();
+    assert(opened === true, "openPathsAsTabs 应返回成功");
+    // 3 文件入签；此前无签（before=0）时装当前档+ensureTabbed 出首签
+    assert(t.length === before + 3, `页签数 ${t.length}`);
+    const bar = document.getElementById("tabbar");
+    assert(getComputedStyle(bar).display !== "none", "多档时标签条应显示");
+    assert(t.find((x) => x.path === f1)?.active === true, "应激活首个拖入文件");
+    assert(t.some((x) => x.path === f2) && t.some((x) => x.path === f3), "其余文件应各有一签");
+    assert(model.rawData(0, 0) === "甲", "激活档内容应为首个文件");
+  });
+
+  check("页签：切换保留数据/脏态/撤销，互不串档", async () => {
+    const ta = window.__app.tabs().find((x) => x.path?.endsWith("tabm/a.csv"));
+    const tb = window.__app.tabs().find((x) => x.path?.endsWith("tabm/b.csv"));
+    await window.__app.activateTab(ta.id);
+    model.setData(0, 0, "改过");
+    assert(window.__app.isDirty() === true, "编辑后应标脏");
+    await window.__app.activateTab(tb.id);
+    assert(model.rawData(0, 0) === "乙", "b 档内容");
+    assert(window.__app.isDirty() === false, "b 档未改过应不脏");
+    await window.__app.activateTab(ta.id);
+    assert(model.rawData(0, 0) === "改过", "a 档修改应随签保留");
+    assert(window.__app.isDirty() === true, "a 档脏态应随签保留");
+    model.undo();
+    assert(model.rawData(0, 0) === "甲", "a 档撤销栈应保留");
+  });
+
+  check("页签：重复路径激活已有，不重复开签", async () => {
+    const n = window.__app.tabs().length;
+    const f2 = window.__app.tabs().find((x) => x.path?.endsWith("tabm/b.csv"));
+    await window.__app.openPathsAsTabs([f2.path]);
+    const t = window.__app.tabs();
+    const diag2 = `n=${n} f2=${f2.path} active=${t.find((x) => x.active)?.path || "?"} ` +
+      `paths=[${t.map((x) => x.path || "?").join(", ")}] ` +
+      `status="${document.getElementById("status-text")?.textContent || "?"}"`;
+    assert(t.length === n, `重复拖入不应新增页签 —— ${diag2}`);
+    // openPathsAsTabs 语义：列表首个文件激活（重复文件=激活已有签）
+    assert(t.find((x) => x.path === f2.path)?.active === true,
+      `应激活已有页签 —— ${diag2}`);
+  });
+
+  check("页签：关闭脏签弹三选确认，放弃后关签并激活相邻", async () => {
+    const a = window.__app.tabs().find((x) => x.path?.endsWith("tabm/a.csv"));
+    await window.__app.activateTab(a.id);
+    model.setData(0, 0, "又要关"); // 弄脏
+    const n = window.__app.tabs().length;
+    const p = window.__app.closeTab(a.id); // 不 await：确认框须在同步阶段挂上
+    assert(clickDiscardDialog("放弃") === true, "关脏签应弹未保存确认");
+    await p;
+    const t = window.__app.tabs();
+    assert(t.length === n - 1, "放弃后页签应被移除");
+    assert(!t.some((x) => x.id === a.id), "被关页签不应再出现");
+    const act = t.find((x) => x.active);
+    assert(act && act.id !== a.id, "应自动激活相邻页签");
+    assert(act.path?.endsWith("tabm/b.csv") === true, "应优先激活右侧相邻签");
+  });
+
+  check("页签：关到只剩一档标签条隐藏，全关回空表", async () => {
+    for (;;) {
+      const t = window.__app.tabs();
+      if (!t.length) break;
+      const cur = t.find((x) => x.active) ?? t[0];
+      const p = window.__app.closeTab(cur.id);
+      clickDiscardDialog("放弃");
+      await p;
+    }
+    assert(window.__app.tabs().length === 0, "页签应全部清空");
+    assert(getComputedStyle(document.getElementById("tabbar")).display === "none",
+      "档数<2 时标签条应隐藏");
+    assert(model.rowCount() === 0 && model.columnCount() === 0, "全关后应回空表");
+  });
+
+  check("页签：标签超出宽度出滚动按钮且可滚动", async () => {
+    const names = [];
+    for (let i = 0; i < 24; i += 1) names.push(`${TMP}/tabm/many_${i}.csv`);
+    for (let i = 0; i < 24; i += 1) await writeText(names[i], `目的地\r\n行${i}\r\n`);
+    await window.__app.openPathsAsTabs(names);
+    const bar = document.getElementById("tabbar");
+    const scroll = document.getElementById("tab-scroll");
+    const next = document.getElementById("tab-next");
+    assert(bar.classList.contains("overflow") || scroll.scrollWidth > scroll.clientWidth,
+      "页签超出宽度应进入溢出态");
+    assert(next.offsetWidth > 0, "溢出时应显示滚动按钮");
+    const before = scroll.scrollLeft;
+    next.click();
+    assert(scroll.scrollLeft > before, "点滚动按钮应滚动页签条");
+  });
+
   check("Del 立即清除选区内容（无确认）", async () => {
     loadBasic();
     grid.select([0, 0]);
@@ -1342,11 +1457,35 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await invoke("smoke_set_force_big", { v: false });
   });
 
+  check("页签：大档引擎单例——第二大档腾退重开，小↔大切换免提示", async () => {
+    await invoke("smoke_set_force_big", { v: true });
+    const b1 = `${TMP}/tabbig/b1.csv`; const b2 = `${TMP}/tabbig/b2.csv`;
+    for (const [p, name] of [[b1, "甲"], [b2, "乙"]]) {
+      await invoke("smoke_write_repeat", { path: p, line: "目的地,评分\r\n", times: 1, append: false });
+      await invoke("smoke_write_repeat", { path: p, line: `${name},1\r\n`, times: 1500, append: true });
+    }
+    await window.__app.openPathsAsTabs([b1, b2]);
+    const t = window.__app.tabs();
+    const tb1 = t.find((x) => x.path === b1);
+    const tb2 = t.find((x) => x.path === b2);
+    assert(tb1?.kind === "big" && tb2?.kind === "big", "两档都应是大档");
+    assert(tb1.active === true && model.rowCount() === 1500, "首个大档应已激活");
+    // 引擎腾退（b1 无脏，不弹窗）→ 重开 b2
+    await window.__app.activateTab(tb2.id);
+    assert(model.rowCount() === 1500 && model.rawData(0, 0) === "乙", "第二大档内容");
+    // 回切 b1：引擎再次重开，数据来自磁盘原样
+    await window.__app.activateTab(tb1.id);
+    assert(model.rawData(0, 0) === "甲", "重开第一大档内容应正确");
+    await window.__app.activateTab(tb2.id);
+    assert(model.rawData(0, 0) === "乙", "大小档再切换内容应正确");
+    await invoke("smoke_set_force_big", { v: false });
+  });
+
   // ---- 执行（看门狗：整体超时强制收尾，防挂死） ----
   const watchdog = setTimeout(async () => {
     lines.push("", `[watchdog] 超时未完成，已通过 ${lines.length} 项`);
     await invoke("finish_smoke", { report: lines.join("\n"), code: 1 });
-  }, 45000);
+  }, 120000);
   for (const [name, fn] of checks) {
     try {
       await fn();

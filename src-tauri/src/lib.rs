@@ -101,6 +101,12 @@ fn finish_smoke(report: String, code: i32) {
 /// 写入失败返回错误串。
 #[tauri::command]
 fn smoke_write_bytes(path: String, bytes: Vec<u8>) -> Result<(), String> {
+    // 前端按名字构造子目录（如 tabm/a.csv），父目录不存在时先建
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| io_err(&path, &e))?;
+        }
+    }
     fs::write(&path, bytes).map_err(|e| io_err(&path, &e))
 }
 

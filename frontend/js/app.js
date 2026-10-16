@@ -85,10 +85,415 @@ function updateTitle() {
   invoke("set_title", { title: `${star}${name} - simpleTable` });
 }
 
+/** 置脏标志并同步活动页签（页签脏点与窗口标题同源），随后刷新标题 */
+function setDirty(v) {
+  dirty = v;
+  const t = activeTab();
+  if (t) t.dirty = v;
+  updateTitle();
+}
+
 /** 标脏并刷新标题与状态栏（对齐 _mark_dirty） */
 function markDirty() {
-  dirty = true;
-  updateTitle();
+  setDirty(true);
+  updateStatusText();
+}
+
+// ============ 多文件页签 ============
+// 小档页签持有完整模型（数据/撤销/脏态随签保留）；大档页签受 Rust 引擎
+// 全局单例约束：激活期间引擎驻留，切到小档不腾退（编辑与撤销原样保留），
+// 切到另一个大档才关闭重开（驻留档有脏时先弹 保存/放弃/取消）。
+// 切换页签时视图重置（筛选/选区/滚动不随签保留，v1 边界）。
+
+/**
+ * @typedef {Object} DocTab
+ * @property {number} id - 页签 id。
+ * @property {string} title - 显示名（文件名/未命名）。
+ * @property {string | null} path - 文件路径（null = 未命名）。
+ * @property {"small" | "big"} kind - 文档类型。
+ * @property {TableModel | BigModel | null} model - 小档恒为模型实例；大档仅引擎驻留期间有效。
+ * @property {boolean} dirty - 未保存修改。
+ */
+/** @type {DocTab[]} */
+let tabs = [];
+/** @type {number | null} 活动页签 id；null = 当前档尚未入签（启动/单档态） */
+let activeId = null;
+/** @type {number | null} 大引擎驻留页签；null = 无驻留（未入签时引擎归当前档） */
+let engineTabId = null;
+let tabSeq = 1;
+
+const tabbarEl = document.getElementById("tabbar");
+const tabScrollEl = document.getElementById("tab-scroll");
+
+/** 文件名（路径分隔符后的末段；无路径 = 未命名） */
+function tabTitleOf(p) {
+  return p ? p.split(/[\\/]/).pop() : "未命名";
+}
+
+/** @returns {DocTab | null} 活动页签（未入签返回 null） */
+function activeTab() {
+  return tabs.find((t) => t.id === activeId) ?? null;
+}
+
+/** 当前档状态写回活动页签（切换/渲染前调用，live 变量 ↔ 页签镜像同步） */
+function syncActiveTab() {
+  const t = activeTab();
+  if (!t) return;
+  t.path = path;
+  t.dirty = dirty;
+  if (!model.isBig || engineTabId === t.id) t.model = model;
+}
+
+/** 当前档装入页签体系（保持内容/脏态不变；幂等） */
+function ensureTabbed() {
+  if (activeId !== null) return;
+  const t = {
+    id: tabSeq++, title: tabTitleOf(path), path, kind: model.isBig ? "big" : "small",
+    model: model.isBig ? model : model, dirty,
+  };
+  tabs.push(t);
+  activeId = t.id;
+  if (model.isBig) engineTabId = t.id;
+}
+
+/** 重建页签条 DOM 并刷新溢出态；激活页签自动滚入可视区 */
+function renderTabbar() {
+  tabbarEl.classList.toggle("show", tabs.length >= 2);
+  tabScrollEl.textContent = "";
+  for (const t of tabs) {
+    const el = document.createElement("div");
+    el.className = "tab" + (t.id === activeId ? " active" : "");
+    el.title = t.path || t.title;
+    el.dataset.id = String(t.id);
+    const label = document.createElement("span");
+    label.className = "tab-label";
+    const d = t.id === activeId ? dirty : t.dirty;
+    label.textContent = d ? `${t.title} ●` : t.title;
+    el.appendChild(label);
+    const x = document.createElement("button");
+    x.className = "tab-close";
+    x.textContent = "×";
+    x.title = "关闭（鼠标中键同效）";
+    x.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void closeTab(t.id);
+    });
+    el.appendChild(x);
+    el.addEventListener("click", () => void activateTab(t.id));
+    el.addEventListener("auxclick", (e) => {
+      if (e.button === 1) {
+        e.preventDefault();
+        void closeTab(t.id);
+      }
+    });
+    tabScrollEl.appendChild(el);
+  }
+  updateTabOverflow();
+  tabScrollEl.querySelector(".tab.active")
+    ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+
+/** 溢出态：页签总宽超可视宽 → 显示 ◀▶ 滚动按钮并按位置禁用 */
+function updateTabOverflow() {
+  const ov = tabScrollEl.scrollWidth > tabScrollEl.clientWidth + 1;
+  tabbarEl.classList.toggle("overflow", ov);
+  document.getElementById("tab-prev").disabled = tabScrollEl.scrollLeft <= 0;
+  document.getElementById("tab-next").disabled =
+    tabScrollEl.scrollLeft + tabScrollEl.clientWidth >= tabScrollEl.scrollWidth - 1;
+}
+
+document.getElementById("tab-prev").addEventListener("click", () => tabScrollEl.scrollBy({ left: -180 }));
+document.getElementById("tab-next").addEventListener("click", () => tabScrollEl.scrollBy({ left: 180 }));
+tabScrollEl.addEventListener("wheel", (e) => {
+  if (tabScrollEl.scrollWidth <= tabScrollEl.clientWidth + 1) return;
+  e.preventDefault();
+  tabScrollEl.scrollLeft += e.deltaY || e.deltaX;
+}, { passive: false });
+tabScrollEl.addEventListener("scroll", updateTabOverflow);
+new ResizeObserver(updateTabOverflow).observe(tabScrollEl);
+
+/**
+ * 引擎腾退：目标大档要用引擎时，关闭当前驻留（脏的弹 保存/放弃/取消）。
+ *
+ * @param {number | null} targetTabId - 目标页签 id（null = 当前未入签档）。
+ * @returns {Promise<boolean>} true = 引擎可用；false = 用户取消。
+ */
+async function evictEngineFor(targetTabId) {
+  if (engineTabId === targetTabId) return true; // 同档：复用驻留
+  if (engineTabId === null) {
+    // 引擎归当前未入签档（启动单档态）：用当前 live 状态询问
+    if (model.isBig) {
+      if (dirty && !(await confirmDiscard())) return false;
+      await invoke("big_close").catch(() => {});
+    }
+    return true;
+  }
+  const holder = tabs.find((t) => t.id === engineTabId);
+  if (holder?.dirty) {
+    const choice = await confirmDiscardDialog();
+    if (choice === "cancel") return false;
+    if (choice === "save") {
+      // 驻留档的 BigModel 实例在引擎存活期间始终有效：无需切签即可保存
+      const dlg = progressDialog(`保存 ${holder.title}…`);
+      const un = await holder.model.onProgress((d, tot, ph, rows) => dlg.set(d, tot, ph, rows));
+      try {
+        await holder.model.save();
+        holder.dirty = false;
+      } catch (err) {
+        un();
+        dlg.close();
+        await errorDialog("保存失败", `${err?.message ?? err}`);
+        return false;
+      }
+      un();
+      await dlg.finish();
+    }
+  }
+  await invoke("big_close").catch(() => {});
+  if (holder) holder.model = null;
+  engineTabId = null;
+  return true;
+}
+
+/**
+ * 为大档打开引擎会话（含腾退仲裁与事件绑定）。
+ *
+ * @param {number | null} tabId - 归属页签（null = 当前未入签档）。
+ * @param {string} p - 文件路径。
+ * @returns {Promise<BigModel | null>} 失败/取消返回 null（已弹窗）。
+ */
+async function openBigEngineFor(tabId, p) {
+  if (!(await evictEngineFor(tabId))) return null;
+  const bm = new BigModel();
+  bindModelEvents(bm); // 先绑事件再 open：内部 reset/data 通知才能到达外壳
+  try {
+    await bm.open(p);
+  } catch (err) {
+    await errorDialog("打开失败", String(err?.message ?? err));
+    return null;
+  }
+  engineTabId = tabId;
+  return bm;
+}
+
+/**
+ * 装载文档（读文件→建模型；大档先仲裁引擎）。不碰当前 live 状态。
+ *
+ * @param {string} p - 文件路径。
+ * @param {boolean} wantBig - 是否走大文件模式。
+ * @param {number | null} tabId - 归属页签（大档仲裁/归属用）。
+ * @returns {Promise<{kind: "small" | "big", model: any, warnings?: string[]} | null>}
+ */
+async function loadDoc(p, wantBig, tabId) {
+  if (wantBig) {
+    const bm = await openBigEngineFor(tabId, p);
+    if (!bm) return null;
+    return { kind: "big", model: bm };
+  }
+  let result;
+  try {
+    result = await invoke("read_csv_file", { path: p });
+  } catch (err) {
+    await errorDialog("打开失败", String(err));
+    return null;
+  }
+  const { headers, rows, warnings } = parseCsv(result.text);
+  const m = new TableModel();
+  bindModelEvents(m);
+  m.load(headers, rows);
+  return { kind: "small", model: m, warnings };
+}
+
+/** 换档/装载后的视图重置：清筛选选区、滚动回顶、窗格清空、计数与按钮刷新 */
+function applyViewState() {
+  grid.clearFilters();
+  grid.clearSelection();
+  grid.setModel(model);
+  grid.scrollEl.scrollTop = 0;
+  grid.scrollEl.scrollLeft = 0;
+  currentCell = null;
+  pane.setText("");
+  lastFilterMs = 0;
+  onCountsChanged(model.rowCount(), model.rowCount());
+  refreshBigUi();
+}
+
+/**
+ * 把装载好的文档应用到当前档（启动/未入签态/重载共用）。
+ *
+ * @param {{kind: string, model: any, warnings?: string[]}} doc - 装载结果。
+ * @param {string} p - 文件路径。
+ */
+function applyDocToCurrent(doc, p) {
+  model = doc.model;
+  path = p;
+  applyViewState();
+  setDirty(false);
+  const t = activeTab();
+  if (t) {
+    t.path = p;
+    t.kind = doc.kind;
+    t.title = tabTitleOf(p);
+    t.model = doc.model;
+  }
+  renderTabbar();
+  updateStatusText();
+  if (doc.kind === "big") {
+    const meta = model.meta();
+    statusMsg(
+      `大文件模式：${meta.rows} 行 × ${meta.cols} 列（${meta.encoding}），` +
+      "筛选需点「执行筛选」", 6000);
+  }
+  if (doc.warnings?.length) {
+    void infoDialog("打开提示", doc.warnings.slice(0, 20).join("\n"));
+  }
+}
+
+/**
+ * 切换活动页签：状态写回旧签 → 引擎仲裁 → 换绑视图。
+ *
+ * @param {number} id - 目标页签 id。
+ * @returns {Promise<boolean>} true = 已切换；false = 用户取消或打开失败。
+ */
+async function activateTab(id) {
+  if (id === activeId) return true;
+  const t = tabs.find((x) => x.id === id);
+  if (!t) return false;
+  syncActiveTab();
+  if (t.kind === "big") {
+    if (!(engineTabId === t.id && t.model)) {
+      // 引擎已腾退（或从未打开）：重新打开
+      const bm = await openBigEngineFor(t.id, t.path);
+      if (!bm) return false;
+      t.model = bm;
+    }
+    model = t.model;
+  } else {
+    model = t.model;
+  }
+  activeId = id;
+  path = t.path;
+  applyViewState();
+  setDirty(t.dirty);
+  renderTabbar();
+  return true;
+}
+
+/**
+ * 新开页签装载文档（批量拖入可不激活，避免连开闪烁）。
+ *
+ * @param {string} p - 文件路径。
+ * @param {boolean} wantBig - 是否走大文件模式。
+ * @param {object} [opts] - 选项。
+ * @param {boolean} [opts.activate] - 装载后激活（默认 true）。
+ * @returns {Promise<DocTab | null>} 新页签或 null（失败已弹窗）。
+ */
+async function loadIntoNewTab(p, wantBig, opts = {}) {
+  const t = {
+    id: tabSeq++, title: tabTitleOf(p), path: p,
+    kind: wantBig ? "big" : "small", model: null, dirty: false,
+  };
+  const doc = await loadDoc(p, wantBig, t.id);
+  if (!doc) return null;
+  t.kind = doc.kind;
+  t.model = doc.model;
+  tabs.push(t);
+  if (opts.activate !== false) {
+    await activateTab(t.id);
+    if (doc.warnings?.length) {
+      void infoDialog("打开提示", doc.warnings.slice(0, 20).join("\n"));
+    }
+  } else {
+    renderTabbar();
+  }
+  return t;
+}
+
+/**
+ * 拖入多文件：逐个入签（重复路径激活已有），最终激活列表首个。
+ *
+ * @param {string[]} paths - CSV 路径列表。
+ * @returns {Promise<boolean>} 至少一个文件成功。
+ */
+async function openPathsAsTabs(paths) {
+  // 未入签的脏档（打开带警告 CSV 后弹过提示框、或其他未命名修改）：
+  // 直接装进当前档会留下 unnamed 悬空签；先问 保存/放弃/取消。
+  if (activeId === null && dirty) {
+    if (!(await confirmDiscard())) return false;
+  }
+  // 收尾激活目标：列表首个文件的归属签。
+  let firstId = null;
+  if (activeId === null) {
+    // 无签状态（启动空档/全关后）：首个文件直接装进当前档，省一个过渡签。
+    // 装入后须 ensureTabbed 实体化，否则按路径找不到归属签。
+    const first = paths.shift();
+    if (first === undefined) return true;
+    if (!(await openPath(first))) return false;
+    ensureTabbed();
+    firstId = activeTab()?.id ?? null;
+  } else {
+    ensureTabbed();
+  }
+  for (const p of paths) {
+    const exist = tabs.find((t) => t.path === p);
+    if (exist) {
+      firstId ??= exist.id;
+      continue;
+    }
+    let size;
+    try {
+      size = await invoke("file_size", { path: p });
+    } catch (err) {
+      await errorDialog("打开失败", String(err));
+      continue;
+    }
+    const forceBig = await invoke("smoke_force_big");
+    const t = await loadIntoNewTab(p, forceBig || size >= BIG_THRESHOLD,
+      { activate: false });
+    if (t) firstId ??= t.id;
+  }
+  if (firstId !== null && firstId !== activeId) await activateTab(firstId);
+  return firstId !== null;
+}
+
+/**
+ * 关闭页签：脏档弹 保存/放弃/取消（非活动脏签先切过去，所见即所关）；
+ * 活动签关闭后激活相邻签；最后一签关闭后回空表。
+ *
+ * @param {number} id - 页签 id。
+ * @returns {Promise<boolean>} true = 已关闭；false = 用户取消。
+ */
+async function closeTab(id) {
+  if (!tabs.some((t) => t.id === id)) return true;
+  if (id !== activeId && !(await activateTab(id))) return false;
+  if (!(await confirmDiscard())) return false; // 脏 → 保存/放弃/取消
+  const t = activeTab();
+  const idx = tabs.indexOf(t);
+  if (engineTabId === t.id) {
+    await invoke("big_close").catch(() => {});
+    engineTabId = null;
+  }
+  tabs.splice(idx, 1);
+  if (!tabs.length) {
+    resetToEmpty();
+    return true;
+  }
+  activeId = null; // 强制 activateTab 走完整换绑
+  const ok = await activateTab(tabs[Math.min(idx, tabs.length - 1)].id);
+  renderTabbar();
+  return ok;
+}
+
+/** 全部页签关闭后回空表（对齐启动态） */
+function resetToEmpty() {
+  model = new TableModel();
+  bindModelEvents(model);
+  path = null;
+  activeId = null;
+  applyViewState();
+  model.load([], []);
+  setDirty(false);
+  renderTabbar();
   updateStatusText();
 }
 
@@ -189,8 +594,7 @@ async function applyColOps() {
     // 物理重写已把内存状态（含覆盖层编辑/插删行）落盘：文件与内存一致。
     // applyColOps 的 _emitData 经 onData 标了脏，此处复位——否则保存会再做
     // 一次全量流式重写（用户看到的"莫名其妙第二根进度条"）。
-    dirty = false;
-    updateTitle();
+    setDirty(false);
     statusMsg("列操作已完成（物理重写，撤销历史已清空）", 4000);
     ok = true;
   } catch (err) {
@@ -366,8 +770,7 @@ let resetPending = false;
 function bindModelEvents(m) {
   m.onReset(() => {
     resetPending = true; // 紧随其后的 onData 是装载/恢复本身，不视为脏
-    dirty = false; // 撤销/重做会由各自 wrapper 在返回前重新标脏
-    updateTitle();
+    setDirty(false); // 撤销/重做会由各自 wrapper 在返回前重新标脏
     clearDock();
     updateStatusText();
     grid.resetScroll(); // WebView2 会话记忆滚动位置，装载须回顶（对齐 Qt）
@@ -406,116 +809,83 @@ bindModelEvents(model);
 
 // ============ 文件操作（F2/F3/F4） ============
 
-/** 新建表格：确认丢弃修改后弹出列定义对话框（F1） */
+/** 新建表格：弹出列定义对话框（F1）；作为新页签打开（旧档保留） */
 async function newFile() {
-  if (!(await confirmDiscard())) return;
   const names = await newTableDialog();
   if (names === null) return;
   if (!names.length) {
     await infoDialog("新建表格", "至少需要一列。");
     return;
   }
-  grid.clearFilters();
-  await switchToModel(new TableModel());
-  model.load(names, Array.from({ length: NEW_TABLE_ROWS }, () => names.map(() => "")));
-  path = null;
-  dirty = false;
-  updateTitle();
-  onCountsChanged(model.rowCount(), model.rowCount());
-  refreshBigUi();
+  const m = new TableModel();
+  m.load(names, Array.from({ length: NEW_TABLE_ROWS }, () => names.map(() => "")));
+  const pristine = tabs.length === 0 && activeId === null && path === null && !dirty
+    && model.rowCount() === 0 && model.columnCount() === 0;
+  if (pristine) {
+    // 启动空表原位替换（尚未入签体系）
+    model = m;
+    bindModelEvents(m);
+    applyViewState();
+    setDirty(false);
+    renderTabbar();
+    updateStatusText();
+    return;
+  }
+  ensureTabbed();
+  const t = {
+    id: tabSeq++, title: "未命名", path: null, kind: "small", model: m, dirty: false,
+  };
+  tabs.push(t);
+  await activateTab(t.id);
 }
 
-/** 打开 CSV：文件对话框选择 */
+/** 打开 CSV：文件对话框选择（作为新页签；已有路径则激活） */
 async function openFile() {
-  if (!(await confirmDiscard())) return;
   const p = await invoke("pick_open_path");
   if (p) await openPath(p);
 }
 
 /**
- * 打开指定路径的 CSV（菜单打开与拖放打开共用）。
+ * 打开指定路径的 CSV（菜单/拖放/启动/重载共用）。
  * 按文件大小路由：≥ 阈值（或冒烟强制）走大文件模式（mmap 秒开），否则原路径。
+ * 入签规则：路径已有签 → 激活；未入签体系 → 装当前档；否则新开页签。
  *
  * @param {string} p - CSV 文件路径。编码自动识别（Rust 层）。
+ * @param {object} [opts] - 选项。
+ * @param {boolean} [opts.replace] - 重载当前签内容（外部改动重载），先确认丢弃。
+ * @param {boolean} [opts.noConfirm] - replace 时跳过丢弃确认（调用方已问过）。
+ * @returns {Promise<boolean>} true = 成功打开/切换。
  */
-async function openPath(p) {
+async function openPath(p, opts = {}) {
   let size;
   try {
     size = await invoke("file_size", { path: p });
   } catch (err) {
     await errorDialog("打开失败", String(err));
-    return;
+    return false;
   }
   const forceBig = await invoke("smoke_force_big");
-  if (forceBig || size >= BIG_THRESHOLD) {
-    await openBigPath(p);
-    return;
-  }
-  let result;
-  try {
-    result = await invoke("read_csv_file", { path: p });
-  } catch (err) {
-    await errorDialog("打开失败", String(err));
-    return;
-  }
-  const { text } = result;
-  const { headers, rows, warnings } = parseCsv(text);
-  grid.clearFilters();
-  await switchToModel(new TableModel());
-  model.load(headers, rows);
-  path = p;
-  dirty = false;
-  updateTitle();
-  onCountsChanged(model.rowCount(), model.rowCount());
-  refreshBigUi();
-  if (warnings.length) {
-    await infoDialog("打开提示", warnings.slice(0, 20).join("\n"));
-  }
-}
+  const wantBig = forceBig || size >= BIG_THRESHOLD;
 
-/**
- * 模型热交换：grid/窗格/工具栏切换到目标模型（大模式关闭旧会话）。
- *
- * @param {TableModel | BigModel} next - 目标模型。
- * @returns {Promise<void>}
- */
-async function switchToModel(next) {
-  if (model.isBig) await model.close().catch(() => {});
-  model = next;
-  grid.setModel(next);
-  bindModelEvents(next);
-  refreshBigUi();
-}
-
-/**
- * 大文件模式打开：mmap + 行索引，秒开；视图经窗口缓存按需取数。
- *
- * @param {string} p - CSV 文件路径。
- * @returns {Promise<void>}
- */
-async function openBigPath(p) {
-  const bm = new BigModel();
-  let meta;
-  try {
-    // 先绑定事件再 open：open 内部的 reset/data 通知才能到达外壳
-    bindModelEvents(bm);
-    meta = await bm.open(p);
-    model = bm;
-    grid.setModel(bm);
-  } catch (err) {
-    await errorDialog("打开失败", String(err?.message ?? err));
-    return;
+  if (opts.replace) {
+    // 重载当前签：引擎归属不变（big_open 原位替换内容），丢弃前确认
+    if (!opts.noConfirm && !(await confirmDiscard())) return false;
+    const doc = await loadDoc(p, wantBig, activeId);
+    if (!doc) return false;
+    applyDocToCurrent(doc, p);
+    return true;
   }
-  grid.clearFilters();
-  path = p;
-  dirty = false;
-  lastFilterMs = 0;
-  updateTitle();
-  onCountsChanged(model.rowCount(), model.rowCount());
-  refreshBigUi();
-  statusMsg(
-    `大文件模式：${meta.rows} 行 × ${meta.cols} 列（${meta.encoding}），` +
-    "筛选需点「执行筛选」", 6000);
+  const exist = tabs.find((t) => t.path === p);
+  if (exist) return activateTab(exist.id);
+  if (tabs.length === 0) {
+    // 启动/初始空表：装当前档（暂不生成页签）
+    const doc = await loadDoc(p, wantBig, activeId);
+    if (!doc) return false;
+    applyDocToCurrent(doc, p);
+    return true;
+  }
+  ensureTabbed();
+  return (await loadIntoNewTab(p, wantBig)) !== null;
 }
 
 /** 保存到当前路径（无路径时转另存为） */
@@ -539,8 +909,7 @@ async function saveFile() {
     // 完成帧短暂停留再关闭：重写期间磁盘 IO 可能饿死渲染管线，屏幕停在
     // 中间的旧帧——保证"100% 完成"被看到，而不是"卡住后消失"。
     await dlg.finish();
-    dirty = false;
-    updateTitle();
+    setDirty(false);
     statusMsg("已保存（大文件模式：流式重写完成）", 3000);
     return;
   }
@@ -553,8 +922,7 @@ async function saveFile() {
     await errorDialog("保存失败", `${err}\n文件可能被其他程序占用，可尝试另存为。`);
     return;
   }
-  dirty = false;
-  updateTitle();
+  setDirty(false);
 }
 
 /** 另存为 CSV */
@@ -564,6 +932,9 @@ async function saveFileAs() {
   if (!p.toLowerCase().endsWith(".csv")) p += ".csv";
   path = p;
   await saveFile();
+  // 另存后当前档的身份（路径/标题）随之变化，同步回页签
+  syncActiveTab();
+  renderTabbar();
 }
 
 /**
@@ -588,7 +959,7 @@ window.addEventListener("focus", async () => {
     if (await model.stale()) {
       const reload = await confirmDialog(
         "文件已被外部程序修改。重新加载将丢失当前未保存的修改，是否重载？");
-      if (reload) await openBigPath(path);
+      if (reload) await openPath(path, { replace: true, noConfirm: true });
     }
   } catch { /* 检测失败静默（会话可能已关闭） */ }
 });
@@ -596,13 +967,19 @@ window.addEventListener("focus", async () => {
 // ---- 拖放打开 ----
 tauri.event.listen("tauri://drag-drop", async (e) => {
   const paths = e.payload?.paths ?? [];
-  const p = paths.find((x) => x.toLowerCase().endsWith(".csv"));
-  if (p && await confirmDiscard()) await openPath(p);
+  const csvs = paths.filter((x) => x.toLowerCase().endsWith(".csv"));
+  if (csvs.length) await openPathsAsTabs(csvs);
 });
 
 // ---- 关闭前确认 ----
 tauri.event.listen("close-request", async () => {
-  if (await confirmDiscard()) invoke("quit_app");
+  syncActiveTab();
+  for (const t of tabs) {
+    if (!t.dirty) continue;
+    activateTab(t.id);
+    if (!(await confirmDiscard())) return; // 用户取消：留在该档，中止退出
+  }
+  invoke("quit_app");
 });
 
 // ============ 排序（F5） ============
@@ -906,4 +1283,11 @@ window.__app = {
   applyColOps, cancelColOps, runBigFilter, gotoRow, gotoRowDialog,
   isDirty: () => dirty, getPath: () => path,
   isBigMode: () => model.isBig === true,
+  // 多档页签：快照 / 切换 / 关闭 / 批量拖入
+  tabs: () => tabs.map((t) => ({
+    id: t.id, title: t.title, path: t.path, kind: t.kind,
+    dirty: t.id === activeId ? dirty : t.dirty,
+    active: t.id === activeId,
+  })),
+  activateTab, closeTab, openPathsAsTabs,
 };
