@@ -1,5 +1,6 @@
 # 持续集成：推送 main、提 PR 或手动触发时自动构建 + 自检。
-# Windows 跑完整冒烟自检（真实 WebView2，52 项断言）；macOS 做 arm64 交叉编译检查。
+# Windows：node 逻辑单测（39）+ Rust 引擎单测（29）+ 完整冒烟（真实 WebView2，85 项断言）；
+# macOS：arm64 编译检查 + Rust 引擎单测（Apple Silicon 首个运行时验证，Windows 专属用例自动跳过）。
 name: CI
 
 on:
@@ -30,6 +31,10 @@ jobs:
 
       - name: 编译 debug 构建
         run: cargo build
+        working-directory: src-tauri
+
+      - name: Rust 引擎单测（cargo test，含字节透传/进度相位等引擎断言）
+        run: cargo test
         working-directory: src-tauri
 
       - name: 冒烟自检（真实 WebView 端到端断言，失败看下方报告）
@@ -64,4 +69,8 @@ jobs:
 
       - name: 编译（aarch64-apple-darwin）
         run: cargo build --target aarch64-apple-darwin
+        working-directory: src-tauri
+
+      - name: Rust 引擎单测（macOS arm64 本机跑，Windows 专属用例 cfg 跳过）
+        run: cargo test
         working-directory: src-tauri
