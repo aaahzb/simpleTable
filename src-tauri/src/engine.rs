@@ -838,6 +838,40 @@ mod tests {
     }
 
     #[test]
+    fn big_save_passthrough_preserves_raw_bytes() {
+        // 字节透传契约：未触碰的行在保存后必须逐字节等于原文件
+        // （引号风格、多余空格、内嵌换行、末尾无换行全部保留——
+        // 旧实现整表重编码会把 `"Bob "` 的引号剥掉、给末行补 \r\n）。
+        let content = b"name,note\r\n\"Alice\",\"line1\nline2\"\r\n\"Bob \",\" spaced \"\r\nCarol,plain\r\nDave,x";
+        let p = tmp_csv("passthru", content);
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.remove_rows(vec![2]).unwrap(); // 删 Carol（中间行）
+        bf.save(|_, _, _, _| {}).unwrap();
+        let out = fs::read(&p).unwrap();
+        let expected: &[u8] = b"name,note\r\n\"Alice\",\"line1\nline2\"\r\n\"Bob \",\" spaced \"\r\nDave,x";
+        assert_eq!(out, expected, "未触碰行必须逐字节保留");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_save_passthrough_mixed_edit_delete_insert() {
+        // 混合改动：删除的行消失、编辑的行重编码、插入的行编码、
+        // 其余行透传（末行无换行时透传段不补换行）。
+        let content = b"name,age\r\nAlice,30\r\nBob,40\r\nCarol,50";
+        let p = tmp_csv("passthru2", content);
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(1, 1, "41".into()).unwrap(); // Bob age 40→41
+        bf.remove_rows(vec![0]).unwrap(); // 删 Alice
+        bf.insert_rows(1, Some(vec![vec!["Zed".into(), "1".into()]]), 0)
+            .unwrap(); // vrow 1 插 Zed（Bob 之后）
+        bf.save(|_, _, _, _| {}).unwrap();
+        let out = fs::read(&p).unwrap();
+        let expected: &[u8] = b"name,age\r\nBob,41\r\nZed,1\r\nCarol,50";
+        assert_eq!(out, expected, "混合改动后的物理字节");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
     fn big_col_ops_pending_blocks_edits_then_apply() {
         let p = tmp_csv("colops", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
@@ -1268,6 +1302,8 @@ pub struct BigFile {
     redo_stack: Vec<Op>,
     base_size: u64,
     base_mtime: std::time::SystemTime,
+    /// 原文件是否带 UTF-8 BOM：保存/列操作重写时按原样回写（不注入也不剥除）。
+    has_bom: bool,
 }
 
 impl BigFile {
@@ -1286,6 +1322,8 @@ impl BigFile {
             memmap2::MmapOptions::new().map(&file).map_err(|e| e.to_string())?
         };
         let enc = sniff_encoding(&mmap);
+        // BOM 只对 UTF-8 有意义（GBK 文件可能以相同字节开头纯属巧合）
+        let has_bom = enc == Encoding::Utf8 && mmap.starts_with(&[0xEF, 0xBB, 0xBF]);
         let idx = build_index(&mmap);
         if idx.n_records() == 0 {
             return Err("文件中没有记录".into());
@@ -1316,6 +1354,7 @@ impl BigFile {
             redo_stack: Vec::new(),
             base_size: meta.len(),
             base_mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            has_bom,
         })
     }
 
@@ -1425,6 +1464,19 @@ impl BigFile {
     // ---- 读路径 ----
 
     /// 读取源记录字段（解码 + 解析 + pad/truncate + 覆盖层）。
+    /// 把源文件 data rec 区间 [first, end) 的原始字节整段写入（透传不重编码）。
+    /// 端点取记录首行偏移；区间末尾即文件末时用 mmap 长度。
+    /// 仅在 save() 透传路径使用：调用方保证行未删除（段已剔除被删行）、无覆盖层。
+    fn write_raw_range(&self, w: &mut impl Write, first: u32, end: u32) -> Result<(), String> {
+        let s = self.idx.record_span(self.mmap.len(), first as usize + 1).0;
+        let e = if (end as usize + 1) < self.idx.n_records() {
+            self.idx.record_span(self.mmap.len(), end as usize + 1).0
+        } else {
+            self.mmap.len()
+        };
+        w.write_all(&self.mmap[s..e]).map_err(|e| e.to_string())
+    }
+
     fn src_fields(&self, rec: u32) -> Vec<String> {
         let (s, e) = self.idx.record_span(self.mmap.len(), rec as usize + 1);
         let mut f = parse_record(&decode_slice(self.enc, &self.mmap[s..e]), b',');
@@ -1905,28 +1957,46 @@ impl BigFile {
         let tmp = tmp_path_for(&self.path);
         let out = fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
         let mut w = BufWriter::new(out);
-        if self.enc == Encoding::Utf8 {
+        if self.has_bom {
             w.write_all(&[0xEF, 0xBB, 0xBF]).map_err(|e| e.to_string())?;
         }
         let header = self.view_headers();
         w.write_all(&encode_record(&header, b',', self.enc))
             .map_err(|e| e.to_string())?;
         let total = self.seg.vrow_count();
+        // 有覆盖层编辑的源行（透传判定的"不洁净"集；覆盖层通常极小）
+        let edited: std::collections::HashSet<u32> =
+            self.overlay.keys().map(|k| k.0).collect();
         let mut done = 0u64;
         let mut last_emit: Option<Instant> = None;
         for s in &self.seg.segs {
             match s.kind {
                 SegKind::Src { start, len } => {
-                    for rec in start..start + len {
-                        let f = self.src_fields(rec);
-                        w.write_all(&encode_record(&f, b',', self.enc))
-                            .map_err(|e| e.to_string())?;
+                    // 字节透传：无覆盖层编辑的连续行整段照抄原文件字节
+                    // （引号风格/空格/末行无换行全部原样，且是顺序拷贝不重编码，
+                    // 删行保存从"逐行解析重编码"变"按洞拷贝"）；遇编辑行落编码。
+                    let seg_end = start + len;
+                    let mut run: Option<u32> = None;
+                    for rec in start..seg_end {
+                        if edited.contains(&rec) {
+                            if let Some(rs) = run.take() {
+                                self.write_raw_range(&mut w, rs, rec)?;
+                            }
+                            let f = self.src_fields(rec);
+                            w.write_all(&encode_record(&f, b',', self.enc))
+                                .map_err(|e| e.to_string())?;
+                        } else if run.is_none() {
+                            run = Some(rec);
+                        }
                         done += 1;
                         // 16 行粒度过闸：磁盘拖慢时进度仍按 80ms 节拍更新
                         // （旧 65536 行粒度在龟速段可能十分钟不刷新）。
                         if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
                             progress(stream_weighted(done), total, PHASE_STREAM, done);
                         }
+                    }
+                    if let Some(rs) = run.take() {
+                        self.write_raw_range(&mut w, rs, seg_end)?;
                     }
                 }
                 SegKind::Ins { block } => {
@@ -1981,7 +2051,7 @@ impl BigFile {
         let tmp = tmp_path_for(&self.path);
         let out = fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
         let mut w = BufWriter::new(out);
-        if self.enc == Encoding::Utf8 {
+        if self.has_bom {
             w.write_all(&[0xEF, 0xBB, 0xBF]).map_err(|e| e.to_string())?;
         }
         w.write_all(&encode_record(&new_headers, b',', self.enc))

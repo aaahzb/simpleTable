@@ -248,6 +248,7 @@ for (const spec of [
   ["undo", "撤销", () => undo()],
   ["redo", "重做", () => redo()],
   "|",
+  ["goto", "跳转行…", () => gotoRowDialog()],
   ["sort", "排序…", () => openSortDialog()],
   ["clearFilter", "清除筛选", () => {
     grid.clearFilters();
@@ -640,6 +641,8 @@ function showRowMenu(e) {
   const rows = grid.selectedRows();
   if (!rows.length) return;
   showMenu(e.clientX, e.clientY, [
+    { label: "跳转到行…", onClick: gotoRowDialog },
+    null,
     { label: `在上方插入 ${rows.length} 行`,
       onClick: () => op(model.insertRows(Math.min(...rows), rows.length)) },
     { label: "在末尾添加 N 行…", onClick: appendRowsDialog },
@@ -680,6 +683,38 @@ function showCellMenu(e) {
     { label: `删除选区跨越的 ${cols.length} 列…`, onClick: () => deleteColumns(cols) },
     { label: `清除选区 ${n} 个单元格内容…`, onClick: () => clearSelCells(n) },
   ]);
+}
+
+/**
+ * 跳到显示行号（0 基内部序号）：选中整行并滚入视野，窗格随选中联动。
+ * 筛选视图下按可见序号解释（行头看到的序号），与 ensureVisible 同一坐标系。
+ *
+ * @param {number} vi - 显示行号（0 基；自动夹取到 [0, 行数)）。
+ * @returns {boolean} 是否成功跳转。
+ */
+function gotoRow(vi) {
+  const n = grid.visCount();
+  if (!n) return false;
+  const v = Math.min(Math.max(0, Math.trunc(vi)), n - 1);
+  const r = grid.visAt(v);
+  if (r == null) return false;
+  grid.selectRow(r);
+  grid.ensureVisible(r, grid.sel.current?.[1] ?? 0);
+  return true;
+}
+
+/** 跳转行对话框（工具栏"跳转行…" / Ctrl+G）：输入 1 基显示行号直达。 */
+async function gotoRowDialog() {
+  const n = grid.visCount();
+  if (!n) {
+    statusMsg("空表无法跳转", 2000);
+    return;
+  }
+  const cur0 = grid.sel.current?.[0];
+  const def = cur0 != null ? grid.visibleIndexOf(cur0) + 1 : 1;
+  const target = await intDialog("跳转到行", `行号（1 – ${n.toLocaleString()}）：`, def, 1, n);
+  if (target === null) return;
+  gotoRow(target - 1);
 }
 
 /** 末尾添加 N 行对话框（默认 10，1–10000） */
@@ -772,6 +807,11 @@ document.addEventListener("keydown", (e) => {
   }
   // Ctrl+Z / Ctrl+Y：输入控件内让浏览器原生文本撤销接管
   if (inField) return;
+  if (mods && !e.shiftKey && (e.key === "g" || e.key === "G")) {
+    e.preventDefault();
+    gotoRowDialog();
+    return;
+  }
   if (mods && !e.shiftKey && (e.key === "z" || e.key === "Z")) {
     e.preventDefault();
     undo();
@@ -861,7 +901,7 @@ document.addEventListener("keydown", (e) => {
 window.__app = {
   get model() { return model; }, grid, pane, invoke, statusMsg,
   newFile, openPath, saveFile, undo, redo,
-  applyColOps, cancelColOps, runBigFilter,
+  applyColOps, cancelColOps, runBigFilter, gotoRow, gotoRowDialog,
   isDirty: () => dirty, getPath: () => path,
   isBigMode: () => model.isBig === true,
 };

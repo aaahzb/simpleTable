@@ -266,6 +266,37 @@ export async function runPark({ invoke, grid, mode }) {
     return;
   }
 
+  if (mode === "savebench") {
+    // 删行保存透传验证：散布删 4 行（位图，应瞬时）→ 保存（应接近纯拷贝速度，
+    // 对照 delcol 模式全量重编码 ~50s）。验证字节透传后删行保存的真实耗时。
+    const p = `${await invoke("smoke_tmp_dir")}/${DELCOL}`;
+    const fsize = async () => {
+      try { return Number(await invoke("file_size", { path: p })); }
+      catch { return -1; }
+    };
+    await window.__app.openPath(p);
+    const bm = window.__app.model;
+    const noop = () => invoke("path_exists", { path: `${dir}/__noop` });
+    for (let i = 0; i < 1200; i += 1) {
+      if (window.__app.isBigMode() && bm.rowCount() > 0) break;
+      await noop();
+    }
+    const before = { rows: bm.rowCount(), cols: bm.columnCount(), bytes: await fsize() };
+    await mark(invoke, dir, "save_before", JSON.stringify(before));
+    const t0 = performance.now();
+    await bm.removeRows([100, 1000000, 8000000, 15000000]);
+    const delMs = Math.round(performance.now() - t0);
+    await mark(invoke, dir, "save_deleted", String(delMs));
+    const t1 = performance.now();
+    await bm.save();
+    const saveMs = Math.round(performance.now() - t1);
+    await mark(invoke, dir, "save_applied", String(saveMs));
+    const after = { rows: bm.rowCount(), bytes: await fsize() };
+    await mark(invoke, dir, "save_after", JSON.stringify(after));
+    await mark(invoke, dir, "done");
+    return;
+  }
+
   if (mode === "delcol") {
     // 真机删列实验（不动用户数据）：打开 recovered 副本（2.16GB，天然大模式），
     // 删最后一列 → 执行列操作（物理重写，与保存共用流式重写+换名链路），

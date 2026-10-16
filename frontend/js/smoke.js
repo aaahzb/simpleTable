@@ -207,6 +207,21 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(cur(grid)?.[1] === 1, "右移后列号应为 1");
   });
 
+  check("跳转行：直达选中并滚入视野，越界夹取", async () => {
+    grid.clearFilters();
+    model.load(headers, Array.from({ length: 8000 }, (_, i) => [`R${i}`, String(i), ""]));
+    grid.renderAll();
+    assert(window.__app.gotoRow(3999) === true, "跳转应成功");
+    const r = cur(grid)?.[0];
+    assert(r != null && grid.visibleIndexOf(r) === 3999, "当前格应位于显示行 4000");
+    grid._renderRows();
+    const el = document.querySelector(`.cell[data-row="${r}"][data-col="0"]`);
+    assert(el, "目标行应渲染在视口内（ensureVisible 生效）");
+    assert(window.__app.gotoRow(99999999) === true, "越界输入应夹取后仍跳转");
+    assert(cur(grid)?.[0] === grid.visAt(grid.visCount() - 1), "应夹取到末行");
+    window.__app.gotoRow(0);
+  });
+
   check("Tab 右移 / Shift+Tab 左移", async () => {
     grid.select([1, 1]);
     const scroller = document.getElementById("grid-scroll");
@@ -670,8 +685,9 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     rh.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
     await sleep(30);
     const items = [...document.querySelectorAll(".ctx-menu .mi")].map((e) => e.textContent);
-    assert(items[0] === "在上方插入 1 行" && items[1] === "在末尾添加 N 行…" &&
-      items[2] === "删除选中的 1 行…" && items[3] === "清除选中 1 行的内容…",
+    assert(items[0] === "跳转到行…" && items[1] === "在上方插入 1 行" &&
+      items[2] === "在末尾添加 N 行…" &&
+      items[3] === "删除选中的 1 行…" && items[4] === "清除选中 1 行的内容…",
       `行菜单 ${items}`);
     document.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
     await sleep(30);
