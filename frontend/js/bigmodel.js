@@ -619,7 +619,8 @@ export class BigModel {
     this._filterOn = true;
     this._filterCount = n;
     this._invalidate();
-    this._emitData(true);
+    // origin "fetch"：筛选只切视图不改正文——不得标脏（对齐小模式筛选行为）
+    this._emitData(true, "fetch");
     return n;
   }
 
@@ -633,7 +634,8 @@ export class BigModel {
     this._filterOn = false;
     this._filterCount = 0;
     this._invalidate();
-    this._emitData(true);
+    // 同 runFilter：视图恢复，不标脏
+    this._emitData(true, "fetch");
   }
 
   // ---- 列操作（pending 预览 → 执行物理重写） ----

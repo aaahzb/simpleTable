@@ -62,14 +62,18 @@ export class Grid {
    *   行头右键菜单。
    * @param {(c: number, e: MouseEvent) => string} opts.hooks.colMenu -
    *   列头右键菜单。
+   * @param {HTMLElement} [opts.areaEl] - --grid-zoom 挂载面（分屏副网格传副侧；
+   *   缺省 #grid-area）。
    */
-  constructor({ model, scrollEl, canvasEl, headerEl, rowsEl, editorEl, hooks }) {
+  constructor({ model, scrollEl, canvasEl, headerEl, rowsEl, editorEl, areaEl, hooks }) {
     this.model = model;
     this.scrollEl = scrollEl;
     this.canvasEl = canvasEl;
     this.headerEl = headerEl;
     this.rowsEl = rowsEl;
     this.editorEl = editorEl;
+    // --grid-zoom 的挂载面（分屏时两侧各自缩放；缺省回退全局 #grid-area）
+    this.areaEl = areaEl ?? document.getElementById("grid-area");
     this.hooks = hooks;
 
     this.zoom = 1;
@@ -1573,7 +1577,7 @@ export class Grid {
     } else {
       this.rowH = this.rowH.map((h) => Math.max(MIN_ROW_H, Math.round(h * ratio)));
     }
-    document.getElementById("grid-area").style.setProperty("--grid-zoom", String(factor));
+    this.areaEl.style.setProperty("--grid-zoom", String(factor));
     this.renderAll();
     this.hooks.zoomed(factor);
   }

@@ -103,10 +103,20 @@ body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; 
 
 /* ========== 主行：网格 + 分隔条 + 编辑窗格 ========== */
 #main-row { display: flex; flex: 1 1 auto; min-height: 0; }
-#grid-area {
+#grid-area, #grid-area2 {
   flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column;
   font-size: calc(13px * var(--grid-zoom)); /* 网格内全部尺寸用 em，随缩放 */
 }
+/* 分屏（body.split）：副网格与主网格并列各半；平时隐藏 */
+#grid-area2 { display: none; flex: 1 1 0; }
+body.split #grid-area { flex: 1 1 0; }
+body.split #grid-area2 { display: flex; }
+#vsplit {
+  display: none; flex: 0 0 5px; cursor: col-resize; background: #e8e8e8;
+  border-left: 1px solid var(--border); border-right: 1px solid var(--border);
+}
+#vsplit:hover { background: var(--accent); }
+body.split #vsplit { display: block; }
 #splitter {
   flex: 0 0 5px; cursor: col-resize; background: #e8e8e8;
   border-left: 1px solid var(--border); border-right: 1px solid var(--border);
@@ -114,22 +124,22 @@ body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; 
 #splitter:hover { background: var(--accent); }
 
 /* ---- 网格滚动区 ---- */
-#grid-scroll {
+#grid-scroll, #grid-scroll2 {
   flex: 1 1 auto; overflow: auto; position: relative; outline: none;
   background: #fff;
 }
 /* overflow-x: clip 裁掉列宽拖拽手柄超出画布右缘的悬垂（不建滚动容器，吸顶表头不受影响） */
-#grid-canvas { position: relative; overflow-x: clip; }
+#grid-canvas, #grid-canvas2 { position: relative; overflow-x: clip; }
 /* 行容器：作为 .row 绝对定位的参照（相对列头之下），否则行会画进吸顶表头下面 */
-#rows { position: relative; }
+#rows, #rows2 { position: relative; }
 
 /* ---- 列头（两带：列名 + 筛选）D1 ---- */
-#col-header {
+#col-header, #col-header2 {
   position: sticky; top: 0; z-index: 5; display: flex;
   background: var(--header-bg); border-bottom: 1px solid #a0a0a0;
   font-size: 1em;
 }
-#corner {
+#corner, #corner2 {
   flex: 0 0 var(--row-header-w); position: sticky; left: 0; z-index: 7;
   background: var(--header-bg); border-right: 1px solid #a0a0a0;
 }
@@ -185,7 +195,7 @@ body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; 
 .cell.row-full-sel, .cell.col-full-sel { background: #dbe9f5; }
 
 /* ---- 格内编辑器浮层（C5） ---- */
-#cell-editor {
+#cell-editor, #cell-editor2 {
   position: absolute; z-index: 10; display: none;
   font: inherit; padding: 0 0.3em; border: 2px solid var(--accent);
   outline: none; resize: none; overflow: hidden; background: #fff;
@@ -255,6 +265,9 @@ body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; 
   border-right: 1px solid var(--border);
 }
 .tab.active { background: #fff; color: #111; font-weight: 600; box-shadow: inset 0 2px 0 var(--accent); }
+/* 分屏签：正显示在副侧网格的页签（底部绿色标记，与活动签的顶部蓝条区分） */
+.tab.split-side { box-shadow: inset 0 -2px 0 #6a9a3a; }
+.tab.split-side.active { box-shadow: inset 0 2px 0 var(--accent), inset 0 -2px 0 #6a9a3a; }
 .tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tab-close {
   flex: 0 0 auto; border: none; background: transparent; color: #999;
@@ -333,6 +346,16 @@ body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; 
           <div id="col-header"><div id="corner"></div></div>
           <div id="rows"></div>
           <textarea id="cell-editor"></textarea>
+        </div>
+      </div>
+    </div>
+    <div id="vsplit" title="分屏"></div>
+    <div id="grid-area2">
+      <div id="grid-scroll2" tabindex="0">
+        <div id="grid-canvas2">
+          <div id="col-header2"><div id="corner2"></div></div>
+          <div id="rows2"></div>
+          <textarea id="cell-editor2"></textarea>
         </div>
       </div>
     </div>

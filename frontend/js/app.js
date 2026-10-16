@@ -122,6 +122,23 @@ let activeId = null;
 let engineTabId = null;
 let tabSeq = 1;
 
+// ---- 分屏视图 ----
+// 副侧（B）网格常驻实例，分屏时展示"分屏签"；焦点侧（focusedSide）独占键盘、
+// 工具栏、编辑窗格与状态栏，非分屏时恒为 "A"。两侧绑定内容稳定：点另一侧
+// 仅交换焦点（活动签跟随焦点侧），网格不重绑；激活任一侧之外的页签才把焦点
+// 侧重绑到新签。大档受引擎单例约束：分屏拒绝双大档。
+/** @type {boolean} 分屏开关 */
+let splitOn = false;
+/** @type {number | null} 副侧（分屏签）页签 id */
+let splitTabId = null;
+/** @type {"A" | "B"} 焦点侧：工具栏/快捷键/编辑窗格的作用侧 */
+let focusedSide = "A";
+/** 分屏各侧绑定的页签 id（非分屏恒 null；焦点侧绑定 = 活动签） */
+const sideTab = {
+  A: /** @type {number | null} */ (null),
+  B: /** @type {number | null} */ (null),
+};
+
 const tabbarEl = document.getElementById("tabbar");
 const tabScrollEl = document.getElementById("tab-scroll");
 
@@ -133,6 +150,14 @@ function tabTitleOf(p) {
 /** @returns {DocTab | null} 活动页签（未入签返回 null） */
 function activeTab() {
   return tabs.find((t) => t.id === activeId) ?? null;
+}
+
+/** @returns {"A" | "B" | null} 页签绑定侧（未分屏返回 null） */
+function sideOfTab(id) {
+  if (!splitOn) return null;
+  if (sideTab.A === id) return "A";
+  if (sideTab.B === id) return "B";
+  return null;
 }
 
 /** 当前档状态写回活动页签（切换/渲染前调用，live 变量 ↔ 页签镜像同步） */
@@ -162,7 +187,8 @@ function renderTabbar() {
   tabScrollEl.textContent = "";
   for (const t of tabs) {
     const el = document.createElement("div");
-    el.className = "tab" + (t.id === activeId ? " active" : "");
+    el.className = "tab" + (t.id === activeId ? " active" : "")
+      + (splitOn && t.id === splitTabId ? " split-side" : "");
     el.title = t.path || t.title;
     el.dataset.id = String(t.id);
     const label = document.createElement("span");
@@ -185,6 +211,10 @@ function renderTabbar() {
         e.preventDefault();
         void closeTab(t.id);
       }
+    });
+    el.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      showTabMenu(t, e.clientX, e.clientY);
     });
     tabScrollEl.appendChild(el);
   }
@@ -252,6 +282,11 @@ async function evictEngineFor(targetTabId) {
   await invoke("big_close").catch(() => {});
   if (holder) holder.model = null;
   engineTabId = null;
+  // 被动侧大档模型随引擎关闭而失效：收起分屏，避免死模型占侧
+  if (holder && splitOn && sideOfTab(holder.id) !== null
+      && sideOfTab(holder.id) !== focusedSide) {
+    closeSplit();
+  }
   return true;
 }
 
@@ -304,13 +339,17 @@ async function loadDoc(p, wantBig, tabId) {
   return { kind: "small", model: m, warnings };
 }
 
-/** 换档/装载后的视图重置：清筛选选区、滚动回顶、窗格清空、计数与按钮刷新 */
-function applyViewState() {
-  grid.clearFilters();
-  grid.clearSelection();
-  grid.setModel(model);
-  grid.scrollEl.scrollTop = 0;
-  grid.scrollEl.scrollLeft = 0;
+/**
+ * 换档/装载后的视图重置：清筛选选区、滚动回顶、窗格清空、计数与按钮刷新。
+ *
+ * @param {Grid} g - 目标网格（焦点侧；分屏焦点交换不调用本函数）。
+ */
+function applyViewState(g) {
+  g.clearFilters();
+  g.clearSelection();
+  g.setModel(model);
+  g.scrollEl.scrollTop = 0;
+  g.scrollEl.scrollLeft = 0;
   currentCell = null;
   pane.setText("");
   lastFilterMs = 0;
@@ -327,7 +366,7 @@ function applyViewState() {
 function applyDocToCurrent(doc, p) {
   model = doc.model;
   path = p;
-  applyViewState();
+  applyViewState(fgrid());
   setDirty(false);
   const t = activeTab();
   if (t) {
@@ -351,6 +390,7 @@ function applyDocToCurrent(doc, p) {
 
 /**
  * 切换活动页签：状态写回旧签 → 引擎仲裁 → 换绑视图。
+ * 分屏下点另一侧的签 = 纯焦点交换（内容稳定）；点侧外签 = 焦点侧重绑新签。
  *
  * @param {number} id - 目标页签 id。
  * @returns {Promise<boolean>} true = 已切换；false = 用户取消或打开失败。
@@ -360,6 +400,11 @@ async function activateTab(id) {
   const t = tabs.find((x) => x.id === id);
   if (!t) return false;
   syncActiveTab();
+  const side = sideOfTab(id);
+  if (side && side !== focusedSide) {
+    focusSide(side); // 目标签在另一侧：交换焦点即可，两侧绑定不动
+    return true;
+  }
   if (t.kind === "big") {
     if (!(engineTabId === t.id && t.model)) {
       // 引擎已腾退（或从未打开）：重新打开
@@ -373,7 +418,8 @@ async function activateTab(id) {
   }
   activeId = id;
   path = t.path;
-  applyViewState();
+  if (splitOn) sideTab[focusedSide] = id; // 分屏激活侧外签：焦点侧重绑新签
+  applyViewState(fgrid());
   setDirty(t.dirty);
   renderTabbar();
   return true;
@@ -474,6 +520,9 @@ async function closeTab(id) {
     engineTabId = null;
   }
   tabs.splice(idx, 1);
+  if (splitOn && splitTabId !== null && !tabs.some((x) => x.id === splitTabId)) {
+    closeSplit(); // 分屏签被关：分屏随之收起（其余页签保留）
+  }
   if (!tabs.length) {
     resetToEmpty();
     return true;
@@ -486,11 +535,17 @@ async function closeTab(id) {
 
 /** 全部页签关闭后回空表（对齐启动态） */
 function resetToEmpty() {
+  splitOn = false;
+  splitTabId = null;
+  sideTab.A = null;
+  sideTab.B = null;
+  focusedSide = "A";
+  document.body.classList.remove("split");
   model = new TableModel();
   bindModelEvents(model);
   path = null;
   activeId = null;
-  applyViewState();
+  applyViewState(fgrid());
   model.load([], []);
   setDirty(false);
   renderTabbar();
@@ -498,33 +553,201 @@ function resetToEmpty() {
 }
 
 // ============ 网格 ============
+// 主网格（A）常驻，恒展示焦点签；副网格（B）仅分屏时展示分屏签。
+// 工具栏/快捷键/右键菜单统一经 fgrid() 落到焦点侧。
 
-const grid = new Grid({
+/**
+ * 构造一侧网格的钩子集。焦点侧守卫：编辑窗格/行计数/状态栏/工具按钮等
+ * 共享外壳状态只随焦点侧更新，避免副侧滚动取数等非焦点事件改写焦点侧状态
+ * （典型：副侧大档预取落定不得刷编辑窗格、不得切换大模式按钮显隐）。
+ *
+ * @param {"A" | "B"} side - 侧标识。
+ * @returns {object} Grid hooks。
+ */
+function makeHooks(side) {
+  const focused = () => focusedSide === side;
+  return {
+    statusMsg,
+    countsChanged: (v, t) => { if (focused()) onCountsChanged(v, t); },
+    zoomed: (f) => { if (focused()) statusMsg(`表格缩放 ${Math.round(f * 100)}%`, 1500); },
+    undoRequested: () => { if (focused()) undo(); },
+    redoRequested: () => { if (focused()) redo(); },
+    currentChanged: (r, c) => {
+      if (!focused()) return;
+      currentCell = [r, c];
+      pane.setText(model.rawData(r, c));
+    },
+    cellMenu: (r, c, e) => { if (focused()) showCellMenu(e); },
+    rowMenu: (r, e) => { if (focused()) showRowMenu(e); },
+    colMenu: (c, e) => { if (focused()) showColMenu(e); },
+    // 大模式：执行筛选（工具栏按钮 / 筛选框回车共用）
+    bigFilterRun: () => { if (focused()) runBigFilter(); },
+    // 大模式：筛选条件变化（仅记录，刷新"执行筛选"按钮态）
+    bigFilterStatus: () => { if (focused()) refreshBigUi(); },
+  };
+}
+
+const gridA = new Grid({
   model,
   scrollEl: document.getElementById("grid-scroll"),
   canvasEl: document.getElementById("grid-canvas"),
   headerEl: document.getElementById("col-header"),
   rowsEl: document.getElementById("rows"),
   editorEl: document.getElementById("cell-editor"),
-  hooks: {
-    statusMsg,
-    countsChanged: onCountsChanged,
-    zoomed: (f) => statusMsg(`表格缩放 ${Math.round(f * 100)}%`, 1500),
-    undoRequested: () => undo(),
-    redoRequested: () => redo(),
-    currentChanged: (r, c) => {
-      currentCell = [r, c];
-      pane.setText(model.rawData(r, c));
-    },
-    cellMenu: (r, c, e) => showCellMenu(e),
-    rowMenu: (r, e) => showRowMenu(e),
-    colMenu: (c, e) => showColMenu(e),
-    // 大模式：执行筛选（工具栏按钮 / 筛选框回车共用）
-    bigFilterRun: () => runBigFilter(),
-    // 大模式：筛选条件变化（仅记录，刷新"执行筛选"按钮态）
-    bigFilterStatus: () => refreshBigUi(),
-  },
+  areaEl: document.getElementById("grid-area"),
+  hooks: makeHooks("A"),
 });
+// 副网格挂独立空模型：不镜像活动档（否则隐藏副网格也在渲染，双份 DOM 会
+// 污染全局类选择器的断言/交互）；分屏建立时经 setModel 换绑分屏签。
+const gridB = new Grid({
+  model: new TableModel(),
+  scrollEl: document.getElementById("grid-scroll2"),
+  canvasEl: document.getElementById("grid-canvas2"),
+  headerEl: document.getElementById("col-header2"),
+  rowsEl: document.getElementById("rows2"),
+  editorEl: document.getElementById("cell-editor2"),
+  areaEl: document.getElementById("grid-area2"),
+  hooks: makeHooks("B"),
+});
+
+/**
+ * 侧 → 网格实例。
+ *
+ * @param {"A" | "B"} side - 侧标识。
+ * @returns {Grid} 该侧网格。
+ */
+function gridOfSide(side) {
+  return side === "A" ? gridA : gridB;
+}
+
+/**
+ * 焦点侧网格：工具栏/快捷键/右键菜单/视图重置的作用目标。
+ *
+ * @returns {Grid} 焦点侧网格（非分屏 = gridA）。
+ */
+function fgrid() {
+  return gridOfSide(focusedSide);
+}
+
+// 分屏焦点激活：按下任一侧网格（含右键）焦点即交给该侧。捕获阶段先行，
+// 网格自身 mousedown 处理选中时，currentChanged 等钩子已见到正确焦点。
+for (const [side, g] of [["A", gridA], ["B", gridB]]) {
+  g.scrollEl.addEventListener("mousedown", () => {
+    if (splitOn && focusedSide !== side) focusSide(side);
+  }, true);
+}
+
+// ============ 分屏控制 ============
+
+/**
+ * 焦点交换：焦点/活动签/live 状态切到指定侧，两侧网格绑定不动（内容稳定）。
+ * 全程同步执行：mousedown 激活路径要求后续 contextmenu/键盘事件见到正确焦点。
+ *
+ * @param {"A" | "B"} side - 目标焦点侧（该侧须已绑定页签）。
+ * @returns {void}
+ */
+function focusSide(side) {
+  if (side === focusedSide) return;
+  syncActiveTab(); // live 状态写回旧焦点签
+  const t = tabs.find((x) => x.id === sideTab[side]);
+  if (!t) return;
+  focusedSide = side;
+  activeId = t.id;
+  model = t.model;
+  path = t.path;
+  currentCell = null;
+  pane.setText("");
+  lastFilterMs = 0;
+  setDirty(t.dirty); // 同步新活动签脏点 + 窗口标题
+  onCountsChanged(model.rowCount(), model.rowCount());
+  // 多重筛选闩锁/输入随焦点侧还原（两侧各自记忆）
+  const g = fgrid();
+  tb.multiFilter.classList.toggle("on", g.multi.on);
+  multiWrap.classList.toggle("hidden", !g.multi.on);
+  multiInput.value = g.multi.text;
+  refreshBigUi();
+  renderTabbar();
+}
+
+/**
+ * 建立分屏：目标签上副侧（B 网格），焦点留在主侧。
+ * 目标签不得为活动签；大档受引擎单例约束，双大档拒绝（提示并返回 false）。
+ *
+ * @param {number} id - 目标页签 id。
+ * @returns {Promise<boolean>} true = 分屏已建立。
+ */
+async function openSplit(id) {
+  if (splitOn || id === activeId) return false;
+  const t = tabs.find((x) => x.id === id);
+  if (!t) return false;
+  if (t.kind === "big" && model.isBig) {
+    statusMsg("分屏不支持同时打开两个大文件", 3000);
+    return false;
+  }
+  syncActiveTab();
+  if (t.kind === "big" && !(engineTabId === t.id && t.model)) {
+    const bm = await openBigEngineFor(t.id, t.path);
+    if (!bm) return false;
+    t.model = bm;
+  }
+  splitOn = true;
+  splitTabId = id;
+  sideTab.A = activeId;
+  sideTab.B = id;
+  document.body.classList.add("split");
+  // 副侧视图重置（对齐 applyViewState 顺序）：上次分屏的筛选/选区不残留
+  gridB.clearFilters();
+  gridB.clearSelection();
+  gridB.setModel(t.model);
+  gridB.scrollEl.scrollTop = 0;
+  gridB.scrollEl.scrollLeft = 0;
+  renderTabbar();
+  return true;
+}
+
+/**
+ * 关闭分屏：副网格隐藏、页签保留（含分屏签），焦点归主侧。
+ * 焦点在副侧时主网格接管活动签（视图重置，对齐换档语义）。
+ *
+ * @returns {void}
+ */
+function closeSplit() {
+  if (!splitOn) return;
+  splitOn = false;
+  splitTabId = null;
+  sideTab.A = null;
+  sideTab.B = null;
+  document.body.classList.remove("split");
+  if (focusedSide !== "A") {
+    focusedSide = "A";
+    if (activeTab()) applyViewState(gridA);
+  }
+  renderTabbar();
+}
+
+/**
+ * 页签右键菜单：未分屏给「在分屏中打开」（活动签/双大档禁用）；
+ * 分屏态点分屏签给「关闭分屏」；其余场景不出菜单。
+ *
+ * @param {DocTab} t - 目标页签。
+ * @param {number} x - 菜单位置 x。
+ * @param {number} y - 菜单位置 y。
+ * @returns {void}
+ */
+function showTabMenu(t, x, y) {
+  if (!splitOn) {
+    const bothBig = t.kind === "big" && model.isBig;
+    showMenu(x, y, [{
+      label: "在分屏中打开",
+      disabled: t.id === activeId || bothBig,
+      onClick: () => openSplit(t.id),
+    }]);
+    return;
+  }
+  if (t.id === splitTabId) {
+    showMenu(x, y, [{ label: "关闭分屏", onClick: () => closeSplit() }]);
+  }
+}
 
 // ============ 大文件模式 UI（按钮显隐/筛选执行/列操作 pending） ============
 
@@ -538,7 +761,7 @@ function refreshBigUi() {
   tb.sort.classList.toggle("hidden", big);
   tb.execFilter.classList.toggle("hidden", !big);
   if (big) {
-    const hasCond = grid.filters.size > 0 || !!grid.multi.text;
+    const hasCond = fgrid().filters.size > 0 || !!fgrid().multi.text;
     tb.execFilter.disabled = !hasCond || model.colOpsPending();
     const pending = model.colOpsPending();
     tb.execColOps.classList.toggle("hidden", !pending);
@@ -558,11 +781,11 @@ async function runBigFilter() {
   if (!model.isBig) return; // 兜底：小模式此按钮隐藏，防御误触调用小模型不存在的 runFilter
   const cc = model.columnCount();
   const kws = [];
-  for (const [col, kw] of grid.filters) {
+  for (const [col, kw] of fgrid().filters) {
     if (col < cc && kw) kws.push([col, kw]);
   }
-  const mKw = grid.multi.on ? grid.multi.text : "";
-  const mCols = mKw ? [...grid.multi.cols].filter((c) => c < cc) : [];
+  const mKw = fgrid().multi.on ? fgrid().multi.text : "";
+  const mCols = mKw ? [...fgrid().multi.cols].filter((c) => c < cc) : [];
   // 整表扫描要几秒到几十秒：先弹不确定进度模态，避免界面看似卡死
   const busy = busyDialog("正在筛选大文件…");
   try {
@@ -572,7 +795,7 @@ async function runBigFilter() {
     // 坐标系无意义——渲染锚点由 scrollTop 反推，旧值会把锚点夹到末行、transform
     // 把 #rows 推到画布外且回灌 scrollHeight 自锁（视口只剩末几行、滚动条跳回）。
     // 回顶后一次重绘落定，同任务内完成不出现中间帧。
-    grid.resetScroll();
+    fgrid().resetScroll();
     lastFilterMs = performance.now() - t0;
     statusMsg(`匹配 ${n} 行 · 用时 ${(lastFilterMs / 1000).toFixed(1)} 秒`, 4000);
     updateStatusText();
@@ -657,12 +880,12 @@ for (const spec of [
   ["goto", "跳转行…", () => gotoRowDialog()],
   ["sort", "排序…", () => openSortDialog()],
   ["clearFilter", "清除筛选", () => {
-    grid.clearFilters();
+    fgrid().clearFilters();
     multiInput.value = "";
   }],
   ["multiFilter", "多重筛选", (e) => {
     const on = e.currentTarget.classList.toggle("on");
-    grid.setMultiOn(on);
+    fgrid().setMultiOn(on);
     multiWrap.classList.toggle("hidden", !on);
     if (on) multiInput.focus();
   }],
@@ -705,7 +928,7 @@ multiWrap.className = "hidden";
 const multiInput = document.createElement("input");
 multiInput.id = "multi-filter-input";
 multiInput.placeholder = "在勾选列中匹配（或）…";
-multiInput.addEventListener("input", () => grid.setMultiText(multiInput.value));
+multiInput.addEventListener("input", () => fgrid().setMultiText(multiInput.value));
 multiWrap.appendChild(multiInput);
 tb.multiFilter.after(multiWrap);
 
@@ -735,7 +958,7 @@ function updateUndoButtons() {
 /** 撤销一步表格改动（Ctrl+Z；大模型 undo 为异步） */
 async function undo() {
   if (await model.undo()) {
-    grid.clearSelection();
+    fgrid().clearSelection();
     clearDock();
     markDirty();
   }
@@ -744,7 +967,7 @@ async function undo() {
 /** 重做一步表格改动（Ctrl+Y / Ctrl+Shift+Z） */
 async function redo() {
   if (await model.redo()) {
-    grid.clearSelection();
+    fgrid().clearSelection();
     clearDock();
     markDirty();
   }
@@ -763,19 +986,24 @@ let resetPending = false;
 
 /**
  * 绑定模型事件（大小模式热交换时重绑；旧模型连同监听一并废弃）。
+ * 分屏下两侧模型都存活且有事件流：只有焦点侧（m === model）的事件允许
+ * 触碰共享外壳状态（脏点/编辑窗格/状态栏），副侧事件仅驱动其自身网格重绘
+ * （网格在 setModel 里自行订阅，不经此处）。
  *
  * @param {TableModel | BigModel} m - 模型实例。
  * @returns {void}
  */
 function bindModelEvents(m) {
   m.onReset(() => {
+    if (m !== model) return; // 非焦点侧（装载中的新档等）：外壳状态不动
     resetPending = true; // 紧随其后的 onData 是装载/恢复本身，不视为脏
     setDirty(false); // 撤销/重做会由各自 wrapper 在返回前重新标脏
     clearDock();
     updateStatusText();
-    grid.resetScroll(); // WebView2 会话记忆滚动位置，装载须回顶（对齐 Qt）
+    fgrid().resetScroll(); // WebView2 会话记忆滚动位置，装载须回顶（对齐 Qt）
   });
   m.onData((structural, origin) => {
+    if (m !== model) return; // 副侧数据/预取落定：不得改写焦点侧外壳状态
     if (resetPending) resetPending = false;
     // 大模式预取页落定是纯重绘（origin="fetch"），打开/滚动不得误标脏
     else if (!(m.isBig && origin === "fetch")) markDirty();
@@ -799,9 +1027,13 @@ function bindModelEvents(m) {
     const newText = m.isBig && m.peekData ? (m.peekData(r, c) ?? null) : m.rawData(r, c);
     if (newText !== null && pane.editEl.value !== newText) pane.setText(newText);
   });
-  m.onUndoStack(updateUndoButtons);
+  m.onUndoStack(() => {
+    if (m !== model) return;
+    updateUndoButtons();
+  });
   // 大表撤销降级：状态栏提示一次（小模型专属；BigModel 无此方法）
   m.onUndoCap?.((cap) => {
+    if (m !== model) return;
     statusMsg(`表格较大：撤销上限已降为 ${cap} 步`, 6000);
   });
 }
@@ -825,7 +1057,7 @@ async function newFile() {
     // 启动空表原位替换（尚未入签体系）
     model = m;
     bindModelEvents(m);
-    applyViewState();
+    applyViewState(fgrid());
     setDirty(false);
     renderTabbar();
     updateStatusText();
@@ -994,7 +1226,7 @@ async function openSortDialog() {
   if (!names.length) return;
   const levels = await sortDialog(names);
   if (!levels || !levels.length) return;
-  grid.clearSelection();
+  fgrid().clearSelection();
   clearDock();
   model.sortRows(levels);
   markDirty();
@@ -1017,7 +1249,7 @@ function op(result) {
 
 /** 行头右键菜单：插入/添加/删除/清除行 */
 function showRowMenu(e) {
-  const rows = grid.selectedRows();
+  const rows = fgrid().selectedRows();
   if (!rows.length) return;
   showMenu(e.clientX, e.clientY, [
     { label: "跳转到行…", onClick: gotoRowDialog },
@@ -1033,7 +1265,7 @@ function showRowMenu(e) {
 
 /** 列头右键菜单：插入/删除/清除/重命名列 */
 function showColMenu(e) {
-  const cols = grid.selectedCols();
+  const cols = fgrid().selectedCols();
   if (!cols.length) return;
   const col = cols[0];
   showMenu(e.clientX, e.clientY, [
@@ -1048,11 +1280,11 @@ function showColMenu(e) {
 
 /** 单元格右键菜单：按选区跨度插入/删除/清除行列 + 拆分粘贴 */
 function showCellMenu(e) {
-  const rows = grid.selectedRows();
-  const cols = grid.selectedCols();
-  const n = grid.selectedCells().length;
+  const rows = fgrid().selectedRows();
+  const cols = fgrid().selectedCols();
+  const n = fgrid().selectedCells().length;
   showMenu(e.clientX, e.clientY, [
-    { label: "按行拆分粘贴", onClick: () => grid.pasteClipboard(true) },
+    { label: "按行拆分粘贴", onClick: () => fgrid().pasteClipboard(true) },
     null,
     { label: `在上方插入 ${rows.length} 行`,
       onClick: () => op(model.insertRows(Math.min(...rows), rows.length)) },
@@ -1072,25 +1304,25 @@ function showCellMenu(e) {
  * @returns {boolean} 是否成功跳转。
  */
 function gotoRow(vi) {
-  const n = grid.visCount();
+  const n = fgrid().visCount();
   if (!n) return false;
   const v = Math.min(Math.max(0, Math.trunc(vi)), n - 1);
-  const r = grid.visAt(v);
+  const r = fgrid().visAt(v);
   if (r == null) return false;
-  grid.selectRow(r);
-  grid.ensureVisible(r, grid.sel.current?.[1] ?? 0);
+  fgrid().selectRow(r);
+  fgrid().ensureVisible(r, fgrid().sel.current?.[1] ?? 0);
   return true;
 }
 
 /** 跳转行对话框（工具栏"跳转行…" / Ctrl+G）：输入 1 基显示行号直达。 */
 async function gotoRowDialog() {
-  const n = grid.visCount();
+  const n = fgrid().visCount();
   if (!n) {
     statusMsg("空表无法跳转", 2000);
     return;
   }
-  const cur0 = grid.sel.current?.[0];
-  const def = cur0 != null ? grid.visibleIndexOf(cur0) + 1 : 1;
+  const cur0 = fgrid().sel.current?.[0];
+  const def = cur0 != null ? fgrid().visibleIndexOf(cur0) + 1 : 1;
   const target = await intDialog("跳转到行", `行号（1 – ${n.toLocaleString()}）：`, def, 1, n);
   if (target === null) return;
   gotoRow(target - 1);
@@ -1131,7 +1363,7 @@ async function clearRows(rows) {
  */
 function insertColumnsAt(cols) {
   op(model.insertColumns(Math.min(...cols), cols.length));
-  grid.clearFilters();
+  fgrid().clearFilters();
 }
 
 /**
@@ -1142,7 +1374,7 @@ function insertColumnsAt(cols) {
 async function deleteColumns(cols) {
   if (cols.length && await confirmDialog(`确定删除选中的 ${cols.length} 列及其全部数据？（列操作将预览，需点「执行列操作」生效）`)) {
     op(model.removeColumns(cols));
-    grid.clearFilters();
+    fgrid().clearFilters();
   }
 }
 
@@ -1160,7 +1392,7 @@ async function clearColumns(cols) {
 /** 二次确认后清除选区单元格内容（结构保留） */
 async function clearSelCells(n) {
   if (n && await confirmDialog(`确定清除选区 ${n} 个单元格的内容？（结构保留）`)) {
-    op(model.clearCells(grid.selectedCells()));
+    op(model.clearCells(fgrid().selectedCells()));
   }
 }
 
@@ -1225,6 +1457,17 @@ document.addEventListener("keydown", (e) => {
 
 // ============ 启动 ============
 
+// 冒烟/截屏诊断经此代理访问网格：函数调用绑定到当前焦点侧实例，
+// 属性读写直通（对齐上方 model 实时代理的同一套路）。
+const gridLive = new Proxy(/** @type {any} */ ({}), {
+  get: (_t, k) => {
+    const g = fgrid();
+    const v = g[k];
+    return typeof v === "function" ? v.bind(g) : v;
+  },
+  set: (_t, k, val) => { fgrid()[k] = val; return true; },
+});
+
 (async () => {
   const version = await invoke("get_version");
   document.getElementById("status-version").textContent = version;
@@ -1251,8 +1494,9 @@ document.addEventListener("keydown", (e) => {
       });
     });
     try {
+      // 网格走实时代理：分屏焦点交换后，冒烟里的 grid.* 仍作用于焦点侧
       const { runSmoke } = await import("./smoke.js");
-      runSmoke({ model, grid, pane, invoke, statusMsg });
+      runSmoke({ model, grid: gridLive, pane, invoke, statusMsg });
     } catch (err) {
       await invoke("finish_smoke", { report: `[fatal] 冒烟套件异常: ${err.stack}`, code: 1 });
     }
@@ -1262,7 +1506,7 @@ document.addEventListener("keydown", (e) => {
     // 截屏诊断：停在指定渲染场景待命（进程不退出），供 park_capture.ps1 读像素。
     // catch 里错误标记尽力而为（嵌套 try 包住 invoke，失败不再级联）
     const { runPark } = await import("./park.js");
-    runPark({ model, grid, pane, invoke, statusMsg, mode: parkMode }).catch(async (err) => {
+    runPark({ model, grid: gridLive, pane, invoke, statusMsg, mode: parkMode }).catch(async (err) => {
       try { console.error("park error", err); } catch (_) { /* ignore */ }
       try {
         document.title = "PARK-ERR " + (err && err.message || err);
@@ -1278,7 +1522,9 @@ document.addEventListener("keydown", (e) => {
 
 // 供冒烟测试与调试使用
 window.__app = {
-  get model() { return model; }, grid, pane, invoke, statusMsg,
+  get model() { return model; },
+  get grid() { return fgrid(); },
+  pane, invoke, statusMsg,
   newFile, openPath, saveFile, undo, redo,
   applyColOps, cancelColOps, runBigFilter, gotoRow, gotoRowDialog,
   isDirty: () => dirty, getPath: () => path,
@@ -1290,4 +1536,7 @@ window.__app = {
     active: t.id === activeId,
   })),
   activateTab, closeTab, openPathsAsTabs,
+  // 分屏视图：状态快照 / 建立 / 关闭
+  split: () => ({ on: splitOn, splitTabId, focused: focusedSide }),
+  openSplit, closeSplit,
 };
