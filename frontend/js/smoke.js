@@ -604,6 +604,43 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(model.rawData(1, 0) === "", "下一行不应被覆盖");
   });
 
+  check("单格一对多填充：选区>1 且剪贴板为单值 → 全选区填充（Excel）", async () => {
+    loadBasic();
+    grid.select([0, 0]);
+    grid._extendTo([1, 1]); // 2×2 选区
+    stubClipboard("填充值\r\n"); // 内部复制的单格格式（带行尾）
+    await grid.pasteClipboard();
+    assert(model.rawData(0, 0) === "填充值" && model.rawData(0, 1) === "填充值"
+      && model.rawData(1, 0) === "填充值" && model.rawData(1, 1) === "填充值",
+      "选区每个格都应填充为剪贴板单值");
+    assert(model.rawData(2, 0) !== "填充值", "选区外的行不应被改");
+  });
+
+  check("单格填充合并为一步撤销", async () => {
+    loadBasic();
+    grid.select([0, 0]);
+    grid._extendTo([1, 1]);
+    const before = model._undoStack.length;
+    stubClipboard("X");
+    await grid.pasteClipboard();
+    assert(model._undoStack.length === before + 1, "整块填充应为一步撤销");
+    model.undo();
+    assert(model.rawData(0, 0) === "大理" && model.rawData(1, 1) === "10",
+      "撤销后选区应整体复原");
+  });
+
+  check("多行文本不触发填充（保持整段进当前格语义）", async () => {
+    model.load(["a"], [["m1"], ["m2"]]);
+    grid.renderAll();
+    grid.select([0, 0]);
+    grid._extendTo([1, 0]); // 当前格=扩展终点 [1,0]
+    stubClipboard("第一段\n第二段"); // 外部多行纯文本
+    await grid.pasteClipboard();
+    // 整段进"当前格"（选区扩展终点，对齐 Excel 活动格语义）
+    assert(model.rawData(1, 0) === "第一段\n第二段", "多行文本应整段进当前格");
+    assert(model.rawData(0, 0) === "m1", "多行文本不应填充选区");
+  });
+
   check("Del 立即清除选区内容（无确认）", async () => {
     loadBasic();
     grid.select([0, 0]);
@@ -777,6 +814,19 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
   });
 
   // ========== 辅助：绕过系统剪贴板的粘贴核心验证 ==========
+
+  /**
+   * 打桩 navigator.clipboard.readText（WebView 里读真实剪贴板需权限且
+   * 污染系统剪贴板；defineProperty 覆盖实例属性，测完由后续用例自行覆盖）。
+   *
+   * @param {string} text - 模拟剪贴板文本。
+   */
+  function stubClipboard(text) {
+    Object.defineProperty(navigator, "clipboard", {
+      value: { readText: () => Promise.resolve(text), writeText: () => Promise.resolve() },
+      configurable: true,
+    });
+  }
 
   /**
    * 直接走区域粘贴解析核心（模拟含 Tab 内部分区文本的粘贴效果）。
@@ -1184,6 +1234,26 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(parsed.rows[0][0] === "昆明", `保存后首格 ${parsed.rows[0][0]}`);
     // 列操作后行已变为 4 列：["大理","","3","古城"]
     assert(parsed.rows[4999][3] === "古城", `末行内容应不变：${parsed.rows[4999]}`);
+  });
+
+  check("大模式：单格一对多填充逐格写引擎（选区外不动）", async () => {
+    const bm = bigM();
+    grid.ensureVisible(0, 0);
+    grid._renderRows();
+    await waitFor(() => bm.rawData(0, 0) === "昆明", "首屏缓存回锚");
+    grid.select([0, 1]);
+    grid._extendTo([1, 2]); // 2×2 选区（避开 col0，防污染后续大理计数）
+    stubClipboard("填big\r\n");
+    await grid.pasteClipboard();
+    await waitFor(() => bm.rawData(1, 2) === "填big", "填充落定");
+    assert(bm.rawData(0, 1) === "填big" && bm.rawData(0, 2) === "填big"
+      && bm.rawData(1, 1) === "填big", "选区每个格都应填充");
+    assert(bm.rawData(0, 0) === "昆明" && bm.rawData(1, 0) === "大理",
+      "选区外的列不应被改");
+    for (let i = 0; i < 4; i += 1) await bm.undo(); // 大模式撤销逐条：一格一条
+    // undo 落定是异步的（缓存刷新经引擎回推），两个格都要等，不能只等一个
+    await waitFor(() => bm.rawData(0, 1) === "" && bm.rawData(1, 2) === "3",
+      "撤销后逐格复原");
   });
 
   check("大模式：筛选后回顶显示结果（旧滚动位置不串坐标系）", async () => {

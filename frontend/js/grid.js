@@ -1390,6 +1390,15 @@ export class Grid {
     const cur = this.sel.current;
     if (!cur) return;
     const [r0, c0] = cur;
+    // 一对多填充（Excel）：剪贴板是单格单值（无 Tab/换行的单行，内外部来源皆然）
+    // 且选区超过一格 → 全选区填充。必须先于"纯文本整段进当前格"分支判定，
+    // 否则外部单值文本会被整段吞进当前格。forceSplit（按行拆分粘贴）不填充。
+    const single = text.replace(/[\r\n]+$/, "");
+    if (!forceSplit && single && this.selectedSet.size > 1
+        && !single.includes("\t") && !single.includes("\n")) {
+      await this._fillSelection(single);
+      return;
+    }
     // 内部分区判据：剪贴板文本与本软件上次复制一致（Web 无法写自定义 MIME）
     const mine = this.lastCopiedText &&
       (text === this.lastCopiedText ||
@@ -1444,6 +1453,38 @@ export class Grid {
     }
     if (!selMade) this.select([r0, c0]);
     this.hooks.statusMsg(`已粘贴 ${rows.length} 行`, 2000);
+  }
+
+  /**
+   * 一对多填充：把单值写入选区每一格（Excel 行为，选区保持不动）。
+   * 小模式整块合并为一步撤销；大模式逐格异步（引擎撤销逐条，与 _pasteBig
+   * 一致），同值格跳过以免撤销日志刷屏。
+   *
+   * @param {string} value - 填充值。
+   * @returns {Promise<void>}
+   */
+  async _fillSelection(value) {
+    const cells = this.selectedCells();
+    if (!cells.length) return;
+    if (this.model.isBig) {
+      try {
+        await this.model.batch(async () => {
+          for (const [r, c] of cells) {
+            if (this.model.rawData(r, c) === value) continue;
+            // eslint-disable-next-line no-await-in-loop
+            await this.model.setData(r, c, value);
+          }
+        });
+      } catch (err) {
+        this.hooks.statusMsg(String(err?.message ?? err), 3000);
+        return;
+      }
+    } else {
+      this.model.batch(() => {
+        for (const [r, c] of cells) this.model.setData(r, c, value);
+      });
+    }
+    this.hooks.statusMsg(`已填充 ${cells.length} 个单元格`, 2000);
   }
 
   /**
