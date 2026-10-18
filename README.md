@@ -22,7 +22,7 @@
 ## 快速开始
 
 - **Windows 10+**：从 [Releases](../../releases) 下载 `simpletable.exe`，双击即用（系统自带 WebView2；LTSC 需先装 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)）
-- **macOS**：仅 Apple Silicon（arm64），Intel Mac 不提供
+- **macOS**：仅 Apple Silicon（arm64），Intel Mac 不提供。应用为 ad-hoc 签名（未走 Apple 公证）：首次打开如提示"无法验证开发者"，右键 → 打开；若提示"已损坏"，终端执行 `xattr -cr /Applications/simpleTable.app` 后再打开
 - 打开方式：拖 CSV 进窗口 / `simpletable.exe 文件.csv` / 文件对话框
 
 ## 功能一览

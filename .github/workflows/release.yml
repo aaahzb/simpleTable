@@ -92,9 +92,20 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: 构建 dmg（aarch64-apple-darwin）
+      - name: 构建 dmg（aarch64-apple-darwin，ad-hoc 签名）
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
         run: npx --yes @tauri-apps/cli@2 build --target aarch64-apple-darwin
         working-directory: src-tauri
+
+      # 回归门槛：未签名的 arm64 应用下载后会被 Gatekeeper 报"已损坏"。
+      # tauri.conf.json 的 signingIdentity "-" 必须真正生效，否则让流水线红。
+      - name: 校验 macOS 签名（ad-hoc）
+        run: |
+          APP="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/simpleTable.app"
+          test -d "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv "$APP" 2>&1 | grep -E "Signature|Identifier"
 
       - name: 规整产物名
         run: cp src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg simpleTable-macos-arm64.dmg
@@ -127,7 +138,7 @@ jobs:
           ## 下载
 
           - **Windows (x64)**：`simpleTable-windows-x64.exe`，单文件免安装，下载即用。
-          - **macOS (Apple Silicon)**：`simpleTable-macos-arm64.dmg`，双击打开后把 app 拖入"应用程序"。首次打开如提示无法验证开发者：右键 → 打开。'
+          - **macOS (Apple Silicon)**：`simpleTable-macos-arm64.dmg`，双击打开后把 app 拖入"应用程序"。应用为 ad-hoc 签名（未走 Apple 公证）：首次打开如提示"无法验证开发者"，右键 → 打开；若提示"已损坏"，终端执行 `xattr -cr /Applications/simpleTable.app` 后再打开。'
           if [ -n "$PREV" ]; then
             LOG=$(git log --no-merges --pretty=format:'- %s' "${PREV}..${CUR}")
             RANGE="${PREV} → ${CUR}"
