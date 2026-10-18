@@ -1468,6 +1468,25 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(await invoke("big_filter_count") === 5000, "引擎侧命中数不一致");
   });
 
+  check("大模式：筛选落定时不重建筛选框（焦点不丢）", async () => {
+    // 回归：筛选落定的数据事件会走 renderAll → _renderHeader，若无条件重建表头，
+    // 正在输入的筛选框 DOM 被替换——用户每打两个字就丢焦点、按键被吞。
+    const bm = bigM();
+    const input = document.querySelector('.col-filter input[data-col="0"]');
+    // 先清空回全量，确保随后的 waitFor(filterActive) 真正等到"本次筛选落定"
+    input.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await waitFor(() => bm.filterActive() === false, "先回全量");
+    input.focus();
+    input.value = "大理";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await waitFor(() => bm.filterActive() && bm.rowCount() === 5000, "本次筛选落定");
+    await sleep(150); // 给"落定后重建"一次发生的机会
+    assert(input.isConnected, "筛选框 DOM 被重建替换");
+    assert(document.activeElement === input, "筛选落定后焦点被夺走");
+    assert(input.value === "大理", `筛选框内容丢失：${input.value}`);
+  });
+
   check("大模式：键入收窄与清空自动回全量", async () => {
     const bm = bigM();
     const input = document.querySelector('.col-filter input[data-col="0"]');

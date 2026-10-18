@@ -114,6 +114,8 @@ export class Grid {
     this._staleText = new Map();
     /** @type {string} 行结构形状键（列数/列序/列宽），变化即整窗重建 */
     this._shapeKey = "";
+    /** @type {string} 表头 DOM 重建签名（列序/列名/宽度/多重筛选），未变不重建 */
+    this._headerKeyCache = "";
     /** @type {string} 最近一次本软件复制的文本（内部分区粘贴判据） */
     this.lastCopiedText = "";
     this._suppressFilterInput = false;
@@ -147,6 +149,7 @@ export class Grid {
     this.rowsEl.textContent = "";
     this._staleText.clear();
     this._shapeKey = "";
+    this._headerKeyCache = "";
     m.onData((structural) => this._onModelData(structural));
     this.rebuildStructure();
   }
@@ -373,13 +376,32 @@ export class Grid {
   /** 全量重绘（表头 + 画布） */
   renderAll() {
     this._effWidthsCache = this._effWidths();
-    this._renderHeader();
+    // 数据事件（筛选落定/预取落定）会高频走这里；表头结构未变时绝不重建，
+    // 否则正在输入的筛选框 DOM 被替换——焦点丢失、后续按键被吞。
+    if (this._headerKey() !== this._headerKeyCache) this._renderHeader();
     this._layout();
     this._renderRows();
   }
 
+  /**
+   * 表头 DOM 重建签名：列顺序/列名/宽度/多重筛选开关与勾选列。
+   *
+   * @returns {string} 可比较的签名串。
+   */
+  _headerKey() {
+    const widths = this._effWidthsCache ?? this._effWidths();
+    return JSON.stringify([
+      this.multi.on,
+      [...this.multi.cols].sort((a, b) => a - b),
+      this.colOrder,
+      this.colOrder.map((c) => this.model.headers()[c] ?? ""),
+      widths,
+    ]);
+  }
+
   /** 重绘列头（列名带 + 筛选带） */
   _renderHeader() {
+    this._headerKeyCache = this._headerKey();
     // 保留 corner，重建列单元格
     for (const el of [...this.headerEl.children]) {
       if (el.id !== "corner") el.remove();
