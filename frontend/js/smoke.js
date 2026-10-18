@@ -1707,10 +1707,47 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await invoke("smoke_write_repeat", { path: p, line: "a,b,c,d,e\n", times: 1000001, append: false });
     await invoke("smoke_set_force_big", { v: true });
     await window.__app.openPath(p);
+    // ---- 渐进索引：10MB 夹具超过首屏同步扫描上限（1MiB），打开先返回首批行 ----
+    const bm0 = bigM();
+    assert(bm0.indexing() === true, "打开后应仍在后台索引");
+    const partialRows = bm0.rowCount();
+    assert(partialRows >= 1000 && partialRows < 1000000,
+      `首批可用行数 ${partialRows} 应介于 1000 与全量之间`);
+    assert(bm0.meta().total_bytes > 0 && bm0.meta().indexed_bytes > 0,
+      "索引进度字节字段应有效");
+    assert(bm0.firstPaintMs() > 0, "首屏耗时应已记录");
+    // 筛选框禁用 + "索引中…" 占位；状态栏报进度（EmEditor 式）
+    const fin = document.querySelector(".col-filter input");
+    assert(fin?.disabled === true, "索引中筛选框应禁用");
+    assert(String(fin?.placeholder).includes("索引中"), `索引中占位 ${fin?.placeholder}`);
+    assert(String(document.getElementById("status-text").textContent).includes("索引中"),
+      "状态栏应显示索引进度");
+    // 索引中结构操作被拒（单元格编辑放行不在此断言）
+    let rejected = false;
+    try { await bm0.insertRows(0, 1); } catch (e) { rejected = /索引中/.test(String(e?.message ?? e)); }
+    assert(rejected, "索引中插入行应被拒绝");
+    // 视口锚点：滚到首批范围内的中间行。索引完成会改变行数并触发 _yScale
+    // 虚拟缩放，同一 scrollTop 将落到别的行——实现须把锚点行送回视口顶。
+    const sc = document.getElementById("grid-scroll");
+    const anchorRow = Math.min(50000, partialRows - 1);
+    sc.scrollTop = Math.round(
+      grid._originY() + (anchorRow * grid._uniformRowH) / grid._yScale);
+    grid._renderRows();
+    await waitFor(() => !bigM().indexing(), "后台索引完成");
+    // ---- 索引完成：行数收敛、筛选框恢复、状态栏报首屏/索引耗时 ----
     const n = grid.visCount();
     assert(n > 999000, `行数 ${n}`);
+    const fin2 = document.querySelector(".col-filter input");
+    assert(fin2?.disabled === false, "索引完成后筛选框应恢复可用");
+    assert(fin2?.placeholder === "筛选…", `筛选占位恢复 ${fin2?.placeholder}`);
+    await waitFor(() => {
+      const t = document.getElementById("status-text").textContent;
+      return /首屏\s*\d+\s*ms/.test(t) && /索引\s/.test(t);
+    }, "状态栏耗时摘要");
+    const anchorNow = grid._rowAt(sc.scrollTop - grid._originY());
+    assert(Math.abs(anchorNow - anchorRow) <= 2,
+      `索引完成后锚点行 ${anchorNow} 应≈${anchorRow}（不得因行数增长跳走）`);
     assert(grid._yScale > 1, `yScale=${grid._yScale} 应已启用虚拟缩放`);
-    const sc = document.getElementById("grid-scroll");
     const cv = sc.firstElementChild;
     const styleH = parseFloat(cv.style.height);
     assert(styleH < 16800000, `画布 style 高 ${styleH} 应压到上限以内`);

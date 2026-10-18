@@ -285,6 +285,8 @@ fn with_big<T>(
 ) -> Result<T, String> {
     let mut guard = state.lock().map_err(|e| e.to_string())?;
     let bf = guard.as_mut().ok_or("大文件会话未打开")?;
+    // 后台索引恰好完成时先并入正式结构：所有命令看到的都是同一份索引
+    bf.refresh_indexed();
     f(bf)
 }
 
@@ -295,17 +297,28 @@ fn file_size(path: String) -> Result<u64, String> {
     Ok(meta.len())
 }
 
-/// 打开大文件会话（mmap + 行索引，秒开）。
+/// 打开大文件会话（mmap + 首屏前缀索引；全量索引转后台，UI 不冻结）。
+///
+/// 同步命令会占住主线程：慢盘上整文件索引要一两分钟，窗口直接"未响应"。
+/// 这里只同步扫 1 MiB/1000 条记录（百毫秒级），其余由引擎后台线程继续；
+/// 走 spawn_blocking 连前缀扫描也不占 UI 线程。
 #[tauri::command]
-fn big_open(
+async fn big_open(
     path: String,
-    state: tauri::State<BigShared>,
-    gate: tauri::State<FilterGen>,
+    state: tauri::State<'_, BigShared>,
+    gate: tauri::State<'_, FilterGen>,
 ) -> Result<BigMeta, String> {
     gate.bump(); // 旧文件的筛选扫描没有继续的意义
-    let mut guard = state.lock().map_err(|e| e.to_string())?;
-    *guard = Some(BigFile::open(std::path::Path::new(&path))?);
-    Ok(guard.as_ref().unwrap().meta())
+    let shared = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let bf = BigFile::open_progressive(std::path::Path::new(&path))?;
+        let meta = bf.meta();
+        let mut guard = shared.lock().map_err(|e| e.to_string())?;
+        *guard = Some(bf);
+        Ok(meta)
+    })
+    .await
+    .map_err(|e| format!("打开任务被取消：{e}"))?
 }
 
 /// 关闭大文件会话。
@@ -469,10 +482,7 @@ async fn big_save(
 
 #[tauri::command]
 fn big_col_push(state: tauri::State<BigShared>, op: ColOp) -> Result<(), String> {
-    with_big(&state, |bf| {
-        bf.push_col_op(op);
-        Ok(())
-    })
+    with_big(&state, |bf| bf.push_col_op(op))
 }
 
 #[tauri::command]

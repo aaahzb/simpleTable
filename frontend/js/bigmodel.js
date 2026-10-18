@@ -40,14 +40,28 @@ export class BigModel {
     this._invoke = tauri.invoke;
     /** @type {Function} */
     this._listen = tauri.listen;
+    /** @type {number} 索引进度轮询周期 ms（测试可注入更短值） */
+    this._pollMs = tauri.pollMs ?? 200;
     /** @type {object | null} 最近一次的 big_meta 缓存 */
     this._meta = null;
     /** @type {Map<string, string[][]>} 页缓存，键 `${"f"|""}${pageIdx}` */
     this._cache = new Map();
     /** @type {Set<string>} 正在拉取的页 */
     this._inflight = new Set();
+    /** @type {Set<string>} 索引中拉取的"部分页"（页尾尚未索引，行数增长后须重拉） */
+    this._partial = new Set();
     /** @type {number} 代际号：结构变化后旧响应作废 */
     this._gen = 0;
+    /** @type {number} 会话语义号：只被 open/close 递增，撤销等缓存失效不得停掉轮询 */
+    this._session = 0;
+    /** @type {number} 索引进度轮询计时器（0 = 未在轮询） */
+    this._indexTimer = 0;
+    /** @type {number | null} 打开起点（performance.now；首屏耗时基准） */
+    this._openT0 = null;
+    /** @type {number} 首屏耗时 ms（第一次 markFirstPaint 锁定） */
+    this._firstPaintMs = 0;
+    /** @type {Set<Function>} 索引进度订阅者 */
+    this._progressCbs = new Set();
     /** @type {boolean} 筛选结果视图 */
     this._filterOn = false;
     /** @type {number} 筛选命中数（_filterOn 时的 rowCount） */
@@ -65,17 +79,27 @@ export class BigModel {
   // ---- 生命周期 ----
 
   /**
-   * 打开大文件会话（引擎 mmap + 建索引，秒开）。
+   * 打开大文件会话（引擎 mmap + 同步扫首批行，秒开）。
+   *
+   * 引擎打开后立即返回首批可用行（indexing=true），后台线程继续索引；
+   * 本模型按 `pollMs` 轮询 big_meta，行数增长经 onData 重绘，进度经
+   * onIndexProgress 通知。首屏耗时从本调用开始计。
    *
    * @param {string} path - 文件绝对路径。
-   * @returns {Promise<object>} BigMeta。
+   * @returns {Promise<object>} BigMeta（可能 indexing=true）。
    */
   async open(path) {
+    this._stopIndexPolling();
+    this._session += 1;
+    this._openT0 = performance.now();
+    this._firstPaintMs = 0;
     this._meta = await this._invoke("big_open", { path });
     this._invalidate();
     this._emitReset();
     this._emitData(true);
     this._emitUndo();
+    this._emitProgress();
+    this._startIndexPolling();
     return this._meta;
   }
 
@@ -85,9 +109,113 @@ export class BigModel {
    * @returns {Promise<void>}
    */
   async close() {
+    this._stopIndexPolling();
+    this._session += 1;
     await this._invoke("big_close");
     this._meta = null;
+    this._openT0 = null;
+    this._firstPaintMs = 0;
     this._invalidate();
+  }
+
+  /**
+   * 是否仍在后台建立行索引（大文件打开后的短暂窗口）。
+   *
+   * @returns {boolean} true = 索引中：筛选/跳转/保存/结构变更暂不可用。
+   */
+  indexing() {
+    return !!this._meta?.indexing;
+  }
+
+  /**
+   * 首屏耗时：open 开始 → app 完成首次视图装载（只认第一次标记）。
+   *
+   * @returns {number} 毫秒；尚未标记返回 0。
+   */
+  firstPaintMs() {
+    return this._firstPaintMs;
+  }
+
+  /**
+   * 标记首屏完成（app 在 applyViewState 后调用；只认第一次）。
+   *
+   * @returns {void}
+   */
+  markFirstPaint() {
+    if (this._openT0 === null || this._firstPaintMs) return;
+    this._firstPaintMs = Math.max(0, performance.now() - this._openT0);
+  }
+
+  /**
+   * 订阅索引进度（每次轮询/打开时通知，载荷为最新 BigMeta）。
+   *
+   * @param {(meta: object) => void} cb - 回调。
+   * @returns {void}
+   */
+  onIndexProgress(cb) {
+    this._progressCbs.add(cb);
+  }
+
+  /** 通知索引进度订阅者 */
+  _emitProgress() {
+    for (const cb of this._progressCbs) cb(this._meta);
+  }
+
+  /**
+   * 开始轮询索引进度（indexing=false 或无元数据时不启动）。
+   *
+   * @returns {void}
+   */
+  _startIndexPolling() {
+    if (!this._meta?.indexing || this._indexTimer) return;
+    this._indexTimer = setTimeout(() => this._pollIndex(), this._pollMs);
+  }
+
+  /** 停止索引进度轮询 */
+  _stopIndexPolling() {
+    clearTimeout(this._indexTimer);
+    this._indexTimer = 0;
+  }
+
+  /**
+   * 轮询一次索引进度：行数增长时丢弃部分页并触发结构重绘；完成后停表。
+   *
+   * 用会话语义号（而非缓存代际号）校验迟到响应——索引期间撤销/编辑会
+   * 递增缓存代际，但轮询必须继续。
+   *
+   * @returns {Promise<void>}
+   */
+  async _pollIndex() {
+    this._indexTimer = 0;
+    if (!this._meta?.indexing) return;
+    const session = this._session;
+    let meta;
+    try {
+      meta = await this._invoke("big_meta");
+    } catch {
+      return; // 会话已关闭等：静默停止
+    }
+    if (session !== this._session || !this._meta) return;
+    const prevRows = Number(this._meta.rows ?? 0);
+    const grew = Number(meta.rows ?? 0) > prevRows;
+    const finished = !meta.indexing;
+    this._meta = meta;
+    if (grew) this._dropPartialPages();
+    this._emitProgress();
+    // 行数增长/索引完成：画布总高与行号域变化，按结构变化重绘（origin=fetch 不标脏）
+    if (grew || finished) this._emitData(true, "fetch");
+    if (!finished) this._indexTimer = setTimeout(() => this._pollIndex(), this._pollMs);
+  }
+
+  /**
+   * 丢弃索引中拉取的部分页：页尾在拉取时尚未索引，行数增长后须按新行数重拉。
+   * 完整页（拉取时页尾已在已索引范围内）保留，避免无谓 IPC 与白闪。
+   *
+   * @returns {void}
+   */
+  _dropPartialPages() {
+    for (const key of this._partial) this._cache.delete(key);
+    this._partial.clear();
   }
 
   /**
@@ -311,16 +439,29 @@ export class BigModel {
     this._inflight.add(key);
     const gen = this._gen;
     const from = page * BIG_PAGE;
+    // 拉取时的行数上限：页尾是否已索引，决定这一页落定后是否算"部分页"
+    const atRows = this._filterOn ? this._filterCount : Number(this._meta?.rows ?? 0);
     const req = this._filterOn
       ? this._invoke("big_filter_page", { from, count: BIG_PAGE })
       : this._invoke("big_rows", { from, count: BIG_PAGE });
     req.then((rows) => {
       // 结构已变化（代际不同/筛选态翻转）→ 旧响应作废
-      if (gen === this._gen && this._key(page) === key) {
-        this._cache.set(key, rows);
-        this._trim(page);
-        this._emitData(false, "fetch"); // 纯预取落定：重绘即可，不得标脏
+      if (gen !== this._gen || this._key(page) !== key) return;
+      const fullAtFetch = from + BIG_PAGE <= atRows;
+      if (!fullAtFetch) {
+        const nowRows = this._filterOn ? this._filterCount : Number(this._meta?.rows ?? 0);
+        if (nowRows > atRows) {
+          // 飞行期间行数增长：本页响应缺尾部行，丢弃后按新行数重拉
+          this._inflight.delete(key);
+          this._schedule(page);
+          return;
+        }
+        // 页尾尚未索引：登记为部分页，后续行数增长时整体失效
+        this._partial.add(key);
       }
+      this._cache.set(key, rows);
+      this._trim(page);
+      this._emitData(false, "fetch"); // 纯预取落定：重绘即可，不得标脏
     }).catch(() => {
       // 拉取失败静默：下次渲染重试（编辑冲突另有错误通道）
     }).finally(() => {
@@ -339,7 +480,10 @@ export class BigModel {
     for (const key of this._cache.keys()) {
       if (!key.startsWith(prefix)) continue;
       const p = Number(key.slice(prefix.length));
-      if (p < around - 2 || p > around + 2) this._cache.delete(key);
+      if (p < around - 2 || p > around + 2) {
+        this._cache.delete(key);
+        this._partial.delete(key);
+      }
     }
   }
 
@@ -352,9 +496,21 @@ export class BigModel {
     this._gen += 1;
     this._cache.clear();
     this._inflight.clear();
+    this._partial.clear();
   }
 
   // ---- 编辑 ----
+
+  /**
+   * 索引期间的能力闸门：结构变更/筛选/保存/列操作一律拒绝（单元格编辑放行）。
+   *
+   * @param {string} msg - 面向用户的中文原因。
+   * @returns {void}
+   * @throws {Error} 引擎仍在建索引时。
+   */
+  _requireNotIndexing(msg) {
+    if (this.indexing()) throw new Error(msg);
+  }
 
   /**
    * 写单元格（乐观写缓存 + 异步落引擎，失败回滚抛错）。
@@ -492,6 +648,7 @@ export class BigModel {
    * @returns {Promise<void>}
    */
   async insertRows(row, count = 1) {
+    this._requireNotIndexing("文件仍在索引中，暂不支持插入/删除行");
     await this._invoke("big_insert_rows", { vpos: row, rows: null, count });
     await this._afterStructural();
   }
@@ -514,6 +671,7 @@ export class BigModel {
    * @returns {Promise<void>}
    */
   async insertRowsWithValues(vpos, rows) {
+    this._requireNotIndexing("文件仍在索引中，暂不支持插入/删除行");
     await this._invoke("big_insert_rows", { vpos, rows, count: 0 });
     await this._afterStructural();
   }
@@ -528,6 +686,7 @@ export class BigModel {
     if (this._filterOn) {
       throw new Error("筛选结果中不可删除：请先清除筛选");
     }
+    this._requireNotIndexing("文件仍在索引中，暂不支持插入/删除行");
     const sorted = [...new Set(rows)].sort((a, b) => a - b);
     await this._invoke("big_remove_rows", { vrows: sorted });
     await this._afterStructural();
@@ -612,6 +771,7 @@ export class BigModel {
    * @returns {Promise<number | null>} 命中数；请求已过期/被引擎中断时返回 null。
    */
   async runFilter(cols, multiCols, multiText) {
+    this._requireNotIndexing("文件仍在索引中，暂不支持筛选");
     const gen = ++this._filterGen;
     const spec = {
       cols: cols.map(([c, kw]) => [c, kw.toLowerCase()]),
@@ -727,6 +887,7 @@ export class BigModel {
    * @returns {Promise<void>}
    */
   async _pushColOp(op) {
+    this._requireNotIndexing("文件仍在索引中，暂不支持列操作");
     await this._invoke("big_col_push", { op });
     await this._refreshMeta();
     this._emitData(true);
@@ -738,6 +899,7 @@ export class BigModel {
    * @returns {Promise<void>}
    */
   async applyColOps() {
+    this._requireNotIndexing("文件仍在索引中，暂不支持列操作");
     await this._invoke("big_col_apply");
     this._invalidate();
     await this._refreshMeta();
@@ -752,6 +914,7 @@ export class BigModel {
    * @returns {Promise<void>}
    */
   async save() {
+    this._requireNotIndexing("文件仍在索引中，请稍候再保存");
     await this._invoke("big_save");
     await this._refreshMeta();
   }

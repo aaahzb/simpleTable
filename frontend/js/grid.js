@@ -101,6 +101,8 @@ export class Grid {
     this.visibleRows = null;
     /** @type {number} 大文件模式统一行高 px（rebuildStructure 计算） */
     this._uniformRowH = 20;
+    /** @type {number} 上一次布局的可见行数（渐进索引行数增长判定） */
+    this._lastVisCount = 0;
     /** @type {boolean} 选区截断提示已发（防抖） */
     this._selCapNotified = false;
     /** @type {{current: [number, number]|null, anchor: [number, number]|null,
@@ -225,6 +227,7 @@ export class Grid {
    */
   _layout() {
     const n = this.visCount();
+    this._lastVisCount = n;
     const oy = this._originY();
     const totalW = this._rowHeadW() + this._effWidths().reduce((a, b) => a + b, 0);
     this.canvasEl.style.width = `${Math.max(totalW, this.scrollEl.clientWidth)}px`;
@@ -396,12 +399,16 @@ export class Grid {
       this.colOrder,
       this.colOrder.map((c) => this.model.headers()[c] ?? ""),
       widths,
+      // 大模式索引中/完成：筛选框禁用态与占位文案不同，完成瞬间须重建一次
+      this.model.isBig ? this.model.indexing?.() === true : false,
     ]);
   }
 
   /** 重绘列头（列名带 + 筛选带） */
   _renderHeader() {
     this._headerKeyCache = this._headerKey();
+    // 大模式后台索引期间：筛选框禁用并显示"索引中…"（EmEditor 式进度语义）
+    const indexing = this.model.isBig && this.model.indexing?.() === true;
     // 保留 corner，重建列单元格
     for (const el of [...this.headerEl.children]) {
       if (el.id !== "corner") el.remove();
@@ -433,7 +440,9 @@ export class Grid {
       const filter = document.createElement("div");
       filter.className = "col-filter";
       const input = document.createElement("input");
-      input.placeholder = "筛选…";
+      input.placeholder = indexing ? "索引中…" : "筛选…";
+      input.disabled = indexing;
+      if (indexing) input.title = "文件仍在后台索引，稍后即可筛选";
       input.value = this.filters.get(srcCol) ?? "";
       input.dataset.col = String(srcCol);
       filter.appendChild(input);
@@ -683,6 +692,14 @@ export class Grid {
    * @param {boolean} structural - 是否结构变化（行列增删/排序/装载）。
    */
   _onModelData(structural) {
+    // 大模式索引推进：行数增长会改变画布总高与 _yScale，同一 scrollTop 可能
+    // 落到别的行——先记住视口锚点行，重排后把它送回视口顶（顶部用户不打扰）。
+    let anchor = null;
+    const rowsBefore = this._lastVisCount;
+    if (structural && this.model.isBig && !this.visibleRows) {
+      const a = this._yAnchor().anchor;
+      if (a > 0 && a < rowsBefore) anchor = a;
+    }
     if (structural) {
       if (!this.model.isBig) {
         const rows = this.model.rowCount();
@@ -700,6 +717,13 @@ export class Grid {
     }
     this._refilter();
     this.renderAll();
+    if (anchor !== null && this.visCount() > rowsBefore) {
+      const top = this._originY() + this._rowTop(anchor);
+      if (Math.abs(this.scrollEl.scrollTop - top) > 1) {
+        this.scrollEl.scrollTop = top;
+        this._renderRows();
+      }
+    }
   }
 
   /** 窗口尺寸/缩放变化 → 重排（末列拉伸量可能变化）；rAF 去抖防自激循环 */

@@ -55,11 +55,75 @@ function statusMsg(msg, ms = 0) {
   }
 }
 
-/** 刷新左侧状态（显示 X / 共 Y 行；大模式筛选中显示匹配数与用时） */
+/**
+ * 毫秒时长 → 用户可读文本（<1s 用 ms，否则秒保留 1 位小数）。
+ *
+ * @param {number} ms - 毫秒。
+ * @returns {string} 展示文本。
+ */
+function fmtDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "-";
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  return `${(ms / 1000).toFixed(1)} 秒`;
+}
+
+/**
+ * 大模式耗时后缀（状态栏常驻）：首屏（毫秒级）+ 全量索引（秒级）。
+ *
+ * @param {BigModel} m - 大文件模型。
+ * @returns {string} 形如 " · 首屏 320 ms · 索引 115.2 秒"；非大模式返回空串。
+ */
+function bigTimingSuffix(m) {
+  const meta = m.meta?.();
+  if (!meta) return "";
+  const parts = [];
+  const first = m.firstPaintMs?.() || meta.open_ms || 0;
+  if (first) parts.push(`首屏 ${fmtDuration(first)}`);
+  if (!meta.indexing) {
+    const idx = meta.index_ms || meta.elapsed_ms || meta.open_ms;
+    if (idx) parts.push(`索引 ${fmtDuration(idx)}`);
+  }
+  return parts.length ? ` · ${parts.join(" · ")}` : "";
+}
+
+/**
+ * 大文件打开完成摘要（状态栏瞬时消息）：行列、编码、首屏与索引耗时。
+ *
+ * @param {BigModel} m - 大文件模型。
+ * @returns {string} 摘要文本。
+ */
+function bigOpenSummary(m) {
+  const meta = m.meta();
+  const idx = meta.index_ms || meta.elapsed_ms || meta.open_ms;
+  return `大文件模式：${Number(meta.rows).toLocaleString()} 行 × ${meta.cols} 列` +
+    `（${meta.encoding}）· 首屏 ${fmtDuration(m.firstPaintMs?.() || meta.open_ms)}` +
+    ` · 索引 ${fmtDuration(idx)}`;
+}
+
+/** 刷新左侧状态（显示 X / 共 Y 行；大模式索引中显示进度与耗时） */
 function updateStatusText() {
-  if (model.isBig && model.filterActive()) {
-    statusText.textContent = `匹配 ${lastCounts[0]} / 共 ${model.meta()?.rows ?? lastCounts[1]} 行` +
-      (lastFilterMs ? ` · 用时 ${(lastFilterMs / 1000).toFixed(1)} 秒` : "");
+  if (model.isBig) {
+    const meta = model.meta();
+    // 渐进索引进行中：百分比 + 已可用行数 + 首屏/已用耗时（EmEditor 式反馈）
+    if (meta?.indexing) {
+      const total = Number(meta.total_bytes) || 0;
+      const pct = total
+        ? Math.min(99, Math.floor((Number(meta.indexed_bytes) || 0) * 100 / total))
+        : 0;
+      const first = model.firstPaintMs?.() || meta.open_ms || 0;
+      statusText.textContent =
+        `索引中 ${pct}% · 已可用 ${Number(meta.rows).toLocaleString()} 行` +
+        (first ? ` · 首屏 ${fmtDuration(first)}` : "") +
+        ` · 已用 ${fmtDuration(meta.elapsed_ms)}（筛选/跳转稍后可用）`;
+      return;
+    }
+    if (model.filterActive()) {
+      statusText.textContent = `匹配 ${lastCounts[0]} / 共 ${meta?.rows ?? lastCounts[1]} 行` +
+        (lastFilterMs ? ` · 用时 ${(lastFilterMs / 1000).toFixed(1)} 秒` : "");
+      return;
+    }
+    statusText.textContent =
+      `显示 ${lastCounts[0]} / 共 ${lastCounts[1]} 行${bigTimingSuffix(model)}`;
     return;
   }
   statusText.textContent = `显示 ${lastCounts[0]} / 共 ${lastCounts[1]} 行`;
@@ -358,6 +422,8 @@ function applyViewState(g) {
   bigFilterSeq += 1;
   onCountsChanged(model.rowCount(), model.rowCount());
   refreshBigUi();
+  // 大模式：视图已装载完成，锁定首屏耗时（只认每个模型会话的第一次）
+  model.markFirstPaint?.();
 }
 
 /**
@@ -382,9 +448,15 @@ function applyDocToCurrent(doc, p) {
   updateStatusText();
   if (doc.kind === "big") {
     const meta = model.meta();
-    statusMsg(
-      `大文件模式：${meta.rows} 行 × ${meta.cols} 列（${meta.encoding}），` +
-      "筛选框键入即筛（回车立即执行）", 6000);
+    if (meta.indexing) {
+      // 秒开路径：首批行已可用，其余在后台索引；筛选/跳转完成前不可用
+      statusMsg(
+        `大文件模式：首批 ${Number(meta.rows).toLocaleString()} 行已可查看` +
+        ` · 首屏 ${fmtDuration(model.firstPaintMs?.() || meta.open_ms)}` +
+        " · 后台索引中…（筛选/跳转稍后可用）", 6000);
+    } else {
+      statusMsg(`${bigOpenSummary(model)}，筛选框键入即筛（回车立即执行）`, 8000);
+    }
   }
   if (doc.warnings?.length) {
     void infoDialog("打开提示", doc.warnings.slice(0, 20).join("\n"));
@@ -820,6 +892,11 @@ function collectBigFilter() {
  */
 function scheduleBigFilter() {
   if (!model.isBig) return;
+  if (model.indexing?.()) {
+    statusMsg("文件仍在索引中，暂不支持筛选（已可用 " +
+      `${Number(model.meta()?.rows ?? 0).toLocaleString()} 行）`, 2500);
+    return;
+  }
   clearTimeout(bigFilterTimer);
   bigFilterTimer = setTimeout(() => {
     const { kws, mKw } = collectBigFilter();
@@ -840,6 +917,11 @@ function scheduleBigFilter() {
  */
 async function runBigFilter(opts = {}) {
   if (!model.isBig) return; // 兜底：小模式此按钮隐藏，防御误触调用小模型不存在的 runFilter
+  if (model.indexing?.()) {
+    statusMsg("文件仍在索引中，暂不支持筛选（已可用 " +
+      `${Number(model.meta()?.rows ?? 0).toLocaleString()} 行）`, 2500);
+    return;
+  }
   clearTimeout(bigFilterTimer);
   const { kws, mKw, mCols } = collectBigFilter();
   if (!kws.length && !mKw) {
@@ -873,6 +955,10 @@ async function runBigFilter(opts = {}) {
 /** 执行 pending 列操作（物理重写 + 进度条） */
 async function applyColOps() {
   if (!model.isBig || !model.colOpsPending()) return;
+  if (model.indexing?.()) {
+    statusMsg("文件仍在索引中，暂不支持列操作", 2500);
+    return;
+  }
   const dlg = progressDialog("执行列操作…");
   const un = await model.onProgress((done, total, phase, rows) => dlg.set(done, total, phase, rows));
   let ok = false;
@@ -1094,6 +1180,15 @@ function bindModelEvents(m) {
     if (m !== model) return;
     updateUndoButtons();
   });
+  // 大模式渐进索引：轮询进度刷新状态栏；完成瞬间报一次首屏/索引耗时
+  let wasIndexing = m.indexing?.() === true;
+  m.onIndexProgress?.((meta) => {
+    if (m !== model) return; // 副侧进度不得改写焦点侧状态栏
+    updateStatusText();
+    const now = meta?.indexing === true;
+    if (wasIndexing && !now) statusMsg(`${bigOpenSummary(m)}，筛选已可用`, 8000);
+    wasIndexing = now;
+  });
   // 大表撤销降级：状态栏提示一次（小模型专属；BigModel 无此方法）
   m.onUndoCap?.((cap) => {
     if (m !== model) return;
@@ -1185,6 +1280,11 @@ async function openPath(p, opts = {}) {
 
 /** 保存到当前路径（无路径时转另存为） */
 async function saveFile() {
+  if (model.isBig && model.indexing?.()) {
+    // 索引未完成时引擎无法流式重写（后台线程仍持有映射），提示稍候
+    statusMsg("文件仍在索引中，请稍候再保存", 2500);
+    return;
+  }
   if (path === null) {
     await saveFileAs();
     return;
@@ -1222,6 +1322,10 @@ async function saveFile() {
 
 /** 另存为 CSV */
 async function saveFileAs() {
+  if (model.isBig && model.indexing?.()) {
+    statusMsg("文件仍在索引中，请稍候再另存为", 2500);
+    return;
+  }
   let p = await invoke("pick_save_path", { defaultName: "未命名.csv" });
   if (!p) return;
   if (!p.toLowerCase().endsWith(".csv")) p += ".csv";
@@ -1379,6 +1483,11 @@ function gotoRow(vi) {
 
 /** 跳转行对话框（工具栏"跳转行…" / Ctrl+G）：输入 1 基显示行号直达。 */
 async function gotoRowDialog() {
+  if (model.isBig && model.indexing?.()) {
+    statusMsg("文件仍在索引中，暂不支持跳转行（已可用 " +
+      `${Number(model.meta()?.rows ?? 0).toLocaleString()} 行）`, 2500);
+    return;
+  }
   const n = fgrid().visCount();
   if (!n) {
     statusMsg("空表无法跳转", 2000);

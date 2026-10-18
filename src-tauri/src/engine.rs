@@ -16,7 +16,8 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use memchr::{memchr, memchr_iter};
 use rayon::prelude::*;
@@ -392,6 +393,128 @@ pub fn build_index(bytes: &[u8]) -> RawIndex {
     RawIndex { line_off, rec_lines }
 }
 
+// ============================================================
+// 渐进索引：分块扫描
+// ============================================================
+
+/// 首屏同步索引目标：最多扫 1 MiB 或 1000 条记录（含表头），先让表格可用；
+/// 剩余部分交给后台单线程继续（慢盘上首屏仍是百毫秒级，而不是等整文件）。
+const INITIAL_INDEX_BYTES: usize = 1 << 20;
+
+/// 首屏同步索引的记录数上限（含表头）。短行大文件据此在 1 MiB 前收手。
+const INITIAL_INDEX_RECORDS: usize = 1000;
+
+/// 后台索引分块：单线程顺序读，限制磁盘并发；每块发布一次新行，
+/// 读路径（拖滚动条）随时能拿到刚扫过的部分。
+const INDEX_CHUNK_BYTES: usize = 1 << 20;
+
+/// 分块扫描游标：所有跨块状态都在这里，块边界可落在任意字节
+/// （包括多字节字符/引号内换行中间——引号状态机只认 ASCII 引号，安全）。
+#[derive(Clone, Copy)]
+struct ScanCursor {
+    /// 已扫描（已喂入引号状态机）到的字节位置。
+    pos: usize,
+    /// 当前物理行起始偏移（可能早于 pos，块从行中间开始时）。
+    line_start: usize,
+    /// 当前物理行号（对应 line_off 下标）。
+    line_no: u32,
+    /// pos 处的引号状态。
+    in_quotes: bool,
+    /// 当前物理行起始时的引号状态：true = 本行是上一条记录的续行，
+    /// 该记录在行结束前都不完整（渐进可见性判据）。
+    line_started_open: bool,
+}
+
+impl ScanCursor {
+    /// 从文件头开始。
+    fn new() -> Self {
+        Self {
+            pos: 0,
+            line_start: 0,
+            line_no: 0,
+            in_quotes: false,
+            line_started_open: false,
+        }
+    }
+}
+
+/// 扫描 [pos, pos+max_bytes) 内的完整物理行，返回新行偏移与记录起始行号。
+/// `cur` 推进到块尾（可能停在行中间，状态由游标携带到下一块）。
+///
+/// 块尾无换行且未到 EOF 时不产出行/记录，只推进引号状态；到 EOF 时把
+/// 无结尾换行的最后一行按完整记录处理（与 `build_index_seq` 一致）。
+///
+/// # Parameters
+/// - `bytes`: 整个文件字节。
+/// - `cur`: 扫描游标（跨块状态）。
+/// - `max_bytes`: 本块最多推进的字节数（≥1）。
+///
+/// # Returns
+/// `(新增行偏移, 新增记录起始行号)`。
+fn scan_chunk(
+    bytes: &[u8],
+    cur: &mut ScanCursor,
+    max_bytes: usize,
+) -> (Vec<u64>, Vec<u32>) {
+    let n = bytes.len();
+    if cur.pos >= n {
+        return (Vec::new(), Vec::new());
+    }
+    let end = cur.pos.saturating_add(max_bytes.max(1)).min(n);
+    let mut line_off: Vec<u64> = Vec::new();
+    let mut rec_lines: Vec<u32> = Vec::new();
+    let mut m = QuoteMachine::new(cur.in_quotes);
+    let mut from = cur.pos;
+    while let Some(rel) = memchr(b'\n', &bytes[from..end]) {
+        let q = from + rel;
+        // 行结束位置 = 换行符之后；本行起始时的引号状态决定是否记录起始。
+        m.feed(&bytes[from..=q]);
+        if !cur.line_started_open && !line_is_blank(bytes, cur.line_start, q + 1) {
+            rec_lines.push(cur.line_no);
+        }
+        line_off.push((q + 1) as u64);
+        cur.line_no += 1;
+        cur.line_start = q + 1;
+        cur.line_started_open = m.in_quotes;
+        from = q + 1;
+    }
+    if from < end {
+        // 块尾残行/块内无换行的超长行：只推进引号状态，行完成留给后续块。
+        m.feed(&bytes[from..end]);
+    }
+    cur.in_quotes = m.in_quotes;
+    cur.pos = end;
+    if end == n && cur.line_start < n {
+        // 文件末行无换行：同样是一条完整记录，但不产生新行偏移。
+        if !cur.line_started_open && !line_is_blank(bytes, cur.line_start, n) {
+            rec_lines.push(cur.line_no);
+        }
+        cur.line_start = n;
+        cur.line_started_open = false;
+    }
+    (line_off, rec_lines)
+}
+
+/// 当前已完整、可安全展示的记录数。
+///
+/// 未完成时若当前物理行是上一条记录的续行（`line_started_open`），该记录
+/// 的结束位置还未知，必须暂时隐藏；否则已产出的记录都已在新行边界结束。
+///
+/// # Parameters
+/// - `n`: 已产出的记录数。
+/// - `line_started_open`: 当前未完成物理行是否从引号内开始。
+/// - `done`: 是否已扫到 EOF。
+///
+/// # Returns
+/// 可展示的记录数（含表头记录）。
+fn usable_record_count(n: usize, line_started_open: bool, done: bool) -> usize {
+    if done || !line_started_open {
+        n
+    } else {
+        n.saturating_sub(1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +688,180 @@ mod tests {
         assert_eq!(&bytes[s..e], b"\"a\nb\",c\n");
         let (s, e) = idx.record_span(bytes.len(), 2);
         assert_eq!(&bytes[s..e], b"d,e\n");
+    }
+
+    // ---- 渐进索引：分块扫描 / 部分可见性 / 打开生命周期 ----
+
+    /// 用 `scan_chunk` 按指定块大小扫完全文，拼出索引（黄金参照对拍用）。
+    fn incremental_index(bytes: &[u8], chunk: usize) -> RawIndex {
+        let mut cur = ScanCursor::new();
+        let mut line_off = vec![0u64];
+        let mut rec_lines = Vec::new();
+        loop {
+            let (o, r) = scan_chunk(bytes, &mut cur, chunk);
+            line_off.extend(o);
+            rec_lines.extend(r);
+            if cur.pos >= bytes.len() {
+                break;
+            }
+        }
+        RawIndex { line_off, rec_lines }
+    }
+
+    /// 任意小块切分都必须与顺序索引逐字节一致：块尾不完整行/引号状态跨块、
+    /// CRLF、空行、无结尾换行、宽松引号全部覆盖。
+    #[test]
+    fn scan_chunk_matches_seq_for_all_chunk_sizes() {
+        let cases: Vec<Vec<u8>> = vec![
+            b"a,b\n1,2\n3,4\n".to_vec(),
+            b"a,b\r\n1,2\r\n3,4\r\n".to_vec(),
+            b"a,b\n1,2\n3,4".to_vec(),
+            b"a,b\n1,2\n\n3,4\n".to_vec(),
+            b"a,b\n\n\n\n1,2\n\n".to_vec(),
+            b"h1,h2\n\"a\nb\",c\nd,e\n".to_vec(),
+            b"h\n\"x\ny\"\nz\n\"p\nq\"\nr\n".to_vec(),
+            b"h1,h2\na\"b,c\n\"a\",b\n".to_vec(),
+            b"h\n\"unterminated\n".to_vec(),
+            b"".to_vec(),
+            b"\n".to_vec(),
+            "标题,备注\n\"第一行\n第二行\",值\n第三行,尾\n".as_bytes().to_vec(),
+        ];
+        for bytes in cases {
+            let golden = build_index_seq(&bytes);
+            for &chunk in &[1usize, 2, 3, 5, 7, 13, 64, 1 << 20] {
+                let got = incremental_index(&bytes, chunk);
+                assert_eq!(
+                    got.line_off, golden.line_off,
+                    "line_off 不一致：chunk={chunk} bytes={:?}",
+                    String::from_utf8_lossy(&bytes)
+                );
+                assert_eq!(
+                    got.rec_lines, golden.rec_lines,
+                    "rec_lines 不一致：chunk={chunk} bytes={:?}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+        }
+    }
+
+    /// 不完整的引号续行必须隐藏最后一条记录；尚未产出记录的新行不能把
+    /// 上一条完整记录误藏（header 不能被吞）。
+    #[test]
+    fn usable_hides_partial_continuation_record() {
+        let bytes = b"h\n\"a\nb\"\n";
+        let mut cur = ScanCursor::new();
+        let mut recs: Vec<u32> = Vec::new();
+
+        let (_, r) = scan_chunk(bytes, &mut cur, 3); // 恰好停在 `"` 之后
+        recs.extend(r);
+        assert_eq!(recs, vec![0], "header 已完整");
+        assert!(!cur.line_started_open, "新记录尚未开始（当前行从引号外起）");
+        assert_eq!(
+            usable_record_count(recs.len(), cur.line_started_open, false),
+            1,
+            "尚未产出的记录不能把 header 一起藏掉"
+        );
+
+        let (_, r) = scan_chunk(bytes, &mut cur, 3); // 停在续行 `b` 之后
+        recs.extend(r);
+        assert_eq!(recs, vec![0, 1], "多行记录第一行已完成、已产出");
+        assert!(cur.line_started_open, "当前行是上一条记录的续行");
+        assert_eq!(
+            usable_record_count(recs.len(), cur.line_started_open, false),
+            1,
+            "续行未结束：最后一条记录必须暂时隐藏"
+        );
+
+        let (_, r) = scan_chunk(bytes, &mut cur, 3);
+        recs.extend(r);
+        let done = cur.pos >= bytes.len();
+        assert!(done);
+        assert_eq!(
+            usable_record_count(recs.len(), cur.line_started_open, done),
+            2,
+            "EOF 后全部记录可见"
+        );
+    }
+
+    /// 渐进打开：前缀立即可读、结构操作/筛选/保存被拒；补齐后行数增长、
+    /// 索引期单元格编辑经覆盖层保留。
+    #[test]
+    fn progressive_open_prefix_and_refresh() {
+        let mut s = String::from("a,b\r\n");
+        for i in 0..100 {
+            s.push_str(&format!("{i:04},x\r\n"));
+        }
+        let bytes = s.into_bytes();
+        // 表头 5B + 3 行×8B = 29B：前缀恰好 3 条数据行
+        let p = tmp_csv("progressive", &bytes);
+        let mut bf =
+            BigFile::open_progressive_with(&p, 29, 1000, 8, false).unwrap();
+
+        let m = bf.meta();
+        assert!(m.indexing);
+        assert_eq!(m.rows, 3, "前缀应立即可用 3 行");
+        assert_eq!(m.total_bytes, bytes.len() as u64);
+        assert!(m.indexed_bytes < m.total_bytes);
+        assert_eq!(m.index_ms, 0, "索引未完成时 index_ms 为 0");
+        assert!(m.open_ms <= m.elapsed_ms);
+
+        let rows = bf.rows(0, 100);
+        assert_eq!(rows.len(), 3, "未索引部分不得返回");
+        assert_eq!(rows[2], vec!["0002", "x"]);
+
+        // 索引期允许仿编辑，但结构变更/筛选/保存/列操作必须拒绝
+        bf.set_cell(2, 1, "EDITED".into()).unwrap();
+        assert_eq!(bf.rows(2, 1)[0][1], "EDITED");
+        assert!(bf.insert_rows(0, None, 1).is_err());
+        assert!(bf.remove_rows(vec![0]).is_err());
+        assert!(bf.run_filter(&FilterSpec::default()).is_err());
+        assert!(bf.save(|_, _, _, _| {}).is_err());
+        assert!(bf
+            .push_col_op(ColOp::Rename { col: 0, name: "A".into() })
+            .is_err());
+
+        // 后台补齐（测试里同步驱动），完成瞬间无需 refresh 也能读全量
+        bf.drive_index_for_test();
+        let m = bf.meta();
+        assert!(!m.indexing);
+        assert_eq!(m.rows, 100);
+        assert!(m.index_ms <= m.elapsed_ms);
+        assert_eq!(bf.rows(0, 1000).len(), 100);
+        assert_eq!(bf.rows(2, 1)[0][1], "EDITED", "覆盖层跨索引完成保留");
+
+        // 并入正式索引后行为不变，且重复调用幂等
+        bf.refresh_indexed();
+        assert!(bf.partial.is_none());
+        bf.refresh_indexed();
+        assert_eq!(bf.meta().rows, 100);
+        assert_eq!(bf.rows(2, 1)[0][1], "EDITED");
+        assert!(bf.insert_rows(100, None, 1).is_ok(), "完成后恢复结构操作");
+
+        fs::remove_file(&p).ok();
+    }
+
+    /// 真实后台线程：打开立即返回，随后行数增长至全量。
+    #[test]
+    fn progressive_open_background_completes() {
+        let mut s = String::from("a,b\r\n");
+        for i in 0..300 {
+            s.push_str(&format!("{i:04},x\r\n"));
+        }
+        let bytes = s.into_bytes();
+        let p = tmp_csv("progressive_bg", &bytes);
+        // 前缀 64B：表头 + 7 行；后台每块 64B
+        let mut bf = BigFile::open_progressive_with(&p, 64, 3, 64, true).unwrap();
+        assert!(bf.meta().indexing);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while bf.meta().indexing && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!bf.meta().indexing, "后台索引未在 5 秒内完成");
+        assert_eq!(bf.meta().rows, 300);
+        bf.refresh_indexed();
+        assert_eq!(bf.rows(0, 1000).len(), 300);
+        assert_eq!(bf.rows(299, 1)[0][0], "0299");
+        fs::remove_file(&p).ok();
     }
 
     // ---- Part 3：BigFile 行为测试（临时文件夹具） ----
@@ -877,7 +1174,7 @@ mod tests {
         let p = tmp_csv("colops", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         // pending：视图立即多出列
-        bf.push_col_op(ColOp::Insert { pos: 1, name: "memo".into() });
+        bf.push_col_op(ColOp::Insert { pos: 1, name: "memo".into() }).unwrap();
         assert!(bf.meta().pending_cols);
         assert_eq!(bf.meta().cols, 4);
         assert_eq!(bf.meta().headers, vec!["name", "memo", "age", "city"]);
@@ -893,9 +1190,9 @@ mod tests {
         assert!(!bf.meta().pending_cols);
         assert_eq!(bf.meta().cols, 3);
         // 重新 push 并真正执行
-        bf.push_col_op(ColOp::Insert { pos: 1, name: "memo".into() });
-        bf.push_col_op(ColOp::Rename { col: 0, name: "姓名".into() });
-        bf.push_col_op(ColOp::Delete { col: 2 }); // 删原 age
+        bf.push_col_op(ColOp::Insert { pos: 1, name: "memo".into() }).unwrap();
+        bf.push_col_op(ColOp::Rename { col: 0, name: "姓名".into() }).unwrap();
+        bf.push_col_op(ColOp::Delete { col: 2 }).unwrap(); // 删原 age
         bf.apply_col_ops(|_, _, _, _| {}).unwrap();
         assert!(!bf.meta().pending_cols);
         assert_eq!(bf.meta().headers, vec!["姓名", "memo", "city"]);
@@ -914,7 +1211,7 @@ mod tests {
         // 阶段 2 重建索引完成后收尾必到满 (total,total)；序列单调不减。
         let p = tmp_csv("colprog", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
-        bf.push_col_op(ColOp::Delete { col: 2 });
+        bf.push_col_op(ColOp::Delete { col: 2 }).unwrap();
         let mut events: Vec<(u64, u64, u8, u64)> = Vec::new();
         bf.apply_col_ops(|d, t, ph, rows| events.push((d, t, ph, rows)))
             .unwrap();
@@ -1608,6 +1905,17 @@ pub struct BigMeta {
     pub pending_cols: bool,
     pub can_undo: bool,
     pub can_redo: bool,
+    /// 后台索引是否仍在进行（true 时 rows 会持续增长）。
+    pub indexing: bool,
+    /// 已建立索引的字节数 / 文件总字节数。
+    pub indexed_bytes: u64,
+    pub total_bytes: u64,
+    /// 首屏同步索引耗时（毫秒，从打开文件到返回前端）。
+    pub open_ms: u64,
+    /// 全量索引耗时（毫秒）；未完成时为 0。
+    pub index_ms: u64,
+    /// 距打开已过毫秒数（索引中实时增长）。
+    pub elapsed_ms: u64,
 }
 
 /// 单条筛选关键字（已小写）。
@@ -2065,12 +2373,36 @@ fn can_narrow(prev: &FilterSpec, next: &FilterSpec) -> bool {
     }
 }
 
+/// 未完成的后台索引：分块扫描持续追加行偏移/记录起始，读路径短暂加锁取快照。
+struct PartialIndex {
+    line_off: Vec<u64>,
+    rec_lines: Vec<u32>,
+    cursor: ScanCursor,
+    done: bool,
+    /// 全量索引耗时（毫秒）；完成后写入。
+    index_ms: u64,
+}
+
 /// 大文件编辑会话。
 pub struct BigFile {
     path: PathBuf,
-    mmap: memmap2::Mmap,
+    /// 共享映射：后台索引线程持有一份，读路径不复制文件内容。
+    mmap: Arc<memmap2::Mmap>,
     enc: Encoding,
+    /// 已完成的全量索引；渐进索引期间为空（数据在 `partial` 里）。
     idx: RawIndex,
+    /// 渐进索引状态；全量完成后由 `refresh_indexed` 并入 `idx` 并清空。
+    partial: Option<Arc<Mutex<PartialIndex>>>,
+    /// 会话销毁时通知后台线程退出（每块检查一次）。
+    cancel: Arc<AtomicBool>,
+    /// 打开起点：计算实时已用时间。
+    open_started: Instant,
+    /// 首屏同步索引耗时（毫秒）。
+    open_ms: u64,
+    /// 全量索引耗时（毫秒）；未完成时为 0。
+    index_ms: u64,
+    /// 文件总字节数（meta 展示进度用）。
+    total_bytes: u64,
     base_ncols: usize,
     base_headers: Vec<String>,
     seg: Segments,
@@ -2095,30 +2427,39 @@ pub struct BigFile {
     has_bom: bool,
 }
 
+impl Drop for BigFile {
+    fn drop(&mut self) {
+        // 后台线程每块检查；文件关闭/换档后不继续占用磁盘。
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 impl BigFile {
     /// 打开并建索引（秒级：三趟并行扫描，不解析字段内容）。
     ///
     /// # Errors
     /// 文件不可读/为空/无记录时返回错误字符串。
     pub fn open(path: &Path) -> Result<Self, String> {
+        let t0 = Instant::now();
         let file = fs::File::open(path)
             .map_err(|e| format!("打开失败：{}（{}）", path.display(), e))?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
         if meta.len() == 0 {
             return Err("空文件".into());
         }
-        let mmap = unsafe {
+        let mmap = Arc::new(unsafe {
             memmap2::MmapOptions::new().map(&file).map_err(|e| e.to_string())?
-        };
-        let enc = sniff_encoding(&mmap);
+        });
+        let bytes: &[u8] = &mmap;
+        let enc = sniff_encoding(bytes);
         // BOM 只对 UTF-8 有意义（GBK 文件可能以相同字节开头纯属巧合）
-        let has_bom = enc == Encoding::Utf8 && mmap.starts_with(&[0xEF, 0xBB, 0xBF]);
-        let idx = build_index(&mmap);
+        let has_bom = enc == Encoding::Utf8 && bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
+        let idx = build_index(bytes);
         if idx.n_records() == 0 {
             return Err("文件中没有记录".into());
         }
-        let (hs, he) = idx.record_span(mmap.len(), 0);
-        let mut headers = parse_record(&decode_slice(enc, &mmap[hs..he]), b',');
+        let (hs, he) = idx.record_span(bytes.len(), 0);
+        let mut headers = parse_record(&decode_slice(enc, &bytes[hs..he]), b',');
         if enc == Encoding::Utf8 {
             if let Some(first) = headers.first_mut() {
                 if let Some(stripped) = first.strip_prefix('\u{FEFF}') {
@@ -2128,11 +2469,18 @@ impl BigFile {
         }
         let n_data = idx.n_records() - 1;
         let base_ncols = headers.len();
+        let open_ms = t0.elapsed().as_millis() as u64;
         Ok(Self {
             path: path.to_path_buf(),
             mmap,
             enc,
             idx,
+            partial: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            open_started: t0,
+            open_ms,
+            index_ms: open_ms,
+            total_bytes: meta.len(),
             base_ncols,
             base_headers: headers,
             seg: Segments::new(n_data as u32),
@@ -2153,9 +2501,316 @@ impl BigFile {
         })
     }
 
+    /// 渐进打开：同步扫一小段前缀让表格立即可用，剩余部分后台继续建索引。
+    ///
+    /// # Parameters
+    /// - `path`: CSV 文件路径。
+    ///
+    /// # Errors
+    /// 文件不可读/为空/首条记录无法完成时返回错误字符串。
+    pub fn open_progressive(path: &Path) -> Result<Self, String> {
+        Self::open_progressive_with(
+            path,
+            INITIAL_INDEX_BYTES,
+            INITIAL_INDEX_RECORDS,
+            INDEX_CHUNK_BYTES,
+            true,
+        )
+    }
+
+    /// 渐进打开的可调参版本（测试用小阈值/同步驱动）。
+    ///
+    /// # Parameters
+    /// - `path`: CSV 文件路径。
+    /// - `initial_bytes`: 同步索引最多推进字节数。
+    /// - `initial_records`: 同步索引最多记录数（含表头）。
+    /// - `chunk_bytes`: 后台每块推进字节数。
+    /// - `background`: true = 启动后台线程；false = 保持部分索引（测试手动驱动）。
+    fn open_progressive_with(
+        path: &Path,
+        initial_bytes: usize,
+        initial_records: usize,
+        chunk_bytes: usize,
+        background: bool,
+    ) -> Result<Self, String> {
+        let t0 = Instant::now();
+        let file = fs::File::open(path)
+            .map_err(|e| format!("打开失败：{}（{}）", path.display(), e))?;
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        if meta.len() == 0 {
+            return Err("空文件".into());
+        }
+        let mmap = Arc::new(unsafe {
+            memmap2::MmapOptions::new().map(&file).map_err(|e| e.to_string())?
+        });
+        let bytes: &[u8] = &mmap;
+        let enc = sniff_encoding(bytes);
+        let has_bom = enc == Encoding::Utf8 && bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
+
+        // ---- 首屏同步前缀：至少一条完整记录（表头），再按字节/记录数收手 ----
+        let mut cur = ScanCursor::new();
+        let mut line_off = vec![0u64];
+        let mut rec_lines: Vec<u32> = Vec::new();
+        let mut done = false;
+        loop {
+            let (o, r) = scan_chunk(bytes, &mut cur, initial_bytes.max(1));
+            line_off.extend(o);
+            rec_lines.extend(r);
+            if cur.pos >= bytes.len() {
+                done = true;
+                break;
+            }
+            let usable =
+                usable_record_count(rec_lines.len(), cur.line_started_open, false);
+            if usable >= 1
+                && (cur.pos >= initial_bytes
+                    || usable >= initial_records.saturating_add(1))
+            {
+                break;
+            }
+        }
+        let usable = usable_record_count(rec_lines.len(), cur.line_started_open, done);
+        if usable == 0 {
+            return Err("文件中没有记录".into());
+        }
+        // 表头记录必定完整；parse_record 在首个引号外换行处停止，后缀内容
+        // （后续记录）不会混入表头。
+        let header_start = line_off[rec_lines[0] as usize] as usize;
+        let header_end = if done { bytes.len() } else { cur.pos };
+        let mut headers =
+            parse_record(&decode_slice(enc, &bytes[header_start..header_end]), b',');
+        if enc == Encoding::Utf8 {
+            if let Some(first) = headers.first_mut() {
+                if let Some(stripped) = first.strip_prefix('\u{FEFF}') {
+                    *first = stripped.to_string();
+                }
+            }
+        }
+        let base_ncols = headers.len();
+        let n_data = usable - 1;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let open_ms = t0.elapsed().as_millis() as u64;
+        let total_bytes = meta.len();
+
+        let (partial, idx, index_ms) = if done {
+            (None, RawIndex { line_off, rec_lines }, open_ms)
+        } else {
+            let p = Arc::new(Mutex::new(PartialIndex {
+                line_off,
+                rec_lines,
+                cursor: cur,
+                done: false,
+                index_ms: 0,
+            }));
+            if background {
+                let mmap2 = mmap.clone();
+                let p2 = p.clone();
+                let c2 = cancel.clone();
+                std::thread::Builder::new()
+                    .name("csv-index".into())
+                    .spawn(move || {
+                        Self::index_worker(mmap2, p2, c2, cur, chunk_bytes, t0);
+                    })
+                    .map_err(|e| format!("启动索引线程失败：{e}"))?;
+            }
+            (
+                Some(p),
+                RawIndex { line_off: Vec::new(), rec_lines: Vec::new() },
+                0,
+            )
+        };
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            mmap,
+            enc,
+            idx,
+            partial,
+            cancel,
+            open_started: t0,
+            open_ms,
+            index_ms,
+            total_bytes,
+            base_ncols,
+            base_headers: headers,
+            seg: Segments::new(n_data as u32),
+            overlay: HashMap::new(),
+            pending_cols: Vec::new(),
+            filter: None,
+            last_spec: None,
+            col_cache: HashMap::new(),
+            cache_lru: VecDeque::new(),
+            cache_bytes: 0,
+            cache_skip: std::collections::HashSet::new(),
+            filter_stats: FilterStats::default(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            base_size: meta.len(),
+            base_mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            has_bom,
+        })
+    }
+
+    /// 后台索引线程主体：单线程顺序扫描剩余字节，每块发布一次。
+    ///
+    /// # Parameters
+    /// - `mmap`: 文件映射（与会话共享）。
+    /// - `partial`: 发布区（读路径短暂加锁）。
+    /// - `cancel`: 会话销毁标志。
+    /// - `cur`: 从前缀扫描继续的游标。
+    /// - `chunk_bytes`: 每块推进字节数。
+    /// - `started`: 打开起点（全量索引耗时从这里算）。
+    fn index_worker(
+        mmap: Arc<memmap2::Mmap>,
+        partial: Arc<Mutex<PartialIndex>>,
+        cancel: Arc<AtomicBool>,
+        mut cur: ScanCursor,
+        chunk_bytes: usize,
+        started: Instant,
+    ) {
+        // 磁盘顺序扫描是重 IO：线程级降到 BELOW_NORMAL，让 UI/读页优先。
+        let _bg = bg::BackgroundGuard::enter();
+        let bytes: &[u8] = &mmap;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let (o, r) = scan_chunk(bytes, &mut cur, chunk_bytes.max(1));
+            let done = cur.pos >= bytes.len();
+            let mut st = partial.lock().unwrap();
+            st.line_off.extend(o);
+            st.rec_lines.extend(r);
+            st.cursor = cur;
+            if done {
+                st.done = true;
+                st.index_ms = started.elapsed().as_millis() as u64;
+                return;
+            }
+            drop(st); // 每块之间放锁：读路径可随时取已扫部分
+        }
+    }
+
+    /// 测试辅助：同步扫完剩余部分（不经过后台线程）。
+    #[cfg(test)]
+    fn drive_index_for_test(&mut self) {
+        let Some(p) = self.partial.clone() else { return };
+        let mut cur = p.lock().unwrap().cursor;
+        let bytes: &[u8] = &self.mmap;
+        loop {
+            let (o, r) = scan_chunk(bytes, &mut cur, INDEX_CHUNK_BYTES);
+            let done = cur.pos >= bytes.len();
+            let mut st = p.lock().unwrap();
+            st.line_off.extend(o);
+            st.rec_lines.extend(r);
+            st.cursor = cur;
+            if done {
+                st.done = true;
+                st.index_ms = self.open_started.elapsed().as_millis() as u64;
+                return;
+            }
+            drop(st);
+        }
+    }
+
+    /// 后台索引是否仍在进行。
+    pub fn is_indexing(&self) -> bool {
+        self.partial
+            .as_ref()
+            .is_some_and(|p| !p.lock().unwrap().done)
+    }
+
+    /// 全量索引完成后并回正式结构；索引期仅允许单元格编辑，故段表可安全重建
+    /// （覆盖层按稳定记录号寻址，原样保留）。
+    pub fn refresh_indexed(&mut self) {
+        let Some(p) = self.partial.clone() else { return };
+        let done = p.lock().unwrap().done;
+        if !done {
+            return;
+        }
+        let (line_off, rec_lines, index_ms) = {
+            let mut st = p.lock().unwrap();
+            (
+                std::mem::take(&mut st.line_off),
+                std::mem::take(&mut st.rec_lines),
+                st.index_ms,
+            )
+        };
+        let n_data = rec_lines.len().saturating_sub(1);
+        self.idx = RawIndex { line_off, rec_lines };
+        self.seg = Segments::new(n_data as u32);
+        self.index_ms = index_ms;
+        self.partial = None;
+    }
+
+    /// 当前可展示的数据行数（渐进索引期间随扫描增长）。
+    fn indexed_data_rows(&self) -> u64 {
+        if let Some(p) = &self.partial {
+            let st = p.lock().unwrap();
+            usable_record_count(
+                st.rec_lines.len(),
+                st.cursor.line_started_open,
+                st.done,
+            )
+            .saturating_sub(1) as u64
+        } else {
+            self.seg.vrow_count()
+        }
+    }
+
+    /// 记录 r（含表头，0 基）的字节范围；渐进索引期间只暴露完整记录。
+    fn record_span_visible(&self, r: usize) -> Option<(usize, usize)> {
+        if let Some(p) = &self.partial {
+            let st = p.lock().unwrap();
+            let usable = usable_record_count(
+                st.rec_lines.len(),
+                st.cursor.line_started_open,
+                st.done,
+            );
+            if r >= usable {
+                return None;
+            }
+            let start = st.line_off[st.rec_lines[r] as usize] as usize;
+            let end = if r + 1 < st.rec_lines.len() {
+                st.line_off[st.rec_lines[r + 1] as usize] as usize
+            } else {
+                st.cursor.pos
+            };
+            Some((start, end.min(self.mmap.len())))
+        } else {
+            if r >= self.idx.n_records() {
+                return None;
+            }
+            Some(self.idx.record_span(self.mmap.len(), r))
+        }
+    }
+
     pub fn meta(&self) -> BigMeta {
+        let (rows, indexing, indexed_bytes, index_ms, elapsed_ms) =
+            if let Some(p) = &self.partial {
+                let st = p.lock().unwrap();
+                (
+                    usable_record_count(
+                        st.rec_lines.len(),
+                        st.cursor.line_started_open,
+                        st.done,
+                    )
+                    .saturating_sub(1) as u64,
+                    !st.done,
+                    st.cursor.pos as u64,
+                    st.index_ms,
+                    self.open_started.elapsed().as_millis() as u64,
+                )
+            } else {
+                (
+                    self.seg.vrow_count(),
+                    false,
+                    self.total_bytes,
+                    self.index_ms,
+                    self.index_ms,
+                )
+            };
         BigMeta {
-            rows: self.seg.vrow_count(),
+            rows,
             cols: self.view_ncols(),
             headers: self.view_headers(),
             encoding: match self.enc {
@@ -2165,6 +2820,12 @@ impl BigFile {
             pending_cols: !self.pending_cols.is_empty(),
             can_undo: !self.undo_stack.is_empty(),
             can_redo: !self.redo_stack.is_empty(),
+            indexing,
+            indexed_bytes,
+            total_bytes: self.total_bytes,
+            open_ms: self.open_ms,
+            index_ms,
+            elapsed_ms,
         }
     }
 
@@ -2273,7 +2934,11 @@ impl BigFile {
     }
 
     fn src_fields(&self, rec: u32) -> Vec<String> {
-        let (s, e) = self.idx.record_span(self.mmap.len(), rec as usize + 1);
+        // 渐进索引期间只允许读已完整发布的记录；未命中给空行（调用方已按
+        // 可见行数过滤，正常不会发生）。
+        let Some((s, e)) = self.record_span_visible(rec as usize + 1) else {
+            return vec![String::new(); self.base_ncols];
+        };
         let mut f = parse_record(&decode_slice(self.enc, &self.mmap[s..e]), b',');
         let n = self.base_ncols;
         if f.len() < n {
@@ -2308,8 +2973,14 @@ impl BigFile {
         f
     }
 
-    /// 取 vrow 的视图行（pending 期做列映射）。
+    /// 取 vrow 的视图行（pending 期做列映射；渐进索引期 vrow == 源记录号）。
     fn row_at(&self, vrow: u64) -> Option<Vec<String>> {
+        if self.partial.is_some() {
+            if vrow >= self.indexed_data_rows() {
+                return None;
+            }
+            return Some(self.map_fields_to_view(&self.src_fields(vrow as u32)));
+        }
         match self.seg.resolve(vrow)? {
             ResolvedRow::Src(rec) => {
                 let f = self.src_fields(rec);
@@ -2324,7 +2995,11 @@ impl BigFile {
 
     /// 取行窗口 [from, from+count)。
     pub fn rows(&self, from: u64, count: u32) -> Vec<Vec<String>> {
-        let total = self.seg.vrow_count();
+        let total = if self.partial.is_some() {
+            self.indexed_data_rows()
+        } else {
+            self.seg.vrow_count()
+        };
         (from..(from + count as u64).min(total))
             .filter_map(|v| self.row_at(v))
             .collect()
@@ -2356,7 +3031,15 @@ impl BigFile {
     /// 写单元格（覆盖层/直改块 + 撤销日志）。
     pub fn set_cell(&mut self, vrow: u64, col: u32, value: String) -> Result<(), String> {
         self.require_editable()?;
-        let resolved = self.seg.resolve(vrow).ok_or("行号越界")?;
+        // 渐进索引期没有插入/删除行，vrow 恒等于源记录号；完成后再走段表。
+        let resolved = if self.partial.is_some() {
+            if vrow >= self.indexed_data_rows() {
+                return Err("行号越界".into());
+            }
+            ResolvedRow::Src(vrow as u32)
+        } else {
+            self.seg.resolve(vrow).ok_or("行号越界")?
+        };
         let cell = match resolved {
             ResolvedRow::Src(rec) => CellId::Src { rec, col },
             ResolvedRow::Ins { block, row } => CellId::Ins { block, row, col },
@@ -2397,6 +3080,10 @@ impl BigFile {
         count: u32,
     ) -> Result<(), String> {
         self.require_editable()?;
+        self.refresh_indexed();
+        if self.is_indexing() {
+            return Err("文件仍在索引中，暂不支持插入/删除行".into());
+        }
         if vpos > self.seg.vrow_count() {
             return Err("插入位置越界".into());
         }
@@ -2429,6 +3116,10 @@ impl BigFile {
     /// 删除一组 vrow（升序传入；快照超限的删除不可撤销）。
     pub fn remove_rows(&mut self, mut vrows: Vec<u64>) -> Result<u32, String> {
         self.require_editable()?;
+        self.refresh_indexed();
+        if self.is_indexing() {
+            return Err("文件仍在索引中，暂不支持插入/删除行".into());
+        }
         vrows.sort_unstable();
         vrows.dedup();
         let total = self.seg.vrow_count();
@@ -2694,6 +3385,10 @@ impl BigFile {
         gate: Option<(&AtomicU64, u64)>,
     ) -> Result<Option<u32>, String> {
         self.require_editable()?;
+        self.refresh_indexed();
+        if self.is_indexing() {
+            return Err("文件仍在索引中，暂不支持筛选".into());
+        }
         let total = self.seg.vrow_count();
         if total > u32::MAX as u64 {
             return Err("文件过大（超过 42.9 亿行），暂不支持筛选".into());
@@ -3080,11 +3775,27 @@ impl BigFile {
 
     /// 选区转 TSV（含引号转义，\r\n 行尾，对齐 csv.js serializeRecords）。
     pub fn copy_tsv(&self, r0: u64, r1: u64, c0: u32, c1: u32) -> Result<String, String> {
-        if r1 < r0 || r1 > self.seg.vrow_count() {
+        let total = if self.partial.is_some() {
+            self.indexed_data_rows()
+        } else {
+            self.seg.vrow_count()
+        };
+        if r1 < r0 || r1 > total {
             return Err("复制范围越界".into());
         }
-        let cum = self.seg_cum_lens();
         let mut out = String::new();
+        if self.partial.is_some() {
+            // 渐进索引期 vrow == 源记录号（无插删行）
+            for v in r0..r1 {
+                let fields = self.src_fields(v as u32);
+                let row: Vec<String> = (c0..c1)
+                    .map(|c| fields.get(c as usize).cloned().unwrap_or_default())
+                    .collect();
+                out.push_str(&serialize_record(&row, b'\t'));
+            }
+            return Ok(out);
+        }
+        let cum = self.seg_cum_lens();
         for v in r0..r1 {
             if let Some(fields) = self.row_at_fast(&cum, v) {
                 let row: Vec<String> = (c0..c1)
@@ -3099,10 +3810,18 @@ impl BigFile {
     // ---- 列操作 ----
 
     /// 追加待执行列操作（渲染预览即时，物理重写延迟到 apply）。
-    pub fn push_col_op(&mut self, op: ColOp) {
+    ///
+    /// # Errors
+    /// 后台索引未完成时拒绝（列映射会打乱索引期 vrow == 记录号的前提）。
+    pub fn push_col_op(&mut self, op: ColOp) -> Result<(), String> {
+        self.refresh_indexed();
+        if self.is_indexing() {
+            return Err("文件仍在索引中，暂不支持列操作".into());
+        }
         self.pending_cols.push(op);
         self.filter = None; // 列映射变化，旧筛选结果作废
         self.last_spec = None;
+        Ok(())
     }
 
     /// 撤销最近一次待执行列操作。
@@ -3123,6 +3842,10 @@ impl BigFile {
     /// 保存后重建 mmap 与索引；撤销栈保留（操作按稳定记录号寻址，仍有效）。
     pub fn save<F: FnMut(u64, u64, u8, u64)>(&mut self, mut progress: F) -> Result<(), String> {
         self.require_editable()?;
+        self.refresh_indexed();
+        if self.is_indexing() {
+            return Err("文件仍在索引中，请稍候再保存".into());
+        }
         // 整表重写数十秒：本线程降为背景优先级，让出 UI/系统调度。
         let _bg = bg::BackgroundGuard::enter();
         let tmp = tmp_path_for(&self.path);
@@ -3209,6 +3932,10 @@ impl BigFile {
         &mut self,
         mut progress: F,
     ) -> Result<(), String> {
+        self.refresh_indexed();
+        if self.is_indexing() {
+            return Err("文件仍在索引中，暂不支持列操作".into());
+        }
         if self.pending_cols.is_empty() {
             return Ok(());
         }
@@ -3294,12 +4021,17 @@ impl BigFile {
     /// 重新映射原文件并重建行索引（不动 Segment/覆盖层/撤销栈）。
     /// 用于保存换名失败后的读路径恢复。
     fn remap(&mut self) -> Result<(), String> {
+        let t0 = Instant::now();
         let file = fs::File::open(&self.path).map_err(|e| e.to_string())?;
-        let mmap = unsafe {
+        let mmap = Arc::new(unsafe {
             memmap2::MmapOptions::new().map(&file).map_err(|e| e.to_string())?
-        };
-        self.idx = build_index(&mmap);
+        });
+        let bytes: &[u8] = &mmap;
+        self.cancel.store(true, Ordering::Relaxed); // 防御：旧索引线程不要再用旧映射
+        self.partial = None;
+        self.idx = build_index(bytes);
         self.mmap = mmap;
+        self.index_ms = t0.elapsed().as_millis() as u64;
         Ok(())
     }
 
@@ -3314,7 +4046,8 @@ impl BigFile {
         let dummy = memmap2::MmapMut::map_anon(1)
             .and_then(|m| m.make_read_only())
             .map_err(|e| e.to_string())?;
-        drop(std::mem::replace(&mut self.mmap, dummy)); // 旧映射解除、文件句柄关闭
+        // 旧映射解除、文件句柄关闭（保存前已 refresh_indexed，无后台线程共享）
+        drop(std::mem::replace(&mut self.mmap, Arc::new(dummy)));
         let mut last: Option<std::io::Error> = None;
         for _ in 0..5 {
             match fs::rename(tmp, &self.path) {
@@ -3343,18 +4076,23 @@ impl BigFile {
 
     /// 写盘后重建 mmap/索引；编辑层已落盘故清空，撤销栈保留。
     fn reopen_after_write(&mut self) -> Result<(), String> {
+        let t0 = Instant::now();
         let n_data = self.seg.vrow_count();
         let file = fs::File::open(&self.path).map_err(|e| e.to_string())?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
-        let mmap = unsafe {
+        let mmap = Arc::new(unsafe {
             memmap2::MmapOptions::new().map(&file).map_err(|e| e.to_string())?
-        };
-        let idx = build_index(&mmap);
+        });
+        let bytes: &[u8] = &mmap;
+        let idx = build_index(bytes);
         if idx.n_records() as u64 != n_data + 1 {
             return Err("写入后行数校验失败".into());
         }
         self.mmap = mmap;
         self.idx = idx;
+        self.partial = None;
+        self.index_ms = t0.elapsed().as_millis() as u64;
+        self.total_bytes = meta.len();
         self.seg = Segments::new(n_data as u32);
         self.overlay.clear();
         self.filter = None;
