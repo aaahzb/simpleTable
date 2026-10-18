@@ -8,7 +8,6 @@
 import { parseCsv, serializeCsv, serializeRecords } from "./csv.js";
 import { TableModel } from "./model.js";
 import { BigModel, BIG_THRESHOLD } from "./bigmodel.js";
-import { createHeaderlessPrefs } from "./prefs.js";
 import { Grid } from "./grid.js";
 import { EditPane } from "./pane.js";
 import { showMenu } from "./menu.js";
@@ -39,8 +38,6 @@ let dockOrigin = false; // 编辑窗格发起的写回中（避免回灌）
 let paneWrite = Promise.resolve();
 /** 「首行非列名」切换进行中：防重入，同时禁用按钮 */
 let headerlessBusy = false;
-/** 按文件路径记忆的「首行非列名」开关（CSV 本身无此元数据位） */
-const headerlessPrefs = createHeaderlessPrefs(window.localStorage);
 
 // ============ 状态栏（E5） ============
 
@@ -495,7 +492,7 @@ async function activateTab(id) {
   }
   if (t.kind === "big") {
     if (!(engineTabId === t.id && t.model)) {
-      // 引擎已腾退（或从未打开）：按该档记忆的模式重新打开
+      // 引擎已腾退（或从未打开）：按该页签当前模式重新打开
       const bm = await openBigEngineFor(t.id, t.path, t.headerless);
       if (!bm) return false;
       t.model = bm;
@@ -524,13 +521,12 @@ async function activateTab(id) {
  * @returns {Promise<DocTab | null>} 新页签或 null（失败已弹窗）。
  */
 async function loadIntoNewTab(p, wantBig, opts = {}) {
-  // 该文件上次的解读方式（无记录 = 首行是列名）
-  const headerless = headerlessPrefs.get(p);
   const t = {
     id: tabSeq++, title: tabTitleOf(p), path: p,
-    kind: wantBig ? "big" : "small", model: null, dirty: false, headerless,
+    kind: wantBig ? "big" : "small", model: null, dirty: false, headerless: false,
   };
-  const doc = await loadDoc(p, wantBig, t.id, headerless);
+  // 不记忆解读方式：每次打开都从「首行是列名」开始
+  const doc = await loadDoc(p, wantBig, t.id);
   if (!doc) return null;
   t.kind = doc.kind;
   t.model = doc.model;
@@ -889,7 +885,7 @@ function refreshHeaderlessUi() {
   // 无列（无法生成列1..N）或列操作待执行（切换会错位）时禁用
   tb.headerless.disabled = headerlessBusy || model.columnCount() === 0 || pending;
   tb.headerless.title = "开启后：第一行作为数据参与筛选/编辑，列名显示为 列1、列2…；"
-    + "关闭时：当前第一行成为列名并从数据中移除。每个文件独立记忆。";
+    + "关闭时：当前第一行成为列名并从数据中移除。仅对当前页签生效，不写入磁盘。";
 }
 
 /**
@@ -928,10 +924,9 @@ async function toggleHeaderless() {
     bigFilterSeq += 1;
     // 4) 模型/引擎切换；失败信息原样给用户，状态保持不变
     await model.setHeaderless(want);
-    // 5) 页签镜像 + 按文件记忆 + 计数与按钮
+    // 5) 页签镜像 + 计数与按钮（不做持久化：绿色轻量，重开即默认）
     const t = activeTab();
     if (t) t.headerless = model.isHeaderless?.() === true;
-    if (path) headerlessPrefs.set(path, model.isHeaderless?.() === true);
     onCountsChanged(model.rowCount(), model.rowCount());
     statusMsg(model.isHeaderless?.() === true
       ? "首行已作为数据参与筛选/编辑（列名显示为 列1、列2…）"
@@ -1364,8 +1359,8 @@ async function openPath(p, opts = {}) {
   const exist = tabs.find((t) => t.path === p);
   if (exist) return activateTab(exist.id);
   if (tabs.length === 0) {
-    // 启动/初始空表：装当前档（暂不生成页签），按该文件上次的解读打开
-    const doc = await loadDoc(p, wantBig, activeId, headerlessPrefs.get(p));
+    // 启动/初始空表：装当前档（暂不生成页签）；不记忆上次解读
+    const doc = await loadDoc(p, wantBig, activeId);
     if (!doc) return false;
     applyDocToCurrent(doc, p);
     return true;
@@ -1447,9 +1442,6 @@ async function saveFileAs() {
   if (!p.toLowerCase().endsWith(".csv")) p += ".csv";
   path = p;
   const ok = await saveFile();
-  // 成功写盘后才把该文件的「首行非列名」解读记到新路径。
-  // 大模式「另存为」受引擎既有路径限制（仍写原文件），故不记新路径。
-  if (ok && !model.isBig) headerlessPrefs.set(p, model.isHeaderless?.() === true);
   // 另存后当前档的身份（路径/标题）随之变化，同步回页签
   syncActiveTab();
   renderTabbar();
