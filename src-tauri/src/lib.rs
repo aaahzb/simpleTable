@@ -305,13 +305,18 @@ fn file_size(path: String) -> Result<u64, String> {
 #[tauri::command]
 async fn big_open(
     path: String,
+    headerless: Option<bool>,
     state: tauri::State<'_, BigShared>,
     gate: tauri::State<'_, FilterGen>,
 ) -> Result<BigMeta, String> {
     gate.bump(); // 旧文件的筛选扫描没有继续的意义
     let shared = state.inner().clone();
+    let headerless = headerless.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
-        let bf = BigFile::open_progressive(std::path::Path::new(&path))?;
+        let bf = BigFile::open_progressive_with_mode(
+            std::path::Path::new(&path),
+            headerless,
+        )?;
         let meta = bf.meta();
         let mut guard = shared.lock().map_err(|e| e.to_string())?;
         *guard = Some(bf);
@@ -428,6 +433,23 @@ fn big_clear_filter(state: tauri::State<BigShared>, gate: tauri::State<FilterGen
     with_big(&state, |bf| {
         bf.clear_filter();
         Ok(())
+    })
+}
+
+/// 切换「首行非列名」：返回最新 meta（行数/表头随模式变化）。
+///
+/// 切换是视图属性，不改文件；筛选结果/撤销栈/列缓存在引擎内清空，
+/// 因此先 bump 代数让在跑的筛选扫描退出。
+#[tauri::command]
+fn big_set_headerless(
+    state: tauri::State<BigShared>,
+    gate: tauri::State<FilterGen>,
+    on: bool,
+) -> Result<BigMeta, String> {
+    gate.bump();
+    with_big(&state, |bf| {
+        bf.set_headerless(on)?;
+        Ok(bf.meta())
     })
 }
 
@@ -628,6 +650,7 @@ pub fn run() {
             big_filter_count,
             big_filter_page,
             big_clear_filter,
+            big_set_headerless,
             big_copy,
             big_save,
             big_col_push,

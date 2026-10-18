@@ -5,9 +5,10 @@
  * 行为逐项对齐 Qt 版 main_window.py；数据模型/网格/对话框见各自模块。
  */
 
-import { parseCsv, serializeCsv } from "./csv.js";
+import { parseCsv, serializeCsv, serializeRecords } from "./csv.js";
 import { TableModel } from "./model.js";
 import { BigModel, BIG_THRESHOLD } from "./bigmodel.js";
+import { createHeaderlessPrefs } from "./prefs.js";
 import { Grid } from "./grid.js";
 import { EditPane } from "./pane.js";
 import { showMenu } from "./menu.js";
@@ -34,6 +35,12 @@ let lastFilterMs = 0;
 /** @type {[number, number] | null} 编辑窗格跟踪的源坐标 */
 let currentCell = null;
 let dockOrigin = false; // 编辑窗格发起的写回中（避免回灌）
+/** 编辑窗格最近一次异步写回（切换「首行非列名」前必须等它落定） */
+let paneWrite = Promise.resolve();
+/** 「首行非列名」切换进行中：防重入，同时禁用按钮 */
+let headerlessBusy = false;
+/** 按文件路径记忆的「首行非列名」开关（CSV 本身无此元数据位） */
+const headerlessPrefs = createHeaderlessPrefs(window.localStorage);
 
 // ============ 状态栏（E5） ============
 
@@ -177,6 +184,7 @@ function markDirty() {
  * @property {"small" | "big"} kind - 文档类型。
  * @property {TableModel | BigModel | null} model - 小档恒为模型实例；大档仅引擎驻留期间有效。
  * @property {boolean} dirty - 未保存修改。
+ * @property {boolean} headerless - 首行是否为数据（列名自动生成），按档/文件独立。
  */
 /** @type {DocTab[]} */
 let tabs = [];
@@ -230,6 +238,7 @@ function syncActiveTab() {
   if (!t) return;
   t.path = path;
   t.dirty = dirty;
+  t.headerless = model.isHeaderless?.() === true;
   if (!model.isBig || engineTabId === t.id) t.model = model;
 }
 
@@ -239,6 +248,7 @@ function ensureTabbed() {
   const t = {
     id: tabSeq++, title: tabTitleOf(path), path, kind: model.isBig ? "big" : "small",
     model: model.isBig ? model : model, dirty,
+    headerless: model.isHeaderless?.() === true,
   };
   tabs.push(t);
   activeId = t.id;
@@ -359,14 +369,15 @@ async function evictEngineFor(targetTabId) {
  *
  * @param {number | null} tabId - 归属页签（null = 当前未入签档）。
  * @param {string} p - 文件路径。
+ * @param {boolean} [headerless] - 首行是否作为数据打开。
  * @returns {Promise<BigModel | null>} 失败/取消返回 null（已弹窗）。
  */
-async function openBigEngineFor(tabId, p) {
+async function openBigEngineFor(tabId, p, headerless = false) {
   if (!(await evictEngineFor(tabId))) return null;
   const bm = new BigModel();
   bindModelEvents(bm); // 先绑事件再 open：内部 reset/data 通知才能到达外壳
   try {
-    await bm.open(p);
+    await bm.open(p, { headerless: !!headerless });
   } catch (err) {
     await errorDialog("打开失败", String(err?.message ?? err));
     return null;
@@ -381,11 +392,12 @@ async function openBigEngineFor(tabId, p) {
  * @param {string} p - 文件路径。
  * @param {boolean} wantBig - 是否走大文件模式。
  * @param {number | null} tabId - 归属页签（大档仲裁/归属用）。
+ * @param {boolean} [headerless] - 首行是否作为数据（默认 false = 首行是列名）。
  * @returns {Promise<{kind: "small" | "big", model: any, warnings?: string[]} | null>}
  */
-async function loadDoc(p, wantBig, tabId) {
+async function loadDoc(p, wantBig, tabId, headerless = false) {
   if (wantBig) {
-    const bm = await openBigEngineFor(tabId, p);
+    const bm = await openBigEngineFor(tabId, p, headerless);
     if (!bm) return null;
     return { kind: "big", model: bm };
   }
@@ -396,10 +408,10 @@ async function loadDoc(p, wantBig, tabId) {
     await errorDialog("打开失败", String(err));
     return null;
   }
-  const { headers, rows, warnings } = parseCsv(result.text);
+  const { headers, rows, warnings } = parseCsv(result.text, ",", { headerless });
   const m = new TableModel();
   bindModelEvents(m);
-  m.load(headers, rows);
+  m.load(headers, rows, { headerless });
   return { kind: "small", model: m, warnings };
 }
 
@@ -443,6 +455,7 @@ function applyDocToCurrent(doc, p) {
     t.kind = doc.kind;
     t.title = tabTitleOf(p);
     t.model = doc.model;
+    t.headerless = doc.model.isHeaderless?.() === true;
   }
   renderTabbar();
   updateStatusText();
@@ -482,8 +495,8 @@ async function activateTab(id) {
   }
   if (t.kind === "big") {
     if (!(engineTabId === t.id && t.model)) {
-      // 引擎已腾退（或从未打开）：重新打开
-      const bm = await openBigEngineFor(t.id, t.path);
+      // 引擎已腾退（或从未打开）：按该档记忆的模式重新打开
+      const bm = await openBigEngineFor(t.id, t.path, t.headerless);
       if (!bm) return false;
       t.model = bm;
     }
@@ -491,6 +504,7 @@ async function activateTab(id) {
   } else {
     model = t.model;
   }
+  t.headerless = model.isHeaderless?.() === true;
   activeId = id;
   path = t.path;
   if (splitOn) sideTab[focusedSide] = id; // 分屏激活侧外签：焦点侧重绑新签
@@ -510,14 +524,17 @@ async function activateTab(id) {
  * @returns {Promise<DocTab | null>} 新页签或 null（失败已弹窗）。
  */
 async function loadIntoNewTab(p, wantBig, opts = {}) {
+  // 该文件上次的解读方式（无记录 = 首行是列名）
+  const headerless = headerlessPrefs.get(p);
   const t = {
     id: tabSeq++, title: tabTitleOf(p), path: p,
-    kind: wantBig ? "big" : "small", model: null, dirty: false,
+    kind: wantBig ? "big" : "small", model: null, dirty: false, headerless,
   };
-  const doc = await loadDoc(p, wantBig, t.id);
+  const doc = await loadDoc(p, wantBig, t.id, headerless);
   if (!doc) return null;
   t.kind = doc.kind;
   t.model = doc.model;
+  t.headerless = doc.model.isHeaderless?.() === true;
   tabs.push(t);
   if (opts.activate !== false) {
     await activateTab(t.id);
@@ -777,7 +794,7 @@ async function openSplit(id) {
   }
   syncActiveTab();
   if (t.kind === "big" && !(engineTabId === t.id && t.model)) {
-    const bm = await openBigEngineFor(t.id, t.path);
+    const bm = await openBigEngineFor(t.id, t.path, t.headerless);
     if (!bm) return false;
     t.model = bm;
   }
@@ -860,6 +877,72 @@ function refreshBigUi() {
     tb.execColOps.classList.add("hidden");
     tb.cancelColOps.classList.add("hidden");
   }
+  refreshHeaderlessUi();
+}
+
+/** 刷新「首行非列名」按钮：开启态、可用性、说明 */
+function refreshHeaderlessUi() {
+  if (!tb.headerless) return;
+  const on = model.isHeaderless?.() === true;
+  const pending = model.isBig && model.colOpsPending?.() === true;
+  tb.headerless.classList.toggle("on", on);
+  // 无列（无法生成列1..N）或列操作待执行（切换会错位）时禁用
+  tb.headerless.disabled = headerlessBusy || model.columnCount() === 0 || pending;
+  tb.headerless.title = "开启后：第一行作为数据参与筛选/编辑，列名显示为 列1、列2…；"
+    + "关闭时：当前第一行成为列名并从数据中移除。每个文件独立记忆。";
+}
+
+/**
+ * 切换「首行非列名」：先落定未提交编辑，再清筛选/视图，最后换模型状态。
+ *
+ * 大模式格内编辑与编辑窗格写回是异步的；必须在改变行坐标前等待，
+ * 否则写回会落到错误的行。切换是视图属性：清空筛选/选区/撤销，但不标脏。
+ *
+ * @returns {Promise<boolean>} true = 切换后处于无列名状态。
+ */
+async function toggleHeaderless() {
+  if (headerlessBusy) return model.isHeaderless?.() === true;
+  if (model.isBig && model.colOpsPending?.()) {
+    statusMsg("列操作待执行：请先执行或撤销列操作", 3000);
+    return model.isHeaderless?.() === true;
+  }
+  const want = !(model.isHeaderless?.() === true);
+  headerlessBusy = true;
+  refreshHeaderlessUi();
+  try {
+    // 1) 未提交的格内编辑与窗格异步写回先落定（行坐标即将 ±1）
+    await fgrid().commitEdit();
+    await paneWrite;
+    // 2) 大模式先退出筛选：旧命中行号在切换后的坐标系里会错位
+    if (model.isBig && model.filterActive()) {
+      try { await model.clearFilter(); } catch { /* 会话已关闭：继续切换 */ }
+    }
+    // 3) 清视图（筛选框/多重输入/选区/滚动/窗格）
+    fgrid().clearFilters();
+    fgrid().clearSelection();
+    fgrid().resetScroll();
+    multiInput.value = "";
+    clearDock();
+    lastFilterMs = 0;
+    clearTimeout(bigFilterTimer);
+    bigFilterSeq += 1;
+    // 4) 模型/引擎切换；失败信息原样给用户，状态保持不变
+    await model.setHeaderless(want);
+    // 5) 页签镜像 + 按文件记忆 + 计数与按钮
+    const t = activeTab();
+    if (t) t.headerless = model.isHeaderless?.() === true;
+    if (path) headerlessPrefs.set(path, model.isHeaderless?.() === true);
+    onCountsChanged(model.rowCount(), model.rowCount());
+    statusMsg(model.isHeaderless?.() === true
+      ? "首行已作为数据参与筛选/编辑（列名显示为 列1、列2…）"
+      : "当前第一行已成为列名", 3000);
+  } catch (err) {
+    statusMsg(String(err?.message ?? err), 4000);
+  } finally {
+    headerlessBusy = false;
+    refreshHeaderlessUi();
+  }
+  return model.isHeaderless?.() === true;
 }
 
 /** @type {number} 大模式键入即筛防抖计时器 */
@@ -1004,12 +1087,20 @@ const pane = new EditPane({
     if (currentCell === null) return;
     const [r, c] = currentCell;
     dockOrigin = true;
+    let write;
     try {
       // 同格连续击键合并为一步撤销（对齐 set_data_merged）
-      model.setDataMerged(r, c, value);
+      write = model.setDataMerged(r, c, value);
     } finally {
       dockOrigin = false;
     }
+    // 大模式写回异步：串成链跟踪全部落定，切换「首行非列名」前等待，
+    // 避免前面的写回在行坐标变化后才完成而落到错误的行。
+    paneWrite = paneWrite
+      .then(() => write)
+      .catch((err) => {
+        statusMsg(String(err?.message ?? err), 3000);
+      });
   },
 });
 
@@ -1039,6 +1130,7 @@ for (const spec of [
     multiWrap.classList.toggle("hidden", !on);
     if (on) multiInput.focus();
   }],
+  ["headerless", "首行非列名", () => void toggleHeaderless()],
 ]) {
   if (spec === "|") {
     const sep = document.createElement("div");
@@ -1154,9 +1246,11 @@ function bindModelEvents(m) {
   m.onData((structural, origin) => {
     if (m !== model) return; // 副侧数据/预取落定：不得改写焦点侧外壳状态
     if (resetPending) resetPending = false;
-    // 大模式预取页落定是纯重绘（origin="fetch"），打开/滚动不得误标脏
-    else if (!(m.isBig && origin === "fetch")) markDirty();
+    // 视图属性变更（首行非列名开关）不标脏；大模式预取页落定（origin="fetch"）
+    // 也是纯重绘，打开/滚动不得误标脏
+    else if (origin !== "view" && !(m.isBig && origin === "fetch")) markDirty();
     if (m.isBig) refreshBigUi();
+    else refreshHeaderlessUi();
     if (currentCell === null) return;
     const [r, c] = currentCell;
     if (structural) {
@@ -1258,9 +1352,11 @@ async function openPath(p, opts = {}) {
   const wantBig = forceBig || size >= BIG_THRESHOLD;
 
   if (opts.replace) {
-    // 重载当前签：引擎归属不变（big_open 原位替换内容），丢弃前确认
+    // 重载当前签：引擎归属不变（big_open 原位替换内容），丢弃前确认。
+    // 沿用当前档的「首行非列名」解读，避免外部改动重载后视图含义突变。
     if (!opts.noConfirm && !(await confirmDiscard())) return false;
-    const doc = await loadDoc(p, wantBig, activeId);
+    const headerless = model.isHeaderless?.() === true;
+    const doc = await loadDoc(p, wantBig, activeId, headerless);
     if (!doc) return false;
     applyDocToCurrent(doc, p);
     return true;
@@ -1268,8 +1364,8 @@ async function openPath(p, opts = {}) {
   const exist = tabs.find((t) => t.path === p);
   if (exist) return activateTab(exist.id);
   if (tabs.length === 0) {
-    // 启动/初始空表：装当前档（暂不生成页签）
-    const doc = await loadDoc(p, wantBig, activeId);
+    // 启动/初始空表：装当前档（暂不生成页签），按该文件上次的解读打开
+    const doc = await loadDoc(p, wantBig, activeId, headerlessPrefs.get(p));
     if (!doc) return false;
     applyDocToCurrent(doc, p);
     return true;
@@ -1278,16 +1374,19 @@ async function openPath(p, opts = {}) {
   return (await loadIntoNewTab(p, wantBig)) !== null;
 }
 
-/** 保存到当前路径（无路径时转另存为） */
+/**
+ * 保存到当前路径（无路径时转另存为）。
+ *
+ * @returns {Promise<boolean>} true = 已写入成功。
+ */
 async function saveFile() {
   if (model.isBig && model.indexing?.()) {
     // 索引未完成时引擎无法流式重写（后台线程仍持有映射），提示稍候
     statusMsg("文件仍在索引中，请稍候再保存", 2500);
-    return;
+    return false;
   }
   if (path === null) {
-    await saveFileAs();
-    return;
+    return saveFileAs();
   }
   if (model.isBig) {
     const dlg = progressDialog("保存大文件…");
@@ -1298,7 +1397,7 @@ async function saveFile() {
       un();
       dlg.close();
       await errorDialog("保存失败", `${err?.message ?? err}\n文件可能被其他程序占用，可尝试另存为。`);
-      return;
+      return false;
     }
     un();
     // 完成帧短暂停留再关闭：重写期间磁盘 IO 可能饿死渲染管线，屏幕停在
@@ -1306,34 +1405,55 @@ async function saveFile() {
     await dlg.finish();
     setDirty(false);
     statusMsg("已保存（大文件模式：流式重写完成）", 3000);
-    return;
+    return true;
+  }
+  // 无列名模式没有独立表头：直接序列化全部行；空表会写出无法重开的内容
+  const headerless = model.isHeaderless?.() === true;
+  if (headerless && model.rowCount() === 0) {
+    statusMsg("无列名模式需至少保留一行", 3000);
+    return false;
+  }
+  if (headerless && model.columnCount() === 0) {
+    statusMsg("无列名模式需至少保留一列", 3000);
+    return false;
   }
   try {
     await invoke("write_csv_file", {
       path,
-      text: serializeCsv(model.headers(), model.allRows()),
+      text: headerless
+        ? serializeRecords(model.allRows())
+        : serializeCsv(model.headers(), model.allRows()),
     });
   } catch (err) {
     await errorDialog("保存失败", `${err}\n文件可能被其他程序占用，可尝试另存为。`);
-    return;
+    return false;
   }
   setDirty(false);
+  return true;
 }
 
-/** 另存为 CSV */
+/**
+ * 另存为 CSV。
+ *
+ * @returns {Promise<boolean>} true = 已写入成功。
+ */
 async function saveFileAs() {
   if (model.isBig && model.indexing?.()) {
     statusMsg("文件仍在索引中，请稍候再另存为", 2500);
-    return;
+    return false;
   }
   let p = await invoke("pick_save_path", { defaultName: "未命名.csv" });
-  if (!p) return;
+  if (!p) return false;
   if (!p.toLowerCase().endsWith(".csv")) p += ".csv";
   path = p;
-  await saveFile();
+  const ok = await saveFile();
+  // 成功写盘后才把该文件的「首行非列名」解读记到新路径。
+  // 大模式「另存为」受引擎既有路径限制（仍写原文件），故不记新路径。
+  if (ok && !model.isBig) headerlessPrefs.set(p, model.isHeaderless?.() === true);
   // 另存后当前档的身份（路径/标题）随之变化，同步回页签
   syncActiveTab();
   renderTabbar();
+  return ok;
 }
 
 /**
@@ -1441,7 +1561,7 @@ function showColMenu(e) {
     { label: `删除选中的 ${cols.length} 列…`, onClick: () => deleteColumns(cols) },
     { label: `清除选中 ${cols.length} 列的内容…`, onClick: () => clearColumns(cols) },
     null,
-    { label: "重命名列…", onClick: () => renameColumn(col) },
+    { label: "重命名列…", disabled: model.isHeaderless?.() === true, onClick: () => renameColumn(col) },
   ]);
 }
 
@@ -1512,6 +1632,12 @@ async function appendRowsDialog() {
  * @param {number[]} rows - 源行号列表。
  */
 async function deleteRows(rows) {
+  // 无列名模式至少留一行：否则保存会产出空文件/空行，重开语义不稳定。
+  // 在确认框之前拦下，避免用户确认后才看到错误。
+  if (rows.length && model.isHeaderless?.() && rows.length >= model.rowCount()) {
+    statusMsg("无列名模式需至少保留一行", 3000);
+    return;
+  }
   if (rows.length && await confirmDialog(`确定删除选中的 ${rows.length} 行？（可用 Ctrl+Z 撤销）`)) {
     op(model.removeRows(rows));
   }
@@ -1574,6 +1700,10 @@ async function clearSelCells(n) {
  * @param {number} col - 列号。
  */
 async function renameColumn(col) {
+  if (model.isHeaderless?.() === true) {
+    statusMsg("无列名模式不可重命名列（列名为自动生成的 列1、列2…）", 3000);
+    return;
+  }
   const name = await columnDialog("重命名列", model.headers()[col]);
   if (name) op(model.renameColumn(col, name));
 }
@@ -1669,6 +1799,7 @@ const gridLive = new Proxy(/** @type {any} */ ({}), {
   document.getElementById("status-version").textContent = version;
   model.load([], []); // 起始空表
   updateStatusText();
+  refreshHeaderlessUi();
   // 初始标题保持 "simpleTable"（对齐 Qt：首次标脏/文件操作后才刷新标题）
 
   // 命令行/文件关联传入的 CSV：启动即打开
@@ -1725,11 +1856,14 @@ window.__app = {
   applyColOps, cancelColOps, runBigFilter, gotoRow, gotoRowDialog,
   isDirty: () => dirty, getPath: () => path,
   isBigMode: () => model.isBig === true,
+  isHeaderless: () => model.isHeaderless?.() === true,
+  toggleHeaderless,
   // 多档页签：快照 / 切换 / 关闭 / 批量拖入
   tabs: () => tabs.map((t) => ({
     id: t.id, title: t.title, path: t.path, kind: t.kind,
     dirty: t.id === activeId ? dirty : t.dirty,
     active: t.id === activeId,
+    headerless: t.id === activeId ? model.isHeaderless?.() === true : t.headerless,
   })),
   activateTab, closeTab, openPathsAsTabs,
   // 分屏视图：状态快照 / 建立 / 关闭

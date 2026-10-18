@@ -19,6 +19,119 @@ function makeModel() {
   return m;
 }
 
+test("load 可标记为无列名：行数据原样保留", () => {
+  const m = new TableModel();
+  m.load(["列1", "列2"], [["张三", "1"], ["李四", "2"]], { headerless: true });
+  assert.equal(m.isHeaderless(), true);
+  assert.deepEqual(m.headers(), ["列1", "列2"]);
+  assert.deepEqual(m.allRows(), [["张三", "1"], ["李四", "2"]]);
+});
+
+test("默认 load 仍为有列名模式", () => {
+  const m = makeModel();
+  assert.equal(m.isHeaderless(), false);
+});
+
+test("开启无列名：原表头成为首行，列名变为 列1..N", () => {
+  const m = makeModel();
+  m.setHeaderless(true);
+  assert.equal(m.isHeaderless(), true);
+  assert.equal(m.rowCount(), 4);
+  assert.deepEqual(m.headers(), ["列1", "列2", "列3"]);
+  assert.deepEqual(m.allRows()[0], ["目的地", "评分", "备注"]);
+  assert.deepEqual(m.allRows()[1], ["大理", "3", "古城"]);
+});
+
+test("关闭无列名：当前首行（含编辑）提升为列名", () => {
+  const m = makeModel();
+  m.setHeaderless(true);
+  m.setData(0, 0, "地点");
+  m.setData(0, 2, "说明");
+  m.setHeaderless(false);
+  assert.equal(m.isHeaderless(), false);
+  assert.equal(m.rowCount(), 3);
+  assert.deepEqual(m.headers(), ["地点", "评分", "说明"]);
+  assert.deepEqual(m.allRows()[0], ["大理", "3", "古城"]);
+});
+
+test("0 行时关闭无列名抛错且保持无列名", () => {
+  const m = new TableModel();
+  m.load(["列1"], [], { headerless: true });
+  assert.throws(() => m.setHeaderless(false), /没有数据行可作为列名/);
+  assert.equal(m.isHeaderless(), true);
+});
+
+test("0 列时开启无列名抛错", () => {
+  const m = new TableModel();
+  assert.throws(() => m.setHeaderless(true), /没有列可作为列名/);
+  assert.equal(m.isHeaderless(), false);
+});
+
+test("开关清空撤销/重做栈", () => {
+  const m = makeModel();
+  m.setData(0, 0, "X");
+  assert.equal(m.canUndo(), true);
+  m.undo();
+  assert.equal(m.canRedo(), true);
+  m.setHeaderless(true);
+  assert.equal(m.canUndo(), false);
+  assert.equal(m.canRedo(), false);
+});
+
+test("开关以 origin='view' 通知数据变化", () => {
+  const m = makeModel();
+  const events = [];
+  m.onData((structural, origin) => events.push([structural, origin]));
+  m.setHeaderless(true);
+  assert.deepEqual(events.at(-1), [true, "view"]);
+  m.setHeaderless(false);
+  assert.deepEqual(events.at(-1), [true, "view"]);
+});
+
+test("两个模型实例的开关互相独立", () => {
+  const a = makeModel();
+  const b = makeModel();
+  a.setHeaderless(true);
+  assert.equal(a.isHeaderless(), true);
+  assert.equal(b.isHeaderless(), false);
+  assert.equal(b.rowCount(), 3);
+});
+
+test("无列名下列增删后列名保持 列1..N 连续", () => {
+  const m = makeModel();
+  m.setHeaderless(true);
+  m.appendColumn("随便");
+  assert.deepEqual(m.headers(), ["列1", "列2", "列3", "列4"]);
+  m.insertColumns(1, 2);
+  assert.deepEqual(m.headers(), ["列1", "列2", "列3", "列4", "列5", "列6"]);
+  m.removeColumn(0);
+  assert.deepEqual(m.headers(), ["列1", "列2", "列3", "列4", "列5"]);
+  m.removeColumns([1, 3]);
+  assert.deepEqual(m.headers(), ["列1", "列2", "列3"]);
+});
+
+test("无列名下重命名列被忽略", () => {
+  const m = makeModel();
+  m.setHeaderless(true);
+  m.renameColumn(0, "新名");
+  assert.equal(m.headers()[0], "列1");
+});
+
+test("无列名模式禁止删除最后一行", () => {
+  const m = new TableModel();
+  m.load(["列1"], [["only"]], { headerless: true });
+  assert.throws(() => m.removeRows([0]), /无列名模式需至少保留一行/);
+  assert.equal(m.rowCount(), 1);
+});
+
+test("无列名模式允许删除部分行，但不能清空", () => {
+  const m = new TableModel();
+  m.load(["列1"], [["a"], ["b"], ["c"]], { headerless: true });
+  m.removeRows([0, 2]);
+  assert.deepEqual(m.allRows(), [["b"]]);
+  assert.throws(() => m.removeRows([0]), /无列名模式需至少保留一行/);
+});
+
 test("load 清空撤销栈并触发结构通知", () => {
   const m = makeModel();
   let structural = 0;

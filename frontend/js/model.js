@@ -63,6 +63,76 @@ export class TableModel {
     this._undoCapNotified = false;
     /** @type {Set<Function>} 撤销降级提示回调 */
     this._undoCapCbs = new Set();
+    /** @type {boolean} 首行是否为普通数据（无列名模式） */
+    this._headerless = false;
+  }
+
+  /**
+   * 是否处于「首行非列名」模式。
+   *
+   * @returns {boolean} 首行作为数据时为 true。
+   */
+  isHeaderless() {
+    return this._headerless;
+  }
+
+  /**
+   * 切换「首行非列名」模式。
+   *
+   * 开启：原表头成为第一条数据，列名虚拟为 列1..N。
+   * 关闭：当前第一条数据（含未保存编辑）提升为列名并从数据中移除。
+   * 开关属于视图属性：清空撤销/重做，但不触发整体重置（不标脏）。
+   *
+   * @param {boolean} on - true=首行不是列名；false=首行是列名。
+   * @returns {void}
+   * @throws {Error} 开启时没有任何列，或关闭时没有任何数据行。
+   */
+  setHeaderless(on) {
+    if (on === this._headerless) {
+      return;
+    }
+    if (on) {
+      if (!this._headers.length) {
+        throw new Error("没有列可作为列名");
+      }
+      this._rows.unshift(this._headers.slice());
+      this._headers = this._genericHeaders(this._headers.length);
+    } else {
+      if (!this._rows.length) {
+        throw new Error("没有数据行可作为列名");
+      }
+      this._headers = this._rows.shift().slice();
+    }
+    this._headerless = on;
+    // 行/列坐标已改变，旧快照不可再撤销。
+    this._undoStack = [];
+    this._redoStack = [];
+    this._mergeCell = null;
+    this._undoCap = null;
+    this._undoCapNotified = false;
+    this._emitData(true, "view");
+    this._emitUndo();
+  }
+
+  /**
+   * 生成列1..列N。
+   *
+   * @param {number} count - 列数。
+   * @returns {string[]} 虚拟列名数组。
+   */
+  _genericHeaders(count) {
+    return Array.from({ length: count }, (_, i) => `列${i + 1}`);
+  }
+
+  /**
+   * 无列名模式下按当前列数重新生成虚拟列名（列增删后调用）。
+   *
+   * @returns {void}
+   */
+  _refreshGenericHeaders() {
+    if (this._headerless) {
+      this._headers = this._genericHeaders(this._headers.length);
+    }
   }
 
   /**
@@ -100,7 +170,8 @@ export class TableModel {
   /**
    * 订阅数据/结构变化（每次改动后触发；结构变化传 structural=true）。
    *
-   * @param {(structural: boolean) => void} cb - 回调。
+   * @param {(structural: boolean, origin?: string) => void} cb - 回调；
+   *   origin="view" 表示纯视图变化（如首行非列名开关），不应标脏。
    * @returns {void}
    */
   onData(cb) {
@@ -121,11 +192,12 @@ export class TableModel {
    * 触发数据变化通知。
    *
    * @param {boolean} [structural] - 是否结构变化（行列增删/排序/装载）。
+   * @param {string} [origin] - 事件来源："edit"（默认）/ "view"（纯视图）。
    * @returns {void}
    */
-  _emitData(structural = false) {
+  _emitData(structural = false, origin = "edit") {
     for (const cb of this._dataCbs) {
-      cb(structural);
+      cb(structural, origin);
     }
   }
 
@@ -146,11 +218,14 @@ export class TableModel {
    *
    * @param {string[]} headers - 表头。
    * @param {string[][]} rows - 数据行（列数须与表头一致）。
+   * @param {{headerless?: boolean}} [opts] - headerless=true 表示首行
+   *   也是数据（headers 须为 parseCsv 生成的 列1..N）。
    * @returns {void}
    */
-  load(headers, rows) {
+  load(headers, rows, { headerless = false } = {}) {
     this._headers = headers.slice();
     this._rows = rows.map((r) => r.slice());
+    this._headerless = !!headerless;
     this._undoStack = [];
     this._redoStack = [];
     this._mergeCell = null;
@@ -408,10 +483,16 @@ export class TableModel {
    *
    * @param {number[]} rows - 行号列表。
    * @returns {void}
+   * @throws {Error} 无列名模式试图删掉最后一行（首行还要留作列名来源）。
    */
   removeRows(rows) {
+    const valid = new Set(rows.filter((r) => r >= 0 && r < this._rows.length));
+    if (this._headerless && this._rows.length > 0 &&
+        valid.size >= this._rows.length) {
+      throw new Error("无列名模式需至少保留一行");
+    }
     this._checkpoint();
-    const sorted = Array.from(new Set(rows)).sort((a, b) => b - a);
+    const sorted = Array.from(valid).sort((a, b) => b - a);
     for (const r of sorted) {
       if (r >= 0 && r < this._rows.length) {
         this._rows.splice(r, 1);
@@ -447,12 +528,12 @@ export class TableModel {
    * @returns {void}
    */
   appendColumn(name) {
-    const col = this._headers.length;
     this._checkpoint();
     this._headers.push(name);
     for (const row of this._rows) {
       row.push("");
     }
+    this._refreshGenericHeaders();
     this._emitData(true);
   }
 
@@ -470,11 +551,13 @@ export class TableModel {
     const at = Math.max(0, Math.min(col, this._headers.length));
     this._checkpoint();
     for (let i = 0; i < count; i += 1) {
-      this._headers.splice(at + i, 0, this._uniqueColumnName("新列"));
+      this._headers.splice(at + i, 0,
+        this._headerless ? `列${this._headers.length + 1}` : this._uniqueColumnName("新列"));
       for (const row of this._rows) {
         row.splice(at + i, 0, "");
       }
     }
+    this._refreshGenericHeaders();
     this._emitData(true);
   }
 
@@ -510,6 +593,7 @@ export class TableModel {
     for (const row of this._rows) {
       row.splice(col, 1);
     }
+    this._refreshGenericHeaders();
     this._emitData(true);
   }
 
@@ -540,6 +624,9 @@ export class TableModel {
    * @returns {void}
    */
   renameColumn(col, name) {
+    if (this._headerless) {
+      return; // 列名是自动生成的，无列名模式不允许重命名。
+    }
     this._checkpoint();
     this._headers[col] = name;
     this._emitData(true);

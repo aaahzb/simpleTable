@@ -1341,14 +1341,19 @@ export class Grid {
     return Math.round(fs * 1.45);
   }
 
-  /** 提交编辑器内容到模型 */
+  /**
+   * 提交编辑器内容到模型。
+   *
+   * @returns {Promise<void>} 写入落定（大模型异步写）；无编辑时已 resolve。
+   */
   commitEdit() {
-    if (!this.editing) return;
+    if (!this.editing) return Promise.resolve();
     const { r, c } = this.editing;
     const value = this.editorEl.value;
     this.closeEditor();
-    // 大模型写入是异步的：失败（如列操作 pending）转状态栏，避免未捕获拒绝
-    Promise.resolve(this.model.setData(r, c, value)).catch((err) => {
+    // 大模型写入是异步的：失败（如列操作 pending）转状态栏，避免未捕获拒绝；
+    // 返回 Promise 供调用方（切换无列名开关）等待写入落定后再改行坐标。
+    return Promise.resolve(this.model.setData(r, c, value)).catch((err) => {
       this.hooks.statusMsg(String(err?.message ?? err), 3000);
     });
   }

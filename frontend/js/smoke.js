@@ -65,6 +65,9 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
   const lines = [];
   let failed = 0;
   const TMP = (await invoke("smoke_tmp_dir"));
+  // 注意：不要清空整个 simpletable.headerless.v1——那会抹掉用户真实文件的
+  // 开关记忆。本套件的「首行非列名」夹具路径带时间戳、每次运行唯一，
+  // 天然不会受上一次运行的偏好污染。
 
   // openPath/newFile 会热交换全局模型（大文件模式）：放弃入参快照，
   // 改经实时代理访问当前模型，避免"断言打在被替换的旧模型上"的假败。
@@ -521,7 +524,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
 
   check("工具栏按钮齐全且撤销/重做随栈置灰", async () => {
     const texts = [...document.querySelectorAll("#toolbar button")].map((b) => b.textContent);
-    for (const t of ["新建", "打开", "保存", "另存为", "撤销", "重做", "排序…", "清除筛选", "多重筛选"]) {
+    for (const t of ["新建", "打开", "保存", "另存为", "撤销", "重做", "排序…", "清除筛选", "多重筛选", "首行非列名"]) {
       assert(texts.includes(t), `工具栏缺少 ${t}`);
     }
     loadBasic(); // load 清空撤销栈
@@ -1800,6 +1803,153 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await window.__app.activateTab(tb2.id);
     await waitFor(() => model.rawData(0, 0) === "乙", "大小档再切换首行落定");
     await invoke("smoke_set_force_big", { v: false });
+  });
+
+  // ========== 首行非列名（按文件独立） ==========
+
+  check("首行非列名：大模式开关、异步编辑落定、首行筛选、保存与偏好恢复", async () => {
+    await invoke("smoke_set_force_big", { v: true });
+    const p = `${TMP}/hl_big_${Date.now()}.csv`;
+    await invoke("smoke_write_repeat", { path: p, line: "目的地,评分\r\n", times: 1, append: false });
+    await invoke("smoke_write_repeat", { path: p, line: "大理,1\r\n", times: 20, append: true });
+    await window.__app.openPath(p);
+    assert(window.__app.isBigMode() === true, "应进入大文件模式");
+    assert(window.__app.isHeaderless() === false, "默认首行应为列名");
+    assert(model.rowCount() === 20, `默认数据行数 ${model.rowCount()}`);
+
+    const btn = tbBtn("首行非列名");
+    assert(btn && !btn.disabled, "大模式开关按钮应存在且可用");
+    assert(!btn.classList.contains("on"), "默认按钮应为关闭态");
+
+    // 真实异步路径：格内编辑尚未提交就点开关——toggle 必须先等写入落定，
+    // 否则行坐标 +1 后异步写回会落到错误的行。
+    grid.ensureVisible(0, 0);
+    grid.openEditor(0, 0, { selectAll: true });
+    const ed = document.getElementById("cell-editor");
+    ed.value = "起点";
+    btn.click();
+    await waitFor(() => window.__app.isHeaderless() === true, "大模式切换开启");
+    assert(btn.classList.contains("on"), "按钮应呈开启态");
+    assert(model.rowCount() === 21, `开启后行数 ${model.rowCount()}`);
+    assert(JSON.stringify(model.headers()) === JSON.stringify(["列1", "列2"]),
+      `无列名表头 ${model.headers()}`);
+    await waitFor(() => model.rawData(1, 0) === "起点", "异步编辑应落在被提升后的数据行");
+    await waitFor(() => model.rawData(0, 0) === "目的地", "原表头应成为首行数据");
+    assert(window.__app.isDirty() === true, "格内编辑应标脏（开关本身不标脏）");
+
+    // 首行参与筛选：只有首行（原表头）含「目的地」
+    grid.filters.set(0, "目的地");
+    await window.__app.runBigFilter();
+    assert(await invoke("big_filter_count") === 1, "应仅命中首行");
+    assert(model.rowCount() === 1, `筛选后行数 ${model.rowCount()}`);
+    grid.clearFilters();
+    await waitFor(() => model.filterActive() === false, "清除筛选回全量");
+
+    // 保存：无列名模式不得注入独立表头，首行数据必须原样写入
+    await window.__app.saveFile();
+    assert(window.__app.isDirty() === false, "保存后应为干净");
+    const back = await invoke("read_csv_file", { path: p });
+    const fileLines = back.text.split(/\r\n/).filter((x, i, a) => !(i === a.length - 1 && x === ""));
+    assert(fileLines.length === 21, `保存后行数 ${fileLines.length}`);
+    assert(fileLines[0] === "目的地,评分", `保存首行 ${fileLines[0]}`);
+    assert(fileLines[1] === "起点,1", `保存第二行 ${fileLines[1]}`);
+
+    // 按文件偏好：关签重开后仍按「首行非列名」解读
+    const tab = window.__app.tabs().find((x) => x.path === p);
+    assert(tab?.headerless === true, "页签快照应带无列名状态");
+    await window.__app.closeTab(tab.id);
+    await window.__app.openPath(p);
+    await waitFor(() => window.__app.isBigMode() && window.__app.isHeaderless() === true,
+      "重开应恢复无列名解读");
+    await waitFor(() => model.rowCount() === 21 && model.rawData(0, 0) === "目的地",
+      "重开首行数据落定");
+
+    // 关闭开关：当前首行（原表头）成为列名，数据行 −1
+    tbBtn("首行非列名").click();
+    await waitFor(() => window.__app.isHeaderless() === false, "大模式切换关闭");
+    await waitFor(() => model.rowCount() === 20, "关闭后数据行数");
+    assert(JSON.stringify(model.headers()) === JSON.stringify(["目的地", "评分"]),
+      `关闭后表头 ${model.headers()}`);
+    assert(model.rawData(0, 0) === "起点", `关闭后首条数据 ${model.rawData(0, 0)}`);
+    await invoke("smoke_set_force_big", { v: false });
+  });
+
+  check("首行非列名：小模式筛选首行、编辑后关闭成表头、保存与偏好", async () => {
+    const p = `${TMP}/hl_small_${Date.now()}.csv`;
+    await invoke("write_csv_file", { path: p, text: "甲,1\r\n乙,2\r\n" });
+    await window.__app.openPath(p);
+    assert(window.__app.isBigMode() === false, "小文件应走小模式");
+    assert(model.rowCount() === 1, `默认数据行数 ${model.rowCount()}`);
+
+    const btn = tbBtn("首行非列名");
+    btn.click();
+    await waitFor(() => window.__app.isHeaderless() === true, "小模式切换开启");
+    assert(model.rowCount() === 2, `开启后行数 ${model.rowCount()}`);
+    assert(JSON.stringify(model.headers()) === JSON.stringify(["列1", "列2"]),
+      `无列名表头 ${model.headers()}`);
+    assert(model.rawData(0, 0) === "甲", "首行应作为数据");
+    assert(window.__app.isDirty() === false, "切换开关不应标脏");
+
+    // 首行参与筛选
+    grid.filters.set(0, "甲");
+    grid.refilter();
+    assert(grid.visCount() === 1 && grid.visAt(0) === 0, "筛选应命中首行");
+    grid.clearFilters();
+
+    // 编辑首行 → 关闭：编辑后的当前首行成为列名
+    model.setData(0, 0, "丙");
+    assert(window.__app.isDirty() === true, "编辑应标脏");
+    btn.click();
+    await waitFor(() => window.__app.isHeaderless() === false, "小模式切换关闭");
+    assert(model.rowCount() === 1, `关闭后行数 ${model.rowCount()}`);
+    assert(model.headers()[0] === "丙", `列名应为编辑后的首行 ${model.headers()[0]}`);
+    assert(model.rawData(0, 0) === "乙", "原第二行成为首条数据");
+
+    await window.__app.saveFile();
+    const back = await invoke("read_csv_file", { path: p });
+    assert(back.text === "丙,1\r\n乙,2\r\n", `保存内容 ${JSON.stringify(back.text)}`);
+
+    // 开启偏好后关签重开：文件本身有表头，但应按记忆解读为无列名
+    btn.click();
+    await waitFor(() => window.__app.isHeaderless() === true, "再次开启");
+    const tab = window.__app.tabs().find((x) => x.path === p);
+    await window.__app.closeTab(tab.id);
+    await window.__app.openPath(p);
+    await waitFor(() => window.__app.isHeaderless() === true, "小模式偏好恢复");
+    assert(model.rowCount() === 2, `偏好恢复后行数 ${model.rowCount()}`);
+    assert(model.rawData(0, 0) === "丙", "偏好恢复后首行应为数据");
+    // 清理：恢复默认解读，避免影响后续断言
+    tbBtn("首行非列名").click();
+    await waitFor(() => window.__app.isHeaderless() === false, "清理恢复默认");
+  });
+
+  check("首行非列名：两个小档各自独立，切签按钮状态随之恢复", async () => {
+    const p1 = `${TMP}/hl_t1_${Date.now()}.csv`;
+    const p2 = `${TMP}/hl_t2_${Date.now()}.csv`;
+    await invoke("write_csv_file", { path: p1, text: "a,1\r\nb,2\r\n" });
+    await invoke("write_csv_file", { path: p2, text: "c,3\r\nd,4\r\n" });
+    await window.__app.openPathsAsTabs([p1, p2]);
+    const t1 = window.__app.tabs().find((x) => x.path === p1);
+    const t2 = window.__app.tabs().find((x) => x.path === p2);
+    assert(t1 && t2, "两个文件都应入签");
+
+    await window.__app.activateTab(t1.id);
+    assert(window.__app.isHeaderless() === false, "首档默认关闭");
+    tbBtn("首行非列名").click();
+    await waitFor(() => window.__app.isHeaderless() === true, "首档开启");
+
+    await window.__app.activateTab(t2.id);
+    await waitFor(() => window.__app.isHeaderless() === false, "第二档保持关闭");
+    assert(!tbBtn("首行非列名").classList.contains("on"), "切到第二档按钮应变关闭");
+    assert(model.rowCount() === 1, "第二档行数不受首档影响");
+
+    await window.__app.activateTab(t1.id);
+    await waitFor(() => window.__app.isHeaderless() === true, "切回首档恢复开启");
+    assert(tbBtn("首行非列名").classList.contains("on"), "切回首档按钮应开启");
+    const snap = window.__app.tabs();
+    assert(snap.find((x) => x.path === p1)?.headerless === true
+      && snap.find((x) => x.path === p2)?.headerless === false,
+    "页签快照中的开关状态应各自独立");
   });
 
   // ---- 执行（看门狗：整体超时强制收尾，防挂死） ----

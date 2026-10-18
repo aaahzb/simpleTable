@@ -86,14 +86,16 @@ export class BigModel {
    * onIndexProgress 通知。首屏耗时从本调用开始计。
    *
    * @param {string} path - 文件绝对路径。
+   * @param {{headerless?: boolean}} [opts] - headerless=true 表示首行也是
+   *   数据（无列名文件）。
    * @returns {Promise<object>} BigMeta（可能 indexing=true）。
    */
-  async open(path) {
+  async open(path, { headerless = false } = {}) {
     this._stopIndexPolling();
     this._session += 1;
     this._openT0 = performance.now();
     this._firstPaintMs = 0;
-    this._meta = await this._invoke("big_open", { path });
+    this._meta = await this._invoke("big_open", { path, headerless: !!headerless });
     this._invalidate();
     this._emitReset();
     this._emitData(true);
@@ -125,6 +127,40 @@ export class BigModel {
    */
   indexing() {
     return !!this._meta?.indexing;
+  }
+
+  /**
+   * 是否处于「首行非列名」模式（meta 缺字段视为 false，兼容旧引擎）。
+   *
+   * @returns {boolean} 首行作为数据时为 true。
+   */
+  isHeaderless() {
+    return !!this._meta?.headerless;
+  }
+
+  /**
+   * 切换「首行非列名」模式（引擎段表 O(1) 插/删首行）。
+   *
+   * 引擎同时清空筛选/撤销/列缓存；本模型同步丢弃窗口缓存与筛选态。
+   * 开关属于视图属性：以 origin="view" 通知，不标脏。
+   *
+   * @param {boolean} on - true=首行不是列名；false=首行是列名。
+   * @returns {Promise<void>}
+   * @throws {Error} 引擎拒绝（无行可提升列名、待执行列操作等）。
+   */
+  async setHeaderless(on) {
+    const want = !!on;
+    if (want === this.isHeaderless()) {
+      return;
+    }
+    this._meta = await this._invoke("big_set_headerless", { on: want });
+    // 引擎已清空筛选；让迟到响应作废，前端视图同步回全量。
+    this._filterGen += 1;
+    this._filterOn = false;
+    this._filterCount = 0;
+    this._invalidate();
+    this._emitData(true, "view");
+    this._emitUndo();
   }
 
   /**
@@ -855,6 +891,9 @@ export class BigModel {
    * @returns {Promise<void>}
    */
   async renameColumn(col, name) {
+    if (this.isHeaderless()) {
+      throw new Error("无列名模式不可重命名列");
+    }
     await this._pushColOp({ Rename: { col, name } });
   }
 

@@ -1484,6 +1484,308 @@ mod tests {
         fs::remove_file(&p).ok();
     }
 
+    // ---- Part 5：无列名模式（首行非列名） ----
+
+    fn headerless_csv() -> Vec<u8> {
+        b"name,age,city\r\nAlice,30,Beijing\r\nbob,25,Shanghai\r\n".to_vec()
+    }
+
+    #[test]
+    fn big_open_headerless_keeps_first_record_as_data() {
+        let p = tmp_csv("hlopen", &headerless_csv());
+        let bf = BigFile::open_with(&p, true).unwrap();
+        let m = bf.meta();
+        assert!(m.headerless);
+        assert_eq!(m.rows, 3);
+        assert_eq!(m.cols, 3);
+        assert_eq!(m.headers, vec!["列1", "列2", "列3"]);
+        assert_eq!(bf.rows(0, 10)[0], vec!["name", "age", "city"]);
+        // 对照：默认模式首行是表头
+        let bf2 = BigFile::open(&p).unwrap();
+        let m2 = bf2.meta();
+        assert!(!m2.headerless);
+        assert_eq!(m2.rows, 2);
+        assert_eq!(m2.headers, vec!["name", "age", "city"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_open_headerless_single_record_roundtrip() {
+        let p = tmp_csv("hlone", b"only,row\r\n");
+        let mut bf = BigFile::open_with(&p, true).unwrap();
+        assert_eq!(bf.meta().rows, 1);
+        assert_eq!(bf.rows(0, 1)[0], vec!["only", "row"]);
+        bf.set_headerless(false).unwrap();
+        assert_eq!(bf.meta().rows, 0);
+        assert_eq!(bf.meta().headers, vec!["only", "row"]);
+        // 变成表头后无行：再开启会把表头放回为数据行
+        bf.set_headerless(true).unwrap();
+        assert_eq!(bf.meta().rows, 1);
+        assert_eq!(bf.rows(0, 1)[0], vec!["only", "row"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_headerless_bom_skipped_once_and_saved_once() {
+        let p = tmp_csv("hlbom", b"\xEF\xBB\xBFa,b\r\n1,2\r\n");
+        let mut bf = BigFile::open_with(&p, true).unwrap();
+        assert_eq!(bf.rows(0, 1)[0], vec!["a", "b"], "首格不得含 U+FEFF");
+        bf.set_cell(0, 0, "A".into()).unwrap();
+        bf.save(|_, _, _, _| {}).unwrap();
+        let out = fs::read(&p).unwrap();
+        assert!(out.starts_with(&[0xEF, 0xBB, 0xBF]), "应保留原 BOM");
+        assert!(!out[3..].starts_with(&[0xEF, 0xBB, 0xBF]), "BOM 只能有一个");
+        assert_eq!(&out[3..], b"A,b\r\n1,2\r\n");
+        let bf2 = BigFile::open_with(&p, true).unwrap();
+        assert_eq!(bf2.rows(0, 2), vec![vec!["A", "b"], vec!["1", "2"]]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_headerless_bom_leading_blank_not_over_skipped() {
+        // 防御性回归：若索引把 BOM 所在的前导行当空行跳过，记录 0 起点就
+        // 不在字节 0，此时不能再盲跳 3 字节。真实 build_index 因 BOM 字节
+        // 非空不会跳过该行，这里手工构造该索引形态验证 src_span。
+        let p = tmp_csv("hlbomblank", b"\xEF\xBB\xBF\r\na,b\r\n1,2\r\n");
+        let mut bf = BigFile::open_with(&p, true).unwrap();
+        bf.idx.rec_lines.remove(0); // 模拟"前导 BOM 行被跳过"
+        bf.seg = Segments::new(0, 2);
+        bf.base_ncols = 2;
+        bf.base_headers = generic_headers(2);
+        assert_eq!(bf.rows(0, 1)[0], vec!["a", "b"]);
+        bf.set_cell(0, 1, "B".into()).unwrap();
+        bf.save(|_, _, _, _| {}).unwrap();
+        let out = fs::read(&p).unwrap();
+        assert!(out.starts_with(&[0xEF, 0xBB, 0xBF]), "保存应保留 BOM");
+        assert_eq!(&out[3..], b"a,B\r\n1,2\r\n");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_headerless_toggle_roundtrip_promotes_edited_row() {
+        let p = tmp_csv("hltoggle", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        assert_eq!(bf.meta().rows, 5);
+        bf.set_headerless(true).unwrap();
+        let m = bf.meta();
+        assert!(m.headerless);
+        assert_eq!(m.rows, 6, "原表头进入数据");
+        assert_eq!(m.headers, vec!["列1", "列2", "列3"]);
+        assert_eq!(bf.rows(0, 1)[0], vec!["name", "age", "city"]);
+        bf.set_cell(0, 0, "NAME".into()).unwrap();
+        bf.set_headerless(false).unwrap();
+        let m = bf.meta();
+        assert!(!m.headerless);
+        assert_eq!(m.rows, 5);
+        assert_eq!(m.headers, vec!["NAME", "age", "city"], "应含未保存编辑");
+        assert_eq!(bf.rows(0, 1)[0], vec!["Alice", "30", "Beijing"]);
+        // 再次开启：首行回到数据
+        bf.set_headerless(true).unwrap();
+        assert_eq!(bf.meta().rows, 6);
+        assert_eq!(bf.rows(0, 1)[0], vec!["NAME", "age", "city"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_headerless_insert_at_top_then_disable_keeps_record0_as_data() {
+        let p = tmp_csv("hltop", b"a,b\r\n1,2\r\n");
+        let mut bf = BigFile::open_with(&p, true).unwrap();
+        bf.insert_rows(0, Some(vec![vec!["X".into(), "9".into()]]), 0)
+            .unwrap();
+        bf.set_headerless(false).unwrap();
+        assert_eq!(bf.meta().headers, vec!["X", "9"]);
+        assert_eq!(bf.meta().rows, 2);
+        // 被提升的是插入行；物理记录 0 仍是数据（读路径不得假设数据从 1 开始）
+        assert_eq!(bf.rows(0, 2), vec![vec!["a", "b"], vec!["1", "2"]]);
+        bf.save(|_, _, _, _| {}).unwrap();
+        let bf2 = BigFile::open(&p).unwrap();
+        assert_eq!(bf2.meta().headers, vec!["X", "9"]);
+        assert_eq!(bf2.rows(0, 2), vec![vec!["a", "b"], vec!["1", "2"]]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_headerless_filter_hits_first_row_and_uses_cache() {
+        let p = tmp_csv("hlfilter", b"alpha,1\r\nbeta,2\r\ngamma,3\r\n");
+        let mut bf = BigFile::open_with(&p, true).unwrap();
+        assert_eq!(bf.run_filter(&spec_one(0, "alpha")).unwrap(), 1);
+        assert_eq!(
+            bf.filter_page(0, 10)[0],
+            vec!["alpha", "1"],
+            "首行参与筛选"
+        );
+        let st = bf.last_filter_stats();
+        assert_eq!(st.scanned_rows, 3);
+        assert_eq!(st.cached_cols, 1);
+        // 同列新关键字走缓存，命中正确
+        assert_eq!(bf.run_filter(&spec_one(0, "bet")).unwrap(), 1);
+        assert!(bf.last_filter_stats().used_cache);
+        assert_eq!(bf.filter_page(0, 1)[0], vec!["beta", "2"]);
+        // 编辑首行 → 缓存失效后仍能命中
+        bf.set_cell(0, 0, "ALPHA".into()).unwrap();
+        assert_eq!(bf.run_filter(&spec_one(0, "alp")).unwrap(), 1);
+        assert_eq!(bf.filter_page(0, 1)[0][0], "ALPHA");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_headerless_save_writes_no_header_line() {
+        let p = tmp_csv("hlsave", b"x,1\r\ny,2\r\n");
+        let mut bf = BigFile::open_with(&p, true).unwrap();
+        bf.set_cell(1, 0, "Y".into()).unwrap();
+        bf.save(|_, _, _, _| {}).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"x,1\r\nY,2\r\n", "不得注入表头");
+        let bf2 = BigFile::open_with(&p, true).unwrap();
+        assert_eq!(bf2.meta().rows, 2);
+        assert_eq!(bf2.rows(0, 2), vec![vec!["x", "1"], vec!["Y", "2"]]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_headerless_gbk_first_row_and_save() {
+        let (enc, _, _) = encoding_rs::GBK.encode("张三,1\r\n李四,2\r\n");
+        let p = tmp_csv("hlgbk", &enc.into_owned());
+        let mut bf = BigFile::open_with(&p, true).unwrap();
+        assert_eq!(bf.meta().encoding, "gbk");
+        assert_eq!(bf.rows(0, 1)[0], vec!["张三", "1"]);
+        bf.set_cell(0, 1, "9".into()).unwrap();
+        bf.save(|_, _, _, _| {}).unwrap();
+        let bf2 = BigFile::open_with(&p, true).unwrap();
+        assert_eq!(bf2.meta().encoding, "gbk");
+        assert_eq!(
+            bf2.rows(0, 2),
+            vec![vec!["张三", "9"], vec!["李四", "2"]]
+        );
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_headerless_cannot_remove_last_row() {
+        let p = tmp_csv("hllast", b"a,1\r\nb,2\r\n");
+        let mut bf = BigFile::open_with(&p, true).unwrap();
+        let err = bf.remove_rows(vec![0, 1]).unwrap_err();
+        assert!(err.contains("至少保留一行"), "{err}");
+        assert_eq!(bf.meta().rows, 2, "拒绝后行不变");
+        assert_eq!(bf.remove_rows(vec![0]).unwrap(), 1);
+        assert_eq!(bf.meta().rows, 1);
+        let err = bf.remove_rows(vec![0]).unwrap_err();
+        assert!(err.contains("至少保留一行"), "{err}");
+        assert_eq!(bf.meta().rows, 1);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_headerless_col_ops_and_rename_rejection() {
+        let p = tmp_csv("hlcols", b"a,1\r\nb,2\r\n");
+        let mut bf = BigFile::open_with(&p, true).unwrap();
+        let err = bf
+            .push_col_op(ColOp::Rename { col: 0, name: "名".into() })
+            .unwrap_err();
+        assert!(err.contains("不可重命名"), "{err}");
+        // 待执行列操作期间禁止切换模式
+        bf.push_col_op(ColOp::Insert { pos: 2, name: "新列".into() })
+            .unwrap();
+        let err = bf.set_headerless(false).unwrap_err();
+        assert!(err.contains("列操作"), "{err}");
+        assert!(bf.meta().headerless);
+        bf.apply_col_ops(|_, _, _, _| {}).unwrap();
+        let m = bf.meta();
+        assert!(m.headerless);
+        assert_eq!(m.cols, 3);
+        assert_eq!(m.rows, 2);
+        assert_eq!(bf.rows(0, 1)[0], vec!["a", "1", ""]);
+        // 文件不得写独立表头：重开无列名，两行都是数据
+        let bf2 = BigFile::open_with(&p, true).unwrap();
+        assert_eq!(bf2.meta().rows, 2);
+        assert_eq!(
+            bf2.rows(0, 2),
+            vec![vec!["a", "1", ""], vec!["b", "2", ""]]
+        );
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_headerless_rejects_zero_columns_on_col_ops() {
+        let p = tmp_csv("hlzerocol", b"a\r\nb\r\n");
+        let mut bf = BigFile::open_with(&p, true).unwrap();
+        bf.push_col_op(ColOp::Delete { col: 0 }).unwrap();
+        let err = bf.apply_col_ops(|_, _, _, _| {}).unwrap_err();
+        assert!(err.contains("至少保留一列"), "{err}");
+        assert!(bf.meta().pending_cols, "失败时保留待执行操作");
+        assert_eq!(fs::read(&p).unwrap(), b"a\r\nb\r\n", "文件未被改写");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_headerless_rejects_zero_rows_on_disable_save_and_col_ops() {
+        let p = tmp_csv("hlzerorow", b"a,1\r\nb,2\r\n");
+        let mut bf = BigFile::open_with(&p, true).unwrap();
+        // 正常路径已禁止删最后一行；这里直接构造 0 行状态验证兜底
+        bf.seg = Segments::new(0, 0);
+        let err = bf.set_headerless(false).unwrap_err();
+        assert!(err.contains("没有数据行可作为列名"), "{err}");
+        assert!(bf.meta().headerless, "失败不得切换模式");
+        let err = bf.save(|_, _, _, _| {}).unwrap_err();
+        assert!(err.contains("至少保留一行"), "{err}");
+        bf.push_col_op(ColOp::Insert { pos: 0, name: "x".into() })
+            .unwrap();
+        let err = bf.apply_col_ops(|_, _, _, _| {}).unwrap_err();
+        assert!(err.contains("至少保留一行"), "{err}");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_headerless_toggle_clears_filter_cache_and_undo() {
+        let p = tmp_csv("hlclear", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        assert_eq!(bf.run_filter(&spec_one(2, "beijing")).unwrap(), 2);
+        assert!(bf.last_filter_stats().cached_cols > 0);
+        bf.set_cell(0, 1, "31".into()).unwrap();
+        assert!(bf.meta().can_undo);
+        bf.set_headerless(true).unwrap();
+        assert!(!bf.has_filter(), "切换后筛选清空");
+        assert_eq!(bf.filter_len(), 0);
+        assert!(!bf.meta().can_undo, "切换清空撤销");
+        assert!(!bf.meta().can_redo);
+        assert!(bf.col_cache.is_empty(), "切换丢弃列缓存");
+        // 开关是视图属性：不改变文件
+        assert_eq!(fs::read(&p).unwrap(), people_csv());
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_headerless_progressive_open_and_toggle() {
+        let mut s = String::from("a,b\r\n");
+        for i in 0..20 {
+            s.push_str(&format!("{i:04},x\r\n"));
+        }
+        let bytes = s.into_bytes();
+        let p = tmp_csv("hlprog", &bytes);
+        // 前缀 29B = 表头 + 3 行；无列名时 4 条记录全是数据
+        let mut bf = BigFile::open_progressive_full(&p, 29, 1000, 8, false, true).unwrap();
+        let m = bf.meta();
+        assert!(m.indexing);
+        assert!(m.headerless);
+        assert_eq!(m.rows, 4);
+        assert_eq!(bf.rows(0, 1)[0], vec!["a", "b"]);
+        assert_eq!(bf.copy_tsv(0, 1, 0, 2).unwrap(), "a\tb\r\n");
+        // 索引期关闭开关：只翻 offset，首行变表头
+        bf.set_headerless(false).unwrap();
+        assert_eq!(bf.meta().rows, 3);
+        assert_eq!(bf.meta().headers, vec!["a", "b"]);
+        assert_eq!(bf.rows(0, 1)[0], vec!["0000", "x"]);
+        bf.set_headerless(true).unwrap();
+        assert_eq!(bf.meta().rows, 4);
+        // 完成索引后段表从物理记录 0 开始
+        bf.drive_index_for_test();
+        assert!(!bf.meta().indexing);
+        bf.refresh_indexed();
+        assert_eq!(bf.meta().rows, 21);
+        assert_eq!(bf.rows(0, 1)[0], vec!["a", "b"]);
+        assert_eq!(bf.rows(20, 1)[0], vec!["0019", "x"]);
+        fs::remove_file(&p).ok();
+    }
+
     // ============================================================
     // 性能基准（默认 --ignored；数据全部写入 %TEMP%，绝不碰用户文件）
     // ============================================================
@@ -1656,10 +1958,12 @@ struct Segments {
 }
 
 impl Segments {
-    fn new(n_data: u32) -> Self {
+    /// 建单段段表：`start` 为首条数据记录的物理记录号
+    /// （有表头 = 1，无列名 = 0），`count` 为数据记录数。
+    fn new(start: u32, count: u32) -> Self {
         Self {
-            segs: if n_data > 0 {
-                vec![Seg { kind: SegKind::Src { start: 0, len: n_data }, len: n_data }]
+            segs: if count > 0 {
+                vec![Seg { kind: SegKind::Src { start, len: count }, len: count }]
             } else {
                 Vec::new()
             },
@@ -1901,6 +2205,8 @@ pub struct BigMeta {
     pub rows: u64,
     pub cols: u32,
     pub headers: Vec<String>,
+    /// 首行是否作为普通数据（无列名模式）。
+    pub headerless: bool,
     pub encoding: String,
     pub pending_cols: bool,
     pub can_undo: bool,
@@ -2425,6 +2731,8 @@ pub struct BigFile {
     base_mtime: std::time::SystemTime,
     /// 原文件是否带 UTF-8 BOM：保存/列操作重写时按原样回写（不注入也不剥除）。
     has_bom: bool,
+    /// 无列名模式：记录 0 也是数据，列名为虚拟的 列1..N。
+    headerless: bool,
 }
 
 impl Drop for BigFile {
@@ -2439,7 +2747,20 @@ impl BigFile {
     ///
     /// # Errors
     /// 文件不可读/为空/无记录时返回错误字符串。
+    #[cfg(test)]
     pub fn open(path: &Path) -> Result<Self, String> {
+        Self::open_with(path, false)
+    }
+
+    /// 按指定首行语义打开：`headerless = true` 时记录 0 是普通数据。
+    ///
+    /// # Parameters
+    /// - `path`: CSV 文件路径。
+    /// - `headerless`: true = 首行不是列名（列名虚拟为 列1..N）。
+    ///
+    /// # Errors
+    /// 文件不可读/为空/无记录时返回错误字符串。
+    pub fn open_with(path: &Path, headerless: bool) -> Result<Self, String> {
         let t0 = Instant::now();
         let file = fs::File::open(path)
             .map_err(|e| format!("打开失败：{}（{}）", path.display(), e))?;
@@ -2459,15 +2780,23 @@ impl BigFile {
             return Err("文件中没有记录".into());
         }
         let (hs, he) = idx.record_span(bytes.len(), 0);
-        let mut headers = parse_record(&decode_slice(enc, &bytes[hs..he]), b',');
+        let mut first_fields = parse_record(&decode_slice(enc, &bytes[hs..he]), b',');
         if enc == Encoding::Utf8 {
-            if let Some(first) = headers.first_mut() {
+            if let Some(first) = first_fields.first_mut() {
                 if let Some(stripped) = first.strip_prefix('\u{FEFF}') {
                     *first = stripped.to_string();
                 }
             }
         }
-        let n_data = idx.n_records() - 1;
+        // 有表头：记录 0 是列名，数据从物理记录 1 开始；
+        // 无列名：记录 0 也是数据，列数由它决定。
+        let offset = if headerless { 0u32 } else { 1u32 };
+        let n_data = idx.n_records() - offset as usize;
+        let headers = if headerless {
+            generic_headers(first_fields.len())
+        } else {
+            first_fields
+        };
         let base_ncols = headers.len();
         let open_ms = t0.elapsed().as_millis() as u64;
         Ok(Self {
@@ -2483,7 +2812,7 @@ impl BigFile {
             total_bytes: meta.len(),
             base_ncols,
             base_headers: headers,
-            seg: Segments::new(n_data as u32),
+            seg: Segments::new(offset, n_data as u32),
             overlay: HashMap::new(),
             pending_cols: Vec::new(),
             filter: None,
@@ -2498,23 +2827,29 @@ impl BigFile {
             base_size: meta.len(),
             base_mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
             has_bom,
+            headerless,
         })
     }
 
-    /// 渐进打开：同步扫一小段前缀让表格立即可用，剩余部分后台继续建索引。
+    /// 按指定首行语义渐进打开。
     ///
     /// # Parameters
     /// - `path`: CSV 文件路径。
+    /// - `headerless`: true = 首行不是列名。
     ///
     /// # Errors
     /// 文件不可读/为空/首条记录无法完成时返回错误字符串。
-    pub fn open_progressive(path: &Path) -> Result<Self, String> {
-        Self::open_progressive_with(
+    pub fn open_progressive_with_mode(
+        path: &Path,
+        headerless: bool,
+    ) -> Result<Self, String> {
+        Self::open_progressive_full(
             path,
             INITIAL_INDEX_BYTES,
             INITIAL_INDEX_RECORDS,
             INDEX_CHUNK_BYTES,
             true,
+            headerless,
         )
     }
 
@@ -2526,12 +2861,32 @@ impl BigFile {
     /// - `initial_records`: 同步索引最多记录数（含表头）。
     /// - `chunk_bytes`: 后台每块推进字节数。
     /// - `background`: true = 启动后台线程；false = 保持部分索引（测试手动驱动）。
+    #[cfg(test)]
     fn open_progressive_with(
         path: &Path,
         initial_bytes: usize,
         initial_records: usize,
         chunk_bytes: usize,
         background: bool,
+    ) -> Result<Self, String> {
+        Self::open_progressive_full(
+            path,
+            initial_bytes,
+            initial_records,
+            chunk_bytes,
+            background,
+            false,
+        )
+    }
+
+    /// 渐进打开完整参数版（含首行语义）。
+    fn open_progressive_full(
+        path: &Path,
+        initial_bytes: usize,
+        initial_records: usize,
+        chunk_bytes: usize,
+        background: bool,
+        headerless: bool,
     ) -> Result<Self, String> {
         let t0 = Instant::now();
         let file = fs::File::open(path)
@@ -2577,17 +2932,23 @@ impl BigFile {
         // （后续记录）不会混入表头。
         let header_start = line_off[rec_lines[0] as usize] as usize;
         let header_end = if done { bytes.len() } else { cur.pos };
-        let mut headers =
+        let mut first_fields =
             parse_record(&decode_slice(enc, &bytes[header_start..header_end]), b',');
         if enc == Encoding::Utf8 {
-            if let Some(first) = headers.first_mut() {
+            if let Some(first) = first_fields.first_mut() {
                 if let Some(stripped) = first.strip_prefix('\u{FEFF}') {
                     *first = stripped.to_string();
                 }
             }
         }
+        let offset = if headerless { 0usize } else { 1usize };
+        let n_data = usable - offset;
+        let headers = if headerless {
+            generic_headers(first_fields.len())
+        } else {
+            first_fields
+        };
         let base_ncols = headers.len();
-        let n_data = usable - 1;
         let cancel = Arc::new(AtomicBool::new(false));
         let open_ms = t0.elapsed().as_millis() as u64;
         let total_bytes = meta.len();
@@ -2633,7 +2994,7 @@ impl BigFile {
             total_bytes,
             base_ncols,
             base_headers: headers,
-            seg: Segments::new(n_data as u32),
+            seg: Segments::new(offset as u32, n_data as u32),
             overlay: HashMap::new(),
             pending_cols: Vec::new(),
             filter: None,
@@ -2648,6 +3009,7 @@ impl BigFile {
             base_size: meta.len(),
             base_mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
             has_bom,
+            headerless,
         })
     }
 
@@ -2735,11 +3097,26 @@ impl BigFile {
                 st.index_ms,
             )
         };
-        let n_data = rec_lines.len().saturating_sub(1);
+        // 磁盘索引按物理记录号解释：有表头跳过记录 0，无列名从记录 0 开始。
+        // 注意模式可能在索引期间切换过，这里用当前开关状态重算。
+        let offset = self.record_offset() as usize;
+        let n_data = rec_lines.len().saturating_sub(offset);
         self.idx = RawIndex { line_off, rec_lines };
-        self.seg = Segments::new(n_data as u32);
+        self.seg = Segments::new(offset as u32, n_data as u32);
         self.index_ms = index_ms;
         self.partial = None;
+    }
+
+    /// 视图行 → 物理记录号的模式偏移。
+    ///
+    /// 仅用于重新解释磁盘索引（打开/并入索引/渐进期换算）；已建好的
+    /// 段表一律按物理记录号解析，不能再叠加此偏移。
+    fn record_offset(&self) -> u32 {
+        if self.headerless {
+            0
+        } else {
+            1
+        }
     }
 
     /// 当前可展示的数据行数（渐进索引期间随扫描增长）。
@@ -2751,7 +3128,7 @@ impl BigFile {
                 st.cursor.line_started_open,
                 st.done,
             )
-            .saturating_sub(1) as u64
+            .saturating_sub(self.record_offset() as usize) as u64
         } else {
             self.seg.vrow_count()
         }
@@ -2794,7 +3171,7 @@ impl BigFile {
                         st.cursor.line_started_open,
                         st.done,
                     )
-                    .saturating_sub(1) as u64,
+                    .saturating_sub(self.record_offset() as usize) as u64,
                     !st.done,
                     st.cursor.pos as u64,
                     st.index_ms,
@@ -2813,6 +3190,7 @@ impl BigFile {
             rows,
             cols: self.view_ncols(),
             headers: self.view_headers(),
+            headerless: self.headerless,
             encoding: match self.enc {
                 Encoding::Utf8 => "utf-8".into(),
                 Encoding::Gbk => "gbk".into(),
@@ -2850,8 +3228,11 @@ impl BigFile {
         n.max(0) as u32
     }
 
-    /// 映射后表头。
+    /// 映射后表头。无列名模式下列名是虚拟的 列1..N。
     fn view_headers(&self) -> Vec<String> {
+        if self.headerless {
+            return generic_headers(self.view_ncols() as usize);
+        }
         let mut cols: Vec<Option<String>> =
             self.base_headers.iter().cloned().map(Some).collect();
         for op in &self.pending_cols {
@@ -2920,23 +3301,38 @@ impl BigFile {
     // ---- 读路径 ----
 
     /// 读取源记录字段（解码 + 解析 + pad/truncate + 覆盖层）。
-    /// 把源文件 data rec 区间 [first, end) 的原始字节整段写入（透传不重编码）。
+    /// 把物理记录区间 [first, end) 的原始字节整段写入（透传不重编码）。
     /// 端点取记录首行偏移；区间末尾即文件末时用 mmap 长度。
     /// 仅在 save() 透传路径使用：调用方保证行未删除（段已剔除被删行）、无覆盖层。
     fn write_raw_range(&self, w: &mut impl Write, first: u32, end: u32) -> Result<(), String> {
-        let s = self.idx.record_span(self.mmap.len(), first as usize + 1).0;
-        let e = if (end as usize + 1) < self.idx.n_records() {
-            self.idx.record_span(self.mmap.len(), end as usize + 1).0
+        let mut s = self.idx.record_span(self.mmap.len(), first as usize).0;
+        let e = if (end as usize) < self.idx.n_records() {
+            self.idx.record_span(self.mmap.len(), end as usize).0
         } else {
             self.mmap.len()
         };
+        // BOM 已单独写在文件开头：仅当记录 0 正好从文件字节 0 起才跳过，
+        // 有前导空行时记录 0 起点在 BOM 之后，不能盲跳。
+        if first == 0 && self.has_bom && s == 0 {
+            s = 3;
+        }
         w.write_all(&self.mmap[s..e]).map_err(|e| e.to_string())
     }
 
+    /// 物理记录 rec 的可见字节范围；记录 0 统一剥掉文件头 BOM。
+    fn src_span(&self, rec: u32) -> Option<(usize, usize)> {
+        let (mut s, e) = self.record_span_visible(rec as usize)?;
+        if rec == 0 && self.has_bom && s == 0 {
+            s = 3;
+        }
+        Some((s, e))
+    }
+
+    /// 读取物理记录 rec 的字段（解码 + 解析 + pad/truncate + 覆盖层）。
     fn src_fields(&self, rec: u32) -> Vec<String> {
         // 渐进索引期间只允许读已完整发布的记录；未命中给空行（调用方已按
         // 可见行数过滤，正常不会发生）。
-        let Some((s, e)) = self.record_span_visible(rec as usize + 1) else {
+        let Some((s, e)) = self.src_span(rec) else {
             return vec![String::new(); self.base_ncols];
         };
         let mut f = parse_record(&decode_slice(self.enc, &self.mmap[s..e]), b',');
@@ -2973,13 +3369,14 @@ impl BigFile {
         f
     }
 
-    /// 取 vrow 的视图行（pending 期做列映射；渐进索引期 vrow == 源记录号）。
+    /// 取 vrow 的视图行（pending 期做列映射；渐进索引期按模式偏移换算）。
     fn row_at(&self, vrow: u64) -> Option<Vec<String>> {
         if self.partial.is_some() {
             if vrow >= self.indexed_data_rows() {
                 return None;
             }
-            return Some(self.map_fields_to_view(&self.src_fields(vrow as u32)));
+            let rec = vrow as u32 + self.record_offset();
+            return Some(self.map_fields_to_view(&self.src_fields(rec)));
         }
         match self.seg.resolve(vrow)? {
             ResolvedRow::Src(rec) => {
@@ -3031,12 +3428,12 @@ impl BigFile {
     /// 写单元格（覆盖层/直改块 + 撤销日志）。
     pub fn set_cell(&mut self, vrow: u64, col: u32, value: String) -> Result<(), String> {
         self.require_editable()?;
-        // 渐进索引期没有插入/删除行，vrow 恒等于源记录号；完成后再走段表。
+        // 渐进索引期没有插入/删除行，vrow + 模式偏移 = 物理记录号；完成后再走段表。
         let resolved = if self.partial.is_some() {
             if vrow >= self.indexed_data_rows() {
                 return Err("行号越界".into());
             }
-            ResolvedRow::Src(vrow as u32)
+            ResolvedRow::Src(vrow as u32 + self.record_offset())
         } else {
             self.seg.resolve(vrow).ok_or("行号越界")?
         };
@@ -3125,6 +3522,10 @@ impl BigFile {
         let total = self.seg.vrow_count();
         if vrows.iter().any(|&v| v >= total) {
             return Err("行号越界".into());
+        }
+        // 无列名模式没有独立表头：0 行文件保存后无法重开，禁止删空
+        if self.headerless && !vrows.is_empty() && vrows.len() as u64 >= total {
+            return Err("无列名模式需至少保留一行".into());
         }
         // 降序删除，保证低 vrow 位置稳定
         let mut items: Vec<DeletedRow> = Vec::new();
@@ -3579,8 +3980,10 @@ impl BigFile {
             let v = source.get(i);
             match self.seg.resolve(v as u64) {
                 Some(ResolvedRow::Src(rec)) => {
-                    let (s, e) =
-                        self.idx.record_span(self.mmap.len(), rec as usize + 1);
+                    // rec 已是物理记录号（段表统一寻址）；记录 0 需剥 BOM
+                    let (s, e) = self
+                        .src_span(rec)
+                        .unwrap_or((0, 0));
                     scan.begin_src_record(rec);
                     let hit = scan.record_matches(rec, &self.mmap[s..e]);
                     scan.finish_src_record();
@@ -3612,16 +4015,17 @@ impl BigFile {
             return MergedBuild::Invalid;
         };
         let col = head.col;
-        let n_data = self.idx.n_records().saturating_sub(1);
+        // 缓存按物理记录号索引：记录 0 在无列名模式下也是数据。
+        let n_records = self.idx.n_records();
         let mut data: Vec<u8> = Vec::new();
-        let mut offs = vec![0u32; n_data + 1];
+        let mut offs = vec![0u32; n_records + 1];
         let mut filled = 0usize;
         for b in chunks {
             if b.col != col {
                 return MergedBuild::Invalid;
             }
             let first = b.first_rec as usize;
-            if first > n_data || b.last_rec as usize >= n_data {
+            if b.last_rec as usize >= n_records {
                 return MergedBuild::Invalid;
             }
             if first > filled {
@@ -3651,7 +4055,7 @@ impl BigFile {
                 filled = rec + 1;
             }
         }
-        while filled < n_data {
+        while filled < n_records {
             offs[filled + 1] = data.len() as u32;
             filled += 1;
         }
@@ -3785,9 +4189,9 @@ impl BigFile {
         }
         let mut out = String::new();
         if self.partial.is_some() {
-            // 渐进索引期 vrow == 源记录号（无插删行）
+            // 渐进索引期无插删行：vrow + 模式偏移 = 物理记录号
             for v in r0..r1 {
-                let fields = self.src_fields(v as u32);
+                let fields = self.src_fields(v as u32 + self.record_offset());
                 let row: Vec<String> = (c0..c1)
                     .map(|c| fields.get(c as usize).cloned().unwrap_or_default())
                     .collect();
@@ -3818,6 +4222,10 @@ impl BigFile {
         if self.is_indexing() {
             return Err("文件仍在索引中，暂不支持列操作".into());
         }
+        // 无列名模式列名是自动生成的，重命名没有意义
+        if self.headerless && matches!(op, ColOp::Rename { .. }) {
+            return Err("无列名模式不可重命名列".into());
+        }
         self.pending_cols.push(op);
         self.filter = None; // 列映射变化，旧筛选结果作废
         self.last_spec = None;
@@ -3834,6 +4242,64 @@ impl BigFile {
         self.pending_cols.clear();
     }
 
+    /// 切换「首行非列名」。
+    ///
+    /// 开启：表头行作为普通数据进入顶部，列名虚拟为 列1..N。
+    /// 关闭：当前首行（含未保存编辑）提升为表头并从数据中移除。
+    /// 渐进索引期没有段表，仅翻转模式偏移；关闭时把当前首行记为表头。
+    ///
+    /// # Parameters
+    /// - `on`: true = 首行是数据；false = 首行是列名。
+    ///
+    /// # Errors
+    /// 待执行列操作未清空 / 关闭时没有数据行时返回错误字符串。
+    pub fn set_headerless(&mut self, on: bool) -> Result<(), String> {
+        if on == self.headerless {
+            return Ok(());
+        }
+        if !self.pending_cols.is_empty() {
+            return Err("列操作待执行：请先执行或撤销列操作".into());
+        }
+        self.refresh_indexed();
+        if self.partial.is_some() {
+            if !on {
+                if self.indexed_data_rows() == 0 {
+                    return Err("没有数据行可作为列名".into());
+                }
+                // 记录 0 是当前首行（无列名模式 offset = 0）；覆盖层编辑一并带上
+                self.base_headers = self.src_fields(0);
+                self.base_ncols = self.base_headers.len();
+            }
+            self.headerless = on;
+        } else {
+            if on {
+                if self.base_headers.is_empty() {
+                    return Err("没有列可作为列名".into());
+                }
+                // O(1)：原表头变成顶部插入行，可正常编辑/删除/筛选
+                self.seg.insert_block(0, vec![self.base_headers.clone()]);
+            } else {
+                if self.seg.vrow_count() == 0 {
+                    return Err("没有数据行可作为列名".into());
+                }
+                let Some(row) = self.row_at(0) else {
+                    return Err("没有数据行可作为列名".into());
+                };
+                self.base_headers = row;
+                self.base_ncols = self.base_headers.len();
+                self.seg.delete_one(0);
+            }
+            self.headerless = on;
+        }
+        // 开关是视图属性：筛选、收窄基准、列缓存、撤销历史全部作废
+        self.filter = None;
+        self.last_spec = None;
+        self.cache_clear_all();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        Ok(())
+    }
+
     // ---- 序列化与落盘 ----
 
     /// 保存：流式重写原文件（覆盖层/插入/删除合并）。
@@ -3846,6 +4312,15 @@ impl BigFile {
         if self.is_indexing() {
             return Err("文件仍在索引中，请稍候再保存".into());
         }
+        // 无列名文件没有独立表头：0 行会写出 BOM-only/空文件，重开失败
+        if self.headerless {
+            if self.seg.vrow_count() == 0 {
+                return Err("无列名模式需至少保留一行".into());
+            }
+            if self.view_ncols() == 0 {
+                return Err("无列名模式需至少保留一列".into());
+            }
+        }
         // 整表重写数十秒：本线程降为背景优先级，让出 UI/系统调度。
         let _bg = bg::BackgroundGuard::enter();
         let tmp = tmp_path_for(&self.path);
@@ -3854,9 +4329,12 @@ impl BigFile {
         if self.has_bom {
             w.write_all(&[0xEF, 0xBB, 0xBF]).map_err(|e| e.to_string())?;
         }
-        let header = self.view_headers();
-        w.write_all(&encode_record(&header, b',', self.enc))
-            .map_err(|e| e.to_string())?;
+        // 表头模式先写列名；无列名模式段表第一行就是数据第一行。
+        if !self.headerless {
+            let header = self.view_headers();
+            w.write_all(&encode_record(&header, b',', self.enc))
+                .map_err(|e| e.to_string())?;
+        }
         let total = self.seg.vrow_count();
         // 有覆盖层编辑的源行（透传判定的"不洁净"集；覆盖层通常极小）
         let edited: std::collections::HashSet<u32> =
@@ -3939,11 +4417,23 @@ impl BigFile {
         if self.pending_cols.is_empty() {
             return Ok(());
         }
+        // 视图→物理映射（apply 后 view == 物理，映射只是本次重写用）
+        let ncols = self.view_ncols();
+        let total = self.seg.vrow_count();
+        // 无列名模式没有独立表头；零行/零列都会写出无法重开的文件
+        if self.headerless {
+            if total == 0 {
+                return Err("无列名模式需至少保留一行".into());
+            }
+            if ncols == 0 {
+                return Err("无列名模式需至少保留一列".into());
+            }
+        } else if ncols == 0 {
+            return Err("没有列：无法执行列操作".into());
+        }
         // 整表物理重写数十秒：本线程降为背景优先级，让出 UI/系统调度。
         let _bg = bg::BackgroundGuard::enter();
         let new_headers = self.view_headers();
-        // 视图→物理映射（apply 后 view == 物理，映射只是本次重写用）
-        let ncols = self.view_ncols();
         let mapping: Vec<Option<u32>> = (0..ncols).map(|vc| self.view_to_phys(vc)).collect();
 
         let tmp = tmp_path_for(&self.path);
@@ -3952,9 +4442,11 @@ impl BigFile {
         if self.has_bom {
             w.write_all(&[0xEF, 0xBB, 0xBF]).map_err(|e| e.to_string())?;
         }
-        w.write_all(&encode_record(&new_headers, b',', self.enc))
-            .map_err(|e| e.to_string())?;
-        let total = self.seg.vrow_count();
+        // 无列名模式不写独立表头：第一行记录就是数据
+        if !self.headerless {
+            w.write_all(&encode_record(&new_headers, b',', self.enc))
+                .map_err(|e| e.to_string())?;
+        }
         let mut done = 0u64;
         let mut last_emit: Option<Instant> = None;
         for s in &self.seg.segs {
@@ -4009,8 +4501,8 @@ impl BigFile {
         self.replace_with_retry(&tmp)?;
         progress(renamed_weighted(total), total, PHASE_FLUSH, done);
 
-        // 全量重建：列结构变化，编辑层与撤销历史一并失效
-        let mut fresh = Self::open(&self.path)?;
+        // 全量重建：列结构变化，编辑层与撤销历史一并失效；保持首行语义
+        let mut fresh = Self::open_with(&self.path, self.headerless)?;
         fresh.base_headers = new_headers;
         fresh.base_ncols = ncols as usize;
         *self = fresh;
@@ -4078,6 +4570,7 @@ impl BigFile {
     fn reopen_after_write(&mut self) -> Result<(), String> {
         let t0 = Instant::now();
         let n_data = self.seg.vrow_count();
+        let offset = self.record_offset();
         let file = fs::File::open(&self.path).map_err(|e| e.to_string())?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
         let mmap = Arc::new(unsafe {
@@ -4085,7 +4578,7 @@ impl BigFile {
         });
         let bytes: &[u8] = &mmap;
         let idx = build_index(bytes);
-        if idx.n_records() as u64 != n_data + 1 {
+        if idx.n_records() as u64 != n_data + offset as u64 {
             return Err("写入后行数校验失败".into());
         }
         self.mmap = mmap;
@@ -4093,7 +4586,7 @@ impl BigFile {
         self.partial = None;
         self.index_ms = t0.elapsed().as_millis() as u64;
         self.total_bytes = meta.len();
-        self.seg = Segments::new(n_data as u32);
+        self.seg = Segments::new(offset, n_data as u32);
         self.overlay.clear();
         self.filter = None;
         self.last_spec = None;
@@ -4102,6 +4595,11 @@ impl BigFile {
         self.base_mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         Ok(())
     }
+}
+
+/// 无列名模式的虚拟列名：列1..列N。
+fn generic_headers(ncols: usize) -> Vec<String> {
+    (1..=ncols).map(|i| format!("列{i}")).collect()
 }
 
 /// 筛选匹配（语义对齐 grid.js _refilter：多重 OR 叠加逐列 AND；

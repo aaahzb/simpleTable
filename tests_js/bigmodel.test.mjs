@@ -11,14 +11,18 @@ function makeFakeEngine({ rows = 1000, cols = 3 } = {}) {
     Array.from({ length: cols }, (_, c) => `r${r}c${c}`),
   );
   const calls = [];
+  let headerless = false;
+  let baseHeaders = Array.from({ length: cols }, (_, c) => `h${c}`);
+  const generic = () => Array.from({ length: cols }, (_, c) => `列${c + 1}`);
   const meta = () => ({
     rows: data.length,
     cols,
-    headers: Array.from({ length: cols }, (_, c) => `h${c}`),
+    headers: headerless ? generic() : baseHeaders.slice(),
     encoding: "utf-8",
     pending_cols: false,
     can_undo: false,
     can_redo: false,
+    headerless,
     // 渐进索引字段：普通夹具视为"已索引完成"
     indexing: false,
     indexed_bytes: 1024,
@@ -33,7 +37,22 @@ function makeFakeEngine({ rows = 1000, cols = 3 } = {}) {
       calls.push([cmd, args]);
       switch (cmd) {
         case "big_open":
+          headerless = !!args.headerless;
           return meta();
+        case "big_set_headerless": {
+          const on = !!args.on;
+          if (on !== headerless) {
+            if (on) {
+              data.unshift(baseHeaders.slice());
+            } else {
+              if (!data.length) throw new Error("没有数据行可作为列名");
+              baseHeaders = data.shift().slice();
+            }
+            headerless = on;
+          }
+          filter = null;
+          return meta();
+        }
         case "big_meta":
           return meta();
         case "big_rows": {
@@ -124,7 +143,7 @@ function makeIndexingEngine({ rows = 100, cols = 2, openRows = 20, steps = [], p
   const headers = Array.from({ length: cols }, (_, c) => `h${c}`);
   let meta = {
     rows: openRows, cols, headers, encoding: "utf-8",
-    pending_cols: false, can_undo: false, can_redo: false,
+    pending_cols: false, can_undo: false, can_redo: false, headerless: false,
     indexing: true, indexed_bytes: 200, total_bytes: 1024,
     open_ms: 7, index_ms: 0, elapsed_ms: 30,
   };
@@ -158,6 +177,9 @@ function makeIndexingEngine({ rows = 100, cols = 2, openRows = 20, steps = [], p
           return 0;
         case "big_clear_filter":
           return null;
+        case "big_set_headerless":
+          meta = { ...meta, headerless: !!args.on };
+          return { ...meta };
         default:
           return null;
       }
@@ -526,4 +548,86 @@ test("重新打开会重置首屏耗时与索引轮询", async () => {
   // 旧会话轮询不得叠加（每次 tick 只应有一次 big_meta）
   const ticks = calls.filter(([c]) => c === "big_meta").length - metaCalls;
   assert.ok(ticks <= 4, `旧轮询不得叠加（观察窗口内 ${ticks} 次 big_meta）`);
+});
+
+test("open 把 headerless 传给 big_open，缺省为 false", async () => {
+  const { model, calls } = makeFakeEngine();
+  await model.open("/x.csv");
+  assert.deepEqual(calls[0], ["big_open", { path: "/x.csv", headerless: false }]);
+  assert.equal(model.isHeaderless(), false);
+});
+
+test("open 无列名：isHeaderless=true、表头为 列1..N、首行计入数据", async () => {
+  const { model } = makeFakeEngine({ rows: 5, cols: 2 });
+  await model.open("/x.csv", { headerless: true });
+  assert.equal(model.isHeaderless(), true);
+  assert.deepEqual(model.headers(), ["列1", "列2"]);
+  assert.equal(model.rowCount(), 5);
+});
+
+test("meta 缺 headerless 字段时按 false 兼容", async () => {
+  const model = new BigModel({
+    invoke: async (cmd) =>
+      cmd === "big_open" ? { rows: 0, cols: 0, headers: [], indexing: false } : null,
+    listen: async () => () => {},
+  });
+  await model.open("/x.csv");
+  assert.equal(model.isHeaderless(), false);
+});
+
+test("setHeaderless 调引擎并更新元数据/表头/行数", async () => {
+  const { model, calls } = makeFakeEngine({ rows: 3, cols: 2 });
+  await model.open("/x.csv");
+  await model.setHeaderless(true);
+  assert.deepEqual(calls.at(-1), ["big_set_headerless", { on: true }]);
+  assert.equal(model.isHeaderless(), true);
+  assert.deepEqual(model.headers(), ["列1", "列2"]);
+  assert.equal(model.rowCount(), 4);
+  await model.setHeaderless(false);
+  assert.equal(model.isHeaderless(), false);
+  assert.deepEqual(model.headers(), ["h0", "h1"]);
+  assert.equal(model.rowCount(), 3);
+});
+
+test("setHeaderless 清空筛选，以 origin='view' 通知且不标脏", async () => {
+  const { model } = makeFakeEngine({ rows: 100, cols: 2 });
+  await model.open("/x.csv");
+  await model.runFilter([[0, "r1"]], [], "");
+  assert.equal(model.filterActive(), true);
+  const events = [];
+  let undoEvents = 0;
+  model.onData((s, o) => events.push([s, o]));
+  model.onUndoStack(() => { undoEvents += 1; });
+  await model.setHeaderless(true);
+  assert.equal(model.filterActive(), false);
+  assert.deepEqual(events.at(-1), [true, "view"]);
+  assert.equal(undoEvents, 1);
+});
+
+test("索引期间允许切换 headerless", async () => {
+  const { model } = makeIndexingEngine({ rows: 50, openRows: 10 });
+  await model.open("/x.csv");
+  try {
+    assert.equal(model.indexing(), true);
+    await model.setHeaderless(true);
+    assert.equal(model.isHeaderless(), true);
+  } finally {
+    await model.close();
+  }
+});
+
+test("相同状态不重复调用引擎", async () => {
+  const { model, calls } = makeFakeEngine();
+  await model.open("/x.csv");
+  const before = calls.length;
+  await model.setHeaderless(false);
+  assert.equal(calls.length, before);
+});
+
+test("无列名模式拒绝重命名列且不调用引擎", async () => {
+  const { model, calls } = makeFakeEngine();
+  await model.open("/x.csv", { headerless: true });
+  const before = calls.length;
+  await assert.rejects(() => model.renameColumn(0, "x"), /无列名/);
+  assert.equal(calls.length, before);
 });
