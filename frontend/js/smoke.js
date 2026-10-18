@@ -1323,11 +1323,12 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(JSON.stringify(bm.headers()) === JSON.stringify(["目的地", "评分", "备注"]),
       `表头 ${bm.headers()}`);
     assert(bm.meta().encoding === "utf-8", `编码 ${bm.meta().encoding}`);
-    // 模式专属工具栏显隐：大模式隐藏「排序…」、显示「执行筛选」；
-    // 列操作两按钮无 pending 时应隐藏（小模式从不依赖这三个大文件按钮）。
+    // 模式专属工具栏显隐：大模式隐藏「排序…」；「执行筛选」按钮已移除
+    // （筛选框键入即筛，回车立即执行）；列操作两按钮无 pending 时应隐藏。
     // 注意：必须断言计算样式 display——.hidden 类曾无 CSS 规则，类在但视觉不隐藏。
     assert(tbHidden("排序…"), "大模式应隐藏排序按钮");
-    assert(!tbHidden("执行筛选"), "大模式应显示执行筛选");
+    assert(tbBtn("执行筛选") === undefined,
+      "执行筛选按钮应已移除（键入即筛 + 回车立即执行）");
     assert(tbHidden("执行列操作"), "无 pending 应隐藏执行列操作");
     assert(tbHidden("撤销列操作预览"), "无 pending 应隐藏撤销列操作预览");
   });
@@ -1485,6 +1486,25 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(input.isConnected, "筛选框 DOM 被重建替换");
     assert(document.activeElement === input, "筛选落定后焦点被夺走");
     assert(input.value === "大理", `筛选框内容丢失：${input.value}`);
+  });
+
+  check("大模式：输入法组合中的回车不触发筛选（isComposing 守卫）", async () => {
+    // 中文输入法用回车选词时，keydown 的 key 也是 Enter；不设守卫会提前
+    // 拿未上屏的组合串去筛。组合态回车必须放行给输入法，普通回车仍立即执行。
+    const bm = bigM();
+    const input = document.querySelector('.col-filter input[data-col="0"]');
+    const status = document.getElementById("status-text");
+    status.textContent = "哨兵";
+    input.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "Enter", bubbles: true, isComposing: true,
+    }));
+    assert(status.textContent === "哨兵",
+      `组合态回车不应触发筛选，状态栏：${status.textContent}`);
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    assert(status.textContent.includes("正在筛选大文件"),
+      `普通回车应立即执行，状态栏：${status.textContent}`);
+    await waitFor(() => /匹配/.test(status.textContent), "回车筛选落定");
+    assert(bm.filterActive(), "回车筛选后应保持命中视图");
   });
 
   check("大模式：键入收窄与清空自动回全量", async () => {
@@ -1673,10 +1693,10 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await window.__app.openPath(`${TMP}/rt.csv`);
     assert(window.__app.isBigMode() === false, "关开关后应回到小文件模式");
     assert(window.__app.model.rowCount() === 1, `小模型行数 ${window.__app.model.rowCount()}`);
-    // 模式专属工具栏显隐回到小模式态：排序恢复显示，三个大文件按钮隐藏
+    // 模式专属工具栏显隐回到小模式态：排序恢复显示，两个大文件按钮隐藏
     // （断言计算样式 display——.hidden 类曾无 CSS 规则，类在但视觉不隐藏）
     assert(!tbHidden("排序…"), "小模式应显示排序按钮");
-    assert(tbHidden("执行筛选"), "小模式应隐藏执行筛选");
+    assert(tbBtn("执行筛选") === undefined, "执行筛选按钮应已移除（两种模式都不存在）");
     assert(tbHidden("执行列操作"), "小模式应隐藏执行列操作");
     assert(tbHidden("撤销列操作预览"), "小模式应隐藏撤销列操作预览");
   });

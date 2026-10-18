@@ -994,8 +994,8 @@ export class Grid {
     }, true);
 
     // ---- 筛选输入 ----
-    // 小表即时筛选（手感优先，行数超阈值防抖）；大表只记录条件，
-    // 整表扫描在 Rust 引擎，由「执行筛选」按钮/回车触发
+    // 小表即时筛选（手感优先，行数超阈值防抖）；大表条件进 grid 后
+    // 由 app 侧防抖触发引擎扫描（键入即筛），回车跳过防抖立即执行
     this.headerEl.addEventListener("input", (e) => {
       if (this._suppressFilterInput) return;
       const input = e.target.closest(".col-filter input");
@@ -1016,10 +1016,13 @@ export class Grid {
       }
     });
 
-    // 大模式：筛选框内回车 = 执行筛选（与「执行筛选」按钮同效）
+    // 大模式：筛选框内回车 = 跳过防抖立即执行一次
     this.headerEl.addEventListener("keydown", (e) => {
       if (e.key !== "Enter" || !this.model.isBig) return;
       if (e.target.closest(".col-filter input")) {
+        // 输入法组合态的 Enter 是"选词/上屏"，必须放行给输入法，
+        // 否则会拿未上屏的拼音串提前触发筛选。
+        if (e.isComposing) return;
         e.preventDefault();
         this.hooks.bigFilterRun?.();
       }

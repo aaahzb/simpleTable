@@ -384,7 +384,7 @@ function applyDocToCurrent(doc, p) {
     const meta = model.meta();
     statusMsg(
       `大文件模式：${meta.rows} 行 × ${meta.cols} 列（${meta.encoding}），` +
-      "筛选需点「执行筛选」", 6000);
+      "筛选框键入即筛（回车立即执行）", 6000);
   }
   if (doc.warnings?.length) {
     void infoDialog("打开提示", doc.warnings.slice(0, 20).join("\n"));
@@ -584,11 +584,11 @@ function makeHooks(side) {
     cellMenu: (r, c, e) => { if (focused()) showCellMenu(e); },
     rowMenu: (r, e) => { if (focused()) showRowMenu(e); },
     colMenu: (c, e) => { if (focused()) showColMenu(e); },
-    // 大模式：执行筛选（工具栏按钮 / 筛选框回车共用）
+    // 大模式：筛选框内回车 = 跳过防抖立即执行一次
     bigFilterRun: () => { if (focused()) runBigFilter(); },
     // 大模式：筛选条件键入即筛（防抖 + 引擎侧可中断扫描）
     bigFilterInput: () => { if (focused()) scheduleBigFilter(); },
-    // 大模式：筛选条件变化（刷新"执行筛选"按钮态与状态栏）
+    // 大模式：筛选条件变化（刷新列操作按钮态与状态栏）
     bigFilterStatus: () => { if (focused()) refreshBigUi(); },
   };
 }
@@ -777,12 +777,10 @@ function showTabMenu(t, x, y) {
 function refreshBigUi() {
   const big = !!model.isBig;
   // 模式专属按钮显隐：大模式隐藏「排序…」（F5 快捷键仍有 isBig 守卫兜底）；
-  // 三个大文件按钮仅大模式可见（小模式筛选键入即生效、列操作即时应用，不依赖它们）
+  // 列操作两按钮仅 pending 时出现（小模式即时应用，不依赖它们）。
+  // 「执行筛选」按钮已移除：筛选框键入即筛，回车立即执行。
   tb.sort.classList.toggle("hidden", big);
-  tb.execFilter.classList.toggle("hidden", !big);
   if (big) {
-    const hasCond = fgrid().filters.size > 0 || !!fgrid().multi.text;
-    tb.execFilter.disabled = !hasCond || model.colOpsPending();
     const pending = model.colOpsPending();
     tb.execColOps.classList.toggle("hidden", !pending);
     tb.cancelColOps.classList.toggle("hidden", !pending);
@@ -845,7 +843,7 @@ async function runBigFilter(opts = {}) {
   clearTimeout(bigFilterTimer);
   const { kws, mKw, mCols } = collectBigFilter();
   if (!kws.length && !mKw) {
-    // 无条件下点「执行筛选」= 回到全量（通常已由 grid 自动清空，此处兜底）
+    // 无条件下执行筛选（如回车）= 回到全量（通常已由 grid 自动清空，此处兜底）
     try {
       await model.clearFilter();
     } catch { /* 会话已关闭等：保持现状 */ }
@@ -972,9 +970,8 @@ for (const spec of [
   tb[key] = b;
 }
 
-// 大模式工具按钮：执行筛选（条件存在时可用）、执行/撤销列操作（pending 时出现）
+// 大模式工具按钮：执行/撤销列操作（pending 时出现）
 for (const [key, text, fn, title] of [
-  ["execFilter", "执行筛选", () => runBigFilter(), "对大文件执行一次筛选（Enter 同效）"],
   ["execColOps", "执行列操作", () => applyColOps(), "物理重写整个文件（显示进度），完成后不可撤销"],
   ["cancelColOps", "撤销列操作预览", () => cancelColOps(), "放弃待执行的列操作，恢复原结构"],
 ]) {
