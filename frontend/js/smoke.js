@@ -1456,16 +1456,45 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(bm.filterActive() === false, "清除筛选后应回全量");
   });
 
-  check("大模式：执行筛选显示进行中弹窗（防界面看似卡死）", async () => {
-    grid.filters.set(0, "大理");
-    const p = window.__app.runBigFilter(); // 不 await：弹窗须在同步阶段挂上
-    const mask = document.querySelector(".modal-mask");
-    assert(mask !== null && mask.textContent.includes("筛选"),
-      "筛选期间应显示进行中弹窗");
-    await p; // 等待完成
-    assert(document.querySelector(".modal-mask") === null, "完成后弹窗应消失");
+  check("大模式：筛选框键入即筛（防抖、无弹窗）", async () => {
+    const bm = bigM();
+    const input = document.querySelector('.col-filter input[data-col="0"]');
+    assert(input !== null, "未找到第一列筛选框");
+    input.value = "大";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await waitFor(() => bm.filterActive() && bm.rowCount() === 5000, "键入即筛落定");
+    assert(document.querySelector(".modal-mask") === null,
+      "键入即筛不应弹模态（扫描在引擎线程，UI 不冻结）");
+    assert(await invoke("big_filter_count") === 5000, "引擎侧命中数不一致");
+  });
+
+  check("大模式：键入收窄与清空自动回全量", async () => {
+    const bm = bigM();
+    const input = document.querySelector('.col-filter input[data-col="0"]');
+    // 追加字符 = 前缀收窄（引擎只扫上一轮命中行，结果集不变）
+    input.value = "大理";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await waitFor(() => bm.filterActive() && bm.rowCount() === 5000, "收窄落定");
+    // 清空输入 = 自动清除引擎筛选、回全量视图
+    input.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await waitFor(() => bm.filterActive() === false, "清空后回全量");
+    assert(bm.rowCount() === 5000, `清空后全量行数 ${bm.rowCount()}`);
+  });
+
+  check("大模式：连续键入只认最后一个条件（旧结果不覆盖）", async () => {
+    const bm = bigM();
+    const input = document.querySelector('.col-filter input[data-col="0"]');
+    input.value = "大理";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.value = "不存在xyz";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await waitFor(() => bm.filterActive() && bm.rowCount() === 0, "最后条件落定");
+    await sleep(400); // 给第一轮（若尚未取消）迟到的机会
+    assert(bm.rowCount() === 0, `旧结果覆盖了最终条件：${bm.rowCount()}`);
     grid.clearFilters();
     await sleep(150);
+    assert(bm.filterActive() === false, "清除筛选后应回全量");
   });
 
   check("大模式：筛选结果分页取行", async () => {

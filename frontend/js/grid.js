@@ -982,7 +982,8 @@ export class Grid {
       const v = input.value;
       if (v) this.filters.set(col, v); else this.filters.delete(col);
       if (this.model.isBig) {
-        this._refilter(); // 仅刷新"待执行"状态，不扫描
+        this._refilter(); // 刷新状态；条件清空时 _refilter 会自动清引擎筛选
+        this.hooks.bigFilterInput?.(); // 键入即筛（app 侧防抖 + 可中断扫描）
         return;
       }
       clearTimeout(this._filterTimer);
@@ -1008,7 +1009,8 @@ export class Grid {
       if (!cb) return;
       const col = Number(cb.dataset.col);
       if (cb.checked) this.multi.cols.add(col); else this.multi.cols.delete(col);
-      this._refilter(); // 大模式仅记录条件（引擎按钮触发）
+      this._refilter();
+      if (this.model.isBig) this.hooks.bigFilterInput?.(); // 勾选列变化也影响命中集
     });
 
     // ---- 右键菜单 ----
@@ -1544,6 +1546,7 @@ export class Grid {
     }
     this._renderHeader();
     this._refilter();
+    if (this.model.isBig) this.hooks.bigFilterInput?.(); // 开/关多重筛选改变匹配语义
   }
 
   /**
@@ -1553,7 +1556,8 @@ export class Grid {
    */
   setMultiText(text) {
     this.multi.text = text;
-    this._refilter(); // 大模式仅记录条件（引擎按钮触发）
+    this._refilter();
+    if (this.model.isBig) this.hooks.bigFilterInput?.();
   }
 
   /** @returns {number} 生效的筛选条件数 */

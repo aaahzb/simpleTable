@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// 冒烟自检强制大模式（运行期开关，供 smoke 大文件段在小夹具上路由大模式）。
 static FORCE_BIG: AtomicBool = AtomicBool::new(false);
@@ -266,6 +266,18 @@ struct StartupArgs {
 /// Arc 托管以便长命令把会话搬进 spawn_blocking（离开 tauri::State 借用）。
 type BigShared = std::sync::Arc<Mutex<Option<BigFile>>>;
 
+/// 筛选代数：每次新筛选/关闭/清空自增，正在运行的旧扫描检测到代数变化即放弃。
+/// 只有设置筛选的路径需要它；编辑等命令仍走同一把会话锁。
+#[derive(Clone, Default)]
+struct FilterGen(std::sync::Arc<AtomicU64>);
+
+impl FilterGen {
+    /// 让当前及更早的扫描失效，返回新代数。
+    fn bump(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
 /// 取大文件会话锁，未打开时返回统一错误串。
 fn with_big<T>(
     state: &BigShared,
@@ -285,7 +297,12 @@ fn file_size(path: String) -> Result<u64, String> {
 
 /// 打开大文件会话（mmap + 行索引，秒开）。
 #[tauri::command]
-fn big_open(path: String, state: tauri::State<BigShared>) -> Result<BigMeta, String> {
+fn big_open(
+    path: String,
+    state: tauri::State<BigShared>,
+    gate: tauri::State<FilterGen>,
+) -> Result<BigMeta, String> {
+    gate.bump(); // 旧文件的筛选扫描没有继续的意义
     let mut guard = state.lock().map_err(|e| e.to_string())?;
     *guard = Some(BigFile::open(std::path::Path::new(&path))?);
     Ok(guard.as_ref().unwrap().meta())
@@ -293,7 +310,8 @@ fn big_open(path: String, state: tauri::State<BigShared>) -> Result<BigMeta, Str
 
 /// 关闭大文件会话。
 #[tauri::command]
-fn big_close(state: tauri::State<BigShared>) {
+fn big_close(state: tauri::State<BigShared>, gate: tauri::State<FilterGen>) {
+    gate.bump();
     if let Ok(mut guard) = state.lock() {
         *guard = None;
     }
@@ -355,10 +373,26 @@ fn big_redo(state: tauri::State<BigShared>) -> Result<bool, String> {
     with_big(&state, |bf| Ok(bf.redo()))
 }
 
-/// 执行一次筛选（rayon 并行扫描），返回命中数。
+/// 执行一次筛选（rayon 并行扫描），返回命中数；被更新请求打断时返回 null。
+///
+/// 长扫描走 spawn_blocking，避免占用异步运行时 worker；新请求通过
+/// `FilterGen` 自增让旧扫描在下一个检查点退出，不覆盖上一次的结果。
 #[tauri::command]
-fn big_filter(state: tauri::State<BigShared>, spec: FilterSpec) -> Result<u32, String> {
-    with_big(&state, |bf| bf.run_filter(&spec))
+async fn big_filter(
+    state: tauri::State<'_, BigShared>,
+    gate: tauri::State<'_, FilterGen>,
+    spec: FilterSpec,
+) -> Result<Option<u32>, String> {
+    let shared = state.inner().clone();
+    let gen = gate.bump();
+    let cancel = gate.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut guard = shared.lock().map_err(|e| e.to_string())?;
+        let bf = guard.as_mut().ok_or("大文件会话未打开")?;
+        bf.run_filter_cancelable(&spec, &cancel, gen)
+    })
+    .await
+    .map_err(|e| format!("筛选任务被取消：{e}"))?
 }
 
 #[tauri::command]
@@ -376,7 +410,8 @@ fn big_filter_page(
 }
 
 #[tauri::command]
-fn big_clear_filter(state: tauri::State<BigShared>) -> Result<(), String> {
+fn big_clear_filter(state: tauri::State<BigShared>, gate: tauri::State<FilterGen>) -> Result<(), String> {
+    gate.bump(); // 清空是全量视图：还在跑的筛选结果不应再落库
     with_big(&state, |bf| {
         bf.clear_filter();
         Ok(())
@@ -402,7 +437,12 @@ fn big_copy(
 /// 重写期间主线程被挂起（Wait/WrSuspended）、进度事件挤压到命令结束才
 /// 到达渲染进程，用户看到"进度条卡住 + 窗口未响应"。
 #[tauri::command]
-async fn big_save(window: tauri::Window, state: tauri::State<'_, BigShared>) -> Result<(), String> {
+async fn big_save(
+    window: tauri::Window,
+    state: tauri::State<'_, BigShared>,
+    gate: tauri::State<'_, FilterGen>,
+) -> Result<(), String> {
+    gate.bump(); // 重写文件前先让筛选扫描退出
     let shared = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         // (加权done, total, 阶段, 行数)：阶段 0 流式重写 / 1 落盘换名 / 2 重建索引。
@@ -454,7 +494,12 @@ fn big_col_clear(state: tauri::State<BigShared>) -> Result<(), String> {
 /// 执行待处理的列操作（物理重写整个文件，带进度事件）。
 /// 同 big_save：spawn_blocking + 专用 emit 转发线程（见 big_save 注释）。
 #[tauri::command]
-async fn big_col_apply(window: tauri::Window, state: tauri::State<'_, BigShared>) -> Result<(), String> {
+async fn big_col_apply(
+    window: tauri::Window,
+    state: tauri::State<'_, BigShared>,
+    gate: tauri::State<'_, FilterGen>,
+) -> Result<(), String> {
+    gate.bump(); // 物理重写前先让筛选扫描退出
     let shared = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (tx, rx) = std::sync::mpsc::channel::<(u64, u64, u8, u64)>();
@@ -527,6 +572,7 @@ pub fn run() {
                 .find(|a| a.to_lowercase().ends_with(".csv"));
             app.manage(StartupArgs { open_path });
             app.manage(BigShared::new(Mutex::new(None)));
+            app.manage(FilterGen::default());
             // 关闭请求转发给前端做"未保存确认"，确认后由 quit_app 命令真正退出
             if let Some(window) = app.get_webview_window("main") {
                 let handle = window.clone();

@@ -353,6 +353,9 @@ function applyViewState(g) {
   currentCell = null;
   pane.setText("");
   lastFilterMs = 0;
+  // 旧模型还在跑的筛选禁止改写新档状态栏/滚动位置
+  clearTimeout(bigFilterTimer);
+  bigFilterSeq += 1;
   onCountsChanged(model.rowCount(), model.rowCount());
   refreshBigUi();
 }
@@ -583,7 +586,9 @@ function makeHooks(side) {
     colMenu: (c, e) => { if (focused()) showColMenu(e); },
     // 大模式：执行筛选（工具栏按钮 / 筛选框回车共用）
     bigFilterRun: () => { if (focused()) runBigFilter(); },
-    // 大模式：筛选条件变化（仅记录，刷新"执行筛选"按钮态）
+    // 大模式：筛选条件键入即筛（防抖 + 引擎侧可中断扫描）
+    bigFilterInput: () => { if (focused()) scheduleBigFilter(); },
+    // 大模式：筛选条件变化（刷新"执行筛选"按钮态与状态栏）
     bigFilterStatus: () => { if (focused()) refreshBigUi(); },
   };
 }
@@ -659,6 +664,8 @@ function focusSide(side) {
   currentCell = null;
   pane.setText("");
   lastFilterMs = 0;
+  clearTimeout(bigFilterTimer);
+  bigFilterSeq += 1; // 旧焦点侧的筛选结果不得改写新焦点侧状态栏
   setDirty(t.dirty); // 同步新活动签脏点 + 窗口标题
   onCountsChanged(model.rowCount(), model.rowCount());
   // 多重筛选闩锁/输入随焦点侧还原（两侧各自记忆）
@@ -785,13 +792,18 @@ function refreshBigUi() {
   }
 }
 
+/** @type {number} 大模式键入即筛防抖计时器 */
+let bigFilterTimer = 0;
+/** @type {number} 筛选请求序号：只有最新请求允许改写状态栏 */
+let bigFilterSeq = 0;
+
 /**
- * 执行大文件筛选：收集条件 → 引擎整表扫描 → 状态栏报命中与用时。
+ * 收集大模式当前筛选条件（逐列 AND + 多重 OR）。
  *
- * @returns {Promise<void>}
+ * @returns {{kws: Array<[number, string]>, mKw: string, mCols: number[]}}
+ *   列号/关键字列表、多重关键字与勾选列。
  */
-async function runBigFilter() {
-  if (!model.isBig) return; // 兜底：小模式此按钮隐藏，防御误触调用小模型不存在的 runFilter
+function collectBigFilter() {
   const cc = model.columnCount();
   const kws = [];
   for (const [col, kw] of fgrid().filters) {
@@ -799,11 +811,54 @@ async function runBigFilter() {
   }
   const mKw = fgrid().multi.on ? fgrid().multi.text : "";
   const mCols = mKw ? [...fgrid().multi.cols].filter((c) => c < cc) : [];
-  // 整表扫描要几秒到几十秒：先弹不确定进度模态，避免界面看似卡死
-  const busy = busyDialog("正在筛选大文件…");
+  return { kws, mKw, mCols };
+}
+
+/**
+ * 键入即筛：短防抖后触发一次筛选。整表扫描在 Rust 侧可被下一请求中断，
+ * 故不必等上一次扫完；条件清空由 grid._refilter 自动回全量。
+ *
+ * @returns {void}
+ */
+function scheduleBigFilter() {
+  if (!model.isBig) return;
+  clearTimeout(bigFilterTimer);
+  bigFilterTimer = setTimeout(() => {
+    const { kws, mKw } = collectBigFilter();
+    if (!kws.length && !mKw) {
+      updateStatusText(); // 条件已清空：收敛状态栏（清空动作由 grid 完成）
+      return;
+    }
+    void runBigFilter({ auto: true });
+  }, 180);
+}
+
+/**
+ * 执行大文件筛选：收集条件 → 引擎扫描 → 状态栏报命中与用时。
+ * 引擎按需建列缓存；重复筛选同一列直接读缓存（几十毫秒级）。
+ *
+ * @param {{auto?: boolean}} [opts] - auto=true 为键入即筛（无模态、状态更轻）。
+ * @returns {Promise<void>}
+ */
+async function runBigFilter(opts = {}) {
+  if (!model.isBig) return; // 兜底：小模式此按钮隐藏，防御误触调用小模型不存在的 runFilter
+  clearTimeout(bigFilterTimer);
+  const { kws, mKw, mCols } = collectBigFilter();
+  if (!kws.length && !mKw) {
+    // 无条件下点「执行筛选」= 回到全量（通常已由 grid 自动清空，此处兜底）
+    try {
+      await model.clearFilter();
+    } catch { /* 会话已关闭等：保持现状 */ }
+    return;
+  }
+  const seq = ++bigFilterSeq;
+  // 扫描在 spawn_blocking 中跑、UI 线程不冻结；只报状态，不弹模态
+  statusMsg(opts.auto ? "筛选中…" : "正在筛选大文件…", 0);
   try {
     const t0 = performance.now();
     const n = await model.runFilter(kws, mCols, mKw);
+    // 被更新请求替代（引擎中断返回 null）或已过期：状态栏归新请求管理
+    if (n === null || seq !== bigFilterSeq) return;
     // 筛选切换了滚动坐标系（全量压缩画布 → 命中自然画布）：旧 scrollTop 在新
     // 坐标系无意义——渲染锚点由 scrollTop 反推，旧值会把锚点夹到末行、transform
     // 把 #rows 推到画布外且回灌 scrollHeight 自锁（视口只剩末几行、滚动条跳回）。
@@ -813,9 +868,7 @@ async function runBigFilter() {
     statusMsg(`匹配 ${n} 行 · 用时 ${(lastFilterMs / 1000).toFixed(1)} 秒`, 4000);
     updateStatusText();
   } catch (err) {
-    await errorDialog("筛选失败", String(err?.message ?? err));
-  } finally {
-    busy.close();
+    if (seq === bigFilterSeq) await errorDialog("筛选失败", String(err?.message ?? err));
   }
 }
 

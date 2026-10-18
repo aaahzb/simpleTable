@@ -52,6 +52,8 @@ export class BigModel {
     this._filterOn = false;
     /** @type {number} 筛选命中数（_filterOn 时的 rowCount） */
     this._filterCount = 0;
+    /** @type {number} 筛选请求代际：键入即筛时旧请求的迟到响应一律丢弃 */
+    this._filterGen = 0;
     /** @type {Set<Function>} */
     this._dataCbs = new Set();
     /** @type {Set<Function>} */
@@ -607,15 +609,18 @@ export class BigModel {
    * @param {Array<[number, string]>} cols - (列号, 小写关键字) AND 组合。
    * @param {number[]} multiCols - 多重筛选勾选列。
    * @param {string} multiText - 多重筛选关键字（小写）。
-   * @returns {Promise<number>} 命中数。
+   * @returns {Promise<number | null>} 命中数；请求已过期/被引擎中断时返回 null。
    */
   async runFilter(cols, multiCols, multiText) {
+    const gen = ++this._filterGen;
     const spec = {
       cols: cols.map(([c, kw]) => [c, kw.toLowerCase()]),
       multi_cols: multiCols,
       multi_text: multiText.toLowerCase(),
     };
     const n = await this._invoke("big_filter", { spec });
+    // 引擎中断返回 null；或期间已发起更新的筛选/清空：旧结果一律不落视图
+    if (n === null || n === undefined || gen !== this._filterGen) return null;
     this._filterOn = true;
     this._filterCount = n;
     this._invalidate();
@@ -630,7 +635,9 @@ export class BigModel {
    * @returns {Promise<void>}
    */
   async clearFilter() {
+    const gen = ++this._filterGen;
     await this._invoke("big_clear_filter");
+    if (gen !== this._filterGen) return; // 期间又发起了新筛选：以新请求为准
     this._filterOn = false;
     this._filterCount = 0;
     this._invalidate();

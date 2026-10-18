@@ -279,3 +279,66 @@ test("编辑失败回滚缓存并抛错", async () => {
   await assert.rejects(() => model.setData(0, 0, "x"), /大文件编辑失败/);
   assert.equal(model.displayData(0, 0), "r0c0"); // 缓存已回滚
 });
+
+/** 筛选响应可手动控制的模型：验证键入即筛的过期响应丢弃。 */
+function makeDeferredFilterModel() {
+  const pending = [];
+  const meta = {
+    rows: 100, cols: 1, headers: ["h"], encoding: "utf-8",
+    pending_cols: false, can_undo: false, can_redo: false,
+  };
+  const model = new BigModel({
+    invoke: (cmd) => {
+      switch (cmd) {
+        case "big_open":
+        case "big_meta":
+          return Promise.resolve(meta);
+        case "big_filter":
+          return new Promise((resolve) => pending.push(resolve));
+        case "big_clear_filter":
+          return Promise.resolve(null);
+        case "big_rows":
+          return Promise.resolve([]);
+        default:
+          return Promise.resolve(null);
+      }
+    },
+    listen: async () => () => {},
+  });
+  return { model, pending };
+}
+
+test("筛选：迟到的旧请求不得覆盖新结果", async () => {
+  const { model, pending } = makeDeferredFilterModel();
+  await model.open("/x.csv");
+  const p1 = model.runFilter([[0, "a"]], [], "");
+  const p2 = model.runFilter([[0, "ab"]], [], "");
+  pending[1](5); // 新请求先返回
+  assert.equal(await p2, 5);
+  assert.equal(model.rowCount(), 5);
+  pending[0](9); // 旧请求迟到
+  assert.equal(await p1, null);
+  assert.equal(model.rowCount(), 5, "旧结果不得覆盖新命中数");
+  assert.equal(model.filterActive(), true);
+});
+
+test("筛选：引擎中断返回 null 时保持原视图", async () => {
+  const { model, pending } = makeDeferredFilterModel();
+  await model.open("/x.csv");
+  const p = model.runFilter([[0, "a"]], [], "");
+  pending[0](null); // 引擎放弃本次扫描
+  assert.equal(await p, null);
+  assert.equal(model.filterActive(), false);
+  assert.equal(model.rowCount(), 100);
+});
+
+test("筛选：清空后迟到的筛选结果不得让视图切回命中态", async () => {
+  const { model, pending } = makeDeferredFilterModel();
+  await model.open("/x.csv");
+  const p = model.runFilter([[0, "a"]], [], "");
+  await model.clearFilter();
+  pending[0](7); // 清空后才到达的旧结果
+  assert.equal(await p, null);
+  assert.equal(model.filterActive(), false);
+  assert.equal(model.rowCount(), 100);
+});
