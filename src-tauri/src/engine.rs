@@ -3268,6 +3268,26 @@ pub fn available_memory_bytes() -> Option<u64> {
 
 /// 各平台的可用内存查询实现（不引入额外 crate，直接 FFI/读 proc）。
 mod platform_mem {
+    /// 把 sysctl 返回的原生整数字节解码为 `u64`。
+    ///
+    /// macOS 的 sysctl 宽度并不统一：`vm.page_free_count` 等计数器是
+    /// 4 字节 `uint32`，而 `hw.pagesize` 在 Apple Silicon 上经
+    /// `sysctlbyname` 可能返回 8 字节。调用方按实际回填长度传入切片。
+    ///
+    /// # Parameters
+    /// - `bytes`: sysctl 实际写入的字节（4 或 8 字节）。
+    ///
+    /// # Returns
+    /// 解码后的值；长度不是 4/8 时返回 None。
+    #[cfg(any(target_os = "macos", test))]
+    fn decode_native_uint(bytes: &[u8]) -> Option<u64> {
+        match bytes.len() {
+            4 => Some(u32::from_ne_bytes(bytes.try_into().ok()?) as u64),
+            8 => Some(u64::from_ne_bytes(bytes.try_into().ok()?)),
+            _ => None,
+        }
+    }
+
     /// Windows：GlobalMemoryStatusEx.ullAvailPhys。
     #[cfg(windows)]
     pub fn windows_available() -> Option<u64> {
@@ -3311,26 +3331,31 @@ mod platform_mem {
             ) -> c_int;
         }
 
-        fn read_u64(name: &str) -> Option<u64> {
+        fn read_uint(name: &str) -> Option<u64> {
             let cname = std::ffi::CString::new(name).ok()?;
-            let mut value: u64 = 0;
-            let mut len = std::mem::size_of::<u64>();
+            // 缓冲按最大宽度 8 字节准备；sysctl 会回填实际宽度（vm.* 计数为 4 字节，
+            // hw.pagesize 在 Apple Silicon 上可能为 8 字节），再按 len 解码。
+            let mut buf = [0u8; std::mem::size_of::<u64>()];
+            let mut len = buf.len();
             // SAFETY: 缓冲区与长度均指向本栈变量，name 为有效 C 串。
             let rc = unsafe {
                 sysctlbyname(
                     cname.as_ptr(),
-                    &mut value as *mut u64 as *mut c_void,
+                    buf.as_mut_ptr() as *mut c_void,
                     &mut len,
                     std::ptr::null_mut(),
                     0,
                 )
             };
-            (rc == 0 && len == std::mem::size_of::<u64>()).then_some(value)
+            if rc != 0 || len > buf.len() {
+                return None;
+            }
+            decode_native_uint(&buf[..len])
         }
 
-        let free = read_u64("vm.page_free_count")?;
-        let inactive = read_u64("vm.page_inactive_count").unwrap_or(0);
-        let page = read_u64("hw.pagesize").unwrap_or(4096);
+        let free = read_uint("vm.page_free_count")?;
+        let inactive = read_uint("vm.page_inactive_count").unwrap_or(0);
+        let page = read_uint("hw.pagesize").unwrap_or(4096);
         Some(free.saturating_add(inactive).saturating_mul(page))
     }
 
@@ -3345,6 +3370,26 @@ mod platform_mem {
             }
         }
         None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::decode_native_uint;
+
+        #[test]
+        fn decodes_4_and_8_byte_native_ints() {
+            let four = 1234u32.to_ne_bytes();
+            assert_eq!(decode_native_uint(&four), Some(1234));
+            let eight = 12_345_678_901u64.to_ne_bytes();
+            assert_eq!(decode_native_uint(&eight), Some(12_345_678_901));
+        }
+
+        #[test]
+        fn rejects_other_widths() {
+            assert_eq!(decode_native_uint(&[]), None);
+            assert_eq!(decode_native_uint(&[1, 2, 3]), None);
+            assert_eq!(decode_native_uint(&[0; 16]), None);
+        }
     }
 }
 

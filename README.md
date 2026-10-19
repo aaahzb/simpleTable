@@ -223,7 +223,7 @@ Rust + Tauri 2 外壳，前端是原生 HTML/CSS/JS，无构建步骤。需要 R
 # 前端逻辑单测
 node --test tests_js/*.test.mjs
 
-# Rust 引擎单测（77 项，另 2 项默认忽略的性能基准）
+# Rust 引擎单测（79 项，另 2 项默认忽略的性能基准）
 cd src-tauri && cargo test
 
 # 编译并运行（前端资产编译时嵌入 exe，改完前端需重新 build）
