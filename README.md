@@ -151,6 +151,7 @@
 | `Delete` | 清除选中格 |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | 复制 / 剪切 / 粘贴（TSV，与 Excel 互通） |
 | `Ctrl+Z` / `Ctrl+Y` | 撤销 / 重做 |
+| `Ctrl+↑` / `Ctrl+↓` | 跳到当前列数据区域的上 / 下边缘（对齐 Excel：块边缘再按一次越过空档） |
 | `Ctrl+G` | 跳转行 |
 | `Ctrl+S` | 保存 |
 | `Ctrl+滚轮` | 表格区或编辑窗格缩放 |
@@ -223,14 +224,14 @@ Rust + Tauri 2 外壳，前端是原生 HTML/CSS/JS，无构建步骤。需要 R
 # 前端逻辑单测
 node --test tests_js/*.test.mjs
 
-# Rust 引擎单测（79 项，另 2 项默认忽略的性能基准）
+# Rust 引擎单测（87 项，另 2 项默认忽略的性能基准）
 cd src-tauri && cargo test
 
 # 编译并运行（前端资产编译时嵌入 exe，改完前端需重新 build）
 cargo build
 ./target/debug/simpletable.exe
 
-# 真机冒烟自检：真实 WebView2，116 项断言
+# 真机冒烟自检：真实 WebView2，118 项断言
 ./target/debug/simpletable.exe --smoke   # 报告写 %TEMP%\simpletable_smoke_report.txt
 ```
 
@@ -241,7 +242,7 @@ cargo build
 ```
 frontend/            纯 HTML/CSS/JS：自绘虚拟滚动网格 + 编辑窗格 + 对话框
   js/bigmodel.js     文件引擎模型（窗口缓存 / 渐进索引轮询 / 内存排序 / 乐观编辑）
-  js/smoke.js        --smoke 对抗自检套件（116 项）
+  js/smoke.js        --smoke 对抗自检套件（118 项）
 src-tauri/           Tauri 2 外壳 + Rust 数据引擎（mmap / 行索引 / 覆盖层 / 流式保存）
 tests_js/            node:test 逻辑层单测
 scripts/             截图 / 采样巡检脚本（开发用）

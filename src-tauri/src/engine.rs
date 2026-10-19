@@ -252,6 +252,120 @@ fn parse_record(text: &str, delimiter: u8) -> Vec<String> {
     fields
 }
 
+/// 判断一条 CSV 记录中第 `target` 个字段是否有内容。
+///
+/// 与 `parse_record` 使用同一套宽松引号方言，但只跟踪“是否出现过内容”，
+/// 不分配字段数组；用于大文件里逐行判断某列是否为空（Ctrl+↑/↓ 边缘查找）。
+/// 空格算内容（与 Excel 一致），引号空串 `""` 算空。
+///
+/// # Parameters
+/// - `bytes`: 单条记录的字节切片（可含引号内换行与结尾换行符）。
+/// - `delimiter`: 字段分隔符（CSV 为 b','）。
+/// - `target`: 目标字段下标（0 基）。
+///
+/// # Returns
+/// 目标字段存在且含有内容时为 true。
+fn field_nonempty(bytes: &[u8], delimiter: u8, target: usize) -> bool {
+    let mut field = 0usize;
+    let mut in_quotes = false;
+    let mut has_content = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if in_quotes {
+            if ch == b'"' {
+                if bytes.get(i + 1) == Some(&b'"') {
+                    // "" 转义产生一个字面量引号：算内容
+                    has_content = true;
+                    i += 2;
+                } else {
+                    in_quotes = false;
+                    i += 1;
+                }
+            } else {
+                // 引号内任意字节（含内嵌换行与多字节字符）都是内容
+                has_content = true;
+                i += 1;
+            }
+            continue;
+        }
+        if ch == b'"' {
+            in_quotes = true;
+            i += 1;
+            continue;
+        }
+        if ch == delimiter {
+            if field == target {
+                return has_content;
+            }
+            field += 1;
+            has_content = false;
+            i += 1;
+            continue;
+        }
+        if ch == b'\r' || ch == b'\n' {
+            // parse_record 在首个引号外换行处结束记录
+            return field == target && has_content;
+        }
+        has_content = true;
+        i += 1;
+    }
+    field == target && has_content
+}
+
+/// Excel 风格纵向边缘查找的索引层实现（与 JS `findVerticalEdge` 同语义）。
+///
+/// # Parameters
+/// - `start`: 当前行索引（越界时夹取）。
+/// - `count`: 可导航行数。
+/// - `down`: true=向下；false=向上。
+/// - `is_nonempty`: 判断某行目标列是否非空。
+///
+/// # Returns
+/// 目标行索引；无可导航行时为 None。
+fn find_vertical_edge_by<F>(
+    start: u64,
+    count: u64,
+    down: bool,
+    is_nonempty: F,
+) -> Option<u64>
+where
+    F: Fn(u64) -> bool,
+{
+    if count == 0 {
+        return None;
+    }
+    let last = count - 1;
+    let begin = start.min(last);
+    let step: i64 = if down { 1 } else { -1 };
+    let fallback = if down { last } else { 0 };
+    let in_range = |i: i64| i >= 0 && i <= last as i64;
+
+    // 当前格非空：先走完连续非空块；整块只有当前格时再越过空档找下一块。
+    if is_nonempty(begin) {
+        let mut edge = begin;
+        let mut i = begin as i64 + step;
+        while in_range(i) && is_nonempty(i as u64) {
+            edge = i as u64;
+            i += step;
+        }
+        if edge != begin {
+            return Some(edge);
+        }
+        while in_range(i) && !is_nonempty(i as u64) {
+            i += step;
+        }
+        return Some(if in_range(i) { i as u64 } else { fallback });
+    }
+
+    // 当前格为空：直接找该方向的下一个非空格。
+    let mut i = begin as i64 + step;
+    while in_range(i) && !is_nonempty(i as u64) {
+        i += step;
+    }
+    Some(if in_range(i) { i as u64 } else { fallback })
+}
+
 // ============================================================
 // 记录感知索引
 // ============================================================
@@ -626,6 +740,47 @@ mod tests {
         assert_eq!(parse_record("", b','), vec![""]);
     }
 
+    #[test]
+    fn field_nonempty_matches_parsed_field_semantics() {
+        assert!(!field_nonempty(b"", b',', 0));
+        assert!(field_nonempty(b"solo", b',', 0));
+        assert!(!field_nonempty(b"a,", b',', 1));
+        // Excel 语义：空格是内容，不是空单元格
+        assert!(field_nonempty(b"a, ", b',', 1));
+        // 引号空串为空；转义引号本身是内容
+        assert!(!field_nonempty(b"\"\",x", b',', 0));
+        assert!(field_nonempty(b"\"\"\"\"", b',', 0));
+        // 引号内逗号/换行属于同一字段
+        assert!(field_nonempty(b"\"a,b\",c", b',', 0));
+        assert!(field_nonempty("\"line1\nline2\",x".as_bytes(), b',', 0));
+        // 字段数不足与记录结束：不能把下一条记录算进来
+        assert!(!field_nonempty(b"\"a,b\",c", b',', 2));
+        assert!(!field_nonempty(b"a,b\r\nc", b',', 2));
+        assert!(field_nonempty(b"a,b\r\nc", b',', 1));
+    }
+
+    #[test]
+    fn vertical_edge_helper_matches_excel_semantics() {
+        let v = [true, true, false, false, true, true];
+        let get = |i: u64| v[i as usize];
+        assert_eq!(find_vertical_edge_by(0, 6, true, get), Some(1));
+        assert_eq!(find_vertical_edge_by(1, 6, true, get), Some(4));
+        assert_eq!(find_vertical_edge_by(5, 6, true, get), Some(5));
+        // 双空档：从下块首格向上越过两格空档，落到上块末格
+        assert_eq!(find_vertical_edge_by(4, 6, false, get), Some(1));
+        assert_eq!(find_vertical_edge_by(3, 6, false, get), Some(1));
+        assert_eq!(find_vertical_edge_by(1, 6, false, get), Some(0));
+        let v2 = [true, true, false, true, true];
+        let get2 = |i: u64| v2[i as usize];
+        assert_eq!(find_vertical_edge_by(4, 5, false, get2), Some(3));
+        assert_eq!(find_vertical_edge_by(3, 5, false, get2), Some(1));
+        let empty = [false, false, false];
+        let none = |i: u64| empty[i as usize];
+        assert_eq!(find_vertical_edge_by(0, 3, true, none), Some(2));
+        assert_eq!(find_vertical_edge_by(2, 3, false, none), Some(0));
+        assert_eq!(find_vertical_edge_by(0, 0, true, |_| true), None);
+    }
+
     fn rec_starts_of(bytes: &[u8]) -> Vec<usize> {
         let idx = build_index(bytes);
         let seq = build_index_seq(bytes);
@@ -939,6 +1094,109 @@ mod tests {
         assert_eq!(all[1], vec!["bob", "x"]);
         // 窗口分页与全量一致
         assert_eq!(bf.rows(1, 1), vec![vec!["bob", "x"]]);
+        fs::remove_file(&p).ok();
+    }
+
+    /// 纵向边缘夹具：flag 列呈 [1,2,空,空,3,4]。
+    fn edge_gap_bytes() -> Vec<u8> {
+        b"id,flag\r\nA,1\r\nB,2\r\nC,\r\nD,\r\nE,3\r\nF,4\r\n".to_vec()
+    }
+
+    #[test]
+    fn big_find_edge_contiguous_gap_and_boundaries() {
+        let p = tmp_csv("edgegap", &edge_gap_bytes());
+        let bf = BigFile::open(&p).unwrap();
+        let find = |from: u64, down: bool| {
+            bf.find_vertical_edge(from, 1, down, false).unwrap()
+        };
+        assert_eq!(find(0, true), Some(1), "连续块末格");
+        assert_eq!(find(1, true), Some(4), "边缘再按一次越过空档");
+        assert_eq!(find(4, true), Some(5), "下一条块末格");
+        assert_eq!(find(5, true), Some(5), "已是末行不再移动");
+        assert_eq!(find(5, false), Some(4), "向上到连续块首格");
+        assert_eq!(find(4, false), Some(1), "向上越过空档");
+        assert_eq!(find(1, false), Some(0));
+        assert_eq!(find(2, true), Some(4), "空格向下找非空");
+        assert_eq!(find(2, false), Some(1), "空格向上找非空");
+        assert!(bf.find_vertical_edge(0, 2, true, false).is_err(), "列号越界应报错");
+        assert_eq!(bf.find_vertical_edge(0, 1, true, false).unwrap(), Some(1));
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_find_edge_sees_overlay_and_inserted_rows() {
+        let p = tmp_csv("edgeedit", &edge_gap_bytes());
+        let mut bf = BigFile::open(&p).unwrap();
+        // 覆盖层：把原来的空格改成非空，导航必须看见
+        bf.set_cell(2, 1, "x".into()).unwrap();
+        assert_eq!(bf.find_vertical_edge(1, 1, true, false).unwrap(), Some(2));
+        // 插入行带值：被视为新的连续块，可被导航命中
+        bf.insert_rows(3, Some(vec![vec!["X".into(), "y".into()]]), 0)
+            .unwrap();
+        assert_eq!(bf.find_vertical_edge(2, 1, true, false).unwrap(), Some(3));
+        // 插入行之后原空行仍在：从插入行继续向下应越过它
+        assert_eq!(bf.find_vertical_edge(3, 1, true, false).unwrap(), Some(5));
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_find_edge_filtered_uses_visible_rows() {
+        let p = tmp_csv(
+            "edgefilter",
+            b"id,flag\r\nkeepA,1\r\nkeepB,2\r\nkeepC,\r\nkeepD,\r\ndropE,3\r\nkeepF,4\r\n",
+        );
+        let mut bf = BigFile::open(&p).unwrap();
+        assert_eq!(bf.run_filter(&spec_one(0, "keep")).unwrap(), 5);
+        // 可见 flag 序列：[1, 2, 空, 空, 4]（dropE 被筛掉）
+        assert_eq!(bf.find_vertical_edge(0, 1, true, true).unwrap(), Some(1));
+        assert_eq!(bf.find_vertical_edge(1, 1, true, true).unwrap(), Some(4));
+        assert_eq!(bf.find_vertical_edge(4, 1, true, true).unwrap(), Some(4));
+        assert_eq!(bf.find_vertical_edge(4, 1, false, true).unwrap(), Some(1));
+        assert_eq!(
+            bf.filter_page(4, 1)[0][0],
+            "keepF",
+            "命中序号 4 应映射到 keepF"
+        );
+        // 没有筛选结果时返回 None，不应误扫全表
+        bf.clear_filter();
+        assert_eq!(bf.find_vertical_edge(0, 1, true, true).unwrap(), None);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_find_edge_sorted_uses_display_order() {
+        let p = tmp_csv(
+            "edgesort",
+            b"id,val\r\na,\r\nb,x\r\nc,\r\nd,y\r\n",
+        );
+        let mut bf = load_ram(&p);
+        // 排序前：空格在第 0 行，Ctrl+↓ 落到 b(x)
+        assert_eq!(bf.find_vertical_edge(0, 1, true, false).unwrap(), Some(1));
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+            .unwrap();
+        // 排序后显示顺序 d,c,b,a → val [y, 空, x, 空]
+        assert_eq!(bf.find_vertical_edge(0, 1, true, false).unwrap(), Some(2));
+        assert_eq!(bf.find_vertical_edge(2, 1, true, false).unwrap(), Some(3));
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_find_edge_headerless_first_row_is_data() {
+        let p = tmp_csv("edgehl", b",\r\nA,1\r\nB,2\r\n");
+        let bf = BigFile::open_with(&p, true).unwrap();
+        assert_eq!(bf.rows(0, 1)[0], vec!["", ""], "无列名模式首行是数据");
+        assert_eq!(bf.find_vertical_edge(0, 1, true, false).unwrap(), Some(1));
+        assert_eq!(bf.find_vertical_edge(1, 1, true, false).unwrap(), Some(2));
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_find_edge_decodes_gbk_fields() {
+        let (bytes, _, _) = encoding_rs::GBK.encode("id,flag\r\n甲,\r\n乙,1\r\n");
+        let p = tmp_csv("edgegbk", &bytes);
+        let bf = BigFile::open(&p).unwrap();
+        assert_eq!(bf.meta().encoding, "gbk");
+        assert_eq!(bf.find_vertical_edge(0, 1, true, false).unwrap(), Some(1));
         fs::remove_file(&p).ok();
     }
 
@@ -4397,6 +4655,127 @@ impl BigFile {
         (from..(from + count as u64).min(total))
             .filter_map(|v| self.row_at(v))
             .collect()
+    }
+
+    /// 显示行 vrow 的视图列 col 是否非空（含覆盖层/插入行/pending 列映射）。
+    ///
+    /// 只取目标列，不构造整行字段数组；大文件边缘查找逐行调用。
+    ///
+    /// # Parameters
+    /// - `vrow`: 显示行号（筛选视图调用方已换算成命中行的显示位置）。
+    /// - `col`: 视图列号。
+    ///
+    /// # Returns
+    /// 单元格有内容时为 true；越界/虚拟待插入列/未索引行返回 false。
+    fn cell_nonempty_at(&self, vrow: u64, col: u32) -> bool {
+        let vrow = self.orig_vrow(vrow);
+        // pending 列插入：物理记录里没有这一列，值恒为空
+        let Some(phys) = self.view_to_phys(col) else {
+            return false;
+        };
+        let resolved = if self.partial.is_some() {
+            if vrow >= self.indexed_data_rows() {
+                return false;
+            }
+            ResolvedRow::Src(vrow as u32 + self.record_offset())
+        } else {
+            match self.seg.resolve(vrow) {
+                Some(r) => r,
+                None => return false,
+            }
+        };
+        match resolved {
+            ResolvedRow::Src(rec) => {
+                if let Some(v) = self.overlay.get(&(rec, phys)) {
+                    return !v.is_empty();
+                }
+                self.record_field_nonempty(rec, phys)
+            }
+            ResolvedRow::Ins { block, row } => self
+                .seg
+                .blocks
+                .get(block as usize)
+                .and_then(|b| b.as_ref())
+                .and_then(|rows| rows.get(row as usize))
+                .and_then(|cells| cells.get(phys as usize))
+                .is_some_and(|v| !v.is_empty()),
+        }
+    }
+
+    /// 物理记录 rec 的目标列是否非空（不分配整行字段）。
+    ///
+    /// UTF-8 直接在字节上按结构字符扫描（ASCII 分隔符不会出现在多字节序列
+    /// 内部）；GBK 必须先解码，避免 trail byte 被误认成逗号/引号。
+    ///
+    /// # Parameters
+    /// - `rec`: 物理记录号。
+    /// - `col`: 物理列号。
+    ///
+    /// # Returns
+    /// 字段有内容时为 true。
+    fn record_field_nonempty(&self, rec: u32, col: u32) -> bool {
+        let Some((s, e)) = self.src_span(rec) else {
+            return false;
+        };
+        let bytes = &self.bytes()[s..e];
+        if self.enc == Encoding::Gbk {
+            let text = decode_slice(self.enc, bytes);
+            field_nonempty(text.as_bytes(), b',', col as usize)
+        } else {
+            field_nonempty(bytes, b',', col as usize)
+        }
+    }
+
+    /// Excel 风格纵向数据边缘查找（Ctrl+↑/↓）。
+    ///
+    /// 语义：
+    /// - 当前格非空：跳到当前连续非空块的上/下边缘；
+    /// - 已在边缘：越过空档，跳到下一条非空块的边缘格；
+    /// - 当前格为空：向该方向找下一个非空格；
+    /// - 该方向无数据：落到可导航行范围的首/末行。
+    ///
+    /// 筛选视图按命中行序号导航；排序视图按当前显示顺序导航。
+    ///
+    /// # Parameters
+    /// - `from`: 当前视图行号（筛选视图为命中序号）。
+    /// - `col`: 视图列号。
+    /// - `down`: true=向下；false=向上。
+    /// - `filtered`: 是否按当前筛选命中集导航。
+    ///
+    /// # Returns
+    /// 目标视图行号；空表/无命中时为 None。
+    ///
+    /// # Errors
+    /// `col` 超出当前视图列数时返回错误字符串。
+    pub fn find_vertical_edge(
+        &self,
+        from: u64,
+        col: u32,
+        down: bool,
+        filtered: bool,
+    ) -> Result<Option<u64>, String> {
+        if col >= self.view_ncols() {
+            return Err("列号越界".into());
+        }
+        if filtered {
+            let Some(hits) = &self.filter else {
+                return Ok(None);
+            };
+            return Ok(find_vertical_edge_by(
+                from,
+                hits.len() as u64,
+                down,
+                |i| self.cell_nonempty_at(hits[i as usize] as u64, col),
+            ));
+        }
+        let total = if self.partial.is_some() {
+            self.indexed_data_rows()
+        } else {
+            self.seg.vrow_count()
+        };
+        Ok(find_vertical_edge_by(from, total, down, |vrow| {
+            self.cell_nonempty_at(vrow, col)
+        }))
     }
 
     // ---- 编辑 ----

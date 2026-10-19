@@ -501,6 +501,30 @@ fn big_rows(
     with_big(&state, session, |bf| Ok(bf.rows(from, count)))
 }
 
+/// Excel 风格纵向数据边缘查找（Ctrl+↑/↓）。
+///
+/// # Parameters
+/// - `from`: 当前视图行号（筛选视图为命中序号）。
+/// - `col`: 视图列号。
+/// - `down`: true=向下；false=向上。
+/// - `filtered`: 是否按当前筛选命中集导航。
+///
+/// # Returns
+/// 目标视图行号；空表/无命中时为 None。
+#[tauri::command]
+fn big_find_edge(
+    state: tauri::State<BigShared>,
+    session: u64,
+    from: u64,
+    col: u32,
+    down: bool,
+    filtered: bool,
+) -> Result<Option<u64>, String> {
+    with_big(&state, session, |bf| {
+        bf.find_vertical_edge(from, col, down, filtered)
+    })
+}
+
 /// 编辑单元格（源行进覆盖层，插入行直写）。
 #[tauri::command]
 fn big_set_cell(
@@ -809,6 +833,7 @@ pub fn run() {
             big_meta,
             big_stale,
             big_rows,
+            big_find_edge,
             big_set_cell,
             big_insert_rows,
             big_remove_rows,

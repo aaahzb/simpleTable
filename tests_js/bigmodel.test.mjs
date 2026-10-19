@@ -4,12 +4,15 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { BigModel, BIG_PAGE, BIG_THRESHOLD } from "../frontend/js/bigmodel.js";
+import { findVerticalEdge } from "../frontend/js/nav.js";
 
 /** 造一个内存版"引擎"：N 行 M 列的顺序数据 + 记录 invoke 调用。 */
-function makeFakeEngine({ rows = 1000, cols = 3 } = {}) {
-  const data = Array.from({ length: rows }, (_, r) =>
-    Array.from({ length: cols }, (_, c) => `r${r}c${c}`),
-  );
+function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
+  const data = initial
+    ? initial.map((r) => r.slice())
+    : Array.from({ length: rows }, (_, r) =>
+      Array.from({ length: cols }, (_, c) => `r${r}c${c}`),
+    );
   const calls = [];
   let headerless = false;
   let ramBacked = false;
@@ -94,6 +97,14 @@ function makeFakeEngine({ rows = 1000, cols = 3 } = {}) {
         case "big_filter_page": {
           const from = Number(args.from);
           return (filter ?? []).slice(from, from + Number(args.count)).map((r) => data[r]);
+        }
+        case "big_find_edge": {
+          const list = args.filtered ? (filter ?? []) : data.map((_, i) => i);
+          if (!list.length) return null;
+          const col = Number(args.col);
+          const nonEmpty = (i) => String(data[list[i]]?.[col] ?? "") !== "";
+          const edge = findVerticalEdge(nonEmpty, Number(args.from), list.length, !!args.down);
+          return edge < 0 ? null : list[edge];
         }
         case "big_clear_filter":
           filter = null;
@@ -790,4 +801,48 @@ test("无列名模式拒绝重命名列且不调用引擎", async () => {
   const before = calls.length;
   await assert.rejects(() => model.renameColumn(0, "x"), /无列名/);
   assert.equal(calls.length, before);
+});
+
+test("findVerticalEdge 无筛选：连续块边缘、空档与边界", async () => {
+  const { model, calls } = makeFakeEngine({
+    cols: 1,
+    data: [["a"], ["b"], [""], [""], ["c"], ["d"]],
+  });
+  await model.open("/x.csv");
+  assert.equal(await model.findVerticalEdge(0, 0, true), 1, "向下到连续块末格");
+  assert.equal(await model.findVerticalEdge(1, 0, true), 4, "边缘再按一次越过空档");
+  assert.equal(await model.findVerticalEdge(4, 0, true), 5, "下一条块末格");
+  assert.equal(await model.findVerticalEdge(5, 0, false), 4, "向上到连续块首格");
+  assert.equal(await model.findVerticalEdge(4, 0, false), 1, "向上越过空档");
+  assert.equal(await model.findVerticalEdge(2, 0, true), 4, "空格向下找非空");
+  assert.equal(await model.findVerticalEdge(2, 0, false), 1, "空格向上找非空");
+  const last = calls.filter(([cmd]) => cmd === "big_find_edge").at(-1);
+  assert.equal(last[1].filtered, false);
+  assert.equal(last[1].col, 0);
+  assert.equal(last[1].down, false);
+  assert.equal(typeof last[1].session, "number");
+});
+
+test("findVerticalEdge 筛选视图按命中行导航并传 filtered 标记", async () => {
+  const { model, calls } = makeFakeEngine({
+    cols: 2,
+    data: [
+      ["a", "keep"], ["b", "keep"], ["", "keep"], ["c", "keep"], ["d", "drop"],
+    ],
+  });
+  await model.open("/x.csv");
+  assert.equal(await model.runFilter([[1, "keep"]], [], ""), 4);
+  assert.equal(await model.findVerticalEdge(0, 0, true), 1);
+  assert.equal(await model.findVerticalEdge(1, 0, true), 3, "筛选视图内越过空档");
+  assert.equal(await model.findVerticalEdge(3, 0, true), 3, "末条命中不越界");
+  assert.equal(await model.findVerticalEdge(3, 0, false), 1);
+  const last = calls.filter(([cmd]) => cmd === "big_find_edge").at(-1);
+  assert.equal(last[1].filtered, true);
+  assert.equal(last[1].from, 3, "from 是筛选视图行号");
+});
+
+test("findVerticalEdge 空表返回 null", async () => {
+  const { model } = makeFakeEngine({ rows: 0, cols: 1 });
+  await model.open("/x.csv");
+  assert.equal(await model.findVerticalEdge(0, 0, true), null);
 });

@@ -218,6 +218,35 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(cur(grid)?.[1] === 1, "右移后列号应为 1");
   });
 
+  check("Ctrl+↓/↑：按 Excel 语义跳到当前列数据边缘", async () => {
+    await loadBasic();
+    model.load(["值"], [["1"], ["2"], [""], ["3"], ["4"]]);
+    grid.renderAll();
+    const scroller = document.getElementById("grid-scroll");
+    scroller.focus();
+    grid.select([0, 0]);
+    key(scroller, "ArrowDown", { ctrlKey: true });
+    assert(cur(grid)?.[0] === 1, "连续块末格应为 1");
+    key(scroller, "ArrowDown", { ctrlKey: true });
+    assert(cur(grid)?.[0] === 3, "块边缘再按应越过空档到 3");
+    key(scroller, "ArrowDown", { ctrlKey: true });
+    assert(cur(grid)?.[0] === 4, "下一条块末格应为 4");
+    key(scroller, "ArrowDown", { ctrlKey: true });
+    assert(cur(grid)?.[0] === 4, "末行再按应停住");
+    key(scroller, "ArrowUp", { ctrlKey: true });
+    assert(cur(grid)?.[0] === 3, "向上到连续块首格");
+    key(scroller, "ArrowUp", { ctrlKey: true });
+    assert(cur(grid)?.[0] === 1, "向上越过空档到上块末格");
+    key(scroller, "ArrowUp", { ctrlKey: true });
+    assert(cur(grid)?.[0] === 0, "上块首格");
+    grid.select([2, 0]);
+    key(scroller, "ArrowDown", { ctrlKey: true });
+    assert(cur(grid)?.[0] === 3, "空格向下找下一个非空");
+    grid.select([2, 0]);
+    key(scroller, "ArrowUp", { ctrlKey: true });
+    assert(cur(grid)?.[0] === 1, "空格向上找上一个非空");
+  });
+
   check("跳转行：直达选中并滚入视野，越界夹取", async () => {
     grid.clearFilters();
     model.load(headers, Array.from({ length: 8000 }, (_, i) => [`R${i}`, String(i), ""]));
@@ -564,7 +593,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await waitFor(() => document.querySelector(".modal-mask"), "快捷键对话框");
     const text = document.querySelector(".modal-mask").textContent;
     for (const k of ["F2 / 双击", "Enter / Tab", "Alt+Enter", "Ctrl+C / Ctrl+X / Ctrl+V",
-      "Ctrl+Z / Ctrl+Y", "Ctrl+G", "Ctrl+S", "Ctrl+滚轮"]) {
+      "Ctrl+Z / Ctrl+Y", "Ctrl+↑ / Ctrl+↓", "Ctrl+G", "Ctrl+S", "Ctrl+滚轮"]) {
       assert(text.includes(k), `快捷键说明缺少「${k}」`);
     }
     assert(clickModalButton("关闭"), "快捷键对话框应有「关闭」按钮");
@@ -1393,6 +1422,17 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await waitFor(() =>
       document.querySelector('.cell[data-row="0"][data-col="0"]')?.textContent === "大理",
       "首屏行渲染");
+  });
+
+  check("大模式：Ctrl+↓/↑ 经引擎跳到数据边缘", async () => {
+    // 5000 行全部非空：↓ 应直达末行，↑ 应回到首行（跨窗口缓存，必须由 Rust 扫描）
+    const scroller = document.getElementById("grid-scroll");
+    scroller.focus();
+    grid.select([0, 0]);
+    key(scroller, "ArrowDown", { ctrlKey: true });
+    await waitFor(() => cur(grid)?.[0] === 4999, "Ctrl+↓ 跳到末行");
+    key(scroller, "ArrowUp", { ctrlKey: true });
+    await waitFor(() => cur(grid)?.[0] === 0, "Ctrl+↑ 回到首行");
   });
 
   check("大模式：跳远页（窗口缓存未命中→拉取→渲染）", async () => {

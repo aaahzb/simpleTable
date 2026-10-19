@@ -467,6 +467,7 @@ export async function shortcutsDialog() {
     ["Delete", "清除选中格"],
     ["Ctrl+C / Ctrl+X / Ctrl+V", "复制 / 剪切 / 粘贴（TSV，与 Excel 互通）"],
     ["Ctrl+Z / Ctrl+Y", "撤销 / 重做"],
+    ["Ctrl+↑ / Ctrl+↓", "跳到当前列数据区域的上 / 下边缘"],
     ["Ctrl+G", "跳转行"],
     ["Ctrl+S", "保存"],
     ["Ctrl+滚轮", "表格区或编辑窗格缩放"],

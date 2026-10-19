@@ -15,6 +15,7 @@
  */
 
 import { parseCsv, serializeRecords } from "./csv.js";
+import { findVerticalEdge } from "./nav.js";
 
 export const ZOOM_MIN = 0.5;
 export const ZOOM_MAX = 3.0;
@@ -110,6 +111,8 @@ export class Grid {
     this.sel = { current: null, anchor: null, blocks: [] };
     /** @type {Set<number>} 选中单元格集合（r * colCount + c） */
     this.selectedSet = new Set();
+    /** @type {number} Ctrl+↑/↓ 异步查找代际：后续按键/换模型令旧结果作废 */
+    this._navSeq = 0;
     /** @type {{r: number, c: number} | null} 编辑中的单元格 */
     this.editing = null;
     /** @type {Map<number, string>} 等行高键控复用的旧内容兜底（stale-while-revalidate） */
@@ -1187,6 +1190,14 @@ export class Grid {
       this.deselect(); // 对齐 Qt 表格：Esc 取消选定
       return;
     }
+    // Excel Ctrl+↑/↓：跳到当前列数据区域的上/下边缘。
+    // 大模式的数据在 Rust 侧，异步查找；Shift+Ctrl+方向键不在此列（保持逐格扩选）。
+    if (mods && !e.shiftKey && !e.altKey
+        && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+      e.preventDefault();
+      this._jumpVerticalEdge(e.key === "ArrowDown");
+      return;
+    }
     const arrows = {
       ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1],
     };
@@ -1224,6 +1235,65 @@ export class Grid {
     const r = Math.min(Math.max(cur[0] + dr, 0), this.model.rowCount() - 1);
     const c = Math.min(Math.max(cur[1] + dc, 0), this.model.columnCount() - 1);
     if (this.model.rowCount() && this.model.columnCount()) this.select([r, c]);
+  }
+
+  /**
+   * Ctrl+↑/↓：按 Excel 语义跳到当前列的数据边缘。
+   *
+   * 小模型同步扫描可见行；大模型经引擎命令扫描（前端窗口缓存只有 ±2 页，
+   * 不能在 JS 里跨千万行逐格取数）。异步结果落定前若当前格/模型/编辑态
+   * 已变化，直接丢弃。
+   *
+   * @param {boolean} down - true=向下（Ctrl+↓）；false=向上（Ctrl+↑）。
+   * @returns {Promise<void>}
+   */
+  async _jumpVerticalEdge(down) {
+    const cur = this.sel.current;
+    if (!cur) return;
+    const model = this.model;
+    const [row, col] = cur;
+    const seq = ++this._navSeq;
+    let target;
+    if (model.isBig) {
+      try {
+        target = await model.findVerticalEdge(row, col, down);
+      } catch (err) {
+        if (seq === this._navSeq) {
+          this.hooks.statusMsg?.(`查找数据边缘失败：${err}`, 4000);
+        }
+        return;
+      }
+      if (seq !== this._navSeq || model !== this.model || this.editing) return;
+    } else {
+      const total = this.visCount();
+      if (!total) return;
+      let start = this.visibleIndexOf(row);
+      if (start < 0 && this.visibleRows) {
+        // 当前格被筛掉：从该方向最近的可见行起算（二分找插入点）
+        let lo = 0;
+        let hi = this.visibleRows.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (this.visibleRows[mid] < row) lo = mid + 1;
+          else hi = mid;
+        }
+        start = down ? lo : lo - 1;
+      }
+      if (start < 0 || start >= total) return;
+      const targetVi = findVerticalEdge(
+        (vi) => this.model.rawData(this.visAt(vi), col) !== "",
+        start,
+        total,
+        down,
+      );
+      if (targetVi < 0) return;
+      target = this.visAt(targetVi);
+    }
+    if (target === null || target === undefined) return;
+    const now = this.sel.current;
+    if (!now || now[0] !== row || now[1] !== col) return;
+    this.select([target, col]);
+    this.ensureVisible(target, col);
   }
 
   /** 滚动回左上角（装载/恢复时调用；WebView2 会记忆上次滚动位置） */

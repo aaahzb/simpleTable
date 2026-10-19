@@ -457,6 +457,32 @@ export class BigModel {
   }
 
   /**
+   * Excel 风格纵向数据边缘查找（Ctrl+↑/↓）。
+   *
+   * 扫描在 Rust 引擎内完成：前端窗口缓存只有 ±2 页，跨千万行的边缘
+   * 判断不能靠 JS 逐格取数。筛选视图下按命中行序号导航，排序视图下按
+   * 当前显示顺序导航。
+   *
+   * @param {number} row - 当前视图行号（筛选视图为命中序号）。
+   * @param {number} col - 视图列号。
+   * @param {boolean} down - true=向下（Ctrl+↓）；false=向上（Ctrl+↑）。
+   * @returns {Promise<number | null>} 目标视图行号；空表返回 null。
+   * @throws {Error} 引擎拒绝（列号越界/会话失效等）。
+   */
+  async findVerticalEdge(row, col, down) {
+    if (!this._meta || this.rowCount() <= 0) return null;
+    const result = await this._invoke("big_find_edge", {
+      from: row,
+      col,
+      down: !!down,
+      filtered: this._filterOn,
+    });
+    if (result === null || result === undefined) return null;
+    const n = Number(result);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  /**
    * 列数（pending 列操作已映射的视图列数）。
    *
    * @returns {number}
