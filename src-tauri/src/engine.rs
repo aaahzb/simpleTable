@@ -804,6 +804,7 @@ mod tests {
         assert_eq!(m.total_bytes, bytes.len() as u64);
         assert!(m.indexed_bytes < m.total_bytes);
         assert_eq!(m.index_ms, 0, "索引未完成时 index_ms 为 0");
+        assert!(!m.index_sync, "后台索引未完成时不得标记为同步完成");
         assert!(m.open_ms <= m.elapsed_ms);
 
         let rows = bf.rows(0, 100);
@@ -826,6 +827,7 @@ mod tests {
         let m = bf.meta();
         assert!(!m.indexing);
         assert_eq!(m.rows, 100);
+        assert!(!m.index_sync, "后台补齐的索引不应被标成「随首屏完成」");
         assert!(m.index_ms <= m.elapsed_ms);
         assert_eq!(bf.rows(0, 1000).len(), 100);
         assert_eq!(bf.rows(2, 1)[0][1], "EDITED", "覆盖层跨索引完成保留");
@@ -907,6 +909,7 @@ mod tests {
         assert_eq!(m.headers, vec!["name", "age", "city"]);
         assert_eq!(m.encoding, "utf-8");
         assert!(!m.pending_cols && !m.can_undo && !m.can_redo);
+        assert!(m.index_sync, "小文件全量索引应标记为「随打开同步完成」");
         fs::remove_file(&p).ok();
     }
 
@@ -2633,6 +2636,9 @@ pub struct BigMeta {
     pub open_ms: u64,
     /// 全量索引耗时（毫秒）；未完成时为 0。
     pub index_ms: u64,
+    /// 全量索引是否在打开阶段同步完成（小文件）。此时 `index_ms` 与
+    /// `open_ms` 是同一段端到端耗时，不是独立的索引计时，界面不应报数字。
+    pub index_sync: bool,
     /// 距打开已过毫秒数（索引中实时增长）。
     pub elapsed_ms: u64,
 }
@@ -3360,6 +3366,8 @@ pub struct BigFile {
     open_ms: u64,
     /// 全量索引耗时（毫秒）；未完成时为 0。
     index_ms: u64,
+    /// 全量索引是否在打开阶段同步完成（无后台线程）。
+    index_sync: bool,
     /// 文件总字节数（meta 展示进度用）。
     total_bytes: u64,
     base_ncols: usize,
@@ -3467,6 +3475,7 @@ impl BigFile {
             open_started: t0,
             open_ms,
             index_ms: open_ms,
+            index_sync: true,
             total_bytes: meta.len(),
             base_ncols,
             base_headers: headers,
@@ -3651,6 +3660,7 @@ impl BigFile {
             open_started: t0,
             open_ms,
             index_ms,
+            index_sync: done,
             total_bytes,
             base_ncols,
             base_headers: headers,
@@ -4143,6 +4153,7 @@ impl BigFile {
             total_bytes: self.total_bytes,
             open_ms: self.open_ms,
             index_ms,
+            index_sync: self.index_sync,
             elapsed_ms,
         }
     }
@@ -5542,6 +5553,7 @@ impl BigFile {
         self.idx = build_index(bytes);
         self.backing = Backing::Mmap(mmap);
         self.index_ms = t0.elapsed().as_millis() as u64;
+        self.index_sync = true;
         Ok(())
     }
 
@@ -5604,6 +5616,7 @@ impl BigFile {
         self.idx = idx;
         self.partial = None;
         self.index_ms = t0.elapsed().as_millis() as u64;
+        self.index_sync = true;
         self.total_bytes = meta.len();
         self.seg = Segments::new(offset, n_data as u32);
         self.overlay.clear();

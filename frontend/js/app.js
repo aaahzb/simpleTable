@@ -85,8 +85,13 @@ function bigTimingSuffix(m) {
   const first = m.firstPaintMs?.() || meta.open_ms || 0;
   if (first) parts.push(`首屏 ${fmtDuration(first)}`);
   if (!meta.indexing) {
-    const idx = meta.index_ms || meta.elapsed_ms || meta.open_ms;
-    if (idx) parts.push(`索引 ${fmtDuration(idx)}`);
+    if (meta.index_sync) {
+      // 小文件在打开阶段同步扫完，open_ms 已包含索引耗时，单独报数字会误导。
+      parts.push("索引随首屏完成");
+    } else {
+      const idx = meta.index_ms || meta.elapsed_ms || meta.open_ms;
+      if (idx) parts.push(`索引 ${fmtDuration(idx)}`);
+    }
   }
   return parts.length ? ` · ${parts.join(" · ")}` : "";
 }
@@ -100,9 +105,10 @@ function bigTimingSuffix(m) {
 function bigOpenSummary(m) {
   const meta = m.meta();
   const idx = meta.index_ms || meta.elapsed_ms || meta.open_ms;
+  const idxText = meta.index_sync ? "索引随首屏完成" : `索引 ${fmtDuration(idx)}`;
   return `大文件模式：${Number(meta.rows).toLocaleString()} 行 × ${meta.cols} 列` +
     `（${meta.encoding}）· 首屏 ${fmtDuration(m.firstPaintMs?.() || meta.open_ms)}` +
-    ` · 索引 ${fmtDuration(idx)}`;
+    ` · ${idxText}`;
 }
 
 /** 刷新左侧状态（显示 X / 共 Y 行；大模式索引中显示进度与耗时） */
@@ -198,7 +204,7 @@ let tabSeq = 1;
 // 副侧（B）网格常驻实例，分屏时展示"分屏签"；焦点侧（focusedSide）独占键盘、
 // 工具栏、编辑窗格与状态栏，非分屏时恒为 "A"。两侧绑定内容稳定：点另一侧
 // 仅交换焦点（活动签跟随焦点侧），网格不重绑；激活任一侧之外的页签才把焦点
-// 侧重绑到新签。大档受引擎单例约束：分屏拒绝双大档。
+// 侧重绑到新签。引擎按页签多会话：切换页签只换模型，不重开、不重建索引。
 /** @type {boolean} 分屏开关 */
 let splitOn = false;
 /** @type {number | null} 副侧（分屏签）页签 id */
@@ -1920,6 +1926,8 @@ window.__app = {
   get model() { return model; },
   get grid() { return fgrid(); },
   pane, invoke, statusMsg,
+  // 冒烟专用：立即把瞬时消息还原为常驻状态（不受 8 秒超时影响）
+  refreshStatus: updateStatusText,
   newFile, openPath, saveFile, undo, redo,
   openSortDialog, exitSortMode, applyBigSort,
   applyColOps, cancelColOps, runBigFilter, gotoRow, gotoRowDialog,

@@ -1889,6 +1889,16 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(tbBtn("执行筛选") === undefined, "执行筛选按钮应已移除（两种模式都不存在）");
     assert(tbHidden("执行列操作"), "大模式应隐藏执行列操作");
     assert(tbHidden("撤销列操作预览"), "大模式应隐藏撤销列操作预览");
+    // 小文件在打开阶段同步扫完：索引耗时并入首屏，界面应报「索引随首屏完成」
+    // 而不是伪造一个独立的「索引 0 ms」（0 会被误读成没做索引）。
+    assert(bigM().meta().index_sync === true, "小档 meta 应标记索引随打开同步完成");
+    window.__app.refreshStatus();
+    await waitFor(() => {
+      const t = document.getElementById("status-text").textContent;
+      return t.includes("索引随首屏完成");
+    }, "小档状态栏应显示「索引随首屏完成」");
+    assert(!/索引\s*0\s*ms/.test(document.getElementById("status-text").textContent),
+      "小档不应显示独立的「索引 0 ms」");
   });
   check("大模式：超高行数虚拟缩放（滚动到底不空白）", async () => {
     // 回归：元素/滚动高 16,777,214px 上限曾致大文件滚动后视口空白。
@@ -1977,16 +1987,29 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(tb1?.kind === "big" && tb2?.kind === "big", "两档都应是大档");
     assert(tb1.active === true && model.rowCount() === 1500, "首个大档应已激活");
     await waitFor(() => model.rawData(0, 0) === "甲", "第一大档首行落定");
+    // 回归：旧实现切签会腾退引擎并重开文件（整份重新索引一遍）。会话号与
+    // 打开耗时都不允许变化——它们一变就说明模型被重建过。
+    const sid1 = model.sessionId;
+    const meta1 = model.meta();
     // 改 b2 后切回 b1：两个会话各自保留，互不腾退、互不串档
     await window.__app.activateTab(tb2.id);
     await waitFor(() => model.rawData(0, 0) === "乙", "第二大档首行落定");
+    const sid2 = model.sessionId;
+    const meta2 = model.meta();
+    assert(sid1 !== sid2, "两个大档应使用独立引擎会话");
     await model.setData(0, 0, "乙改");
     await waitFor(() => window.__app.isDirty() === true, "b2 编辑标脏");
     await window.__app.activateTab(tb1.id);
     await waitFor(() => model.rawData(0, 0) === "甲", "切回第一大档首行落定");
     assert(window.__app.isDirty() === false, "b1 不应受 b2 脏态影响");
+    assert(model.sessionId === sid1, "切回 b1 不得重建引擎会话");
+    assert(model.meta().open_ms === meta1.open_ms && model.meta().index_ms === meta1.index_ms,
+      `切回 b1 不得重新打开/索引（${meta1.open_ms}/${meta1.index_ms} → ${model.meta().open_ms}/${model.meta().index_ms}）`);
     await window.__app.activateTab(tb2.id);
     await waitFor(() => model.rawData(0, 0) === "乙改", "b2 修改应随签保留");
+    assert(model.sessionId === sid2, "切回 b2 不得重建引擎会话");
+    assert(model.meta().open_ms === meta2.open_ms && model.meta().index_ms === meta2.index_ms,
+      `切回 b2 不得重新打开/索引（${meta2.open_ms}/${meta2.index_ms} → ${model.meta().open_ms}/${model.meta().index_ms}）`);
     // 清理：两签可能都脏（b2 已改），放弃后关闭
     for (const p of [b1, b2]) {
       const tab = window.__app.tabs().find((x) => x.path === p);
