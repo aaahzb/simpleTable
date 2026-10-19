@@ -90,6 +90,16 @@ export class Grid {
      * @type {number}
      */
     this._yScale = 1;
+    /**
+     * 纵向滚动范围（scrollTop 上限）与一屏可容纳的整数行数。
+     * 每次 _layout 按画布显式高度重算；压缩滚动按整个滚动范围把行号等比映射，
+     * 保证滚到底就是最后一行（不能再按全局真实坐标/scale 直接换算，否则末尾
+     * 一屏永远差 viewH×scale/h 行）。
+     * @type {number}
+     */
+    this._maxScroll = 0;
+    /** @type {number} 一屏行数 floor(clientHeight / 行高)，至少 1 */
+    this._rowSpan = 1;
     /** @type {boolean} 等行高模式（大模式恒为 true；小模式行高未被手动调整时为 true） */
     this._yUniform = false;
     /** @type {number[]} 列顺序（源列号数组，位置即显示顺序） */
@@ -232,6 +242,7 @@ export class Grid {
     const n = this.visCount();
     this._lastVisCount = n;
     const oy = this._originY();
+    const viewH = this.scrollEl.clientHeight;
     const totalW = this._rowHeadW() + this._effWidths().reduce((a, b) => a + b, 0);
     this.canvasEl.style.width = `${Math.max(totalW, this.scrollEl.clientWidth)}px`;
     const h = this._uniformRowH;
@@ -240,9 +251,11 @@ export class Grid {
       const real = n * h;
       this._yScale = real > Y_CLAMP ? real / Y_CLAMP : 1;
       this.visTops = null;
+      const compressed = real / this._yScale;
+      this._rowSpan = Math.max(1, Math.floor(viewH / h));
       // 画布高 = 吸顶表头 + 全部行（行是 #rows 内绝对定位，#rows 紧随表头之后）
-      this.canvasEl.style.height =
-        `${Math.max(oy + real / this._yScale, this.scrollEl.clientHeight)}px`;
+      this.canvasEl.style.height = `${Math.max(oy + compressed, viewH)}px`;
+      this._maxScroll = Math.max(0, oy + compressed - viewH);
       return;
     }
     this._yScale = 1;
@@ -253,8 +266,9 @@ export class Grid {
       tops.push(t);
     }
     this.visTops = tops;
-    this.canvasEl.style.height =
-      `${Math.max(oy + t, this.scrollEl.clientHeight)}px`;
+    this.canvasEl.style.height = `${Math.max(oy + t, viewH)}px`;
+    this._maxScroll = Math.max(0, oy + t - viewH);
+    this._rowSpan = Math.max(1, Math.floor(viewH / h));
   }
 
   /** @returns {number} 行区起始 y（吸顶列头高度，行坐标系与画布坐标系的偏移）。 */
@@ -332,10 +346,20 @@ export class Grid {
    */
   _yAnchor() {
     const h = this._uniformRowH;
-    const sv = Math.max(0, this.scrollEl.scrollTop - this._originY());
     const n = this.visCount();
-    const anchor = Math.max(0, Math.min(n - 1, Math.round((sv * this._yScale) / h)));
-    return { sv, anchor, h };
+    const oy = this._originY();
+    const rawSv = Math.max(0, this.scrollEl.scrollTop - oy);
+    if (this._yScale > 1) {
+      // 压缩坐标按整个滚动范围等比映射到 0..n-一屏行数：
+      // scrollTop 到底 ⇔ 锚点为 n-_rowSpan，最后一行正好落在视口底部。
+      const maxSv = Math.max(0, this._maxScroll - oy);
+      const span = Math.max(0, n - this._rowSpan);
+      const sv = Math.min(rawSv, maxSv);
+      const anchor = maxSv > 0 ? Math.round((sv / maxSv) * span) : 0;
+      return { sv, anchor: Math.max(0, Math.min(n - 1, anchor)), h };
+    }
+    const anchor = Math.max(0, Math.min(n - 1, Math.round(rawSv / h)));
+    return { sv: rawSv, anchor, h };
   }
 
   /**
@@ -350,6 +374,60 @@ export class Grid {
     if (!this._yUniform) return this._originY() + this.visTops[vi];
     const { sv, anchor, h } = this._yAnchor();
     return this._originY() + sv + (vi - anchor) * h;
+  }
+
+  /**
+   * 锚点行对齐视口顶部（吸顶表头之下）所需的 scrollTop。
+   *
+   * 压缩滚动（_yScale > 1）按 _yAnchor 的等比映射反解；未压缩时行区坐标
+   * 就是滚动坐标。返回值已夹取到滚动范围内。
+   *
+   * @param {number} anchor - 锚点可见行序号。
+   * @returns {number} scrollTop px。
+   */
+  _scrollTopForAnchor(anchor) {
+    if (anchor <= 0) return 0;
+    const oy = this._originY();
+    if (this._yScale <= 1) {
+      return Math.max(0, Math.min(this._maxScroll, this._rowTop(anchor)));
+    }
+    const maxSv = Math.max(0, this._maxScroll - oy);
+    if (maxSv <= 0) return 0;
+    const span = Math.max(1, this.visCount() - this._rowSpan);
+    return Math.max(0, Math.min(this._maxScroll,
+      oy + Math.round((anchor / span) * maxSv)));
+  }
+
+  /**
+   * 目标行完整贴在视口底部所需的 scrollTop。
+   *
+   * @param {number} vi - 可见行序号。
+   * @returns {number} scrollTop px。
+   */
+  _scrollTopForRowBottom(vi) {
+    const oy = this._originY();
+    const viewH = this.scrollEl.clientHeight;
+    if (this._yScale > 1) {
+      return this._scrollTopForAnchor(Math.max(0, vi - this._rowSpan + 1));
+    }
+    const rh = this._yUniform ? this._uniformRowH : this._rowH(this.visAt(vi));
+    return Math.max(0, Math.min(this._maxScroll,
+      this._rowTop(vi) + rh - (viewH - oy)));
+  }
+
+  /**
+   * 目标行完整露在吸顶表头下方所需的 scrollTop。
+   *
+   * @param {number} vi - 可见行序号。
+   * @returns {number} scrollTop px。
+   */
+  _scrollTopForRowTop(vi) {
+    if (this._yScale > 1) {
+      const h = this._uniformRowH;
+      const headRows = Math.max(1, Math.ceil(this._originY() / h));
+      return this._scrollTopForAnchor(Math.max(0, vi - headRows));
+    }
+    return Math.max(0, Math.min(this._maxScroll, this._rowTop(vi)));
   }
 
   /**
@@ -721,7 +799,8 @@ export class Grid {
     this._refilter();
     this.renderAll();
     if (anchor !== null && this.visCount() > rowsBefore) {
-      const top = this._originY() + this._rowTop(anchor);
+      // 行数增长会改变压缩比例/滚动范围：把原锚点行重新对齐到表头下方。
+      const top = this._scrollTopForRowTop(anchor);
       if (Math.abs(this.scrollEl.scrollTop - top) > 1) {
         this.scrollEl.scrollTop = top;
         this._renderRows();
@@ -1309,22 +1388,25 @@ export class Grid {
     const oy = this._originY();
     const viewTop = this.scrollEl.scrollTop;
     const viewH = this.scrollEl.clientHeight;
-    if (this._yUniform && this._yScale > 1) {
-      // 缩放渲染几何：行以真实行高画在锚点窗口内，"虚拟底部对齐"会落到视口外；
-      // 行不可见时统一顶对齐——锚点取 行序号-表头遮挡行数，使目标行完整露在表头下
+    if (this._yScale > 1) {
+      // 压缩滚动：行的屏幕位置由锚点窗口几何（_paintTop）给出，不能用全局压缩
+      // 坐标直接判断。上方不可见 → 顶对齐；下方不可见 → 底对齐（末行即滚到底）。
       const h = this._uniformRowH;
-      const { anchor } = this._yAnchor();
-      const rowsInView = Math.max(1, Math.floor((viewH - oy) / h));
-      if (vi < anchor || vi > anchor + rowsInView - 1) {
-        const headRows = Math.max(1, Math.ceil(oy / h));
-        const target = Math.max(0, vi - headRows);
-        this.scrollEl.scrollTop = oy + (target * h) / this._yScale;
+      const clientTop = this._paintTop(vi) - viewTop;
+      if (clientTop < oy) {
+        this.scrollEl.scrollTop = this._scrollTopForRowTop(vi);
+      } else if (clientTop + h > viewH) {
+        this.scrollEl.scrollTop = this._scrollTopForRowBottom(vi);
       }
     } else {
-      const top = oy + this._rowTop(vi);
-      const h = this._yUniform ? this._uniformRowH : this._rowH(r);
-      if (top < viewTop) this.scrollEl.scrollTop = top;
-      else if (top + h > viewTop + viewH) this.scrollEl.scrollTop = top + h - viewH;
+      // 未压缩：行区坐标即滚动坐标。吸顶表头占视口顶部 oy，可见区域是
+      // [scrollTop, scrollTop+viewH-oy]；对齐全按这个区间计算。
+      const top = this._rowTop(vi);
+      const rh = this._yUniform ? this._uniformRowH : this._rowH(r);
+      if (top < viewTop) this.scrollEl.scrollTop = Math.max(0, top);
+      else if (top + rh > viewTop + viewH - oy) {
+        this.scrollEl.scrollTop = Math.max(0, top + rh - (viewH - oy));
+      }
     }
     const x = this._colLeft(this.colOrder.indexOf(c));
     const w = this.colW[c];

@@ -1431,8 +1431,22 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     grid.select([0, 0]);
     key(scroller, "ArrowDown", { ctrlKey: true });
     await waitFor(() => cur(grid)?.[0] === 4999, "Ctrl+↓ 跳到末行");
+    await sleep(80); // 等 scroll 事件重绘落定
+    const scRect0 = scroller.getBoundingClientRect();
+    const oy0 = grid._originY();
+    const lastCell = document.querySelector('.cell[data-row="4999"][data-col="0"]');
+    assert(lastCell, "末行应有渲染元素");
+    const lr0 = lastCell.getBoundingClientRect();
+    assert(lr0.bottom <= scRect0.bottom + 1,
+      `Ctrl+↓ 末行应完整进入视口：bottom=${Math.round(lr0.bottom - scRect0.top)} 视口高=${scRect0.height}`);
     key(scroller, "ArrowUp", { ctrlKey: true });
     await waitFor(() => cur(grid)?.[0] === 0, "Ctrl+↑ 回到首行");
+    await sleep(80);
+    const firstCell = document.querySelector('.cell[data-row="0"][data-col="0"]');
+    assert(firstCell, "首行应有渲染元素");
+    const fr0 = firstCell.getBoundingClientRect();
+    assert(fr0.top >= scRect0.top + oy0 - 1,
+      `Ctrl+↑ 首行不得被表头遮住：cellTop=${Math.round(fr0.top - scRect0.top)} headerH=${oy0}`);
   });
 
   check("大模式：跳远页（窗口缓存未命中→拉取→渲染）", async () => {
@@ -2012,9 +2026,11 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       const t = document.getElementById("status-text").textContent;
       return /首屏\s*\d+\s*ms/.test(t) && /索引\s/.test(t);
     }, "状态栏耗时摘要");
-    const anchorNow = grid._rowAt(sc.scrollTop - grid._originY());
+    // 吸顶表头遮住顶部若干行：取「表头下第一行」作为用户看到的锚点。
+    const headRows = Math.ceil(grid._originY() / grid._uniformRowH);
+    const anchorNow = grid._rowAt(sc.scrollTop - grid._originY()) + headRows;
     assert(Math.abs(anchorNow - anchorRow) <= 2,
-      `索引完成后锚点行 ${anchorNow} 应≈${anchorRow}（不得因行数增长跳走）`);
+      `索引完成后表头下首行 ${anchorNow} 应≈${anchorRow}（不得因行数增长跳走）`);
     assert(grid._yScale > 1, `yScale=${grid._yScale} 应已启用虚拟缩放`);
     const cv = sc.firstElementChild;
     const styleH = parseFloat(cv.style.height);
@@ -2041,6 +2057,43 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const midR = midKids.getBoundingClientRect();
     assert(midR.bottom > scRect.top && midR.top < scRect.bottom,
       `底部中段行屏幕矩形 ${Math.round(midR.top)}..${Math.round(midR.bottom)} 应在视口内`);
+  });
+
+  check("大模式：虚拟缩放下 Ctrl+↑/↓ 把目标行完整滚入视口", async () => {
+    // 回归：压缩滚动坐标用「全局真实高度/scale」直接把 scrollTop 映射到行，
+    // 末尾一屏永远到不了最后一行（滚到底仍差 viewH*scale/h 行）；且向上跳时
+    // 把目标行对齐到视口顶，正好被吸顶表头盖住。
+    const sc = document.getElementById("grid-scroll");
+    sc.focus();
+    const n = grid.visCount();
+    assert(n > 200000, `夹具应启用虚拟缩放，n=${n}`);
+    assert(grid._yScale > 1, `应处于虚拟缩放，yScale=${grid._yScale}`);
+    grid.select([n - 1, 0]);
+    key(sc, "ArrowUp", { ctrlKey: true });
+    await waitFor(() => cur(grid)?.[0] === 0, "Ctrl+↑ 到首行");
+    await sleep(80);
+    const scRect = sc.getBoundingClientRect();
+    const oy = grid._originY();
+    assert(Math.round(sc.scrollTop) <= 1, `Ctrl+↑ 后应回顶，scrollTop=${sc.scrollTop}`);
+    const firstCell = document.querySelector('.cell[data-row="0"][data-col="0"]');
+    assert(firstCell, "首行应有渲染元素");
+    const fr = firstCell.getBoundingClientRect();
+    assert(fr.top >= scRect.top + oy - 1,
+      `首行不得被表头遮住：cellTop=${Math.round(fr.top - scRect.top)} headerH=${oy}`);
+    key(sc, "ArrowDown", { ctrlKey: true });
+    await waitFor(() => cur(grid)?.[0] === n - 1, "Ctrl+↓ 到末行");
+    await waitFor(() =>
+      document.querySelector(`.cell[data-row="${n - 1}"][data-col="0"]`)?.textContent === "a",
+      "末行数据渲染");
+    const lastCell = document.querySelector(`.cell[data-row="${n - 1}"][data-col="0"]`);
+    const lr = lastCell.getBoundingClientRect();
+    assert(lr.top >= scRect.top + oy - 1 && lr.bottom <= scRect.bottom + 1,
+      `末行应完整在视口内：${Math.round(lr.top - scRect.top)}..${Math.round(lr.bottom - scRect.top)} 视口高=${scRect.height}`);
+    // 末页附近继续滚动：新窗口的页落定后必须自动补齐，不得留下需要点击/再滚才填的空白。
+    sc.scrollTop = Math.max(0, sc.scrollTop - 40);
+    grid._renderRows();
+    await waitFor(() => [...grid.rowsEl.querySelectorAll('.cell[data-col="0"]')]
+      .every((el) => el.textContent === "a"), "滚动后渲染窗格无空白格");
   });
 
   check("页签：多个大档各自独立会话，切换不丢修改", async () => {
