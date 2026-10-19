@@ -12,6 +12,11 @@ on:
 permissions:
   contents: write # 创建 Release 需要
 
+# 发布构建的版本号直接取本次 tag，不再由 build.rs 从 .git 推断：
+# 同一提交改 tag 后重新构建时，cargo 缓存可能沿用上一次的版本字符串。
+env:
+  BUILD_VERSION: "${{ startsWith(github.ref, 'refs/tags/') && format('release {0}', github.ref_name) || '' }}"
+
 jobs:
   test:
     name: 发布门槛：Windows 冒烟自检
@@ -36,7 +41,7 @@ jobs:
         run: cargo build
         working-directory: src-tauri
 
-      - name: 冒烟自检（52 项断言，报告打在日志里）
+      - name: 冒烟自检（118 项断言，报告打在日志里）
         working-directory: src-tauri
         env:
           SMOKE_REPORT_PATH: ${{ github.workspace }}/smoke-report.txt
