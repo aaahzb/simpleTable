@@ -466,5 +466,60 @@ export async function runPark({ invoke, grid, mode }) {
     return;
   }
 
+  if (mode === "idle" || mode === "idlefile" || mode === "idlebig") {
+    // 空转闪烁定位：不做任何操作，只计数 renderAll/_renderRows/_renderHeader 与
+    // DOM 变动，并逐拍采样滚动区/画布尺寸。用于区分「ResizeObserver 自激」与
+    // 「表头反复重建」两类逐帧重绘。
+    const p = `${await invoke("smoke_tmp_dir")}/park_idle.csv`;
+    if (mode === "idlefile" || mode === "idlebig") {
+      const rows = mode === "idlebig" ? 400000 : 2000;
+      if (mode === "idlebig") await invoke("smoke_set_force_big", { v: true });
+      await invoke("smoke_write_repeat",
+        { path: p, line: "a,b,c,d,e\r\n", times: 1, append: false });
+      await invoke("smoke_write_repeat",
+        { path: p, line: "1,2,3,4,5\r\n", times: rows, append: true });
+      await window.__app.openPath(p);
+      const bm = window.__app.model;
+      const noop = () => invoke("path_exists", { path: `${dir}/__noop` });
+      for (let i = 0; i < 1200; i += 1) {
+        if (window.__app.isBigMode() && bm.rowCount() > 0) break;
+        await noop();
+      }
+    }
+    await sleep(500); // 等首屏落定
+    let allN = 0;
+    let rowsN = 0;
+    let headN = 0;
+    let mutations = 0;
+    const origAll = grid.renderAll.bind(grid);
+    const origRows = grid._renderRows.bind(grid);
+    const origHead = grid._renderHeader.bind(grid);
+    grid.renderAll = () => { allN += 1; origAll(); };
+    grid._renderRows = () => { rowsN += 1; origRows(); };
+    grid._renderHeader = () => { headN += 1; origHead(); };
+    new MutationObserver((recs) => { mutations += recs.length; })
+      .observe(grid.rowsEl.parentElement, { childList: true, subtree: true });
+    const headEl = document.querySelector("#col-header");
+    const rowHead = document.querySelector("#grid-canvas .row-head");
+    const sample = (tag) => {
+      const cs = getComputedStyle(document.getElementById("grid-area"));
+      return [tag, Math.round(performance.now()), allN, rowsN, headN, mutations,
+        sc.clientWidth, sc.clientHeight, sc.scrollWidth, sc.scrollHeight,
+        grid.canvasEl.style.width, grid.canvasEl.style.height,
+        cs.getPropertyValue("--row-header-w").trim(),
+        rowHead ? getComputedStyle(rowHead).width : "?",
+        headEl ? headEl.children.length : -1,
+        grid.visCount(), grid.model.indexing?.() === true ? 1 : 0].join(",");
+    };
+    const log = [sample("start")];
+    for (let i = 0; i < 16; i += 1) {
+      await sleep(500);
+      log.push(sample(`t${i}`));
+    }
+    await mark(invoke, dir, "idle_log", log.join("\n"));
+    await mark(invoke, dir, "done");
+    return;
+  }
+
   await mark(invoke, dir, "error", `unknown mode ${mode}`);
 }

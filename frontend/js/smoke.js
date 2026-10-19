@@ -134,6 +134,29 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       + `行号列 ${rr.left.toFixed(1)}..${rr.right.toFixed(1)}，应同宽同位`);
   }
 
+  // ========== 空闲稳定性 ==========
+
+  check("空闲稳定：连续两次布局不得引发滚动条/画布尺寸翻转", async () => {
+    // 用户现场：启动后什么都不做，表格区域逐帧狂闪。根因是 clientWidth/
+    // clientHeight 会把 761.5px 之类的真实小数尺寸四舍五入成 762；画布按
+    // 762 设置就比真实可视区高 0.5px，滚动条出现后 ResizeObserver 又触发
+    // 重排，下一帧画布缩小、滚动条消失……尺寸逐帧翻转。
+    // 这里在空闲态连做两次布局：任何一次尺寸翻转都会让两次快照不同。
+    const sc = document.getElementById("grid-scroll");
+    const cv = document.getElementById("grid-canvas");
+    const snap = () => [
+      sc.clientWidth, sc.clientHeight, sc.scrollWidth, sc.scrollHeight,
+      cv.style.width, cv.style.height,
+    ].join("|");
+    grid.renderAll();
+    const first = snap();
+    grid.renderAll();
+    const second = snap();
+    assert(first === second,
+      `连续两次空闲布局结果不一致：${first} vs ${second}；`
+      + "尺寸翻转会让表格区域逐帧闪烁");
+  });
+
   // ========== Rust 命令层 ==========
 
   check("版本号非空且为 beta/release 格式", async () => {

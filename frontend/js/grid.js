@@ -164,6 +164,28 @@ export class Grid {
   }
 
   /**
+   * 滚动区真实内容盒（可视区）尺寸，向下取整。
+   *
+   * clientWidth/clientHeight 返回四舍五入后的整数：真实 761.5px 会报 762。
+   * 若把画布按 762 设置，画布就比可视区高 0.5px → 出现滚动条；滚动条又
+   * 改变 client 尺寸并触发 ResizeObserver 重排，下一帧画布缩小、滚动条
+   * 消失……尺寸逐帧翻转，表现就是空闲时表格区域狂闪。
+   *
+   * 这里用 getBoundingClientRect 的小数边框盒尺寸减去「边框 + 滚动条」
+   * 厚度（offset - client），再向下取整，保证画布永远不超过真实可视区。
+   *
+   * @returns {{w: number, h: number}} 可视区宽高（px，非负整数）。
+   */
+  _viewportSize() {
+    const el = this.scrollEl;
+    const rect = el.getBoundingClientRect();
+    return {
+      w: Math.max(0, Math.floor(rect.width - (el.offsetWidth - el.clientWidth))),
+      h: Math.max(0, Math.floor(rect.height - (el.offsetHeight - el.clientHeight))),
+    };
+  }
+
+  /**
    * 热交换模型（小/大模式切换）：订阅新模型数据通知并重建设置。
    * 旧模型随订阅一并废弃（其后再无改动来源，残留闭包无副作用）。
    *
@@ -255,14 +277,15 @@ export class Grid {
     const n = this.visCount();
     this._lastVisCount = n;
     const oy = this._originY();
-    const viewH = this.scrollEl.clientHeight;
+    const vp = this._viewportSize();
+    const viewH = vp.h;
     const rowHeadW = this._rowHeadW();
     // 行号列宽统一由 JS 取整后以 px 下发：CSS 的 3.2em 在表头角块（13px）
     // 与行号（0.92em ≈ 11.96px）里会解析出两个不同宽度（41.6 vs 38.3），
     // 造成数据列整体比表头左移。px 变量让角块/行号列/JS 几何完全一致。
     this.areaEl.style.setProperty("--row-header-w", `${rowHeadW}px`);
     const totalW = rowHeadW + this._effWidths().reduce((a, b) => a + b, 0);
-    this.canvasEl.style.width = `${Math.max(totalW, this.scrollEl.clientWidth)}px`;
+    this.canvasEl.style.width = `${Math.max(totalW, vp.w)}px`;
     const h = this._uniformRowH;
     this._yUniform = this.model.isBig || this.rowH.every((v) => v === h);
     if (this._yUniform) {
@@ -300,7 +323,7 @@ export class Grid {
   _effWidths() {
     const widths = this.colOrder.map((c) => this.colW[c]);
     if (widths.length) {
-      const avail = this.scrollEl.clientWidth - this._rowHeadW();
+      const avail = this._viewportSize().w - this._rowHeadW();
       const sum = widths.reduce((a, b) => a + b, 0);
       if (sum < avail) {
         widths[widths.length - 1] += avail - sum;
@@ -424,7 +447,7 @@ export class Grid {
    */
   _scrollTopForRowBottom(vi) {
     const oy = this._originY();
-    const viewH = this.scrollEl.clientHeight;
+    const viewH = this._viewportSize().h;
     if (this._yScale > 1) {
       return this._scrollTopForAnchor(Math.max(0, vi - this._rowSpan + 1));
     }
@@ -572,7 +595,7 @@ export class Grid {
       this._staleText.clear();
       return;
     }
-    const viewH = this.scrollEl.clientHeight;
+    const viewH = this._viewportSize().h;
     const top = this.scrollEl.scrollTop;
     // 行画在吸顶表头之下；窗口与基准分两套几何：
     // - 等行高：锚点窗口——行以真实行高连续排布、锚点行对齐视口顶，base 为行区滚动位置
@@ -1408,7 +1431,8 @@ export class Grid {
     if (vi < 0) return;
     const oy = this._originY();
     const viewTop = this.scrollEl.scrollTop;
-    const viewH = this.scrollEl.clientHeight;
+    const vp = this._viewportSize();
+    const viewH = vp.h;
     if (this._yScale > 1) {
       // 压缩滚动：行的屏幕位置由锚点窗口几何（_paintTop）给出，不能用全局压缩
       // 坐标直接判断。上方不可见 → 顶对齐；下方不可见 → 底对齐（末行即滚到底）。
@@ -1432,7 +1456,7 @@ export class Grid {
     const x = this._colLeft(this.colOrder.indexOf(c));
     const w = this.colW[c];
     const viewL = this.scrollEl.scrollLeft;
-    const viewW = this.scrollEl.clientWidth;
+    const viewW = vp.w;
     if (x < viewL + this._rowHeadW()) this.scrollEl.scrollLeft = Math.max(0, x - this._rowHeadW());
     else if (x + w > viewL + viewW) this.scrollEl.scrollLeft = x + w - viewW;
   }

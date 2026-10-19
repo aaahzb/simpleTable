@@ -41,7 +41,7 @@ jobs:
         run: cargo build
         working-directory: src-tauri
 
-      - name: 冒烟自检（121 项断言，报告打在日志里）
+      - name: 冒烟自检（122 项断言，报告打在日志里）
         working-directory: src-tauri
         env:
           SMOKE_REPORT_PATH: ${{ github.workspace }}/smoke-report.txt
