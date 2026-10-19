@@ -2169,7 +2169,35 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const firstRow = Number(kids[0].querySelector(".row-head")?.dataset.row);
     assert(firstRow > n - 10000, `底部首渲染行 ${firstRow} 应接近末行 ${n}`);
     // 命中测试与渲染一致：视口顶命中锚点行（= 首渲染行 + overscan 5，容差 1 行）
+    // 用户反馈：大文件滚到底时倒数前两行显示不出来（元素缺失/空白/被裁掉）。
+    // 取页是异步的：必须以「数据落定并重绘后的文本」为判据，渲染调用返回的
+    // 瞬间页面请求尚未落定，此时读到的空串只是占位，不能当缺陷。
+    const diagTail = () => {
+      const m = bigM();
+      const pageA = Math.floor((n - 2) / 200);
+      const pageB = Math.floor((n - 1) / 200);
+      return `n=${n} 需要页=${pageA},${pageB} cache尾=[${[...m._cache.keys()].slice(-6)}]`
+        + ` inflight=[${[...m._inflight]}] queue=[${m._queue.slice(0, 6)}]`
+        + ` view=[${m._viewFirst},${m._viewLast}]`;
+    };
+    await waitFor(() => {
+      const a = document.querySelector(`.cell[data-row="${n - 2}"][data-col="0"]`);
+      const b = document.querySelector(`.cell[data-row="${n - 1}"][data-col="0"]`);
+      return a?.textContent === "a" && b?.textContent === "a";
+    }, `滚动到底后末两行数据落定（${diagTail()}）`);
     const rect = sc.getBoundingClientRect();
+    // 用可视内容盒（clientHeight，已排除水平滚动条）而不是边框盒：边框盒
+    // 会把被滚动条盖住的行也算「可见」，放过用户实际看不到的末行。
+    const viewBottom = rect.top + sc.clientHeight;
+    for (const rr of [n - 2, n - 1]) {
+      const cell = document.querySelector(`.cell[data-row="${rr}"][data-col="0"]`);
+      assert(cell, `倒数第 ${n - rr} 行应有渲染元素`);
+      assert(cell.textContent === "a",
+        `倒数第 ${n - rr} 行数据应为 a，实际 "${cell.textContent}"（${diagTail()}）`);
+      const cr = cell.getBoundingClientRect();
+      assert(cr.top >= rect.top - 1 && cr.bottom <= viewBottom + 1,
+        `倒数第 ${n - rr} 行应完整可见：${Math.round(cr.top - rect.top)}..${Math.round(cr.bottom - rect.top)}，可视高 ${sc.clientHeight}`);
+    }
     const hit = grid._hitTest(rect.left + 150, rect.top + 2);
     assert(hit && hit[0] >= firstRow + 4 && hit[0] <= firstRow + 6,
       `命中 ${hit?.[0]} 应≈首渲染行+5 ${firstRow + 5}`);

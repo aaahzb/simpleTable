@@ -68,3 +68,32 @@ test("渐进索引：首次布局前（_lastVisCount=0）回退到当前可见�
     `首次布局前应按当前行数换算，期望 ≈${Math.round(expect)}，实际 ${anchor}`,
   );
 });
+
+test("虚拟缩放滚动到底：可滚动上限少数像素时锚点仍吸附末行", () => {
+  // 现场：1550 万行（_yScale≈89.125，行高 23）滚到底，倒数两行永远看不见。
+  // 浏览器实际可滚动上限 = scrollHeight - 视口小数高，可能比 _maxScroll
+  // 少至多 1px；压缩坐标下 0.5px ≈ 2 行，按比例四舍五入就停在 span-2，
+  // 末尾两行被画到视口下缘之外且再也滚不出来。
+  const n = 15_500_000;
+  const g = makeStaleLayoutGrid({ oldN: n, h: 23, viewH: 761 });
+  g.scrollEl.scrollTop = g._maxScroll - 0.5;
+
+  const { anchor } = g._yAnchor();
+
+  const span = n - g._rowSpan;
+  assert.equal(anchor, span, `贴底时锚点应吸附到 n-_rowSpan=${span}，实际 ${anchor}`);
+});
+
+test("未缩放滚动到底：末行不得被视口下缘裁掉", () => {
+  // 视口高 712、行高 20：rawSv/行高 的小数部分 .6 会四舍五入到下一行，
+  // 末行下缘超出视口 8px（用户看到半截/看不到）。贴底时必须吸附到
+  // n-_rowSpan，让末行整体落在视口内。
+  const n = 100_000;
+  const g = makeStaleLayoutGrid({ oldN: n, h: 20, viewH: 712 });
+  g.scrollEl.scrollTop = g._maxScroll - 0.5;
+
+  const { anchor } = g._yAnchor();
+
+  assert.equal(anchor, n - g._rowSpan,
+    `贴底时锚点应为 n-_rowSpan=${n - g._rowSpan}，实际 ${anchor}`);
+});

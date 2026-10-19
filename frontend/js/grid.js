@@ -427,10 +427,22 @@ export class Grid {
       const maxSv = Math.max(0, this._maxScroll - oy);
       const span = Math.max(0, n - this._rowSpan);
       const sv = Math.min(rawSv, maxSv);
-      const anchor = maxSv > 0 ? Math.round((sv / maxSv) * span) : 0;
+      // 贴底吸附：浏览器实际可滚动上限 = scrollHeight - 视口（小数边框盒），
+      // 可能比 _maxScroll 少至多 1px；压缩坐标下 1 滚动 px ≈ _yScale 行，
+      // 按比例四舍五入会停在 span 之前（1550 万行实测差 2 行），末尾行被画
+      // 到视口下缘之外，用户滚到底也永远看不见。
+      const atBottom = maxSv > 0 && maxSv - sv < 1;
+      const anchor = maxSv > 0
+        ? (atBottom ? span : Math.round((sv / maxSv) * span))
+        : 0;
       return { sv, anchor: Math.max(0, Math.min(n - 1, anchor)), h };
     }
-    const anchor = Math.max(0, Math.min(n - 1, Math.round(rawSv / h)));
+    // 未压缩路径同理：贴底时 rawSv/h 的小数部分会把锚点四舍五入到下一行，
+    // 末行下缘最多超出视口近一行。吸附到 n-_rowSpan，末行整体可见。
+    const maxSv = Math.max(0, this._maxScroll - oy);
+    const anchor = maxSv > 0 && rawSv >= maxSv - 1
+      ? Math.max(0, n - this._rowSpan)
+      : Math.max(0, Math.min(n - 1, Math.round(rawSv / h)));
     return { sv: rawSv, anchor, h };
   }
 
