@@ -412,7 +412,13 @@ export class Grid {
    */
   _yAnchor() {
     const h = this._uniformRowH;
-    const n = this.visCount();
+    // 渐进索引期间模型行数会先增长、renderAll/_layout 才更新 _yScale/_maxScroll：
+    // 此刻必须继续按"上一次布局的行数"换算锚点，否则同一 scrollTop 会被新行数
+    // 放大（CI 实测 50,000 → 79,470 的跳走）。首次布局前 _lastVisCount 为 0，
+    // 回退当前可见行数；小模式不走该镜像（筛选会即时改变可见行数）。
+    const n = this.model.isBig && this._lastVisCount > 0
+      ? this._lastVisCount
+      : this.visCount();
     const oy = this._originY();
     const rawSv = Math.max(0, this.scrollEl.scrollTop - oy);
     if (this._yScale > 1) {

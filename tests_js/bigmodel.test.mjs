@@ -117,7 +117,8 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
         case "big_col_apply":
           return null;
         case "big_save":
-          // 真实引擎保存后重开文件：筛选结果被丢弃、排序视图已物理落盘
+        case "big_save_as":
+          // 真实引擎保存/另存为后重开文件：筛选结果被丢弃、排序视图已物理落盘
           filter = null;
           sorted = false;
           return null;
@@ -416,6 +417,29 @@ test("save 后筛选态复位：引擎重开文件后视图回到全量", async 
   assert.equal(model.rowCount(), 200, "rowCount 应回到全量行数");
   assert.deepEqual(events.at(-1), [true, "view"],
     "保存后应发结构通知（origin=view，不额外标脏）以重建全量视图");
+});
+
+test("saveAs 把目标路径交给引擎，并按保存语义复位视图", async () => {
+  const { model, data, calls } = makeFakeEngine({ rows: 200, cols: 1 });
+  await model.open("/x.csv");
+  data[7][0] = "needle";
+  await model.runFilter([[0, "needle"]], [], "");
+  assert.equal(model.rowCount(), 1);
+  const events = [];
+  model.onData((structural, origin) => events.push([structural, origin]));
+
+  await model.saveAs("/out/new.csv");
+
+  const call = calls.find(([cmd]) => cmd === "big_save_as");
+  assert.ok(call, "另存为应调用 big_save_as");
+  assert.equal(call[1].path, "/out/new.csv", "目标路径必须交给引擎");
+  assert.equal(typeof call[1].session, "number", "命令应携带会话号");
+  assert.equal(calls.some(([cmd]) => cmd === "big_save"), false,
+    "另存为不得退化为写回原文件的 big_save");
+  assert.equal(model.filterActive(), false);
+  assert.equal(model.rowCount(), 200);
+  assert.deepEqual(events.at(-1), [true, "view"],
+    "另存为后应按 origin=view 重建全量视图");
 });
 
 test("筛选结果中禁止编辑/删除", async () => {

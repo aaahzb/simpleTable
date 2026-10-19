@@ -657,6 +657,28 @@ async fn big_save(
     state: tauri::State<'_, BigShared>,
     session: u64,
 ) -> Result<(), String> {
+    run_big_save(window, state, session, None).await
+}
+
+/// 另存为：把当前视图流式写到 `path`，原文件保持不变；成功后会话切到新路径。
+/// 进度与线程模型同 `big_save`。
+#[tauri::command]
+async fn big_save_as(
+    window: tauri::Window,
+    state: tauri::State<'_, BigShared>,
+    session: u64,
+    path: String,
+) -> Result<(), String> {
+    run_big_save(window, state, session, Some(path)).await
+}
+
+/// `big_save`/`big_save_as` 共用实现。`target=None` 写回当前文件。
+async fn run_big_save(
+    window: tauri::Window,
+    state: tauri::State<'_, BigShared>,
+    session: u64,
+    target: Option<String>,
+) -> Result<(), String> {
     let entry = big_entry(state.inner(), session)?;
     entry.bump_gate(); // 重写文件前先让本会话的筛选扫描退出
     tauri::async_runtime::spawn_blocking(move || {
@@ -670,9 +692,13 @@ async fn big_save(
         let result = (|| {
             let mut bf = entry.file.lock().map_err(|e| e.to_string())?;
             bf.refresh_indexed();
-            bf.save(move |done, total, phase, rows| {
+            let mut on_progress = move |done: u64, total: u64, phase: u8, rows: u64| {
                 let _ = tx.send((done, total, phase, rows));
-            })
+            };
+            match target {
+                Some(path) => bf.save_as(std::path::Path::new(&path), &mut on_progress),
+                None => bf.save(&mut on_progress),
+            }
         })();
         // save 返回后进度闭包随 tx 一并释放，emit 线程 recv 出错即退出。
         emitter.join().map_err(|e| format!("进度转发线程异常：{e:?}"))?;
@@ -846,6 +872,7 @@ pub fn run() {
             big_set_headerless,
             big_copy,
             big_save,
+            big_save_as,
             big_col_push,
             big_col_pop,
             big_col_clear,

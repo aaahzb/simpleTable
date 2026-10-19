@@ -1348,6 +1348,42 @@ async function openPath(p, opts = {}) {
 }
 
 /**
+ * 大文件模式写盘共用流程：进度框 + 引擎调用 + 视图/筛选/脏态复位。
+ *
+ * @param {() => Promise<void>} write - 实际写盘（model.save 或 model.saveAs）。
+ * @param {string} action - 动作名（用于失败对话框标题）。
+ * @param {string} okMsg - 成功后的状态栏文案。
+ * @param {string} hint - 失败对话框的操作建议。
+ * @returns {Promise<boolean>} true = 已写入成功。
+ */
+async function runBigWrite(write, action, okMsg, hint) {
+  const hadFilter = model.filterActive();
+  const dlg = progressDialog("保存大文件…");
+  const un = await model.onProgress((done, total, phase, rows) => dlg.set(done, total, phase, rows));
+  try {
+    await write();
+  } catch (err) {
+    un();
+    dlg.close();
+    await errorDialog(`${action}失败`, `${err?.message ?? err}\n${hint}`);
+    return false;
+  }
+  un();
+  // 完成帧短暂停留再关闭：重写期间磁盘 IO 可能饿死渲染管线，屏幕停在
+  // 中间的旧帧——保证"100% 完成"被看到，而不是"卡住后消失"。
+  await dlg.finish();
+  setDirty(false);
+  // 引擎重开文件后不再保留筛选结果：同步清掉筛选框，避免"框里有条件、
+  // 视图却是全量"的错位（只在保存前确有筛选时动它，不误清多重筛选输入）。
+  if (hadFilter) fgrid().clearFilters();
+  // 排序保存会按当前顺序物理重写并退出排序视图：按钮/状态随之刷新。
+  refreshBigUi();
+  onCountsChanged(model.rowCount(), model.meta()?.rows ?? model.rowCount());
+  statusMsg(okMsg, 3000);
+  return true;
+}
+
+/**
  * 保存到当前路径（无路径时转另存为）。
  *
  * @returns {Promise<boolean>} true = 已写入成功。
@@ -1362,30 +1398,12 @@ async function saveFile() {
     return saveFileAs();
   }
   if (model.isBig) {
-    const hadFilter = model.filterActive();
-    const dlg = progressDialog("保存大文件…");
-    const un = await model.onProgress((done, total, phase, rows) => dlg.set(done, total, phase, rows));
-    try {
-      await model.save();
-    } catch (err) {
-      un();
-      dlg.close();
-      await errorDialog("保存失败", `${err?.message ?? err}\n文件可能被其他程序占用，可尝试另存为。`);
-      return false;
-    }
-    un();
-    // 完成帧短暂停留再关闭：重写期间磁盘 IO 可能饿死渲染管线，屏幕停在
-    // 中间的旧帧——保证"100% 完成"被看到，而不是"卡住后消失"。
-    await dlg.finish();
-    setDirty(false);
-    // 引擎重开文件后不再保留筛选结果：同步清掉筛选框，避免"框里有条件、
-    // 视图却是全量"的错位（只在保存前确有筛选时动它，不误清多重筛选输入）。
-    if (hadFilter) fgrid().clearFilters();
-    // 排序保存会按当前顺序物理重写并退出排序视图：按钮/状态随之刷新。
-    refreshBigUi();
-    onCountsChanged(model.rowCount(), model.meta()?.rows ?? model.rowCount());
-    statusMsg("已保存（大文件模式：流式重写完成）", 3000);
-    return true;
+    return runBigWrite(
+      () => model.save(),
+      "保存",
+      "已保存（大文件模式：流式重写完成）",
+      "文件可能被其他程序占用，可尝试另存为。",
+    );
   }
   // 无列名模式没有独立表头：直接序列化全部行；空表会写出无法重开的内容
   const headerless = model.isHeaderless?.() === true;
@@ -1415,22 +1433,48 @@ async function saveFile() {
 /**
  * 另存为 CSV。
  *
+ * 大文件模式把当前视图流式写到新路径（原文件保持不变），成功后引擎会话
+ * 与会话路径一并切换；小模式仍走内存序列化。只有写入成功才更新文档身份，
+ * 失败时保留原路径，避免“标题已变、磁盘没变”的错位。
+ *
+ * @param {string | null} target - 可选目标路径（冒烟测试跳过原生对话框）。
  * @returns {Promise<boolean>} true = 已写入成功。
  */
-async function saveFileAs() {
+async function saveFileAs(target = null) {
   if (model.isBig && model.indexing?.()) {
     statusMsg("文件仍在索引中，请稍候再另存为", 2500);
     return false;
   }
-  let p = await invoke("pick_save_path", { defaultName: "未命名.csv" });
-  if (!p) return false;
+  let p = target;
+  if (!p) {
+    p = await invoke("pick_save_path", { defaultName: "未命名.csv" });
+    if (!p) return false;
+  }
   if (!p.toLowerCase().endsWith(".csv")) p += ".csv";
+
+  if (model.isBig) {
+    const ok = await runBigWrite(
+      () => model.saveAs(p),
+      "另存为",
+      "已另存为（大文件模式：原文件未改动）",
+      "请检查目标目录是否可写，或换一个位置。",
+    );
+    if (!ok) return false;
+  } else {
+    // 小模式：先写入新路径，失败则回滚身份
+    const prev = path;
+    path = p;
+    const ok = await saveFile();
+    if (!ok) {
+      path = prev;
+      return false;
+    }
+  }
   path = p;
-  const ok = await saveFile();
   // 另存后当前档的身份（路径/标题）随之变化，同步回页签
   syncActiveTab();
   renderTabbar();
-  return ok;
+  return true;
 }
 
 /**
@@ -1943,7 +1987,7 @@ window.__app = {
   pane, invoke, statusMsg,
   // 冒烟专用：立即把瞬时消息还原为常驻状态（不受 8 秒超时影响）
   refreshStatus: updateStatusText,
-  newFile, openPath, saveFile, undo, redo,
+  newFile, openPath, saveFile, saveFileAs, undo, redo,
   openSortDialog, exitSortMode, applyBigSort,
   applyColOps, cancelColOps, runBigFilter, gotoRow, gotoRowDialog,
   isDirty: () => dirty, getPath: () => path,

@@ -73,6 +73,7 @@
 - **键入即筛**：180 ms 防抖，新请求自动中断旧扫描，回车跳过防抖立即执行；输入法选词回车不会误触发
 - **编辑/撤销**：单元格编辑、行插删即时生效（覆盖层 + 逆操作日志，微秒级、可撤销）
 - **保存**：流式重写 + 原子换名 + 分阶段进度条；未编辑的行整段照抄原文件字节，BOM / GBK 按原样回写
+- **另存为**：把当前视图（含编辑、插删行与排序结果）流式写到新路径；原文件保持不变，成功后当前页签切换到新文件，后续保存也写新文件
 
 ### 排序：确认后载入内存，载入可取消
 
@@ -225,14 +226,14 @@ Rust + Tauri 2 外壳，前端是原生 HTML/CSS/JS，无构建步骤。需要 R
 # 前端逻辑单测
 node --test tests_js/*.test.mjs
 
-# Rust 引擎单测（87 项，另 2 项默认忽略的性能基准）
+# Rust 引擎单测（90 项，另 2 项默认忽略的性能基准）
 cd src-tauri && cargo test
 
 # 编译并运行（前端资产编译时嵌入 exe，改完前端需重新 build）
 cargo build
 ./target/debug/simpletable.exe
 
-# 真机冒烟自检：真实 WebView2，123 项断言
+# 真机冒烟自检：真实 WebView2，124 项断言
 ./target/debug/simpletable.exe --smoke   # 报告写 %TEMP%\simpletable_smoke_report.txt
 ```
 
@@ -243,7 +244,7 @@ cargo build
 ```
 frontend/            纯 HTML/CSS/JS：自绘虚拟滚动网格 + 编辑窗格 + 对话框
   js/bigmodel.js     文件引擎模型（窗口缓存 / 渐进索引轮询 / 内存排序 / 乐观编辑）
-  js/smoke.js        --smoke 对抗自检套件（123 项）
+  js/smoke.js        --smoke 对抗自检套件（124 项）
 src-tauri/           Tauri 2 外壳 + Rust 数据引擎（mmap / 行索引 / 覆盖层 / 流式保存）
 tests_js/            node:test 逻辑层单测
 scripts/             截图 / 采样巡检脚本（开发用）

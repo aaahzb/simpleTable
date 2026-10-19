@@ -1202,8 +1202,29 @@ export class BigModel {
   async save() {
     this._requireNotIndexing("文件仍在索引中，请稍候再保存");
     await this._invoke("big_save");
-    // 引擎写盘后会重新打开文件并丢弃筛选（排序保存则已按显示顺序落盘）。
-    // 前端必须同步回全量视图，否则 rowCount 仍停在旧命中数、缓存仍是旧页。
+    await this._afterWrite();
+  }
+
+  /**
+   * 另存为：把当前数据视图（含编辑/插入/删除/排序结果）写到 `target`。
+   * 原文件保持不变；成功后引擎会话切到新路径，后续 save() 写新文件。
+   *
+   * @param {string} target - 目标 CSV 全路径。
+   * @returns {Promise<void>}
+   */
+  async saveAs(target) {
+    this._requireNotIndexing("文件仍在索引中，请稍候再另存为");
+    await this._invoke("big_save_as", { path: target });
+    await this._afterWrite();
+  }
+
+  /**
+   * 写盘后的前端状态复位：引擎已重开文件并丢弃筛选，前端必须同步回
+   * 全量视图，否则 rowCount 仍停在旧命中数、缓存仍是旧页。
+   *
+   * @returns {Promise<void>}
+   */
+  async _afterWrite() {
     this._filterGen += 1;
     this._filterOn = false;
     this._filterCount = 0;

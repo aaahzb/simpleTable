@@ -1862,6 +1862,39 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(parsed.rows[4999][3] === "古城", `末行内容应不变：${parsed.rows[4999]}`);
   });
 
+  check("大模式：另存为写新路径且不改原文件，后续保存跟随新路径", async () => {
+    const bm = bigM();
+    const saveAsPath = `${TMP}/big-saveas.csv`;
+    // 另存前的编辑必须进入新文件，且绝不能改写原文件
+    await bm.setData(2, 0, "另存标记");
+    const ok = await window.__app.saveFileAs(saveAsPath);
+    assert(ok === true, "另存为应成功");
+    assert(window.__app.getPath() === saveAsPath,
+      `另存后文档身份应切到新路径：${window.__app.getPath()}`);
+    assert(window.__app.isDirty() === false, "另存成功后应为干净状态");
+
+    const saved = parseCsv((await invoke("read_csv_file", { path: saveAsPath })).text);
+    assert(saved.rows.length === 5000, `另存后行数 ${saved.rows.length}`);
+    assert(saved.headers[1] === "列4", `另存后表头 ${saved.headers}`);
+    assert(saved.rows[2][0] === "另存标记", `另存文件应包含编辑：${saved.rows[2][0]}`);
+
+    // 原文件必须保持最后一次普通保存的内容（row2 仍是 大理）
+    const orig = parseCsv((await invoke("read_csv_file", { path: BIG_CSV })).text);
+    assert(orig.rows[2][0] === "大理", `另存为不得改写原文件：${orig.rows[2][0]}`);
+    assert(orig.rows[0][0] === "昆明", `原文件既有内容应保留：${orig.rows[0][0]}`);
+
+    // 会话已切到新路径：后续普通保存只写新文件
+    await bm.setData(3, 0, "后续保存");
+    await bm.save();
+    const saved2 = parseCsv((await invoke("read_csv_file", { path: saveAsPath })).text);
+    assert(saved2.rows[3][0] === "后续保存", "后续保存应写入新路径");
+    const orig2 = parseCsv((await invoke("read_csv_file", { path: BIG_CSV })).text);
+    assert(orig2.rows[3][0] === "大理", `另存后保存不得碰原文件：${orig2.rows[3][0]}`);
+
+    // 留下一处未保存修改，供下一项“换档确认放弃”使用
+    await bm.setData(4, 0, "留脏");
+  });
+
   check("大模式：单格一对多填充逐格写引擎（选区外不动）", async () => {
     const bm = bigM();
     grid.ensureVisible(0, 0);

@@ -1289,6 +1289,25 @@ mod tests {
     }
 
     #[test]
+    fn big_filter_page_clamps_out_of_range_start() {
+        let p = tmp_csv("filter_page_oor", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.run_filter(&FilterSpec {
+            cols: vec![(2, "beijing".into())],
+            multi_cols: vec![],
+            multi_text: String::new(),
+        })
+        .unwrap();
+        assert_eq!(bf.filter_len(), 2);
+        // 快速拖动后迟到的旧页请求会带着筛选前的行号（如 19000）进来：
+        // 起点越界必须返回空页，不能切片 panic（WebView2 进程直接崩溃）。
+        assert!(bf.filter_page(19000, 200).is_empty());
+        // 部分越界：只返回剩余命中
+        assert_eq!(bf.filter_page(1, 200).len(), 1);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
     fn big_filter_and_multi_or_semantics() {
         let p = tmp_csv("filter", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
@@ -1380,6 +1399,59 @@ mod tests {
         // 保存后仍可撤销编辑（覆盖层语义在写入后依然成立）
         bf.undo();
         assert_eq!(bf.rows(0, 1)[0][0], "Alice");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn big_save_as_writes_target_and_switches_session() {
+        let p = tmp_csv("saveas_src", &people_csv());
+        let orig_bytes = fs::read(&p).unwrap();
+        let target = std::env::temp_dir().join(format!(
+            "st_engine_saveas_dst_{}.csv",
+            std::process::id()
+        ));
+        fs::remove_file(&target).ok(); // 清掉上次运行残留
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 1, "31".into()).unwrap(); // Alice age 30→31
+
+        bf.save_as(&target, |_, _, _, _| {}).unwrap();
+
+        // 另存为绝不能改写原文件；目标文件必须包含当前视图（含未保存编辑）
+        assert_eq!(fs::read(&p).unwrap(), orig_bytes, "另存为不得改写原文件");
+        let bf_new = BigFile::open(&target).unwrap();
+        assert_eq!(bf_new.rows(0, 1)[0], vec!["Alice", "31", "Beijing"]);
+
+        // 会话身份已切到新路径：后续普通保存只更新目标文件
+        bf.set_cell(1, 1, "26".into()).unwrap(); // bob 25→26
+        bf.save(|_, _, _, _| {}).unwrap();
+        let bf_after = BigFile::open(&target).unwrap();
+        assert_eq!(bf_after.rows(1, 1)[0][1], "26");
+        assert_eq!(fs::read(&p).unwrap(), orig_bytes, "另存为后保存不得碰原文件");
+
+        fs::remove_file(&p).ok();
+        fs::remove_file(&target).ok();
+    }
+
+    #[test]
+    fn big_save_as_failure_keeps_session_and_original() {
+        let p = tmp_csv("saveas_fail", &people_csv());
+        let orig_bytes = fs::read(&p).unwrap();
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 1, "31".into()).unwrap();
+        // 目标目录不存在：创建临时文件即失败，不得动原文件/会话
+        let bad = std::env::temp_dir()
+            .join(format!("st_engine_saveas_missing_{}", std::process::id()))
+            .join("dst.csv");
+
+        let err = bf.save_as(&bad, |_, _, _, _| {}).unwrap_err();
+
+        assert!(err.contains("创建临时文件失败"), "错误信息应指出目标不可写：{err}");
+        assert_eq!(fs::read(&p).unwrap(), orig_bytes, "失败时原文件不得变化");
+        assert_eq!(bf.rows(0, 1)[0][1], "31", "失败时会话编辑不得丢失");
+        // 会话仍指向原文件，普通保存照常可用
+        bf.save(|_, _, _, _| {}).unwrap();
+        let bf2 = BigFile::open(&p).unwrap();
+        assert_eq!(bf2.rows(0, 1)[0][1], "31");
         fs::remove_file(&p).ok();
     }
 
@@ -5559,8 +5631,11 @@ impl BigFile {
     /// 筛选命中分页取行。
     pub fn filter_page(&self, from: u32, count: u32) -> Vec<Vec<String>> {
         let Some(f) = &self.filter else { return Vec::new() };
-        let hi = (from as usize + count as usize).min(f.len());
-        f[from as usize..hi]
+        // 起点也要夹取：筛选切换时，筛选前排队的深页请求（如 from=19000）
+        // 可能晚到；此时命中集可能只有几十行，直接切片会 panic 崩掉整个进程。
+        let lo = (from as usize).min(f.len());
+        let hi = (lo + count as usize).min(f.len());
+        f[lo..hi]
             .iter()
             .filter_map(|&v| self.row_at(v as u64))
             .collect()
@@ -5703,7 +5778,36 @@ impl BigFile {
     /// 进度回调 `(加权done, total, 阶段, 行数)`：加权把总体进度切给
     /// 流式 0-70% / 落盘 70-78% / 重建索引至 100%（见 PHASE_* 常量注释）。
     /// 保存后重建 mmap 与索引；撤销栈保留（操作按稳定记录号寻址，仍有效）。
-    pub fn save<F: FnMut(u64, u64, u8, u64)>(&mut self, mut progress: F) -> Result<(), String> {
+    pub fn save<F: FnMut(u64, u64, u8, u64)>(&mut self, progress: F) -> Result<(), String> {
+        let dest = self.path.clone();
+        self.save_to(&dest, false, progress)
+    }
+
+    /// 另存为：把当前视图（覆盖层/插入/删除/排序合并）流式写到 `target`。
+    /// 原文件保持不变；成功后会话身份切换到 `target`，后续保存写新文件。
+    /// 写盘失败时原文件、当前映射与会话状态均不受影响。
+    pub fn save_as<F: FnMut(u64, u64, u8, u64)>(
+        &mut self,
+        target: &Path,
+        progress: F,
+    ) -> Result<(), String> {
+        // 目标就是当前文件：按普通保存处理（同一路径无需“切换会话”）
+        if target == self.path {
+            return self.save(progress);
+        }
+        self.save_to(target, true, progress)
+    }
+
+    /// `save`/`save_as` 共用实现。
+    ///
+    /// @param dest 写盘目标（另存为的新路径，或当前文件路径）。
+    /// @param switch_path 成功后是否把会话路径切到 `dest`（另存为为 true）。
+    fn save_to<F: FnMut(u64, u64, u8, u64)>(
+        &mut self,
+        dest: &Path,
+        switch_path: bool,
+        mut progress: F,
+    ) -> Result<(), String> {
         self.require_editable()?;
         self.refresh_indexed();
         if self.is_indexing() {
@@ -5720,7 +5824,8 @@ impl BigFile {
         }
         // 整表重写数十秒：本线程降为背景优先级，让出 UI/系统调度。
         let _bg = bg::BackgroundGuard::enter();
-        let tmp = tmp_path_for(&self.path);
+        // 临时文件放在目标同目录：换名是同卷原子操作，也保证另存为不碰原文件
+        let tmp = tmp_path_for(dest);
         let out = fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
         let mut w = BufWriter::new(out);
         if self.has_bom {
@@ -5779,7 +5884,10 @@ impl BigFile {
             w.flush().map_err(|e| e.to_string())?;
             drop(w);
             progress(flushed_weighted(total), total, PHASE_FLUSH, done);
-            self.replace_with_retry(&tmp)?;
+            self.replace_with_retry(&tmp, dest)?;
+            if switch_path {
+                self.path = dest.to_path_buf();
+            }
             progress(renamed_weighted(total), total, PHASE_FLUSH, done);
             self.reopen_after_write()?;
             // 物理顺序已重排：排列层与按旧记录号寻址的撤销历史全部失效。
@@ -5846,7 +5954,10 @@ impl BigFile {
         w.flush().map_err(|e| e.to_string())?;
         drop(w);
         progress(flushed_weighted(total), total, PHASE_FLUSH, done);
-        self.replace_with_retry(&tmp)?;
+        self.replace_with_retry(&tmp, dest)?;
+        if switch_path {
+            self.path = dest.to_path_buf();
+        }
         progress(renamed_weighted(total), total, PHASE_FLUSH, done);
         self.reopen_after_write()?;
         self.revision = 0; // 内存状态与磁盘一致
@@ -5889,7 +6000,8 @@ impl BigFile {
         let new_headers = self.view_headers();
         let mapping: Vec<Option<u32>> = (0..ncols).map(|vc| self.view_to_phys(vc)).collect();
 
-        let tmp = tmp_path_for(&self.path);
+        let dest = self.path.clone();
+        let tmp = tmp_path_for(&dest);
         let out = fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
         let mut w = BufWriter::new(out);
         if self.has_bom {
@@ -5951,7 +6063,7 @@ impl BigFile {
         w.flush().map_err(|e| e.to_string())?;
         drop(w);
         progress(flushed_weighted(total), total, PHASE_FLUSH, done);
-        self.replace_with_retry(&tmp)?;
+        self.replace_with_retry(&tmp, &dest)?;
         progress(renamed_weighted(total), total, PHASE_FLUSH, done);
 
         // 全量重建：列结构变化，编辑层与撤销历史一并失效；保持首行语义
@@ -5987,7 +6099,7 @@ impl BigFile {
     /// 错误排查添变量），失败按 200ms 间隔重试 5 次（覆盖杀软/索引器等
     /// 瞬时占用）；仍失败则映回原文件保持会话可用（编辑层/撤销栈不动），
     /// 临时文件原样保留，错误信息给出路径供手动恢复。
-    fn replace_with_retry(&mut self, tmp: &Path) -> Result<(), String> {
+    fn replace_with_retry(&mut self, tmp: &Path, dest: &Path) -> Result<(), String> {
         // 占位匿名映射：mmap 字段不留空，1 字节开销
         let dummy = memmap2::MmapMut::map_anon(1)
             .and_then(|m| m.make_read_only())
@@ -5997,7 +6109,7 @@ impl BigFile {
         drop(std::mem::replace(&mut self.backing, Backing::Mmap(Arc::new(dummy))));
         let mut last: Option<std::io::Error> = None;
         for _ in 0..5 {
-            match fs::rename(tmp, &self.path) {
+            match fs::rename(tmp, dest) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     last = Some(e);
@@ -6008,14 +6120,14 @@ impl BigFile {
         // 换名失败：映回原文件恢复读路径（seg/覆盖层/撤销栈原样保留）
         if let Err(re) = self.remap() {
             return Err(format!(
-                "替换原文件失败：{}\n且原文件重新映射失败：{}",
+                "写入目标文件失败：{}\n且原文件重新映射失败：{}",
                 last.map(|e| e.to_string()).unwrap_or_default(),
                 re
             ));
         }
         Err(format!(
-            "替换原文件失败：{}\n新文件已完整写在临时文件里（数据未丢失）：{}\n\
-             可关闭占用原文件的程序后重试保存，或手动把该临时文件改名为原文件。",
+            "写入目标文件失败：{}\n新文件已完整写在临时文件里（数据未丢失）：{}\n\
+             可关闭占用目标文件的程序后重试保存，或手动把该临时文件改名为目标文件。",
             last.map(|e| e.to_string()).unwrap_or_default(),
             tmp.display()
         ))
