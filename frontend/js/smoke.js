@@ -530,7 +530,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
 
   check("工具栏按钮齐全且撤销/重做随栈置灰", async () => {
     const texts = [...document.querySelectorAll("#toolbar button")].map((b) => b.textContent);
-    for (const t of ["新建", "打开", "保存", "另存为", "撤销", "重做", "排序…", "清除筛选", "多重筛选", "首行非列名"]) {
+    for (const t of ["新建", "打开", "保存", "另存为", "撤销", "重做", "排序…", "清除筛选", "多重筛选", "首行非列名", "快捷键"]) {
       assert(texts.includes(t), `工具栏缺少 ${t}`);
     }
     await loadBasic(); // load 清空撤销栈
@@ -540,6 +540,35 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(undoB.disabled && redoB.disabled, "load 后撤销/重做应置灰");
     model.setData(0, 0, "x");
     assert(!undoB.disabled, "改动后撤销应可用");
+  });
+
+  check("布局：工具栏不撑宽页面，快捷键按钮与编辑窗格都在窗口内", () => {
+    const vw = window.innerWidth;
+    assert(document.documentElement.scrollWidth <= vw + 1,
+      `页面不得横向溢出：scrollWidth=${document.documentElement.scrollWidth} innerWidth=${vw}`);
+    const btn = tbBtn("快捷键");
+    const br = btn.getBoundingClientRect();
+    assert(br.width > 0 && br.left >= 0 && br.right <= vw + 1,
+      `快捷键按钮应在窗口内：left=${Math.round(br.left)} right=${Math.round(br.right)} innerWidth=${vw}`);
+    const pane = document.getElementById("pane").getBoundingClientRect();
+    assert(pane.width > 100 && pane.right <= vw + 1,
+      `编辑窗格应完整可见：width=${Math.round(pane.width)} right=${Math.round(pane.right)} innerWidth=${vw}`);
+  });
+
+  check("快捷键按钮：位于工具栏最右，打开快捷键一览", async () => {
+    const btn = tbBtn("快捷键");
+    assert(btn, "工具栏应有快捷键按钮");
+    assert(document.getElementById("toolbar").lastElementChild === btn,
+      "快捷键按钮应位于工具栏最右（编辑窗格上方）");
+    btn.click();
+    await waitFor(() => document.querySelector(".modal-mask"), "快捷键对话框");
+    const text = document.querySelector(".modal-mask").textContent;
+    for (const k of ["F2 / 双击", "Enter / Tab", "Alt+Enter", "Ctrl+C / Ctrl+X / Ctrl+V",
+      "Ctrl+Z / Ctrl+Y", "Ctrl+G", "Ctrl+S", "Ctrl+滚轮"]) {
+      assert(text.includes(k), `快捷键说明缺少「${k}」`);
+    }
+    assert(clickModalButton("关闭"), "快捷键对话框应有「关闭」按钮");
+    await waitFor(() => !document.querySelector(".modal-mask"), "关闭快捷键对话框");
   });
 
   check("显示符号按钮位于编辑窗格标题右侧（工具栏不再有）", async () => {
@@ -2170,6 +2199,45 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(snap.find((x) => x.path === p1)?.headerless === true
       && snap.find((x) => x.path === p2)?.headerless === false,
     "页签快照中的开关状态应各自独立");
+  });
+
+  check("新建表格：只定列数×行数，默认 60 行并处于首行非列名", async () => {
+    await window.__app.smokeLoadSmall([], []);
+
+    // 第一次：显式 3 列 × 2 行
+    tbBtn("新建").click();
+    await waitFor(() => document.querySelector(".modal-mask"), "新建对话框");
+    const mask = document.querySelector(".modal-mask");
+    const colsIn = mask.querySelector("#newtable-cols");
+    const rowsIn = mask.querySelector("#newtable-rows");
+    assert(colsIn && rowsIn, "新建对话框应提供列数与行数输入");
+    assert(mask.textContent.includes("首行非列名") && mask.textContent.includes("列名"),
+      "新建对话框应提示如何在首行设置列名");
+    assert(colsIn.value === "5", `默认列数应为 5（实际 ${colsIn.value}）`);
+    assert(rowsIn.value === "60", `默认行数应为 60（实际 ${rowsIn.value}）`);
+    colsIn.value = "3";
+    rowsIn.value = "2";
+    assert(clickModalButton("确定"), "新建对话框应有确定按钮");
+    await waitFor(() => !window.__app.isBigMode() && window.__app.isHeaderless()
+      && model.columnCount() === 3 && model.rowCount() === 2, "新建 3×2 表格落定");
+    assert(JSON.stringify(model.headers()) === JSON.stringify(["列1", "列2", "列3"]),
+      `虚拟列名 ${model.headers()}`);
+    assert(model.rawData(0, 0) === "" && model.rawData(1, 2) === "", "新建单元格应为空");
+    assert(tbBtn("首行非列名").classList.contains("on"), "新建后开关应为开启态");
+
+    // 第二次：行数留空 → 默认 60
+    await window.__app.smokeLoadSmall([], []);
+    tbBtn("新建").click();
+    await waitFor(() => document.querySelector(".modal-mask"), "新建对话框（默认行数）");
+    const mask2 = document.querySelector(".modal-mask");
+    mask2.querySelector("#newtable-cols").value = "1";
+    mask2.querySelector("#newtable-rows").value = "";
+    assert(clickModalButton("确定"), "第二次新建确定");
+    await waitFor(() => window.__app.isHeaderless() && model.rowCount() === 60,
+      "行数留空应默认 60");
+    assert(model.columnCount() === 1, `默认列数应保持 1（实际 ${model.columnCount()}）`);
+
+    await window.__app.smokeLoadSmall([], []);
   });
 
   // ---- 执行（看门狗：整体超时强制收尾，防挂死） ----

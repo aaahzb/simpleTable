@@ -35,6 +35,7 @@
 
 ### 查看与编辑
 
+- **新建表格**：只需指定列数 × 行数（列数默认 5，行数默认 60、可留空），建好即处于「首行非列名」模式；在第一行填好列名后点掉该开关，首行就成为列名
 - **格内编辑**：直接打字替换、双击或 `F2` 改原文；`Alt+Enter` 格内换行；`Esc` 取消；编辑器自动加高，行高不变
 - **编辑窗格**：点选任意格，右侧同步全文可直接编辑；「显示符号」像 Notepad++ 一样显示空格 / Tab / 换行；`Ctrl+滚轮` 独立缩放
 - **行列操作**：行号 / 列头选中，右键插入、删除、清除、重命名列；删除二次确认，全部可撤销
@@ -138,6 +139,8 @@
 
 ## 常用快捷键
 
+工具栏右上角的「快捷键」按钮可随时打开本表。
+
 | 快捷键 | 作用 |
 |---|---|
 | 直接打字 | 替换当前格并进入编辑 |
@@ -227,7 +230,7 @@ cd src-tauri && cargo test
 cargo build
 ./target/debug/simpletable.exe
 
-# 真机冒烟自检：真实 WebView2，113 项断言
+# 真机冒烟自检：真实 WebView2，116 项断言
 ./target/debug/simpletable.exe --smoke   # 报告写 %TEMP%\simpletable_smoke_report.txt
 ```
 
@@ -238,7 +241,7 @@ cargo build
 ```
 frontend/            纯 HTML/CSS/JS：自绘虚拟滚动网格 + 编辑窗格 + 对话框
   js/bigmodel.js     文件引擎模型（窗口缓存 / 渐进索引轮询 / 内存排序 / 乐观编辑）
-  js/smoke.js        --smoke 对抗自检套件（113 项）
+  js/smoke.js        --smoke 对抗自检套件（116 项）
 src-tauri/           Tauri 2 外壳 + Rust 数据引擎（mmap / 行索引 / 覆盖层 / 流式保存）
 tests_js/            node:test 逻辑层单测
 scripts/             截图 / 采样巡检脚本（开发用）

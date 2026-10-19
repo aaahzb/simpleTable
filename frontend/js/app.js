@@ -14,15 +14,12 @@ import { showMenu } from "./menu.js";
 import {
   busyDialog, columnDialog, confirmDialog, confirmDiscardDialog,
   confirmExitSortDialog, confirmRamSortDialog, errorDialog, fmtBytes,
-  infoDialog, intDialog, newTableDialog, progressDialog, sortDialog,
+  infoDialog, intDialog, newTableDialog, progressDialog, shortcutsDialog, sortDialog,
 } from "./dialogs.js";
 
 /** @type {any} Tauri v2 全局对象（withGlobalTauri） */
 const tauri = window.__TAURI__;
 const invoke = (cmd, args) => tauri.core.invoke(cmd, args);
-
-/** 新建表格的初始空行数（对齐 Qt NEW_TABLE_ROWS） */
-const NEW_TABLE_ROWS = 20;
 
 // ============ 全局状态 ============
 
@@ -1134,6 +1131,17 @@ multiInput.addEventListener("input", () => fgrid().setMultiText(multiInput.value
 multiWrap.appendChild(multiInput);
 tb.multiFilter.after(multiWrap);
 
+// 快捷键说明：靠右对齐，位于编辑窗格「显示符号」按钮的正上方。
+// 窗口较窄/高 DPI 时工具栏换行，按钮仍保持在所在行的最右。
+const btnShortcuts = document.createElement("button");
+btnShortcuts.id = "btn-shortcuts";
+btnShortcuts.textContent = "快捷键";
+btnShortcuts.title = "查看键盘快捷键";
+btnShortcuts.addEventListener("click", () => { void shortcutsDialog(); });
+btnShortcuts.addEventListener("mousedown", (e) => e.preventDefault());
+toolbar.appendChild(btnShortcuts);
+tb.shortcuts = btnShortcuts;
+
 // 显示符号开关：位于「编辑窗格」标题右侧（功能不变）
 const btnSymbols = document.createElement("button");
 btnSymbols.textContent = "显示符号";
@@ -1254,16 +1262,22 @@ bindModelEvents(model);
 
 // ============ 文件操作（F2/F3/F4） ============
 
-/** 新建表格：弹出列定义对话框（F1）；作为新页签打开（旧档保留） */
+/**
+ * 新建表格：只选列数 × 行数；建好后处于「首行非列名」模式。
+ *
+ * 用户可在第一行填写列名，再关闭「首行非列名」把首行提升为列名。
+ * 作为新页签打开（旧档保留）。
+ *
+ * @returns {Promise<void>}
+ */
 async function newFile() {
-  const names = await newTableDialog();
-  if (names === null) return;
-  if (!names.length) {
-    await infoDialog("新建表格", "至少需要一列。");
-    return;
-  }
+  const spec = await newTableDialog();
+  if (spec === null) return;
+  // 无列名模式下首行也是数据：行数即用户看到的数据行数。
+  const headers = Array.from({ length: spec.cols }, (_, i) => `列${i + 1}`);
+  const rows = Array.from({ length: spec.rows }, () => Array(spec.cols).fill(""));
   const m = new TableModel();
-  m.load(names, Array.from({ length: NEW_TABLE_ROWS }, () => names.map(() => "")));
+  m.load(headers, rows, { headerless: true });
   const pristine = tabs.length === 0 && activeId === null && path === null && !dirty
     && model.rowCount() === 0 && model.columnCount() === 0;
   if (pristine) {
@@ -1279,6 +1293,7 @@ async function newFile() {
   ensureTabbed();
   const t = {
     id: tabSeq++, title: "未命名", path: null, kind: "small", model: m, dirty: false,
+    headerless: true,
   };
   tabs.push(t);
   await activateTab(t.id);

@@ -363,55 +363,137 @@ export async function intDialog(title, label, def, min, max) {
   return typeof v === "function" ? v() : null;
 }
 
+/** 新建表格默认列数 */
+export const DEFAULT_NEW_COLS = 5;
+/** 新建表格默认行数（行数留空时使用） */
+export const DEFAULT_NEW_ROWS = 60;
+/** 新建表格列数上限（防止误输入导致建表卡死） */
+export const MAX_NEW_COLS = 200;
+/** 新建表格行数上限 */
+export const MAX_NEW_ROWS = 10000;
+
 /**
- * 新建表格对话框（列名列表增删，对齐 NewTableDialog）。
+ * 把输入框文本解析为受约束的正整数。
  *
- * @returns {Promise<string[] | null>} 列名列表（去空、去首尾空格）；取消 null。
+ * @param {unknown} raw - 输入框原值。
+ * @param {number} fallback - 留空/非数字时的默认值。
+ * @param {number} max - 上限。
+ * @returns {number} 1..max 之间的整数。
+ */
+function sizeValue(raw, fallback, max) {
+  const text = String(raw ?? "").trim();
+  if (text === "") return fallback;
+  const n = Math.round(Number(text));
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(n, 1), max);
+}
+
+/**
+ * 解析新建表格的列数/行数：留空用默认值，小数取整，越界夹取。
+ *
+ * @param {unknown} colsRaw - 列数输入。
+ * @param {unknown} rowsRaw - 行数输入。
+ * @returns {{cols: number, rows: number}} 合法尺寸。
+ */
+export function normalizeNewTableSize(colsRaw, rowsRaw) {
+  return {
+    cols: sizeValue(colsRaw, DEFAULT_NEW_COLS, MAX_NEW_COLS),
+    rows: sizeValue(rowsRaw, DEFAULT_NEW_ROWS, MAX_NEW_ROWS),
+  };
+}
+
+/**
+ * 新建表格对话框：只确定列数 × 行数，不再要求预先填写列名。
+ *
+ * 新建后表格处于「首行非列名」模式；用户可在第一行填写列名，
+ * 再关闭该开关，把首行提升为列名。
+ *
+ * @returns {Promise<{cols: number, rows: number} | null>} 尺寸；取消 null。
  */
 export async function newTableDialog() {
   const body = document.createElement("div");
   const hint = document.createElement("div");
-  hint.textContent = "定义初始列（之后也可在表格中增删改）：";
-  const list = document.createElement("ul");
-  list.id = "newtable-cols";
-  const btnRow = document.createElement("div");
-  const addBtn = document.createElement("button");
-  addBtn.textContent = "添加列";
-  const removeBtn = document.createElement("button");
-  removeBtn.textContent = "删除选中列";
-  removeBtn.style.marginLeft = "6px";
-  btnRow.append(addBtn, removeBtn);
+  hint.textContent = "确定初始表格大小（列名可在建好后于首行设置）：";
 
-  const addItem = (name = "") => {
-    const li = document.createElement("li");
-    const input = document.createElement("input");
-    input.type = "text";
-    input.value = name;
-    li.appendChild(input);
-    list.appendChild(li);
-    input.focus();
-  };
-  addBtn.addEventListener("click", () => addItem());
-  removeBtn.addEventListener("click", () => {
-    // 删除当前聚焦的列名输入行（对齐 Qt 删除选中列：单列表格聚焦即选中）
-    const active = document.activeElement;
-    if (active && active.tagName === "INPUT" && active.parentElement.parentElement === list) {
-      active.parentElement.remove();
-      list.querySelector("input")?.focus();
-    }
-  });
-  body.append(hint, list, btnRow);
-  addItem(); // 默认先给一个空行便于直接填写（对齐 Qt）
+  const sizeRow = document.createElement("div");
+  sizeRow.className = "newtable-size";
+  const colsInput = document.createElement("input");
+  colsInput.type = "number";
+  colsInput.id = "newtable-cols";
+  colsInput.min = "1";
+  colsInput.max = String(MAX_NEW_COLS);
+  colsInput.value = String(DEFAULT_NEW_COLS);
+  colsInput.setAttribute("aria-label", "列数");
+  const rowsInput = document.createElement("input");
+  rowsInput.type = "number";
+  rowsInput.id = "newtable-rows";
+  rowsInput.min = "1";
+  rowsInput.max = String(MAX_NEW_ROWS);
+  rowsInput.value = String(DEFAULT_NEW_ROWS);
+  rowsInput.setAttribute("aria-label", "行数");
+  rowsInput.placeholder = String(DEFAULT_NEW_ROWS);
+  const times = document.createElement("span");
+  times.textContent = "列 ×";
+  const rowsUnit = document.createElement("span");
+  rowsUnit.textContent = "行";
+  sizeRow.append(colsInput, times, rowsInput, rowsUnit);
 
+  const tip = document.createElement("div");
+  tip.className = "dialog-tip";
+  tip.textContent = "提示：新建后处于「首行非列名」模式，第一行也是数据。"
+    + "要设置列名：先在第一行填入列名，再点掉工具栏上的「首行非列名」，首行就会变成列名。";
+
+  body.append(hint, sizeRow, tip);
   const v = await modal("新建表格", body, [
     { text: "取消", value: null },
-    { text: "确定", value: () =>
-        [...list.querySelectorAll("input")]
-          .map((i) => i.value.trim())
-          .filter((n) => n), primary: true },
+    { text: "确定", value: () => normalizeNewTableSize(colsInput.value, rowsInput.value), primary: true },
   ]);
-  if (v === null || v === undefined) return null;
-  return v();
+  return v === null || v === undefined ? null : v();
+}
+
+/**
+ * 键盘快捷键说明对话框（内容与 README「常用快捷键」保持一致）。
+ *
+ * @returns {Promise<void>} 关闭后完成。
+ */
+export async function shortcutsDialog() {
+  /** @type {Array<[string, string]>} */
+  const items = [
+    ["直接打字", "替换当前格并进入编辑"],
+    ["F2 / 双击", "编辑当前格原文"],
+    ["Enter / Tab", "提交并下移 / 右移"],
+    ["Alt+Enter", "编辑时格内换行"],
+    ["Esc", "取消编辑"],
+    ["Delete", "清除选中格"],
+    ["Ctrl+C / Ctrl+X / Ctrl+V", "复制 / 剪切 / 粘贴（TSV，与 Excel 互通）"],
+    ["Ctrl+Z / Ctrl+Y", "撤销 / 重做"],
+    ["Ctrl+G", "跳转行"],
+    ["Ctrl+S", "保存"],
+    ["Ctrl+滚轮", "表格区或编辑窗格缩放"],
+  ];
+  const table = document.createElement("table");
+  table.className = "shortcut-table";
+  const thead = document.createElement("thead");
+  const hr = document.createElement("tr");
+  for (const h of ["快捷键", "作用"]) {
+    const th = document.createElement("th");
+    th.textContent = h;
+    hr.appendChild(th);
+  }
+  thead.appendChild(hr);
+  const tbody = document.createElement("tbody");
+  for (const [k, desc] of items) {
+    const tr = document.createElement("tr");
+    const kd = document.createElement("td");
+    kd.className = "kbd";
+    kd.textContent = k;
+    const dd = document.createElement("td");
+    dd.textContent = desc;
+    tr.append(kd, dd);
+    tbody.appendChild(tr);
+  }
+  table.append(thead, tbody);
+  await modal("键盘快捷键", table, [{ text: "关闭", value: null, primary: true }]);
 }
 
 /**
