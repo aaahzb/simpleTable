@@ -5,14 +5,15 @@
  * 行为逐项对齐 Qt 版 main_window.py；数据模型/网格/对话框见各自模块。
  */
 
-import { parseCsv, serializeCsv, serializeRecords } from "./csv.js";
+import { serializeCsv, serializeRecords } from "./csv.js";
 import { TableModel } from "./model.js";
-import { BigModel, BIG_THRESHOLD } from "./bigmodel.js";
+import { BigModel } from "./bigmodel.js";
 import { Grid } from "./grid.js";
 import { EditPane } from "./pane.js";
 import { showMenu } from "./menu.js";
 import {
-  busyDialog, columnDialog, confirmDialog, confirmDiscardDialog, errorDialog,
+  busyDialog, columnDialog, confirmDialog, confirmDiscardDialog,
+  confirmExitSortDialog, confirmRamSortDialog, errorDialog, fmtBytes,
   infoDialog, intDialog, newTableDialog, progressDialog, sortDialog,
 } from "./dialogs.js";
 
@@ -121,13 +122,18 @@ function updateStatusText() {
         ` · 已用 ${fmtDuration(meta.elapsed_ms)}（筛选/跳转稍后可用）`;
       return;
     }
+    // 排序视图：明确提示数据在内存、尚未落盘（保存时才按当前顺序重写）。
+    const sortSuffix = meta?.sorted
+      ? ` · 已排序（内存 ${fmtBytes(meta.total_bytes)}，未保存）`
+      : "";
     if (model.filterActive()) {
       statusText.textContent = `匹配 ${lastCounts[0]} / 共 ${meta?.rows ?? lastCounts[1]} 行` +
-        (lastFilterMs ? ` · 用时 ${(lastFilterMs / 1000).toFixed(1)} 秒` : "");
+        (lastFilterMs ? ` · 用时 ${(lastFilterMs / 1000).toFixed(1)} 秒` : "") +
+        sortSuffix;
       return;
     }
     statusText.textContent =
-      `显示 ${lastCounts[0]} / 共 ${lastCounts[1]} 行${bigTimingSuffix(model)}`;
+      `显示 ${lastCounts[0]} / 共 ${lastCounts[1]} 行${bigTimingSuffix(model)}${sortSuffix}`;
     return;
   }
   statusText.textContent = `显示 ${lastCounts[0]} / 共 ${lastCounts[1]} 行`;
@@ -168,9 +174,8 @@ function markDirty() {
 }
 
 // ============ 多文件页签 ============
-// 小档页签持有完整模型（数据/撤销/脏态随签保留）；大档页签受 Rust 引擎
-// 全局单例约束：激活期间引擎驻留，切到小档不腾退（编辑与撤销原样保留），
-// 切到另一个大档才关闭重开（驻留档有脏时先弹 保存/放弃/取消）。
+// 所有磁盘 CSV 页签各自持有一个 Rust 引擎会话（按会话号隔离）：切换页签
+// 不关闭、不重开文件，数据/撤销/脏态随签保留。新建表格仍用内存 TableModel。
 // 切换页签时视图重置（筛选/选区/滚动不随签保留，v1 边界）。
 
 /**
@@ -187,8 +192,6 @@ function markDirty() {
 let tabs = [];
 /** @type {number | null} 活动页签 id；null = 当前档尚未入签（启动/单档态） */
 let activeId = null;
-/** @type {number | null} 大引擎驻留页签；null = 无驻留（未入签时引擎归当前档） */
-let engineTabId = null;
 let tabSeq = 1;
 
 // ---- 分屏视图 ----
@@ -236,7 +239,7 @@ function syncActiveTab() {
   t.path = path;
   t.dirty = dirty;
   t.headerless = model.isHeaderless?.() === true;
-  if (!model.isBig || engineTabId === t.id) t.model = model;
+  t.model = model;
 }
 
 /** 当前档装入页签体系（保持内容/脏态不变；幂等） */
@@ -244,12 +247,11 @@ function ensureTabbed() {
   if (activeId !== null) return;
   const t = {
     id: tabSeq++, title: tabTitleOf(path), path, kind: model.isBig ? "big" : "small",
-    model: model.isBig ? model : model, dirty,
+    model, dirty,
     headerless: model.isHeaderless?.() === true,
   };
   tabs.push(t);
   activeId = t.id;
-  if (model.isBig) engineTabId = t.id;
 }
 
 /** 重建页签条 DOM 并刷新溢出态；激活页签自动滚入可视区 */
@@ -314,102 +316,45 @@ tabScrollEl.addEventListener("scroll", updateTabOverflow);
 new ResizeObserver(updateTabOverflow).observe(tabScrollEl);
 
 /**
- * 引擎腾退：目标大档要用引擎时，关闭当前驻留（脏的弹 保存/放弃/取消）。
+ * 打开一个独立的大文件引擎会话（每个页签一个，互不腾退）。
  *
- * @param {number | null} targetTabId - 目标页签 id（null = 当前未入签档）。
- * @returns {Promise<boolean>} true = 引擎可用；false = 用户取消。
- */
-async function evictEngineFor(targetTabId) {
-  if (engineTabId === targetTabId) return true; // 同档：复用驻留
-  if (engineTabId === null) {
-    // 引擎归当前未入签档（启动单档态）：用当前 live 状态询问
-    if (model.isBig) {
-      if (dirty && !(await confirmDiscard())) return false;
-      await invoke("big_close").catch(() => {});
-    }
-    return true;
-  }
-  const holder = tabs.find((t) => t.id === engineTabId);
-  if (holder?.dirty) {
-    const choice = await confirmDiscardDialog();
-    if (choice === "cancel") return false;
-    if (choice === "save") {
-      // 驻留档的 BigModel 实例在引擎存活期间始终有效：无需切签即可保存
-      const dlg = progressDialog(`保存 ${holder.title}…`);
-      const un = await holder.model.onProgress((d, tot, ph, rows) => dlg.set(d, tot, ph, rows));
-      try {
-        await holder.model.save();
-        holder.dirty = false;
-      } catch (err) {
-        un();
-        dlg.close();
-        await errorDialog("保存失败", `${err?.message ?? err}`);
-        return false;
-      }
-      un();
-      await dlg.finish();
-    }
-  }
-  await invoke("big_close").catch(() => {});
-  if (holder) holder.model = null;
-  engineTabId = null;
-  // 被动侧大档模型随引擎关闭而失效：收起分屏，避免死模型占侧
-  if (holder && splitOn && sideOfTab(holder.id) !== null
-      && sideOfTab(holder.id) !== focusedSide) {
-    closeSplit();
-  }
-  return true;
-}
-
-/**
- * 为大档打开引擎会话（含腾退仲裁与事件绑定）。
+ * 统一走大引擎后，普通 CSV 也会多个页签并存；引擎按会话号隔离，
+ * 切换页签不再关闭/重开文件，未保存修改与撤销栈随签保留。
  *
- * @param {number | null} tabId - 归属页签（null = 当前未入签档）。
+ * @param {number | null} tabId - 归属页签（仅用于调试；会话号由模型自持）。
  * @param {string} p - 文件路径。
  * @param {boolean} [headerless] - 首行是否作为数据打开。
- * @returns {Promise<BigModel | null>} 失败/取消返回 null（已弹窗）。
+ * @param {BigModel | null} [reuseModel] - 重载时复用原模型（同一会话号原位替换）。
+ * @returns {Promise<BigModel | null>} 失败返回 null（已弹窗）。
  */
-async function openBigEngineFor(tabId, p, headerless = false) {
-  if (!(await evictEngineFor(tabId))) return null;
-  const bm = new BigModel();
-  bindModelEvents(bm); // 先绑事件再 open：内部 reset/data 通知才能到达外壳
+async function openBigEngineFor(tabId, p, headerless = false, reuseModel = null) {
+  const bm = reuseModel ?? new BigModel();
+  if (!reuseModel) bindModelEvents(bm); // 先绑事件再 open：reset/data 通知才能到达外壳
   try {
     await bm.open(p, { headerless: !!headerless });
   } catch (err) {
     await errorDialog("打开失败", String(err?.message ?? err));
     return null;
   }
-  engineTabId = tabId;
   return bm;
 }
 
 /**
- * 装载文档（读文件→建模型；大档先仲裁引擎）。不碰当前 live 状态。
+ * 装载文档：所有磁盘 CSV 一律走大引擎（mmap + 渐进索引）。
+ *
+ * 只有「新建表格」（无磁盘文件）仍用内存 TableModel；排序需要把大引擎
+ * 载入内存，属于排序模式自己的事（见 openSortDialog）。
  *
  * @param {string} p - 文件路径。
- * @param {boolean} wantBig - 是否走大文件模式。
- * @param {number | null} tabId - 归属页签（大档仲裁/归属用）。
+ * @param {number | null} tabId - 归属页签（多会话定位用；仅调试展示）。
  * @param {boolean} [headerless] - 首行是否作为数据（默认 false = 首行是列名）。
- * @returns {Promise<{kind: "small" | "big", model: any, warnings?: string[]} | null>}
+ * @param {BigModel | null} [reuseModel] - 重载时复用原模型（复用会话号，旧会话由引擎替换）。
+ * @returns {Promise<{kind: "big", model: BigModel} | null>}
  */
-async function loadDoc(p, wantBig, tabId, headerless = false) {
-  if (wantBig) {
-    const bm = await openBigEngineFor(tabId, p, headerless);
-    if (!bm) return null;
-    return { kind: "big", model: bm };
-  }
-  let result;
-  try {
-    result = await invoke("read_csv_file", { path: p });
-  } catch (err) {
-    await errorDialog("打开失败", String(err));
-    return null;
-  }
-  const { headers, rows, warnings } = parseCsv(result.text, ",", { headerless });
-  const m = new TableModel();
-  bindModelEvents(m);
-  m.load(headers, rows, { headerless });
-  return { kind: "small", model: m, warnings };
+async function loadDoc(p, tabId, headerless = false, reuseModel = null) {
+  const bm = await openBigEngineFor(tabId, p, headerless, reuseModel);
+  if (!bm) return null;
+  return { kind: "big", model: bm };
 }
 
 /**
@@ -490,17 +435,13 @@ async function activateTab(id) {
     focusSide(side); // 目标签在另一侧：交换焦点即可，两侧绑定不动
     return true;
   }
-  if (t.kind === "big") {
-    if (!(engineTabId === t.id && t.model)) {
-      // 引擎已腾退（或从未打开）：按该页签当前模式重新打开
-      const bm = await openBigEngineFor(t.id, t.path, t.headerless);
-      if (!bm) return false;
-      t.model = bm;
-    }
-    model = t.model;
-  } else {
-    model = t.model;
+  if (t.kind === "big" && !t.model) {
+    // 页签模型缺失（异常/旧状态）：按该页签当前模式重新打开
+    const bm = await openBigEngineFor(t.id, t.path, t.headerless);
+    if (!bm) return false;
+    t.model = bm;
   }
+  model = t.model;
   t.headerless = model.isHeaderless?.() === true;
   activeId = id;
   path = t.path;
@@ -514,19 +455,20 @@ async function activateTab(id) {
 /**
  * 新开页签装载文档（批量拖入可不激活，避免连开闪烁）。
  *
+ * 磁盘 CSV 一律走大引擎（mmap + 渐进索引）；每个页签独立会话。
+ *
  * @param {string} p - 文件路径。
- * @param {boolean} wantBig - 是否走大文件模式。
  * @param {object} [opts] - 选项。
  * @param {boolean} [opts.activate] - 装载后激活（默认 true）。
  * @returns {Promise<DocTab | null>} 新页签或 null（失败已弹窗）。
  */
-async function loadIntoNewTab(p, wantBig, opts = {}) {
+async function loadIntoNewTab(p, opts = {}) {
   const t = {
     id: tabSeq++, title: tabTitleOf(p), path: p,
-    kind: wantBig ? "big" : "small", model: null, dirty: false, headerless: false,
+    kind: "big", model: null, dirty: false, headerless: false,
   };
   // 不记忆解读方式：每次打开都从「首行是列名」开始
-  const doc = await loadDoc(p, wantBig, t.id);
+  const doc = await loadDoc(p, t.id);
   if (!doc) return null;
   t.kind = doc.kind;
   t.model = doc.model;
@@ -562,7 +504,8 @@ async function openPathsAsTabs(paths) {
     // 装入后须 ensureTabbed 实体化，否则按路径找不到归属签。
     const first = paths.shift();
     if (first === undefined) return true;
-    if (!(await openPath(first))) return false;
+    // 脏档确认已在本函数开头完成，openPath 不再重复弹窗
+    if (!(await openPath(first, { noConfirm: true }))) return false;
     ensureTabbed();
     firstId = activeTab()?.id ?? null;
   } else {
@@ -574,16 +517,7 @@ async function openPathsAsTabs(paths) {
       firstId ??= exist.id;
       continue;
     }
-    let size;
-    try {
-      size = await invoke("file_size", { path: p });
-    } catch (err) {
-      await errorDialog("打开失败", String(err));
-      continue;
-    }
-    const forceBig = await invoke("smoke_force_big");
-    const t = await loadIntoNewTab(p, forceBig || size >= BIG_THRESHOLD,
-      { activate: false });
+    const t = await loadIntoNewTab(p, { activate: false });
     if (t) firstId ??= t.id;
   }
   if (firstId !== null && firstId !== activeId) await activateTab(firstId);
@@ -603,9 +537,9 @@ async function closeTab(id) {
   if (!(await confirmDiscard())) return false; // 脏 → 保存/放弃/取消
   const t = activeTab();
   const idx = tabs.indexOf(t);
-  if (engineTabId === t.id) {
-    await invoke("big_close").catch(() => {});
-    engineTabId = null;
+  if (t.kind === "big") {
+    // 只关闭本页签的引擎会话，其他页签不受影响
+    try { await t.model?.close?.(); } catch { /* 会话已关闭 */ }
   }
   tabs.splice(idx, 1);
   if (splitOn && splitTabId !== null && !tabs.some((x) => x.id === splitTabId)) {
@@ -638,6 +572,33 @@ function resetToEmpty() {
   model.load([], []);
   setDirty(false);
   renderTabbar();
+  updateStatusText();
+}
+
+/**
+ * 冒烟专用：关掉全部页签的大引擎会话，回到空表后装入内存小表。
+ *
+ * 统一大引擎后，磁盘 CSV 不再走内存 TableModel；只有「新建表格」仍用小模型。
+ * 本钩子让小模型相关的 UI/键位/排序冒烟用例不必真的走新建对话框，并能确保
+ * 前序页签会话全部释放，避免旧事件落到新视图。
+ *
+ * @param {string[]} headers - 列名。
+ * @param {string[][]} rows - 数据行。
+ * @returns {Promise<void>}
+ */
+async function smokeLoadSmall(headers, rows) {
+  closeSplit(); // 先收副网格，避免残留旧模型
+  for (const t of tabs) {
+    if (t.kind === "big" && t.model) {
+      try { await t.model.close(); } catch { /* 会话可能已关闭 */ }
+    }
+  }
+  tabs.length = 0;
+  resetToEmpty(); // 生成新 TableModel、清页签/分屏/计数
+  model.load(headers.map(String), rows.map((row) => row.map(String)));
+  fgrid().renderAll();
+  onCountsChanged(model.rowCount(), model.rowCount());
+  refreshBigUi();
   updateStatusText();
 }
 
@@ -765,7 +726,7 @@ function focusSide(side) {
 /**
  * 建立分屏：目标签上副侧（B 网格），焦点留在主侧。
  * 目标签为活动签时同样允许（VS Code 行为）：主侧先换显右邻签，原活动签入副侧。
- * 双大档（引擎单例约束）拒绝：提示并返回 false。
+ * 每个页签都有独立引擎会话，两侧可同时打开两个大文件。
  *
  * @param {number} id - 目标页签 id。
  * @returns {Promise<boolean>} true = 分屏已建立。
@@ -779,17 +740,10 @@ async function openSplit(id) {
     if (tabs.length < 2) return false;
     const idx = tabs.indexOf(t);
     const next = tabs[(idx + 1) % tabs.length];
-    if (t.kind === "big" && next.kind === "big") {
-      statusMsg("分屏不支持同时打开两个大文件", 3000);
-      return false;
-    }
-    if (!(await activateTab(next.id))) return false; // 主侧重绑邻签（引擎随档仲裁）
-  } else if (t.kind === "big" && model.isBig) {
-    statusMsg("分屏不支持同时打开两个大文件", 3000);
-    return false;
+    if (!(await activateTab(next.id))) return false; // 主侧重绑邻签
   }
   syncActiveTab();
-  if (t.kind === "big" && !(engineTabId === t.id && t.model)) {
+  if (t.kind === "big" && !t.model) {
     const bm = await openBigEngineFor(t.id, t.path, t.headerless);
     if (!bm) return false;
     t.model = bm;
@@ -861,15 +815,19 @@ function showTabMenu(t, x, y) {
 /** 按大模式状态刷新专属按钮显隐与可用态 */
 function refreshBigUi() {
   const big = !!model.isBig;
-  // 模式专属按钮显隐：大模式隐藏「排序…」（F5 快捷键仍有 isBig 守卫兜底）；
+  // 大模式现支持排序（需载入内存）；索引完成前不可点。
   // 列操作两按钮仅 pending 时出现（小模式即时应用，不依赖它们）。
   // 「执行筛选」按钮已移除：筛选框键入即筛，回车立即执行。
-  tb.sort.classList.toggle("hidden", big);
+  tb.sort.classList.remove("hidden");
+  tb.sort.disabled = big && model.indexing?.() === true;
   if (big) {
     const pending = model.colOpsPending();
+    const sorted = model.meta()?.sorted === true;
+    tb.exitSort?.classList.toggle("hidden", !sorted);
     tb.execColOps.classList.toggle("hidden", !pending);
     tb.cancelColOps.classList.toggle("hidden", !pending);
   } else {
+    tb.exitSort?.classList.add("hidden");
     tb.execColOps.classList.add("hidden");
     tb.cancelColOps.classList.add("hidden");
   }
@@ -881,9 +839,10 @@ function refreshHeaderlessUi() {
   if (!tb.headerless) return;
   const on = model.isHeaderless?.() === true;
   const pending = model.isBig && model.colOpsPending?.() === true;
+  const sorted = model.isBig && model.meta?.()?.sorted === true;
   tb.headerless.classList.toggle("on", on);
-  // 无列（无法生成列1..N）或列操作待执行（切换会错位）时禁用
-  tb.headerless.disabled = headerlessBusy || model.columnCount() === 0 || pending;
+  // 无列（无法生成列1..N）、列操作待执行或排序视图中（切换会错位）时禁用
+  tb.headerless.disabled = headerlessBusy || model.columnCount() === 0 || pending || sorted;
   tb.headerless.title = "开启后：第一行作为数据参与筛选/编辑，列名显示为 列1、列2…；"
     + "关闭时：当前第一行成为列名并从数据中移除。仅对当前页签生效，不写入磁盘。";
 }
@@ -1145,6 +1104,7 @@ for (const spec of [
 
 // 大模式工具按钮：执行/撤销列操作（pending 时出现）
 for (const [key, text, fn, title] of [
+  ["exitSort", "退出排序", () => void exitSortMode(), "恢复排序前的行顺序并释放排序内存；未保存的单元格修改保留"],
   ["execColOps", "执行列操作", () => applyColOps(), "物理重写整个文件（显示进度），完成后不可撤销"],
   ["cancelColOps", "撤销列操作预览", () => cancelColOps(), "放弃待执行的列操作，恢复原结构"],
 ]) {
@@ -1326,32 +1286,26 @@ async function openFile() {
 
 /**
  * 打开指定路径的 CSV（菜单/拖放/启动/重载共用）。
- * 按文件大小路由：≥ 阈值（或冒烟强制）走大文件模式（mmap 秒开），否则原路径。
+ *
+ * 所有磁盘 CSV 一律走大引擎（mmap + 渐进索引）：打开秒回、筛选在 Rust
+ * 分块扫描；需要排序时再由用户确认载入内存。
  * 入签规则：路径已有签 → 激活；未入签体系 → 装当前档；否则新开页签。
  *
  * @param {string} p - CSV 文件路径。编码自动识别（Rust 层）。
  * @param {object} [opts] - 选项。
  * @param {boolean} [opts.replace] - 重载当前签内容（外部改动重载），先确认丢弃。
- * @param {boolean} [opts.noConfirm] - replace 时跳过丢弃确认（调用方已问过）。
+ * @param {boolean} [opts.noConfirm] - 未入签换档/replace 时跳过丢弃确认
+ *   （调用方已问过，避免重复弹窗）。
  * @returns {Promise<boolean>} true = 成功打开/切换。
  */
 async function openPath(p, opts = {}) {
-  let size;
-  try {
-    size = await invoke("file_size", { path: p });
-  } catch (err) {
-    await errorDialog("打开失败", String(err));
-    return false;
-  }
-  const forceBig = await invoke("smoke_force_big");
-  const wantBig = forceBig || size >= BIG_THRESHOLD;
-
   if (opts.replace) {
-    // 重载当前签：引擎归属不变（big_open 原位替换内容），丢弃前确认。
+    // 重载当前签：复用同一会话号原位替换内容，丢弃前确认。
     // 沿用当前档的「首行非列名」解读，避免外部改动重载后视图含义突变。
     if (!opts.noConfirm && !(await confirmDiscard())) return false;
     const headerless = model.isHeaderless?.() === true;
-    const doc = await loadDoc(p, wantBig, activeId, headerless);
+    const reuse = model.isBig ? model : null;
+    const doc = await loadDoc(p, activeId, headerless, reuse);
     if (!doc) return false;
     applyDocToCurrent(doc, p);
     return true;
@@ -1359,14 +1313,17 @@ async function openPath(p, opts = {}) {
   const exist = tabs.find((t) => t.path === p);
   if (exist) return activateTab(exist.id);
   if (tabs.length === 0) {
-    // 启动/初始空表：装当前档（暂不生成页签）；不记忆上次解读
-    const doc = await loadDoc(p, wantBig, activeId);
+    // 启动/初始空表：装当前档（暂不生成页签）；不记忆上次解读。
+    // 未入签的档也可能已被编辑（首个文件尚未形成页签）：换文件前必须确认，
+    // 否则未保存修改会静默丢失。
+    if (dirty && !opts.noConfirm && !(await confirmDiscard())) return false;
+    const doc = await loadDoc(p, activeId);
     if (!doc) return false;
     applyDocToCurrent(doc, p);
     return true;
   }
   ensureTabbed();
-  return (await loadIntoNewTab(p, wantBig)) !== null;
+  return (await loadIntoNewTab(p)) !== null;
 }
 
 /**
@@ -1384,6 +1341,7 @@ async function saveFile() {
     return saveFileAs();
   }
   if (model.isBig) {
+    const hadFilter = model.filterActive();
     const dlg = progressDialog("保存大文件…");
     const un = await model.onProgress((done, total, phase, rows) => dlg.set(done, total, phase, rows));
     try {
@@ -1399,6 +1357,12 @@ async function saveFile() {
     // 中间的旧帧——保证"100% 完成"被看到，而不是"卡住后消失"。
     await dlg.finish();
     setDirty(false);
+    // 引擎重开文件后不再保留筛选结果：同步清掉筛选框，避免"框里有条件、
+    // 视图却是全量"的错位（只在保存前确有筛选时动它，不误清多重筛选输入）。
+    if (hadFilter) fgrid().clearFilters();
+    // 排序保存会按当前顺序物理重写并退出排序视图：按钮/状态随之刷新。
+    refreshBigUi();
+    onCountsChanged(model.rowCount(), model.meta()?.rows ?? model.rowCount());
     statusMsg("已保存（大文件模式：流式重写完成）", 3000);
     return true;
   }
@@ -1495,20 +1459,132 @@ tauri.event.listen("close-request", async () => {
 
 // ============ 排序（F5） ============
 
-/** 打开排序对话框并执行物理排序；排序前清空选中避免行号失效 */
-async function openSortDialog() {
-  if (model.isBig) {
-    statusMsg("大文件模式暂不支持排序", 3000);
-    return;
+/**
+ * 大模式排序：估算 → 确认 → 可取消载入 → 引擎排列 → 刷新视图。
+ *
+ * 排序只改变视图（不写盘）；保存时才按当前顺序物理重写。
+ *
+ * @param {Array<{col: number, numeric: boolean, asc: boolean}>} levels - 排序级别。
+ * @param {{confirm?: boolean}} [opts] - confirm=false 跳过内存确认（冒烟/内部复用）。
+ * @returns {Promise<boolean>} true = 已进入排序视图。
+ */
+async function applyBigSort(levels, opts = {}) {
+  if (!model.isBig || !levels?.length) return false;
+  if (model.indexing?.()) {
+    statusMsg("文件仍在索引中，请稍候再排序", 2500);
+    return false;
   }
-  const names = model.headers();
-  if (!names.length) return;
-  const levels = await sortDialog(names);
-  if (!levels || !levels.length) return;
+  // 未提交的格内编辑/窗格写回先落定：排序会改变显示行坐标。
+  await fgrid().commitEdit();
+  await paneWrite;
+  if (model.meta()?.ram_backed !== true) {
+    if (opts.confirm !== false) {
+      const est = await model.sortEstimate(levels.length);
+      if (!(await confirmRamSortDialog(est))) return false;
+    }
+    const dlg = progressDialog("为排序载入内存…", {
+      phases: ["正在载入内存…"],
+      cancelText: "取消载入",
+      onCancel: () => { void model.cancelSortLoad(); },
+    });
+    const un = await model.onSortProgress((done, total) => dlg.set(done, total, 0));
+    let loaded = false;
+    try {
+      loaded = await model.loadIntoRam();
+    } catch (err) {
+      un();
+      dlg.close();
+      await errorDialog("载入失败", String(err?.message ?? err));
+      return false;
+    }
+    un();
+    if (!loaded) {
+      dlg.close();
+      statusMsg("已取消载入，文件未改变", 3000);
+      return false;
+    }
+    dlg.close();
+  }
+  const busy = busyDialog("正在排序…");
+  try {
+    await model.sort(levels);
+  } catch (err) {
+    busy.close();
+    await errorDialog("排序失败", String(err?.message ?? err));
+    return false;
+  }
+  busy.close();
   fgrid().clearSelection();
   clearDock();
-  model.sortRows(levels);
-  markDirty();
+  fgrid().resetScroll();
+  // 筛选命中集已随排序重映射：可见数取当前视图，总数始终是全表行数。
+  onCountsChanged(model.rowCount(), model.meta()?.rows ?? model.rowCount());
+  refreshBigUi();
+  statusMsg(`已按 ${levels.length} 个级别排序（尚未写入磁盘；保存时按当前顺序重写）`, 5000);
+  return true;
+}
+
+/**
+ * 打开排序对话框并执行排序；排序前清空选中避免行号失效。
+ *
+ * 小模式（仅“新建表格”路径）立即物理排序；磁盘文件走
+ * {@link applyBigSort}（内存估算 + 可取消载入 + 排列层）。
+ *
+ * @returns {Promise<void>}
+ */
+async function openSortDialog() {
+  const names = model.headers();
+  if (!names.length) return;
+  if (!model.isBig) {
+    const levels = await sortDialog(names);
+    if (!levels || !levels.length) return;
+    fgrid().clearSelection();
+    clearDock();
+    model.sortRows(levels);
+    markDirty();
+    return;
+  }
+  if (model.indexing?.()) {
+    statusMsg("文件仍在索引中，请稍候再排序", 2500);
+    return;
+  }
+  await fgrid().commitEdit();
+  await paneWrite;
+  const levels = await sortDialog(names);
+  if (!levels || !levels.length) return;
+  await applyBigSort(levels.map(([col, mode, asc]) => ({
+    col, numeric: mode === "numeric", asc,
+  })));
+}
+
+/**
+ * 退出排序视图：提示保存/放弃，随后释放排序内存并恢复原行顺序。
+ *
+ * @returns {Promise<boolean>} true = 已退出（或保存成功）。
+ */
+async function exitSortMode() {
+  if (!model.isBig || model.meta?.()?.sorted !== true) return false;
+  await fgrid().commitEdit();
+  await paneWrite;
+  const choice = await confirmExitSortDialog();
+  if (choice === "cancel") return false;
+  if (choice === "save") return saveFile();
+  try {
+    const meta = await model.exitSort();
+    fgrid().clearSelection();
+    clearDock();
+    fgrid().resetScroll();
+    // 退出排序后筛选命中集已映射回原始行号，仍可能处于筛选视图。
+    onCountsChanged(model.rowCount(), meta.rows);
+    // 排序本身不算修改：引擎仍有内容修改时才保留脏点。
+    setDirty(meta.modified === true);
+    refreshBigUi();
+    statusMsg(`已退出排序并释放排序内存（文件 ${fmtBytes(meta.total_bytes)} 回到磁盘映射视图）`, 4000);
+    return true;
+  } catch (err) {
+    await errorDialog("退出排序失败", String(err?.message ?? err));
+    return false;
+  }
 }
 
 // ============ 右键菜单（F6） ============
@@ -1845,11 +1921,14 @@ window.__app = {
   get grid() { return fgrid(); },
   pane, invoke, statusMsg,
   newFile, openPath, saveFile, undo, redo,
+  openSortDialog, exitSortMode, applyBigSort,
   applyColOps, cancelColOps, runBigFilter, gotoRow, gotoRowDialog,
   isDirty: () => dirty, getPath: () => path,
   isBigMode: () => model.isBig === true,
   isHeaderless: () => model.isHeaderless?.() === true,
   toggleHeaderless,
+  // 冒烟专用：复位页签会话后装载内存小表（新建表格路径）
+  smokeLoadSmall,
   // 多档页签：快照 / 切换 / 关闭 / 批量拖入
   tabs: () => tabs.map((t) => ({
     id: t.id, title: t.title, path: t.path, kind: t.kind,

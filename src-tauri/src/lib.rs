@@ -4,9 +4,10 @@
 //! 前端经 `window.__TAURI__.core.invoke` 调用本模块命令；文件内容一律
 //! 以字符串形式跨边界传输，编码处理全部收敛在本层（对齐 csv_io.py）。
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// 冒烟自检强制大模式（运行期开关，供 smoke 大文件段在小夹具上路由大模式）。
@@ -16,7 +17,7 @@ use serde::Serialize;
 use tauri::{Emitter, Manager};
 
 mod engine;
-use engine::{BigFile, BigMeta, ColOp, FilterSpec};
+use engine::{BigFile, BigMeta, ColOp, FilterSpec, SortEstimate, SortLevel};
 
 /// 读文件结果：解码后的纯文本 + 实际使用的编码名（供状态栏展示）。
 #[derive(Serialize)]
@@ -262,32 +263,62 @@ struct StartupArgs {
     open_path: Option<String>,
 }
 
-/// 大文件会话状态：一次只开一个（打开新文件先关旧）。
-/// Arc 托管以便长命令把会话搬进 spawn_blocking（离开 tauri::State 借用）。
-type BigShared = std::sync::Arc<Mutex<Option<BigFile>>>;
+/// 单个大文件会话：文件本体 + 独立筛选代数。
+///
+/// 多页签各自持有会话号；筛选代数按会话隔离，打开/筛选另一个文件
+/// 不会打断本会话正在跑的扫描。
+#[derive(Clone)]
+struct BigEntry {
+    file: Arc<Mutex<BigFile>>,
+    /// 本会话的筛选代数：新筛选/关闭/清空自增，旧扫描检测到变化即退出。
+    gate: Arc<AtomicU64>,
+    /// 排序模式载入取消标志：载入命令持文件锁逐块检查，取消命令只碰此原子量，
+    /// 不等待文件锁，因此载入期间仍能随时取消。
+    load_cancel: Arc<AtomicBool>,
+}
 
-/// 筛选代数：每次新筛选/关闭/清空自增，正在运行的旧扫描检测到代数变化即放弃。
-/// 只有设置筛选的路径需要它；编辑等命令仍走同一把会话锁。
-#[derive(Clone, Default)]
-struct FilterGen(std::sync::Arc<AtomicU64>);
+/// 大文件会话表：会话号 → 会话。Arc 托管以便长命令把会话搬进
+/// spawn_blocking（离开 tauri::State 借用）。锁只保护表结构，
+/// 具体文件操作锁各自的 `BigEntry::file`。
+type BigShared = Arc<Mutex<HashMap<u64, BigEntry>>>;
 
-impl FilterGen {
+impl BigEntry {
+    /// 新建会话条目。
+    fn new(bf: BigFile) -> Self {
+        Self {
+            file: Arc::new(Mutex::new(bf)),
+            gate: Arc::new(AtomicU64::new(0)),
+            load_cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// 让当前及更早的扫描失效，返回新代数。
-    fn bump(&self) -> u64 {
-        self.0.fetch_add(1, Ordering::Relaxed) + 1
+    fn bump_gate(&self) -> u64 {
+        self.gate.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
 
-/// 取大文件会话锁，未打开时返回统一错误串。
+/// 按会话号取条目；不存在时返回统一错误串。
+fn big_entry(state: &BigShared, session: u64) -> Result<BigEntry, String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get(&session)
+        .cloned()
+        .ok_or_else(|| format!("大文件会话未打开（session={session}）"))
+}
+
+/// 取指定会话的文件锁并执行；后台索引恰好完成时先并入正式结构。
 fn with_big<T>(
     state: &BigShared,
+    session: u64,
     f: impl FnOnce(&mut BigFile) -> Result<T, String>,
 ) -> Result<T, String> {
-    let mut guard = state.lock().map_err(|e| e.to_string())?;
-    let bf = guard.as_mut().ok_or("大文件会话未打开")?;
-    // 后台索引恰好完成时先并入正式结构：所有命令看到的都是同一份索引
-    bf.refresh_indexed();
-    f(bf)
+    let entry = big_entry(state, session)?;
+    let mut guard = entry.file.lock().map_err(|e| e.to_string())?;
+    // 所有命令看到的都是同一份已完成索引
+    guard.refresh_indexed();
+    f(&mut guard)
 }
 
 /// 查询文件大小（字节），打开路径路由用：≥ 阈值走大文件模式。
@@ -305,11 +336,10 @@ fn file_size(path: String) -> Result<u64, String> {
 #[tauri::command]
 async fn big_open(
     path: String,
+    session: u64,
     headerless: Option<bool>,
     state: tauri::State<'_, BigShared>,
-    gate: tauri::State<'_, FilterGen>,
 ) -> Result<BigMeta, String> {
-    gate.bump(); // 旧文件的筛选扫描没有继续的意义
     let shared = state.inner().clone();
     let headerless = headerless.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
@@ -319,7 +349,11 @@ async fn big_open(
         )?;
         let meta = bf.meta();
         let mut guard = shared.lock().map_err(|e| e.to_string())?;
-        *guard = Some(bf);
+        // 同一会话号重复打开（重载）：先让旧会话的扫描退出再替换
+        if let Some(old) = guard.remove(&session) {
+            old.bump_gate();
+        }
+        guard.insert(session, BigEntry::new(bf));
         Ok(meta)
     })
     .await
@@ -328,67 +362,187 @@ async fn big_open(
 
 /// 关闭大文件会话。
 #[tauri::command]
-fn big_close(state: tauri::State<BigShared>, gate: tauri::State<FilterGen>) {
-    gate.bump();
+fn big_close(state: tauri::State<BigShared>, session: u64) {
     if let Ok(mut guard) = state.lock() {
-        *guard = None;
+        if let Some(entry) = guard.remove(&session) {
+            // 正在跑的筛选扫描持有文件锁：先让它在下一个检查点退出；
+            // 正在载入排序内存时也通知其停止，避免关签后继续拷完整个文件。
+            entry.bump_gate();
+            entry.load_cancel.store(true, Ordering::Relaxed);
+        }
     }
+}
+
+/// 排序模式内存估算：文件缓冲 + 排列 + 键 + 安全余量，并附系统可用内存。
+///
+/// # Parameters
+/// - `session`: 大文件会话号。
+/// - `levels`: 排序级别数（缺省 1）。
+#[tauri::command]
+fn big_sort_estimate(
+    state: tauri::State<BigShared>,
+    session: u64,
+    levels: Option<u32>,
+) -> Result<SortEstimate, String> {
+    with_big(&state, session, |bf| {
+        Ok(bf.sort_estimate(levels.unwrap_or(1)))
+    })
+}
+
+/// 排序模式：把文件分块载入私有内存缓冲（非阻塞，进度经
+/// "big-sort-progress" 事件推送，可用 big_sort_cancel 随时取消）。
+///
+/// 载入期间持文件锁；取消命令只置原子标志、不取锁，因此随时可停。
+/// 取消不改文件、不标脏，前端继续用原 mmap 视图。
+#[tauri::command]
+async fn big_sort_load(
+    window: tauri::Window,
+    state: tauri::State<'_, BigShared>,
+    session: u64,
+) -> Result<bool, String> {
+    let entry = big_entry(state.inner(), session)?;
+    // 重置取消标志，并让本会话可能仍在跑的筛选扫描尽快退出（它持文件锁）。
+    entry.load_cancel.store(false, Ordering::Relaxed);
+    entry.bump_gate();
+    let cancel = entry.load_cancel.clone();
+    let emit_session = session;
+    tauri::async_runtime::spawn_blocking(move || {
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, u64)>();
+        let emitter = std::thread::spawn(move || {
+            while let Ok((done, total)) = rx.recv() {
+                let _ = window.emit("big-sort-progress", (done, total, emit_session));
+            }
+        });
+        let result = (|| {
+            let mut bf = entry.file.lock().map_err(|e| e.to_string())?;
+            bf.refresh_indexed();
+            // move：把 tx 移进闭包，载入结束即释放发送端，emit 线程 recv 出错退出。
+            bf.load_into_ram(&cancel, &mut move |done, total| {
+                let _ = tx.send((done, total));
+            })
+        })();
+        emitter.join().map_err(|e| format!("进度转发线程异常：{e:?}"))?;
+        result
+    })
+    .await
+    .map_err(|e| format!("载入任务被取消：{e}"))?
+}
+
+/// 取消正在进行的排序模式载入（幂等；未载入时调用无副作用）。
+#[tauri::command]
+fn big_sort_cancel(state: tauri::State<BigShared>, session: u64) -> Result<(), String> {
+    big_entry(&state, session)?
+        .load_cancel
+        .store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// 应用排序（需已载入内存）。排序计算在阻塞线程执行，完成后返回最新 meta。
+///
+/// # Parameters
+/// - `session`: 大文件会话号。
+/// - `levels`: 排序级别（列号按当前视图）。
+#[tauri::command]
+async fn big_sort_apply(
+    state: tauri::State<'_, BigShared>,
+    session: u64,
+    levels: Vec<SortLevel>,
+) -> Result<BigMeta, String> {
+    let entry = big_entry(state.inner(), session)?;
+    entry.bump_gate(); // 排序会改命中集映射：先让本会话的筛选扫描退出
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut bf = entry.file.lock().map_err(|e| e.to_string())?;
+        bf.refresh_indexed();
+        bf.sort_by_levels(&levels)?;
+        Ok(bf.meta())
+    })
+    .await
+    .map_err(|e| format!("排序任务被取消：{e}"))?
+}
+
+/// 退出排序视图；`release_ram` 为 true（缺省）时同时释放私有内存缓冲。
+#[tauri::command]
+async fn big_sort_exit(
+    state: tauri::State<'_, BigShared>,
+    session: u64,
+    release_ram: Option<bool>,
+) -> Result<BigMeta, String> {
+    let entry = big_entry(state.inner(), session)?;
+    let release = release_ram.unwrap_or(true);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut bf = entry.file.lock().map_err(|e| e.to_string())?;
+        bf.exit_sort_mode(release)?;
+        Ok(bf.meta())
+    })
+    .await
+    .map_err(|e| format!("退出排序任务被取消：{e}"))?
 }
 
 /// 元数据（行/列/表头/编码/待执行列操作/撤销栈状态）。
 #[tauri::command]
-fn big_meta(state: tauri::State<BigShared>) -> Result<BigMeta, String> {
-    with_big(&state, |bf| Ok(bf.meta()))
+fn big_meta(state: tauri::State<BigShared>, session: u64) -> Result<BigMeta, String> {
+    with_big(&state, session, |bf| Ok(bf.meta()))
 }
 
 /// 外部程序是否改动过文件（focus 时前端拉取）。
 #[tauri::command]
-fn big_stale(state: tauri::State<BigShared>) -> Result<bool, String> {
-    with_big(&state, |bf| Ok(bf.stale()))
+fn big_stale(state: tauri::State<BigShared>, session: u64) -> Result<bool, String> {
+    with_big(&state, session, |bf| Ok(bf.stale()))
 }
 
 /// 窗口取行（含覆盖层/插入块/删除位图的视图行）。
 #[tauri::command]
-fn big_rows(state: tauri::State<BigShared>, from: u64, count: u32) -> Result<Vec<Vec<String>>, String> {
-    with_big(&state, |bf| Ok(bf.rows(from, count)))
+fn big_rows(
+    state: tauri::State<BigShared>,
+    session: u64,
+    from: u64,
+    count: u32,
+) -> Result<Vec<Vec<String>>, String> {
+    with_big(&state, session, |bf| Ok(bf.rows(from, count)))
 }
 
 /// 编辑单元格（源行进覆盖层，插入行直写）。
 #[tauri::command]
 fn big_set_cell(
     state: tauri::State<BigShared>,
+    session: u64,
     vrow: u64,
     col: u32,
     value: String,
 ) -> Result<(), String> {
-    with_big(&state, |bf| bf.set_cell(vrow, col, value))
+    with_big(&state, session, |bf| bf.set_cell(vrow, col, value))
 }
 
 /// 在 vpos 处插入行（rows 为 null 时插 count 行空行）。
 #[tauri::command]
 fn big_insert_rows(
     state: tauri::State<BigShared>,
+    session: u64,
     vpos: u64,
     rows: Option<Vec<Vec<String>>>,
     count: u32,
 ) -> Result<(), String> {
-    with_big(&state, |bf| bf.insert_rows(vpos, rows, count))
+    with_big(&state, session, |bf| bf.insert_rows(vpos, rows, count))
 }
 
 /// 删除一组 vrow（升序传入），返回删除行数。
 #[tauri::command]
-fn big_remove_rows(state: tauri::State<BigShared>, vrows: Vec<u64>) -> Result<u32, String> {
-    with_big(&state, |bf| bf.remove_rows(vrows))
+fn big_remove_rows(
+    state: tauri::State<BigShared>,
+    session: u64,
+    vrows: Vec<u64>,
+) -> Result<u32, String> {
+    with_big(&state, session, |bf| bf.remove_rows(vrows))
 }
 
 #[tauri::command]
-fn big_undo(state: tauri::State<BigShared>) -> Result<bool, String> {
-    with_big(&state, |bf| Ok(bf.undo()))
+fn big_undo(state: tauri::State<BigShared>, session: u64) -> Result<bool, String> {
+    with_big(&state, session, |bf| Ok(bf.undo()))
 }
 
 #[tauri::command]
-fn big_redo(state: tauri::State<BigShared>) -> Result<bool, String> {
-    with_big(&state, |bf| Ok(bf.redo()))
+fn big_redo(state: tauri::State<BigShared>, session: u64) -> Result<bool, String> {
+    with_big(&state, session, |bf| Ok(bf.redo()))
 }
 
 /// 执行一次筛选（rayon 并行扫描），返回命中数；被更新请求打断时返回 null。
@@ -398,39 +552,40 @@ fn big_redo(state: tauri::State<BigShared>) -> Result<bool, String> {
 #[tauri::command]
 async fn big_filter(
     state: tauri::State<'_, BigShared>,
-    gate: tauri::State<'_, FilterGen>,
+    session: u64,
     spec: FilterSpec,
 ) -> Result<Option<u32>, String> {
-    let shared = state.inner().clone();
-    let gen = gate.bump();
-    let cancel = gate.0.clone();
+    let entry = big_entry(state.inner(), session)?;
+    let gen = entry.bump_gate();
+    let gate = entry.gate.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut guard = shared.lock().map_err(|e| e.to_string())?;
-        let bf = guard.as_mut().ok_or("大文件会话未打开")?;
-        bf.run_filter_cancelable(&spec, &cancel, gen)
+        let mut bf = entry.file.lock().map_err(|e| e.to_string())?;
+        bf.run_filter_cancelable(&spec, &gate, gen)
     })
     .await
     .map_err(|e| format!("筛选任务被取消：{e}"))?
 }
 
 #[tauri::command]
-fn big_filter_count(state: tauri::State<BigShared>) -> Result<u32, String> {
-    with_big(&state, |bf| Ok(if bf.has_filter() { bf.filter_len() } else { 0 }))
+fn big_filter_count(state: tauri::State<BigShared>, session: u64) -> Result<u32, String> {
+    with_big(&state, session, |bf| Ok(if bf.has_filter() { bf.filter_len() } else { 0 }))
 }
 
 #[tauri::command]
 fn big_filter_page(
     state: tauri::State<BigShared>,
+    session: u64,
     from: u32,
     count: u32,
 ) -> Result<Vec<Vec<String>>, String> {
-    with_big(&state, |bf| Ok(bf.filter_page(from, count)))
+    with_big(&state, session, |bf| Ok(bf.filter_page(from, count)))
 }
 
 #[tauri::command]
-fn big_clear_filter(state: tauri::State<BigShared>, gate: tauri::State<FilterGen>) -> Result<(), String> {
-    gate.bump(); // 清空是全量视图：还在跑的筛选结果不应再落库
-    with_big(&state, |bf| {
+fn big_clear_filter(state: tauri::State<BigShared>, session: u64) -> Result<(), String> {
+    // 清空是全量视图：还在跑的筛选结果不应再落库
+    big_entry(state.inner(), session)?.bump_gate();
+    with_big(&state, session, |bf| {
         bf.clear_filter();
         Ok(())
     })
@@ -443,11 +598,11 @@ fn big_clear_filter(state: tauri::State<BigShared>, gate: tauri::State<FilterGen
 #[tauri::command]
 fn big_set_headerless(
     state: tauri::State<BigShared>,
-    gate: tauri::State<FilterGen>,
+    session: u64,
     on: bool,
 ) -> Result<BigMeta, String> {
-    gate.bump();
-    with_big(&state, |bf| {
+    big_entry(state.inner(), session)?.bump_gate();
+    with_big(&state, session, |bf| {
         bf.set_headerless(on)?;
         Ok(bf.meta())
     })
@@ -457,12 +612,13 @@ fn big_set_headerless(
 #[tauri::command]
 fn big_copy(
     state: tauri::State<BigShared>,
+    session: u64,
     r0: u64,
     r1: u64,
     c0: u32,
     c1: u32,
 ) -> Result<String, String> {
-    with_big(&state, |bf| bf.copy_tsv(r0, r1, c0, c1))
+    with_big(&state, session, |bf| bf.copy_tsv(r0, r1, c0, c1))
 }
 
 /// 保存（流式重写 + 原子换名），进度经 "big-progress" 事件推送。
@@ -475,10 +631,10 @@ fn big_copy(
 async fn big_save(
     window: tauri::Window,
     state: tauri::State<'_, BigShared>,
-    gate: tauri::State<'_, FilterGen>,
+    session: u64,
 ) -> Result<(), String> {
-    gate.bump(); // 重写文件前先让筛选扫描退出
-    let shared = state.inner().clone();
+    let entry = big_entry(state.inner(), session)?;
+    entry.bump_gate(); // 重写文件前先让本会话的筛选扫描退出
     tauri::async_runtime::spawn_blocking(move || {
         // (加权done, total, 阶段, 行数)：阶段 0 流式重写 / 1 落盘换名 / 2 重建索引。
         let (tx, rx) = std::sync::mpsc::channel::<(u64, u64, u8, u64)>();
@@ -487,11 +643,13 @@ async fn big_save(
                 let _ = window.emit("big-progress", (done, total, phase, rows));
             }
         });
-        let result = with_big(&shared, |bf| {
+        let result = (|| {
+            let mut bf = entry.file.lock().map_err(|e| e.to_string())?;
+            bf.refresh_indexed();
             bf.save(move |done, total, phase, rows| {
                 let _ = tx.send((done, total, phase, rows));
             })
-        });
+        })();
         // save 返回后进度闭包随 tx 一并释放，emit 线程 recv 出错即退出。
         emitter.join().map_err(|e| format!("进度转发线程异常：{e:?}"))?;
         result
@@ -503,21 +661,25 @@ async fn big_save(
 // ---- 列操作：pending 预览 → 执行物理重写 ----
 
 #[tauri::command]
-fn big_col_push(state: tauri::State<BigShared>, op: ColOp) -> Result<(), String> {
-    with_big(&state, |bf| bf.push_col_op(op))
+fn big_col_push(
+    state: tauri::State<BigShared>,
+    session: u64,
+    op: ColOp,
+) -> Result<(), String> {
+    with_big(&state, session, |bf| bf.push_col_op(op))
 }
 
 #[tauri::command]
-fn big_col_pop(state: tauri::State<BigShared>) -> Result<(), String> {
-    with_big(&state, |bf| {
+fn big_col_pop(state: tauri::State<BigShared>, session: u64) -> Result<(), String> {
+    with_big(&state, session, |bf| {
         bf.pop_col_op();
         Ok(())
     })
 }
 
 #[tauri::command]
-fn big_col_clear(state: tauri::State<BigShared>) -> Result<(), String> {
-    with_big(&state, |bf| {
+fn big_col_clear(state: tauri::State<BigShared>, session: u64) -> Result<(), String> {
+    with_big(&state, session, |bf| {
         bf.clear_col_ops();
         Ok(())
     })
@@ -529,10 +691,10 @@ fn big_col_clear(state: tauri::State<BigShared>) -> Result<(), String> {
 async fn big_col_apply(
     window: tauri::Window,
     state: tauri::State<'_, BigShared>,
-    gate: tauri::State<'_, FilterGen>,
+    session: u64,
 ) -> Result<(), String> {
-    gate.bump(); // 物理重写前先让筛选扫描退出
-    let shared = state.inner().clone();
+    let entry = big_entry(state.inner(), session)?;
+    entry.bump_gate(); // 物理重写前先让本会话的筛选扫描退出
     tauri::async_runtime::spawn_blocking(move || {
         let (tx, rx) = std::sync::mpsc::channel::<(u64, u64, u8, u64)>();
         let emitter = std::thread::spawn(move || {
@@ -540,11 +702,13 @@ async fn big_col_apply(
                 let _ = window.emit("big-progress", (done, total, phase, rows));
             }
         });
-        let result = with_big(&shared, |bf| {
+        let result = (|| {
+            let mut bf = entry.file.lock().map_err(|e| e.to_string())?;
+            bf.refresh_indexed();
             bf.apply_col_ops(move |done, total, phase, rows| {
                 let _ = tx.send((done, total, phase, rows));
             })
-        });
+        })();
         emitter.join().map_err(|e| format!("进度转发线程异常：{e:?}"))?;
         result
     })
@@ -603,8 +767,7 @@ pub fn run() {
                 .skip(1)
                 .find(|a| a.to_lowercase().ends_with(".csv"));
             app.manage(StartupArgs { open_path });
-            app.manage(BigShared::new(Mutex::new(None)));
-            app.manage(FilterGen::default());
+            app.manage(BigShared::new(Mutex::new(HashMap::new())));
             // 关闭请求转发给前端做"未保存确认"，确认后由 quit_app 命令真正退出
             if let Some(window) = app.get_webview_window("main") {
                 let handle = window.clone();
@@ -638,6 +801,11 @@ pub fn run() {
             file_size,
             big_open,
             big_close,
+            big_sort_estimate,
+            big_sort_load,
+            big_sort_cancel,
+            big_sort_apply,
+            big_sort_exit,
             big_meta,
             big_stale,
             big_rows,

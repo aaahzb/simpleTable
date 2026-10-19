@@ -9,8 +9,11 @@ shot_*.png
 Thumbs.db
 .DS_Store
 
-# 本地开发日志，不上库
+# 本地开发日志/规划，不上库
 TODO.md
+task_plan.md
+progress.md
+findings.md
 /target/
 
 # 待删隔离区（调试验收后由用户手动删除，不入库）

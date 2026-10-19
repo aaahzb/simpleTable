@@ -12,6 +12,7 @@
 //!   行结构变化后依然有效。
 //! - 撤销 = 逆操作日志（全表快照在大文件上不可行）。
 
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -1841,6 +1842,412 @@ mod tests {
         );
     }
 
+    // ---- 排序模式：内存后备（Backing::Ram） ----
+
+    #[test]
+    fn ram_load_switches_backing_and_keeps_rows() {
+        let p = tmp_csv("ram_load", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        assert!(!bf.is_ram_backed());
+        let size = fs::metadata(&p).unwrap().len();
+        let est = bf.sort_estimate(1);
+        assert_eq!(est.file_bytes, size);
+        assert_eq!(est.row_count, 5);
+        assert!(est.new_bytes > est.file_bytes, "估算应含缓冲之外的键/排列开销");
+        assert!(est.peak_bytes >= est.file_bytes * 2, "峰值应体现映射页缓存");
+        let cancel = AtomicBool::new(false);
+        let mut last = (0u64, 0u64);
+        let loaded = bf
+            .load_into_ram(&cancel, &mut |done, total| last = (done, total))
+            .unwrap();
+        assert!(loaded);
+        assert!(bf.is_ram_backed());
+        assert!(bf.meta().ram_backed);
+        assert_eq!(last, (size, size), "最后一次进度应为满");
+        assert_eq!(bf.rows(0, 5)[0], vec!["Alice", "30", "Beijing"]);
+        assert_eq!(bf.rows(4, 1)[0][0], "Eve");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn ram_load_cancel_keeps_mmap_and_data() {
+        let p = tmp_csv("ram_cancel", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let cancel = AtomicBool::new(true); // 用户点取消
+        let loaded = bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap();
+        assert!(!loaded, "取消应返回 false 而不是错误");
+        assert!(!bf.is_ram_backed(), "取消后仍用原 mmap 视图");
+        assert!(!bf.meta().ram_backed);
+        assert_eq!(bf.rows(0, 1)[0][0], "Alice");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn ram_load_progress_is_monotonic_and_reaches_total() {
+        let p = tmp_csv("ram_progress", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut samples: Vec<(u64, u64)> = Vec::new();
+        bf.load_into_ram(&cancel, &mut |d, t| samples.push((d, t)))
+            .unwrap();
+        assert!(samples.len() >= 2, "至少应报告起点与终点");
+        assert_eq!(samples.first().unwrap().0, 0);
+        assert!(samples.windows(2).all(|w| w[0].0 <= w[1].0), "进度不得倒退");
+        let total = fs::metadata(&p).unwrap().len();
+        assert_eq!(samples.last().copied(), Some((total, total)));
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn ram_load_refuses_while_indexing() {
+        let p = tmp_csv("ram_indexing", &people_csv());
+        // 小阈值迫使打开后仍处于渐进索引期（不启后台线程）
+        let mut bf = BigFile::open_progressive_with(&p, 8, 1, 16, false).unwrap();
+        assert!(bf.is_indexing());
+        let cancel = AtomicBool::new(false);
+        let err = bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap_err();
+        assert!(err.contains("索引"), "错误应说明索引未完成：{err}");
+        assert!(!bf.is_ram_backed());
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sort_estimate_scales_with_levels() {
+        let p = tmp_csv("ram_est", &people_csv());
+        let bf = BigFile::open(&p).unwrap();
+        let one = bf.sort_estimate(1);
+        let three = bf.sort_estimate(3);
+        assert_eq!(one.file_bytes, three.file_bytes);
+        assert!(three.new_bytes > one.new_bytes, "级别越多键内存越大");
+        assert_eq!(one.row_count, 5);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn save_after_ram_load_roundtrip() {
+        let p = tmp_csv("ram_save", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let cancel = AtomicBool::new(false);
+        assert!(bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap());
+        bf.set_cell(0, 1, "31".into()).unwrap();
+        bf.save(|_, _, _, _| {}).unwrap();
+        // 保存后回到 mmap 后备（排序模式结束/重建）
+        assert!(!bf.is_ram_backed());
+        let bf2 = BigFile::open(&p).unwrap();
+        assert_eq!(bf2.rows(0, 1)[0], vec!["Alice", "31", "Beijing"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn available_memory_is_positive() {
+        let n = available_memory_bytes().expect("当前平台应能查询可用内存");
+        assert!(n > 0);
+    }
+
+    // ---- 排序键与排列层（阶段 4） ----
+
+    /// 排序夹具：id,age,key；含空/非数字/大小写文本。
+    fn sort_fixture() -> Vec<u8> {
+        b"id,age,key\r\na,10,foo\r\nb,2,bar\r\nc,,foo\r\nd,2,Bar\r\ne,x,foo\r\n"
+            .to_vec()
+    }
+
+    /// 打开并载入内存缓冲（排序模式前置）。
+    fn load_ram(p: &Path) -> BigFile {
+        let mut bf = BigFile::open(p).unwrap();
+        let cancel = AtomicBool::new(false);
+        assert!(bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap());
+        bf
+    }
+
+    /// 取前 n 行的第一列（排序断言用）。
+    fn first_col(bf: &BigFile, n: u32) -> Vec<String> {
+        bf.rows(0, n).into_iter().map(|r| r[0].clone()).collect()
+    }
+
+    #[test]
+    fn sort_numeric_asc_puts_non_numbers_last() {
+        let p = tmp_csv("sort_num_asc", &sort_fixture());
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(&[SortLevel { col: 1, numeric: true, asc: true }])
+            .unwrap();
+        assert!(bf.meta().sorted);
+        // 2(b),2(d),10(a)，非数字（c 空、e x）恒排最后且保持原相对顺序
+        assert_eq!(first_col(&bf, 5), vec!["b", "d", "a", "c", "e"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sort_numeric_desc_still_puts_non_numbers_last() {
+        let p = tmp_csv("sort_num_desc", &sort_fixture());
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(&[SortLevel { col: 1, numeric: true, asc: false }])
+            .unwrap();
+        assert_eq!(first_col(&bf, 5), vec!["a", "b", "d", "c", "e"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sort_text_uses_byte_order_and_is_stable() {
+        let p = tmp_csv("sort_text", &sort_fixture());
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(&[SortLevel { col: 2, numeric: false, asc: true }])
+            .unwrap();
+        // "Bar" < "bar" < "foo"；三个 foo 保持原有 a,c,e 顺序
+        assert_eq!(first_col(&bf, 5), vec!["d", "b", "a", "c", "e"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sort_multilevel_applies_next_level_on_ties() {
+        let p = tmp_csv("sort_multi", &sort_fixture());
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(&[
+            SortLevel { col: 2, numeric: false, asc: true },
+            SortLevel { col: 1, numeric: true, asc: false },
+        ])
+        .unwrap();
+        // 先按 key：Bar(d), bar(b), foo(a,c,e)；foo 内按 age 降序：10(a) 在前
+        assert_eq!(first_col(&bf, 5), vec!["d", "b", "a", "c", "e"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sort_numeric_matches_js_number_parsing() {
+        let p = tmp_csv(
+            "sort_jsnum",
+            b"k,v\r\na,2\r\nb,0x10\r\nc, 3 \r\nd,\r\ne,abc\r\nf,1e2\r\n",
+        );
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(&[SortLevel { col: 1, numeric: true, asc: true }])
+            .unwrap();
+        // 2(a) < 3(c) < 0x10=16(b) < 1e2=100(f)；空/abc 非数字最后（d,e）
+        assert_eq!(first_col(&bf, 6), vec!["a", "c", "b", "f", "d", "e"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sort_rebuilds_filter_positions_in_sorted_order() {
+        let p = tmp_csv("sort_filter", &sort_fixture());
+        let mut bf = load_ram(&p);
+        let spec = FilterSpec {
+            cols: vec![(2, "foo".into())],
+            multi_cols: Vec::new(),
+            multi_text: String::new(),
+        };
+        assert_eq!(bf.run_filter(&spec).unwrap(), 3); // a,c,e
+        // 按 id 降序：e,d,c,b,a
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+            .unwrap();
+        assert_eq!(bf.filter_len(), 3, "排序后命中集不应丢失");
+        let page = bf.filter_page(0, 3);
+        assert_eq!(
+            page.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
+            vec!["e", "c", "a"],
+            "命中行应按排序后的显示顺序返回"
+        );
+        // 新条件在排序视图上重扫：age 含 2 → d(1), b(3)
+        let spec2 = FilterSpec {
+            cols: vec![(1, "2".into())],
+            multi_cols: Vec::new(),
+            multi_text: String::new(),
+        };
+        assert_eq!(bf.run_filter(&spec2).unwrap(), 2);
+        let page2 = bf.filter_page(0, 2);
+        assert_eq!(
+            page2.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
+            vec!["d", "b"]
+        );
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sort_edit_then_refilter_after_clear_still_matches() {
+        let p = tmp_csv("sort_refilt", &sort_fixture());
+        let mut bf = load_ram(&p);
+        // 按 id 降序：e,d,c,b,a
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+            .unwrap();
+        let spec_b = FilterSpec {
+            cols: vec![(0, "b".into())],
+            multi_cols: Vec::new(),
+            multi_text: String::new(),
+        };
+        assert_eq!(bf.run_filter(&spec_b).unwrap(), 1);
+        bf.clear_filter();
+        // 编辑显示首行（e）的 age：不得影响按 id 重筛
+        bf.set_cell(0, 1, "99".into()).unwrap();
+        assert_eq!(
+            bf.run_filter(&spec_b).unwrap(),
+            1,
+            "清筛+编辑后重筛仍应命中 b"
+        );
+        assert_eq!(bf.filter_page(0, 1)[0][0], "b");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sort_then_edit_undo_and_copy_use_display_rows() {
+        let p = tmp_csv("sort_edit", &sort_fixture());
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+            .unwrap(); // e,d,c,b,a
+        assert_eq!(bf.copy_tsv(0, 2, 0, 2).unwrap(), "e\tx\r\nd\t2\r\n");
+        bf.set_cell(0, 0, "E2".into()).unwrap();
+        assert_eq!(bf.rows(0, 1)[0], vec!["E2", "x", "foo"]);
+        bf.undo();
+        assert_eq!(bf.rows(0, 1)[0][0], "e", "撤销应按稳定身份回到原行");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sort_keeps_edits_and_inserted_rows() {
+        let p = tmp_csv("sort_ins", &sort_fixture());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 1, "99".into()).unwrap(); // a 的 age
+        bf.insert_rows(
+            0,
+            Some(vec![vec!["z".into(), "1".into(), "foo".into()]]),
+            0,
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap();
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }])
+            .unwrap();
+        assert_eq!(first_col(&bf, 6), vec!["a", "b", "c", "d", "e", "z"]);
+        assert_eq!(bf.rows(0, 1)[0][1], "99", "覆盖层编辑应跟随记录");
+        assert_eq!(bf.rows(5, 1)[0], vec!["z", "1", "foo"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sort_requires_ram_and_valid_levels() {
+        let p = tmp_csv("sort_bad", &sort_fixture());
+        let mut bf = BigFile::open(&p).unwrap();
+        let err = bf
+            .sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }])
+            .unwrap_err();
+        assert!(err.contains("载入内存"), "未载入应拒绝：{err}");
+        let cancel = AtomicBool::new(false);
+        bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap();
+        assert!(bf.sort_by_levels(&[]).unwrap_err().contains("排序级别"));
+        assert!(
+            bf.sort_by_levels(&[SortLevel { col: 9, numeric: false, asc: true }])
+                .unwrap_err()
+                .contains("列")
+        );
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sort_blocks_structural_ops_until_exit() {
+        let p = tmp_csv("sort_block", &sort_fixture());
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }])
+            .unwrap();
+        assert!(bf.insert_rows(0, None, 1).unwrap_err().contains("排序"));
+        assert!(bf.remove_rows(vec![0]).unwrap_err().contains("排序"));
+        assert!(
+            bf.push_col_op(ColOp::Delete { col: 0 })
+                .unwrap_err()
+                .contains("排序")
+        );
+        assert!(bf.set_headerless(true).unwrap_err().contains("排序"));
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sort_exit_restores_view_and_releases_ram() {
+        let p = tmp_csv("sort_exit", &sort_fixture());
+        let mut bf = load_ram(&p);
+        bf.set_cell(0, 1, "99".into()).unwrap();
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+            .unwrap();
+        bf.exit_sort_mode(true).unwrap();
+        assert!(!bf.meta().sorted);
+        assert!(!bf.is_ram_backed(), "退出并要求释放后应回到 mmap");
+        assert_eq!(first_col(&bf, 5), vec!["a", "b", "c", "d", "e"]);
+        assert_eq!(bf.rows(0, 1)[0][1], "99", "退出排序保留编辑");
+        // 退出后结构操作恢复可用
+        bf.insert_rows(0, None, 1).unwrap();
+        assert_eq!(bf.meta().rows, 6);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn save_sorted_writes_physical_order_and_exits_sort() {
+        let p = tmp_csv("sort_save", &sort_fixture());
+        let mut bf = load_ram(&p);
+        bf.set_cell(0, 1, "77".into()).unwrap(); // a 行（原显示位置 0）
+        bf.insert_rows(0, Some(vec![vec!["z".into(), "5".into(), "foo".into()]]), 0)
+            .unwrap();
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+            .unwrap(); // z,e,d,c,b,a
+        assert!(bf.meta().sorted);
+        bf.save(|_, _, _, _| {}).unwrap();
+        assert!(!bf.meta().sorted, "保存后应退出排序视图");
+        assert!(!bf.is_ram_backed());
+        assert_eq!(first_col(&bf, 6), vec!["z", "e", "d", "c", "b", "a"]);
+        let bf2 = BigFile::open(&p).unwrap();
+        assert_eq!(first_col(&bf2, 6), vec!["z", "e", "d", "c", "b", "a"]);
+        assert_eq!(bf2.rows(5, 1)[0][1], "77", "排序保存应带上单元格编辑");
+        assert_eq!(bf2.rows(0, 1)[0][1], "5", "排序保存应带上插入行");
+        // 物理顺序已重排：文件头之后第一行就是 z
+        let text = String::from_utf8(fs::read(&p).unwrap()).unwrap();
+        assert!(text.starts_with("id,age,key\r\nz,5,foo\r\n"), "实际开头：{text:?}");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn save_sorted_headerless_keeps_first_row_as_data() {
+        let p = tmp_csv("sort_nohdr", b"c,3\r\na,1\r\nb,2\r\n");
+        let mut bf = BigFile::open_with(&p, true).unwrap();
+        let cancel = AtomicBool::new(false);
+        assert!(bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap());
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }])
+            .unwrap();
+        bf.save(&mut |_, _, _, _| {}).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"a,1\r\nb,2\r\nc,3\r\n");
+        // 重开仍按无列名解释：三行全是数据，没有被注入表头
+        let bf2 = BigFile::open_with(&p, true).unwrap();
+        assert_eq!(bf2.meta().rows, 3);
+        assert_eq!(first_col(&bf2, 3), vec!["a", "b", "c"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn save_sorted_handles_missing_final_newline() {
+        // 末行无换行：排序后它可能落在中间，必须补行尾否则两行粘连。
+        let p = tmp_csv("sort_save_nonl", b"id,v\r\nb,2\r\na,1");
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }])
+            .unwrap();
+        bf.save(|_, _, _, _| {}).unwrap();
+        let bf2 = BigFile::open(&p).unwrap();
+        assert_eq!(bf2.rows(0, 2), vec![
+            vec!["a".to_string(), "1".to_string()],
+            vec!["b".to_string(), "2".to_string()],
+        ]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn save_sorted_clears_undo_history() {
+        let p = tmp_csv("sort_save_undo", &sort_fixture());
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }])
+            .unwrap();
+        assert!(!bf.meta().modified, "排序只改视图，不算内容修改");
+        bf.set_cell(0, 0, "A".into()).unwrap();
+        assert!(bf.meta().can_undo);
+        assert!(bf.meta().modified);
+        bf.save(|_, _, _, _| {}).unwrap();
+        assert!(!bf.meta().can_undo, "物理重排后旧记录号失效，撤销栈必须清空");
+        assert!(!bf.meta().modified, "保存后回到干净状态");
+        fs::remove_file(&p).ok();
+    }
+
     /// 打印一次筛选的耗时与引擎统计。
     fn bench_timed(bf: &mut BigFile, spec: &FilterSpec, label: &str) {
         let t = std::time::Instant::now();
@@ -2213,6 +2620,12 @@ pub struct BigMeta {
     pub can_redo: bool,
     /// 后台索引是否仍在进行（true 时 rows 会持续增长）。
     pub indexing: bool,
+    /// 是否已载入私有内存缓冲（排序模式）。
+    pub ram_backed: bool,
+    /// 当前是否处于排序视图（显示行按 `order` 映射）。
+    pub sorted: bool,
+    /// 是否存在上次保存后的内容修改（排序本身不算修改）。
+    pub modified: bool,
     /// 已建立索引的字节数 / 文件总字节数。
     pub indexed_bytes: u64,
     pub total_bytes: u64,
@@ -2689,11 +3102,251 @@ struct PartialIndex {
     index_ms: u64,
 }
 
+/// 会话字节后备：常规浏览用只读文件映射；排序模式载入后换成私有内存缓冲。
+///
+/// 读路径一律经 [`BigFile::bytes`] 取字节，不直接假设后备类型——这样
+/// 排序模式（内存）与普通模式（mmap）共用索引、筛选、编辑与保存逻辑。
+enum Backing {
+    /// 文件映射：后台索引线程也持有一份 Arc，读路径不复制文件内容。
+    Mmap(Arc<memmap2::Mmap>),
+    /// 私有内存缓冲：与磁盘映射解耦后可释放映射，稳定态约 1× 文件大小。
+    Ram(Vec<u8>),
+}
+
+impl Backing {
+    /// 当前后备的只读字节视图。
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Backing::Mmap(m) => m,
+            Backing::Ram(v) => v,
+        }
+    }
+
+    /// 是否已切换为私有内存缓冲。
+    fn is_ram(&self) -> bool {
+        matches!(self, Backing::Ram(_))
+    }
+}
+
+/// 排序模式内存估算（弹窗展示用；单位字节）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SortEstimate {
+    /// 文件字节数（已载入内存时仍报告原文件大小）。
+    pub file_bytes: u64,
+    /// 数据行数（不含表头）。
+    pub row_count: u64,
+    /// 预计新增私有内存：文件缓冲（未载入时）+ 排列 + 键 + 排序 scratch + 余量。
+    pub new_bytes: u64,
+    /// 载入瞬间的物理峰值提示（私有缓冲 + 可回收的文件页缓存）。
+    pub peak_bytes: u64,
+    /// 当前系统可用物理内存；平台不支持时为 null。
+    pub available_bytes: Option<u64>,
+}
+
+/// 单个排序级别（语义对齐小模式 `sortRows` 的 [col, mode, asc]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SortLevel {
+    /// 视图列号。
+    pub col: u32,
+    /// true = 按数字比较（非数字恒排最后）；false = 按文本比较。
+    pub numeric: bool,
+    /// true = 升序。
+    pub asc: bool,
+}
+
+/// 一级排序键（以旧显示位置为索引）。
+enum SortKeys {
+    /// 数字键：NaN 表示非数字（恒排最后，与升降序无关）。
+    Num(Vec<f64>),
+    /// 文本键：UTF-8 字节池 + 每行的起止偏移。
+    Text { blob: Vec<u8>, offs: Vec<u64> },
+}
+
+impl SortKeys {
+    /// 比较两个位置在本级键上的顺序。
+    ///
+    /// # Parameters
+    /// - `a` / `b`: 旧显示位置。
+    /// - `asc`: true = 升序；数字非数字始终排在最后。
+    ///
+    /// # Returns
+    /// 比较结果（相等时由调用方进入下一级）。
+    fn cmp_at(&self, a: usize, b: usize, asc: bool) -> CmpOrdering {
+        match self {
+            SortKeys::Num(v) => {
+                let (x, y) = (v[a], v[b]);
+                match (x.is_nan(), y.is_nan()) {
+                    (true, true) => CmpOrdering::Equal,
+                    (true, false) => CmpOrdering::Greater,
+                    (false, true) => CmpOrdering::Less,
+                    (false, false) => {
+                        let o = x.partial_cmp(&y).unwrap_or(CmpOrdering::Equal);
+                        if asc { o } else { o.reverse() }
+                    }
+                }
+            }
+            SortKeys::Text { blob, offs } => {
+                let x = &blob[offs[a] as usize..offs[a + 1] as usize];
+                let y = &blob[offs[b] as usize..offs[b + 1] as usize];
+                let o = x.cmp(y);
+                if asc { o } else { o.reverse() }
+            }
+        }
+    }
+}
+
+/// 按 JavaScript `Number()` + `Number.isFinite` 语义解析数字。
+///
+/// 与小模式 `toFloat` 一致：trim、空串/非有限值视为非数字；
+/// 支持 `0x`/`0b`/`0o` 前缀与前导 `+`。
+///
+/// # Parameters
+/// - `s`: 单元格原始文本。
+///
+/// # Returns
+/// 有限 `f64`；无法解析或非有限时为 None。
+fn js_number_parse(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let parse_radix = |digits: &str, radix: u32| -> Option<f64> {
+        if digits.is_empty() {
+            return None;
+        }
+        let mut v = 0.0f64;
+        for ch in digits.chars() {
+            let d = ch.to_digit(radix)?;
+            v = v * radix as f64 + d as f64;
+        }
+        Some(v)
+    };
+    let parsed = if let Some(d) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        parse_radix(d, 16)
+    } else if let Some(d) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        parse_radix(d, 2)
+    } else if let Some(d) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+        parse_radix(d, 8)
+    } else {
+        // JS 允许前导 '+'；Rust 的 f64 解析不接受。
+        t.strip_prefix('+').unwrap_or(t).parse::<f64>().ok()
+    };
+    parsed.filter(|v| v.is_finite())
+}
+
+/// 查询当前系统可用物理内存（字节）。
+///
+/// Windows 用 `GlobalMemoryStatusEx`，macOS 用 `sysctlbyname` 汇总空闲/非活跃页，
+/// Linux 读 `/proc/meminfo` 的 `MemAvailable`；其余平台返回 None。
+///
+/// # Returns
+/// 可用字节数；查询失败或平台不支持时为 None。
+pub fn available_memory_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        platform_mem::windows_available()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        platform_mem::macos_available()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        platform_mem::linux_available()
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// 各平台的可用内存查询实现（不引入额外 crate，直接 FFI/读 proc）。
+mod platform_mem {
+    /// Windows：GlobalMemoryStatusEx.ullAvailPhys。
+    #[cfg(windows)]
+    pub fn windows_available() -> Option<u64> {
+        #[repr(C)]
+        struct MemoryStatusEx {
+            length: u32,
+            memory_load: u32,
+            total_phys: u64,
+            avail_phys: u64,
+            total_page_file: u64,
+            avail_page_file: u64,
+            total_virtual: u64,
+            avail_virtual: u64,
+            avail_extended_virtual: u64,
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+        }
+
+        // SAFETY: 结构体按 Win32 布局定义，length 为约定值，调用只写该缓冲。
+        let mut status: MemoryStatusEx = unsafe { std::mem::zeroed() };
+        status.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        (ok != 0).then_some(status.avail_phys)
+    }
+
+    /// macOS：空闲页 + 非活跃页（可回收）折算字节。
+    #[cfg(target_os = "macos")]
+    pub fn macos_available() -> Option<u64> {
+        use std::os::raw::{c_char, c_int, c_void};
+
+        extern "C" {
+            fn sysctlbyname(
+                name: *const c_char,
+                oldp: *mut c_void,
+                oldlenp: *mut usize,
+                newp: *mut c_void,
+                newlen: usize,
+            ) -> c_int;
+        }
+
+        fn read_u64(name: &str) -> Option<u64> {
+            let cname = std::ffi::CString::new(name).ok()?;
+            let mut value: u64 = 0;
+            let mut len = std::mem::size_of::<u64>();
+            // SAFETY: 缓冲区与长度均指向本栈变量，name 为有效 C 串。
+            let rc = unsafe {
+                sysctlbyname(
+                    cname.as_ptr(),
+                    &mut value as *mut u64 as *mut c_void,
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            (rc == 0 && len == std::mem::size_of::<u64>()).then_some(value)
+        }
+
+        let free = read_u64("vm.page_free_count")?;
+        let inactive = read_u64("vm.page_inactive_count").unwrap_or(0);
+        let page = read_u64("hw.pagesize").unwrap_or(4096);
+        Some(free.saturating_add(inactive).saturating_mul(page))
+    }
+
+    /// Linux：/proc/meminfo 的 MemAvailable。
+    #[cfg(target_os = "linux")]
+    pub fn linux_available() -> Option<u64> {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+                return Some(kb.saturating_mul(1024));
+            }
+        }
+        None
+    }
+}
+
 /// 大文件编辑会话。
 pub struct BigFile {
     path: PathBuf,
-    /// 共享映射：后台索引线程持有一份，读路径不复制文件内容。
-    mmap: Arc<memmap2::Mmap>,
+    /// 字节后备：常规为文件映射，排序模式载入后为私有内存缓冲。
+    backing: Backing,
     enc: Encoding,
     /// 已完成的全量索引；渐进索引期间为空（数据在 `partial` 里）。
     idx: RawIndex,
@@ -2733,6 +3386,11 @@ pub struct BigFile {
     has_bom: bool,
     /// 无列名模式：记录 0 也是数据，列名为虚拟的 列1..N。
     headerless: bool,
+    /// 排序排列：显示位置 → 原始 vrow；None = 未排序。
+    order: Option<Vec<u32>>,
+    /// 内容修改计数：每次单元格/行结构变化递增，保存后归零。
+    /// 排序只改变视图，不递增。
+    revision: u64,
 }
 
 impl Drop for BigFile {
@@ -2801,7 +3459,7 @@ impl BigFile {
         let open_ms = t0.elapsed().as_millis() as u64;
         Ok(Self {
             path: path.to_path_buf(),
-            mmap,
+            backing: Backing::Mmap(mmap),
             enc,
             idx,
             partial: None,
@@ -2828,6 +3486,8 @@ impl BigFile {
             base_mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
             has_bom,
             headerless,
+            order: None,
+            revision: 0,
         })
     }
 
@@ -2983,7 +3643,7 @@ impl BigFile {
 
         Ok(Self {
             path: path.to_path_buf(),
-            mmap,
+            backing: Backing::Mmap(mmap),
             enc,
             idx,
             partial,
@@ -3010,6 +3670,8 @@ impl BigFile {
             base_mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
             has_bom,
             headerless,
+            order: None,
+            revision: 0,
         })
     }
 
@@ -3057,7 +3719,7 @@ impl BigFile {
     fn drive_index_for_test(&mut self) {
         let Some(p) = self.partial.clone() else { return };
         let mut cur = p.lock().unwrap().cursor;
-        let bytes: &[u8] = &self.mmap;
+        let bytes: &[u8] = self.bytes();
         loop {
             let (o, r) = scan_chunk(bytes, &mut cur, INDEX_CHUNK_BYTES);
             let done = cur.pos >= bytes.len();
@@ -3152,13 +3814,288 @@ impl BigFile {
             } else {
                 st.cursor.pos
             };
-            Some((start, end.min(self.mmap.len())))
+            Some((start, end.min(self.bytes().len())))
         } else {
             if r >= self.idx.n_records() {
                 return None;
             }
-            Some(self.idx.record_span(self.mmap.len(), r))
+            Some(self.idx.record_span(self.bytes().len(), r))
         }
+    }
+
+    /// 当前后备的只读字节视图（mmap 或内存缓冲）。
+    fn bytes(&self) -> &[u8] {
+        self.backing.bytes()
+    }
+
+    /// 是否已切换到排序模式的内存后备。
+    pub fn is_ram_backed(&self) -> bool {
+        self.backing.is_ram()
+    }
+
+    /// 当前是否处于排序视图。
+    pub fn is_sorted(&self) -> bool {
+        self.order.is_some()
+    }
+
+    /// 显示位置 → 原始 vrow（未排序时恒等）。
+    ///
+    /// # Parameters
+    /// - `display`: 当前视图行号。
+    ///
+    /// # Returns
+    /// 排序前的稳定行号；排列越界时原样返回（调用方会再判越界）。
+    fn orig_vrow(&self, display: u64) -> u64 {
+        match &self.order {
+            Some(order) => order
+                .get(display as usize)
+                .copied()
+                .map_or(display, |v| v as u64),
+            None => display,
+        }
+    }
+
+    /// 按原始 vrow 读取字段（键构建用；不做显示映射）。
+    fn orig_fields(&self, vrow: u64) -> Vec<String> {
+        match self.seg.resolve(vrow) {
+            Some(ResolvedRow::Src(rec)) => self.src_fields(rec),
+            Some(ResolvedRow::Ins { block, row }) => self.ins_fields(block, row),
+            None => vec![String::new(); self.base_ncols],
+        }
+    }
+
+    /// 按级别对当前视图排序（排列层，不改文件；需要内存后备）。
+    ///
+    /// 语义对齐小模式：多级依次比较；数字级非数字恒排最后；
+    /// 文本按 UTF-8 字节序；完全相等时保持原显示顺序（稳定）。
+    /// 已激活的筛选结果会换算到新的显示位置，成员不变。
+    ///
+    /// # Parameters
+    /// - `levels`: 排序级别（列号按当前视图列号）。
+    ///
+    /// # Errors
+    /// 未载入内存 / 索引未完成 / 待执行列操作 / 级别为空或列越界时返回错误字符串。
+    pub fn sort_by_levels(&mut self, levels: &[SortLevel]) -> Result<(), String> {
+        self.require_editable()?;
+        self.refresh_indexed();
+        if self.is_indexing() {
+            return Err("文件仍在索引中，暂不支持排序".into());
+        }
+        if !self.is_ram_backed() {
+            return Err("排序需要先把文件载入内存".into());
+        }
+        if levels.is_empty() {
+            return Err("排序级别不能为空".into());
+        }
+        let ncols = self.view_ncols();
+        if let Some(l) = levels.iter().find(|l| l.col >= ncols) {
+            return Err(format!("排序列越界：{}（共 {} 列）", l.col, ncols));
+        }
+        let total = self.seg.vrow_count();
+        if total > u32::MAX as u64 {
+            return Err("文件过大（超过 42.9 亿行），暂不支持排序".into());
+        }
+        let total = total as usize;
+        // 旧显示序：新排列以它为“原始顺序”，保证稳定与命中集换算。
+        let old_order: Vec<u32> = self
+            .order
+            .clone()
+            .unwrap_or_else(|| (0..total as u32).collect());
+
+        // 逐级建键：一次遍历取一行；键按旧显示位置索引。
+        let mut keys: Vec<SortKeys> = Vec::with_capacity(levels.len());
+        for level in levels {
+            let mut out = if level.numeric {
+                SortKeys::Num(Vec::with_capacity(total))
+            } else {
+                SortKeys::Text {
+                    blob: Vec::new(),
+                    offs: Vec::with_capacity(total + 1),
+                }
+            };
+            if let SortKeys::Text { offs, .. } = &mut out {
+                offs.push(0);
+            }
+            for &orig in &old_order {
+                let fields = self.orig_fields(orig as u64);
+                let text = fields
+                    .get(level.col as usize)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                match &mut out {
+                    SortKeys::Num(v) => {
+                        v.push(js_number_parse(text).unwrap_or(f64::NAN));
+                    }
+                    SortKeys::Text { blob, offs } => {
+                        blob.extend_from_slice(text.as_bytes());
+                        offs.push(blob.len() as u64);
+                    }
+                }
+            }
+            keys.push(out);
+        }
+
+        // 排列：perm[新位置] = 旧显示位置；平局用旧显示序，等价稳定排序。
+        let mut perm: Vec<u32> = (0..total as u32).collect();
+        perm.sort_unstable_by(|&a, &b| {
+            let (ai, bi) = (a as usize, b as usize);
+            for (i, level) in levels.iter().enumerate() {
+                let o = keys[i].cmp_at(ai, bi, level.asc);
+                if o != CmpOrdering::Equal {
+                    return o;
+                }
+            }
+            a.cmp(&b)
+        });
+
+        let mut new_order: Vec<u32> = Vec::with_capacity(total);
+        let mut rank: Vec<u32> = vec![0; total];
+        for (d, &old_d) in perm.iter().enumerate() {
+            let orig = old_order[old_d as usize];
+            new_order.push(orig);
+            rank[orig as usize] = d as u32;
+        }
+
+        // 命中集存的是显示位置：换算并保持升序（= 新视图的浏览顺序）。
+        if let Some(hits) = self.filter.take() {
+            let mut mapped: Vec<u32> = hits
+                .iter()
+                .map(|&d| rank[old_order[d as usize] as usize])
+                .collect();
+            mapped.sort_unstable();
+            self.filter = Some(mapped);
+        }
+        self.order = Some(new_order);
+        // 结构类撤销会破坏显示映射；排序进入新视图时清空历史。
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        Ok(())
+    }
+
+    /// 退出排序视图；命中集换算回原始行号。
+    ///
+    /// # Parameters
+    /// - `release_ram`: true = 同时释放私有内存缓冲，重新映射原文件。
+    ///
+    /// # Errors
+    /// 重新映射失败时返回错误字符串（此时已退出排序视图）。
+    pub fn exit_sort_mode(&mut self, release_ram: bool) -> Result<(), String> {
+        if let Some(order) = self.order.take() {
+            if let Some(hits) = self.filter.take() {
+                let mut mapped: Vec<u32> = hits
+                    .iter()
+                    .map(|&d| order.get(d as usize).copied().unwrap_or(d))
+                    .collect();
+                mapped.sort_unstable();
+                self.filter = Some(mapped);
+            }
+        }
+        if release_ram && self.is_ram_backed() {
+            // 文件本身未变（编辑都在覆盖层），可直接重建映射与索引。
+            self.remap()?;
+        }
+        Ok(())
+    }
+
+    /// 估算排序模式需要的新增内存（不含磁盘页缓存）。
+    ///
+    /// # Parameters
+    /// - `levels`: 排序级别数（≥1；每级需要独立的键数组）。
+    ///
+    /// # Returns
+    /// 文件字节、行数、预计新增/峰值字节与系统可用内存。
+    pub fn sort_estimate(&self, levels: u32) -> SortEstimate {
+        let file_bytes = self.bytes().len() as u64;
+        let rows = if self.partial.is_some() {
+            self.indexed_data_rows()
+        } else {
+            self.seg.vrow_count()
+        };
+        let levels = levels.max(1) as u64;
+        // 排列 4 B/行；键 8 B/行/级（数字）或近似一行字节（文本键）。
+        let perm = rows.saturating_mul(4);
+        let avg_row = if rows > 0 { file_bytes / rows } else { 0 };
+        // 文本键按整行字节上界估算；GBK 解码成 UTF-8 最多约 1.5×。
+        let per_level = avg_row
+            .saturating_mul(if self.enc == Encoding::Gbk { 2 } else { 1 })
+            .max(8);
+        let keys = rows.saturating_mul(per_level).saturating_mul(levels);
+        let scratch = rows.saturating_mul(16);
+        // 已载入内存时不再重复计算文件缓冲。
+        let buffer = if self.is_ram_backed() { 0 } else { file_bytes };
+        let base = buffer
+            .saturating_add(perm)
+            .saturating_add(keys)
+            .saturating_add(scratch);
+        let margin = base / 10 + 32 * 1024 * 1024;
+        let new_bytes = base.saturating_add(margin);
+        // 载入瞬间私有缓冲与文件页缓存并存，物理峰值约 2×（页缓存可回收）。
+        let peak_bytes = if self.is_ram_backed() {
+            new_bytes
+        } else {
+            file_bytes.saturating_mul(2).max(new_bytes)
+        };
+        SortEstimate {
+            file_bytes,
+            row_count: rows,
+            new_bytes,
+            peak_bytes,
+            available_bytes: available_memory_bytes(),
+        }
+    }
+
+    /// 把文件内容分块复制到私有内存缓冲；完成后释放文件映射。
+    ///
+    /// 复制期间每块检查 `cancel`：取消只丢弃半成品缓冲，原 mmap 视图原样保留，
+    /// 不改文件、不标脏。索引未完成时拒绝（排序键需要完整行索引）。
+    ///
+    /// # Parameters
+    /// - `cancel`: 取消标志（由命令层持有，点击取消即置位）。
+    /// - `progress`: 进度回调 `(已复制字节, 总字节)`；首尾各必发一次。
+    ///
+    /// # Returns
+    /// true = 已切换为内存后备；false = 用户取消（后备保持不变）。
+    ///
+    /// # Errors
+    /// 索引未完成或内存分配失败时返回错误；取消不算错误。
+    pub fn load_into_ram(
+        &mut self,
+        cancel: &AtomicBool,
+        progress: &mut impl FnMut(u64, u64),
+    ) -> Result<bool, String> {
+        let total = self.bytes().len();
+        if self.is_ram_backed() {
+            progress(total as u64, total as u64);
+            return Ok(true);
+        }
+        // 后台索引恰好完成时先并回正式结构，再判断是否还在索引。
+        self.refresh_indexed();
+        if self.is_indexing() {
+            return Err("索引尚未完成，暂时不能载入内存".into());
+        }
+        // 先一次性预留，内存不足时在开始拷贝前就失败（而不是拷到一半才 OOM）。
+        let mut buf: Vec<u8> = Vec::new();
+        buf.try_reserve_exact(total)
+            .map_err(|_| format!("内存不足：无法分配 {:.1} MB 文件缓冲", total as f64 / 1048576.0))?;
+        const COPY_CHUNK: usize = 8 * 1024 * 1024;
+        let mut done = 0usize;
+        let mut last_emit: Option<Instant> = None;
+        progress(0, total as u64);
+        while done < total {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(false); // buf 在此丢弃，mmap 仍是后备
+            }
+            let end = (done + COPY_CHUNK).min(total);
+            buf.extend_from_slice(&self.bytes()[done..end]);
+            done = end;
+            if progress_gate(&mut last_emit, PROGRESS_MIN_GAP) || done == total {
+                progress(done as u64, total as u64);
+            }
+        }
+        // 索引已完成且后台线程已退出，切换后旧映射可立即释放。
+        self.backing = Backing::Ram(buf);
+        progress(total as u64, total as u64);
+        Ok(true)
     }
 
     pub fn meta(&self) -> BigMeta {
@@ -3199,6 +4136,9 @@ impl BigFile {
             can_undo: !self.undo_stack.is_empty(),
             can_redo: !self.redo_stack.is_empty(),
             indexing,
+            ram_backed: self.is_ram_backed(),
+            sorted: self.is_sorted(),
+            modified: self.revision > 0,
             indexed_bytes,
             total_bytes: self.total_bytes,
             open_ms: self.open_ms,
@@ -3305,18 +4245,18 @@ impl BigFile {
     /// 端点取记录首行偏移；区间末尾即文件末时用 mmap 长度。
     /// 仅在 save() 透传路径使用：调用方保证行未删除（段已剔除被删行）、无覆盖层。
     fn write_raw_range(&self, w: &mut impl Write, first: u32, end: u32) -> Result<(), String> {
-        let mut s = self.idx.record_span(self.mmap.len(), first as usize).0;
+        let mut s = self.idx.record_span(self.bytes().len(), first as usize).0;
         let e = if (end as usize) < self.idx.n_records() {
-            self.idx.record_span(self.mmap.len(), end as usize).0
+            self.idx.record_span(self.bytes().len(), end as usize).0
         } else {
-            self.mmap.len()
+            self.bytes().len()
         };
         // BOM 已单独写在文件开头：仅当记录 0 正好从文件字节 0 起才跳过，
         // 有前导空行时记录 0 起点在 BOM 之后，不能盲跳。
         if first == 0 && self.has_bom && s == 0 {
             s = 3;
         }
-        w.write_all(&self.mmap[s..e]).map_err(|e| e.to_string())
+        w.write_all(&self.bytes()[s..e]).map_err(|e| e.to_string())
     }
 
     /// 物理记录 rec 的可见字节范围；记录 0 统一剥掉文件头 BOM。
@@ -3335,7 +4275,7 @@ impl BigFile {
         let Some((s, e)) = self.src_span(rec) else {
             return vec![String::new(); self.base_ncols];
         };
-        let mut f = parse_record(&decode_slice(self.enc, &self.mmap[s..e]), b',');
+        let mut f = parse_record(&decode_slice(self.enc, &self.bytes()[s..e]), b',');
         let n = self.base_ncols;
         if f.len() < n {
             f.resize(n, String::new());
@@ -3369,8 +4309,9 @@ impl BigFile {
         f
     }
 
-    /// 取 vrow 的视图行（pending 期做列映射；渐进索引期按模式偏移换算）。
+    /// 取 vrow 的视图行（排序映射 + pending 列映射；渐进期按模式偏移换算）。
     fn row_at(&self, vrow: u64) -> Option<Vec<String>> {
+        let vrow = self.orig_vrow(vrow);
         if self.partial.is_some() {
             if vrow >= self.indexed_data_rows() {
                 return None;
@@ -3428,6 +4369,8 @@ impl BigFile {
     /// 写单元格（覆盖层/直改块 + 撤销日志）。
     pub fn set_cell(&mut self, vrow: u64, col: u32, value: String) -> Result<(), String> {
         self.require_editable()?;
+        // 显示行 → 原始行；编辑仍按稳定身份落覆盖层/插入块。
+        let vrow = self.orig_vrow(vrow);
         // 渐进索引期没有插入/删除行，vrow + 模式偏移 = 物理记录号；完成后再走段表。
         let resolved = if self.partial.is_some() {
             if vrow >= self.indexed_data_rows() {
@@ -3477,6 +4420,9 @@ impl BigFile {
         count: u32,
     ) -> Result<(), String> {
         self.require_editable()?;
+        if self.order.is_some() {
+            return Err("排序模式下暂不支持插入/删除行，请先退出排序".into());
+        }
         self.refresh_indexed();
         if self.is_indexing() {
             return Err("文件仍在索引中，暂不支持插入/删除行".into());
@@ -3513,6 +4459,9 @@ impl BigFile {
     /// 删除一组 vrow（升序传入；快照超限的删除不可撤销）。
     pub fn remove_rows(&mut self, mut vrows: Vec<u64>) -> Result<u32, String> {
         self.require_editable()?;
+        if self.order.is_some() {
+            return Err("排序模式下暂不支持插入/删除行，请先退出排序".into());
+        }
         self.refresh_indexed();
         if self.is_indexing() {
             return Err("文件仍在索引中，暂不支持插入/删除行".into());
@@ -3560,6 +4509,7 @@ impl BigFile {
     }
 
     fn push_undo(&mut self, op: Op) {
+        self.revision = self.revision.saturating_add(1);
         self.undo_stack.push(op);
         if self.undo_stack.len() > UNDO_CAP {
             self.undo_stack.remove(0);
@@ -3632,6 +4582,7 @@ impl BigFile {
         self.last_spec = None;
         let restored = self.apply_inverse(&op);
         self.redo_stack.push(restored);
+        self.revision = self.revision.saturating_add(1);
         true
     }
 
@@ -3642,6 +4593,7 @@ impl BigFile {
         self.last_spec = None;
         let normalized = self.apply(&op);
         self.undo_stack.push(normalized);
+        self.revision = self.revision.saturating_add(1);
         true
     }
 
@@ -3731,6 +4683,7 @@ impl BigFile {
     }
 
     fn row_at_fast(&self, cum: &[u64], vrow: u64) -> Option<Vec<String>> {
+        let vrow = self.orig_vrow(vrow);
         match self.resolve_fast(cum, vrow)? {
             ResolvedRow::Src(rec) => {
                 let f = self.src_fields(rec);
@@ -3854,8 +4807,11 @@ impl BigFile {
             .and_then(|_| self.filter.take());
         let narrowing = narrow.is_some();
 
-        // 缺缓存且本次是全扫：顺带建缓存（收窄只有命中行，建不出全列缓存）
-        let build_cols: Vec<u32> = if narrowing || use_cache {
+        // 缺缓存且本次是全扫：顺带建缓存（收窄只有命中行，建不出全列缓存）。
+        // 排序视图按显示顺序扫描，物理记录号是无序的；列缓存构建器/合并器
+        // 假定记录号递增，故排序时只读已有缓存、不新建（否则会写入空投影，
+        // 下一次筛选命中数变成 0）。缓存键是物理记录号，排序前建好的仍可复用。
+        let build_cols: Vec<u32> = if self.order.is_some() || narrowing || use_cache {
             Vec::new()
         } else {
             requested_cols(&spec)
@@ -3943,17 +4899,17 @@ impl BigFile {
                         return None;
                     }
                 }
-                let v = source.get(i);
-                if let Some(resolved) = self.seg.resolve(v as u64) {
+                let d = source.get(i) as u32;
+                if let Some(resolved) = self.seg.resolve(self.orig_vrow(d as u64)) {
                     let hit = match resolved {
                         ResolvedRow::Src(rec) => self.cache_match(spec, rec),
                         // 插入行不在列缓存中：走一次慢路径（通常极少）
                         ResolvedRow::Ins { .. } => self
-                            .row_at(v as u64)
+                            .row_at(d as u64)
                             .is_some_and(|f| spec_matches(spec, &f)),
                     };
                     if hit {
-                        hits.push(v);
+                        hits.push(d); // 命中集统一存显示位置
                     }
                 }
             }
@@ -3977,26 +4933,26 @@ impl BigFile {
                     return None;
                 }
             }
-            let v = source.get(i);
-            match self.seg.resolve(v as u64) {
+            let d = source.get(i) as u32;
+            match self.seg.resolve(self.orig_vrow(d as u64)) {
                 Some(ResolvedRow::Src(rec)) => {
                     // rec 已是物理记录号（段表统一寻址）；记录 0 需剥 BOM
                     let (s, e) = self
                         .src_span(rec)
                         .unwrap_or((0, 0));
                     scan.begin_src_record(rec);
-                    let hit = scan.record_matches(rec, &self.mmap[s..e]);
+                    let hit = scan.record_matches(rec, &self.bytes()[s..e]);
                     scan.finish_src_record();
                     if hit {
-                        hits.push(v);
+                        hits.push(d);
                     }
                 }
                 Some(ResolvedRow::Ins { .. }) => {
                     if self
-                        .row_at(v as u64)
+                        .row_at(d as u64)
                         .is_some_and(|f| spec_matches(spec, &f))
                     {
-                        hits.push(v);
+                        hits.push(d);
                     }
                 }
                 None => {}
@@ -4222,6 +5178,9 @@ impl BigFile {
         if self.is_indexing() {
             return Err("文件仍在索引中，暂不支持列操作".into());
         }
+        if self.order.is_some() {
+            return Err("排序模式下暂不支持列操作，请先退出排序".into());
+        }
         // 无列名模式列名是自动生成的，重命名没有意义
         if self.headerless && matches!(op, ColOp::Rename { .. }) {
             return Err("无列名模式不可重命名列".into());
@@ -4256,6 +5215,9 @@ impl BigFile {
     pub fn set_headerless(&mut self, on: bool) -> Result<(), String> {
         if on == self.headerless {
             return Ok(());
+        }
+        if self.order.is_some() {
+            return Err("排序模式下暂不支持切换首行语义，请先退出排序".into());
         }
         if !self.pending_cols.is_empty() {
             return Err("列操作待执行：请先执行或撤销列操作".into());
@@ -4341,6 +5303,58 @@ impl BigFile {
             self.overlay.keys().map(|k| k.0).collect();
         let mut done = 0u64;
         let mut last_emit: Option<Instant> = None;
+        let sorted_order = self.order.clone();
+        if let Some(order) = &sorted_order {
+            // 排序保存：按当前视图顺序逐行写出；物理顺序即所得。
+            for &orig in order.iter() {
+                match self.seg.resolve(orig as u64) {
+                    Some(ResolvedRow::Src(rec)) => {
+                        if edited.contains(&rec) {
+                            let f = self.src_fields(rec);
+                            w.write_all(&encode_record(&f, b',', self.enc))
+                                .map_err(|e| e.to_string())?;
+                        } else {
+                            let (s, e) = self.src_span(rec).unwrap_or((0, 0));
+                            w.write_all(&self.bytes()[s..e]).map_err(|e| e.to_string())?;
+                            // 原末行可能没有换行；排到中间时必须补行尾。
+                            if !self.bytes()[s..e].ends_with(b"\n") {
+                                w.write_all(b"\r\n").map_err(|e| e.to_string())?;
+                            }
+                        }
+                    }
+                    Some(ResolvedRow::Ins { block, row }) => {
+                        let mut f = self.ins_fields(block, row);
+                        let n = self.base_ncols;
+                        if f.len() < n {
+                            f.resize(n, String::new());
+                        } else if f.len() > n {
+                            f.truncate(n);
+                        }
+                        w.write_all(&encode_record(&f, b',', self.enc))
+                            .map_err(|e| e.to_string())?;
+                    }
+                    None => {}
+                }
+                done += 1;
+                if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
+                    progress(stream_weighted(done), total, PHASE_STREAM, done);
+                }
+            }
+            progress(stream_weighted(done), total, PHASE_STREAM, done);
+            w.flush().map_err(|e| e.to_string())?;
+            drop(w);
+            progress(flushed_weighted(total), total, PHASE_FLUSH, done);
+            self.replace_with_retry(&tmp)?;
+            progress(renamed_weighted(total), total, PHASE_FLUSH, done);
+            self.reopen_after_write()?;
+            // 物理顺序已重排：排列层与按旧记录号寻址的撤销历史全部失效。
+            self.order = None;
+            self.undo_stack.clear();
+            self.redo_stack.clear();
+            self.revision = 0;
+            progress(total, total, PHASE_REINDEX, total);
+            return Ok(());
+        }
         for s in &self.seg.segs {
             match s.kind {
                 SegKind::Src { start, len } => {
@@ -4400,6 +5414,7 @@ impl BigFile {
         self.replace_with_retry(&tmp)?;
         progress(renamed_weighted(total), total, PHASE_FLUSH, done);
         self.reopen_after_write()?;
+        self.revision = 0; // 内存状态与磁盘一致
         progress(total, total, PHASE_REINDEX, total); // 收尾必到满，前端进度条归零前显示 100%
         Ok(())
     }
@@ -4410,6 +5425,9 @@ impl BigFile {
         &mut self,
         mut progress: F,
     ) -> Result<(), String> {
+        if self.order.is_some() {
+            return Err("排序模式下暂不支持列操作，请先退出排序".into());
+        }
         self.refresh_indexed();
         if self.is_indexing() {
             return Err("文件仍在索引中，暂不支持列操作".into());
@@ -4522,7 +5540,7 @@ impl BigFile {
         self.cancel.store(true, Ordering::Relaxed); // 防御：旧索引线程不要再用旧映射
         self.partial = None;
         self.idx = build_index(bytes);
-        self.mmap = mmap;
+        self.backing = Backing::Mmap(mmap);
         self.index_ms = t0.elapsed().as_millis() as u64;
         Ok(())
     }
@@ -4538,8 +5556,9 @@ impl BigFile {
         let dummy = memmap2::MmapMut::map_anon(1)
             .and_then(|m| m.make_read_only())
             .map_err(|e| e.to_string())?;
-        // 旧映射解除、文件句柄关闭（保存前已 refresh_indexed，无后台线程共享）
-        drop(std::mem::replace(&mut self.mmap, Arc::new(dummy)));
+        // 旧映射解除、文件句柄关闭（保存前已 refresh_indexed，无后台线程共享）；
+        // 排序模式的内存缓冲也在此释放，换名成功后由重开路径重建后备。
+        drop(std::mem::replace(&mut self.backing, Backing::Mmap(Arc::new(dummy))));
         let mut last: Option<std::io::Error> = None;
         for _ in 0..5 {
             match fs::rename(tmp, &self.path) {
@@ -4581,7 +5600,7 @@ impl BigFile {
         if idx.n_records() as u64 != n_data + offset as u64 {
             return Err("写入后行数校验失败".into());
         }
-        self.mmap = mmap;
+        self.backing = Backing::Mmap(mmap);
         self.idx = idx;
         self.partial = None;
         self.index_ms = t0.elapsed().as_millis() as u64;

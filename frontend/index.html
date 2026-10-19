@@ -19,7 +19,8 @@
     fatal(e.message + " @ " + (e.filename || "") + ":" + (e.lineno || 0));
   });
   window.addEventListener("unhandledrejection", (e) => {
-    fatal("unhandledrejection: " + (e.reason && (e.reason.stack || e.reason)));
+    fatal("unhandledrejection [" + (window.__smokeCurrent || "?") + "]: "
+      + (e.reason && (e.reason.stack || e.reason)));
   });
   // 诊断：冒烟模式下 6 秒后若未收尾，把状态写进窗口标题（外部可读）；正常运行不干扰标题
   function armDiag() {

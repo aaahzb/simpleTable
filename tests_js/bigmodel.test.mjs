@@ -12,6 +12,8 @@ function makeFakeEngine({ rows = 1000, cols = 3 } = {}) {
   );
   const calls = [];
   let headerless = false;
+  let ramBacked = false;
+  let sorted = false;
   let baseHeaders = Array.from({ length: cols }, (_, c) => `h${c}`);
   const generic = () => Array.from({ length: cols }, (_, c) => `列${c + 1}`);
   const meta = () => ({
@@ -25,6 +27,8 @@ function makeFakeEngine({ rows = 1000, cols = 3 } = {}) {
     headerless,
     // 渐进索引字段：普通夹具视为"已索引完成"
     indexing: false,
+    ram_backed: ramBacked,
+    sorted,
     indexed_bytes: 1024,
     total_bytes: 1024,
     open_ms: 3,
@@ -102,6 +106,56 @@ function makeFakeEngine({ rows = 1000, cols = 3 } = {}) {
         case "big_col_apply":
           return null;
         case "big_save":
+          // 真实引擎保存后重开文件：筛选结果被丢弃、排序视图已物理落盘
+          filter = null;
+          sorted = false;
+          return null;
+        case "big_sort_estimate":
+          return {
+            file_bytes: 1024,
+            row_count: data.length,
+            new_bytes: 4096,
+            peak_bytes: 8192,
+            available_bytes: 1 << 30,
+          };
+        case "big_sort_load":
+          ramBacked = true;
+          return true;
+        case "big_sort_cancel":
+          return null;
+        case "big_sort_apply": {
+          const levels = args.levels || [];
+          const val = (r, l) => {
+            const text = String(data[r][Number(l.col)] ?? "");
+            if (!l.numeric) return text;
+            const n = Number(text.trim());
+            return text.trim() === "" || !Number.isFinite(n) ? null : n;
+          };
+          const idx = data.map((_, i) => i);
+          idx.sort((a, b) => {
+            for (const l of levels) {
+              const x = val(a, l);
+              const y = val(b, l);
+              if (l.numeric) {
+                if (x === null && y !== null) return 1;
+                if (y === null && x !== null) return -1;
+                if (x === null) continue;
+                if (x !== y) return l.asc ? x - y : y - x;
+              } else if (x !== y) {
+                return l.asc ? (x < y ? -1 : 1) : (x > y ? -1 : 1);
+              }
+            }
+            return a - b;
+          });
+          data.splice(0, data.length, ...idx.map((i) => data[i]));
+          sorted = true;
+          return meta();
+        }
+        case "big_sort_exit":
+          sorted = false;
+          if (args.releaseRam !== false) ramBacked = false;
+          return meta();
+        case "big_close":
           return null;
         case "big_stale":
           return false;
@@ -201,6 +255,29 @@ test("open 后同步元数据可用，行/列/表头正确", async () => {
 
 test("阈值常量为 50MiB", () => {
   assert.equal(BIG_THRESHOLD, 50 * 1024 * 1024);
+});
+
+test("每个模型持有独立会话号，所有 big_* 调用都携带它", async () => {
+  const a = makeFakeEngine({ rows: 3, cols: 1 });
+  const b = makeFakeEngine({ rows: 4, cols: 1 });
+  await a.model.open("/a.csv");
+  await b.model.open("/b.csv");
+  const sidA = a.calls[0][1].session;
+  const sidB = b.calls[0][1].session;
+  assert.equal(typeof sidA, "number");
+  assert.equal(typeof sidB, "number");
+  assert.notEqual(sidA, sidB, "两个模型不应共享会话号");
+
+  // 任意后续命令（取数/筛选/保存/关闭）都必须带上本模型会话号
+  a.model.prefetchRange(0, 0);
+  await tick();
+  await a.model.runFilter([[0, "r"]], [], "");
+  await a.model.close();
+  const later = a.calls.slice(1);
+  assert.ok(later.length >= 3);
+  for (const [cmd, args] of later) {
+    assert.equal(args.session, sidA, `${cmd} 应携带会话号`);
+  }
 });
 
 test("displayData 未命中缓存返回空串并调度拉页，落定后读到值", async () => {
@@ -313,6 +390,21 @@ test("筛选：runFilter 切结果视图，rowCount=命中数，clearFilter 还�
   await model.clearFilter();
   assert.equal(model.filterActive(), false);
   assert.equal(model.rowCount(), 200);
+});
+
+test("save 后筛选态复位：引擎重开文件后视图回到全量", async () => {
+  const { model, data } = makeFakeEngine({ rows: 200, cols: 1 });
+  await model.open("/x.csv");
+  data[7][0] = "needle";
+  await model.runFilter([[0, "needle"]], [], "");
+  assert.equal(model.rowCount(), 1);
+  const events = [];
+  model.onData((structural, origin) => events.push([structural, origin]));
+  await model.save();
+  assert.equal(model.filterActive(), false, "保存后不应再声称筛选视图");
+  assert.equal(model.rowCount(), 200, "rowCount 应回到全量行数");
+  assert.deepEqual(events.at(-1), [true, "view"],
+    "保存后应发结构通知（origin=view，不额外标脏）以重建全量视图");
 });
 
 test("筛选结果中禁止编辑/删除", async () => {
@@ -553,7 +645,10 @@ test("重新打开会重置首屏耗时与索引轮询", async () => {
 test("open 把 headerless 传给 big_open，缺省为 false", async () => {
   const { model, calls } = makeFakeEngine();
   await model.open("/x.csv");
-  assert.deepEqual(calls[0], ["big_open", { path: "/x.csv", headerless: false }]);
+  assert.equal(calls[0][0], "big_open");
+  assert.equal(calls[0][1].path, "/x.csv");
+  assert.equal(calls[0][1].headerless, false);
+  assert.equal(typeof calls[0][1].session, "number");
   assert.equal(model.isHeaderless(), false);
 });
 
@@ -579,7 +674,9 @@ test("setHeaderless 调引擎并更新元数据/表头/行数", async () => {
   const { model, calls } = makeFakeEngine({ rows: 3, cols: 2 });
   await model.open("/x.csv");
   await model.setHeaderless(true);
-  assert.deepEqual(calls.at(-1), ["big_set_headerless", { on: true }]);
+  assert.equal(calls.at(-1)[0], "big_set_headerless");
+  assert.equal(calls.at(-1)[1].on, true);
+  assert.equal(typeof calls.at(-1)[1].session, "number");
   assert.equal(model.isHeaderless(), true);
   assert.deepEqual(model.headers(), ["列1", "列2"]);
   assert.equal(model.rowCount(), 4);
@@ -622,6 +719,69 @@ test("相同状态不重复调用引擎", async () => {
   const before = calls.length;
   await model.setHeaderless(false);
   assert.equal(calls.length, before);
+});
+
+test("排序模式：估算/载入/取消都带 session，载入后刷新 meta", async () => {
+  const { model, calls } = makeFakeEngine();
+  await model.open("/x.csv");
+  const est = await model.sortEstimate(3);
+  assert.equal(calls.at(-1)[0], "big_sort_estimate");
+  assert.equal(calls.at(-1)[1].levels, 3);
+  assert.equal(typeof calls.at(-1)[1].session, "number");
+  assert.equal(est.file_bytes, 1024);
+  assert.equal(est.row_count, 1000);
+  assert.equal(await model.loadIntoRam(), true);
+  assert.equal(calls.at(-1)[0], "big_meta", "载入后应刷新元数据");
+  await model.cancelSortLoad();
+  assert.equal(calls.at(-1)[0], "big_sort_cancel");
+});
+
+test("sort 调引擎带级别，刷新 meta 并以 origin='sort' 通知", async () => {
+  const { model, calls } = makeFakeEngine({ rows: 5, cols: 2 });
+  await model.open("/x.csv");
+  const events = [];
+  model.onData((s, o) => events.push([s, o]));
+  const levels = [{ col: 1, numeric: false, asc: false }];
+  const meta = await model.sort(levels);
+  assert.equal(calls.at(-1)[0], "big_sort_apply");
+  assert.equal(typeof calls.at(-1)[1].session, "number");
+  assert.deepEqual(calls.at(-1)[1].levels, levels);
+  assert.equal(meta.sorted, true);
+  assert.equal(model.rowCount(), 5, "排序不改变行数");
+  assert.deepEqual(events.at(-1), [true, "sort"], "排序应标记为需保存");
+});
+
+test("exitSort 默认释放内存并回到未排序 meta", async () => {
+  const { model, calls } = makeFakeEngine();
+  await model.open("/x.csv");
+  await model.loadIntoRam();
+  await model.sort([{ col: 0, numeric: false, asc: true }]);
+  const events = [];
+  model.onData((s, o) => events.push([s, o]));
+  const meta = await model.exitSort();
+  assert.equal(calls.at(-1)[0], "big_sort_exit");
+  assert.equal(calls.at(-1)[1].releaseRam, true);
+  assert.equal(typeof calls.at(-1)[1].session, "number");
+  assert.equal(meta.sorted, false);
+  assert.equal(meta.ram_backed, false);
+  assert.deepEqual(events.at(-1), [true, "view"]);
+});
+
+test("onSortProgress 只派发本会话进度事件", async () => {
+  const handlers = [];
+  const model = new BigModel({
+    invoke: async () => null,
+    listen: async (event, cb) => {
+      handlers.push([event, cb]);
+      return () => {};
+    },
+  });
+  const got = [];
+  await model.onSortProgress((done, total) => got.push([done, total]));
+  assert.equal(handlers[0][0], "big-sort-progress");
+  handlers[0][1]({ payload: [1, 2, 999] }); // 其他会话
+  handlers[0][1]({ payload: [3, 4, model.sessionId] }); // 本会话
+  assert.deepEqual(got, [[3, 4]]);
 });
 
 test("无列名模式拒绝重命名列且不调用引擎", async () => {

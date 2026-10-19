@@ -22,6 +22,9 @@ export const BIG_THRESHOLD = 50 * 1024 * 1024;
 /** 乐观编辑失败时抛出的统一错误前缀（app 层捕获转状态栏）。 */
 const BIG_EDIT_ERR = "大文件编辑失败";
 
+/** 进程内会话号分配器：每个 BigModel 独占一个引擎会话（多页签互不干扰）。 */
+let nextSessionId = 1;
+
 /**
  * 大文件模型。
  */
@@ -36,8 +39,11 @@ export class BigModel {
       invoke: (cmd, args) => window.__TAURI__.core.invoke(cmd, args),
       listen: (ev, cb) => window.__TAURI__.event.listen(ev, cb),
     };
-    /** @type {Function} */
-    this._invoke = tauri.invoke;
+    /** @type {Function} 原始 Tauri 调用（_invoke 负责附加会话号） */
+    this._rawInvoke = tauri.invoke;
+    /** @type {number} 本模型独占的引擎会话号 */
+    this._sid = nextSessionId;
+    nextSessionId += 1;
     /** @type {Function} */
     this._listen = tauri.listen;
     /** @type {number} 索引进度轮询周期 ms（测试可注入更短值） */
@@ -74,6 +80,29 @@ export class BigModel {
     this._undoCbs = new Set();
     /** @type {Set<Function>} */
     this._resetCbs = new Set();
+  }
+
+  /**
+   * 本模型独占的引擎会话号（调试/诊断用；命令调用请走 _invoke）。
+   *
+   * @returns {number} 会话号。
+   */
+  get sessionId() {
+    return this._sid;
+  }
+
+  /**
+   * 调用引擎命令并附加本模型会话号。
+   *
+   * 所有 big_* 命令都按会话寻址：多页签同时打开时，后台索引轮询/筛选
+   * 只能读写自己的会话，不能落到当前活动页签的引擎上。
+   *
+   * @param {string} cmd - Tauri 命令名。
+   * @param {object} [args] - 命令参数（不含 session）。
+   * @returns {Promise<any>} 命令返回值。
+   */
+  _invoke(cmd, args = {}) {
+    return this._rawInvoke(cmd, { session: this._sid, ...args });
   }
 
   // ---- 生命周期 ----
@@ -316,6 +345,84 @@ export class BigModel {
   async onProgress(cb) {
     return this._listen("big-progress", (e) =>
       cb(e.payload[0], e.payload[1], e.payload[2], e.payload[3]));
+  }
+
+  /**
+   * 订阅排序模式载入进度（事件带会话号，只接收本模型的）。
+   *
+   * @param {(done: number, total: number) => void} cb - 回调（字节）。
+   * @returns {Promise<Function>} 取消监听函数。
+   */
+  async onSortProgress(cb) {
+    return this._listen("big-sort-progress", (e) => {
+      const [done, total, sid] = e.payload;
+      if (sid === this._sid) cb(done, total);
+    });
+  }
+
+  /**
+   * 排序模式内存估算（确认弹窗展示）。
+   *
+   * @param {number} [levels=1] - 排序级别数。
+   * @returns {Promise<{file_bytes: number, row_count: number,
+   *   new_bytes: number, peak_bytes: number,
+   *   available_bytes: number | null}>} 估算结果（字节）。
+   */
+  async sortEstimate(levels = 1) {
+    return this._invoke("big_sort_estimate", { levels });
+  }
+
+  /**
+   * 把文件分块载入私有内存缓冲（排序模式）；进度经 {@link onSortProgress}。
+   *
+   * @returns {Promise<boolean>} true=已载入；false=用户取消（仍用原 mmap 视图）。
+   */
+  async loadIntoRam() {
+    const loaded = await this._invoke("big_sort_load");
+    await this._refreshMeta();
+    return loaded;
+  }
+
+  /**
+   * 取消正在进行的排序模式载入（幂等）。
+   *
+   * @returns {Promise<void>}
+   */
+  async cancelSortLoad() {
+    await this._invoke("big_sort_cancel");
+  }
+
+  /**
+   * 对当前视图排序（引擎侧排列层，不改文件；需先 {@link loadIntoRam}）。
+   *
+   * 排序是物理保存的准备动作：发出结构通知（origin="sort"），由 app 标脏。
+   * 已激活的筛选结果会随排序重新定位，成员不变。
+   *
+   * @param {Array<{col: number, numeric: boolean, asc: boolean}>} levels - 排序级别。
+   * @returns {Promise<object>} 最新 BigMeta（sorted=true）。
+   */
+  async sort(levels) {
+    const meta = await this._invoke("big_sort_apply", { levels });
+    this._meta = meta;
+    this._invalidate();
+    this._emitData(true, "sort");
+    this._emitUndo();
+    return meta;
+  }
+
+  /**
+   * 退出排序视图；默认同时释放私有内存缓冲、回到 mmap 视图。
+   *
+   * @param {{releaseRam?: boolean}} [opts] - releaseRam=false 时保留内存后备。
+   * @returns {Promise<object>} 最新 BigMeta（sorted=false）。
+   */
+  async exitSort({ releaseRam = true } = {}) {
+    const meta = await this._invoke("big_sort_exit", { releaseRam });
+    this._meta = meta;
+    this._invalidate();
+    this._emitData(true, "view");
+    this._emitUndo();
+    return meta;
   }
 
   /**
@@ -955,7 +1062,15 @@ export class BigModel {
   async save() {
     this._requireNotIndexing("文件仍在索引中，请稍候再保存");
     await this._invoke("big_save");
+    // 引擎写盘后会重新打开文件并丢弃筛选（排序保存则已按显示顺序落盘）。
+    // 前端必须同步回全量视图，否则 rowCount 仍停在旧命中数、缓存仍是旧页。
+    this._filterGen += 1;
+    this._filterOn = false;
+    this._filterCount = 0;
+    this._invalidate();
     await this._refreshMeta();
+    // 保存是“落盘”而非内容修改：origin=view 让外壳保持干净，仅重建视图。
+    this._emitData(true, "view");
   }
 
   // ---- 剪贴板（大选区走引擎流式序列化） ----

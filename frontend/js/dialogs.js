@@ -75,18 +75,70 @@ export async function confirmDialog(text) {
 }
 
 /**
- * 进度条模态（大文件保存/列操作物理重写）。
- * 非阻塞：返回句柄由调用方驱动 set/close（进度经 big-progress 事件推送）。
+ * 字节数 → 人类可读文本（GB/MB/KB，保留 1 位小数）。
+ *
+ * @param {number} n - 字节数。
+ * @returns {string} 展示文本，如 "2.3 GB"。
+ */
+export function fmtBytes(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v < 0) return "-";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let x = v;
+  let i = 0;
+  while (x >= 1024 && i < units.length - 1) {
+    x /= 1024;
+    i += 1;
+  }
+  return `${i === 0 ? Math.round(x) : x.toFixed(1)} ${units[i]}`;
+}
+
+/**
+ * 排序内存确认（载入前展示可用内存 / 预计新增 / 峰值）。
+ *
+ * @param {{file_bytes: number, row_count: number, new_bytes: number,
+ *   peak_bytes: number, available_bytes: number | null}} est - 引擎估算。
+ * @returns {Promise<boolean>} true = 用户确认载入。
+ */
+export async function confirmRamSortDialog(est) {
+  const body = document.createElement("div");
+  body.style.whiteSpace = "pre-line";
+  const avail = est.available_bytes == null
+    ? "无法获取"
+    : fmtBytes(est.available_bytes);
+  const tight = est.available_bytes != null && est.available_bytes < est.new_bytes;
+  body.textContent =
+    "启用排序需要把整个文件载入内存，载入期间界面保持可用、可随时取消。\n\n" +
+    `文件大小：${fmtBytes(est.file_bytes)}\n` +
+    `预计新增内存：${fmtBytes(est.new_bytes)}\n` +
+    `载入瞬间峰值：约 ${fmtBytes(est.peak_bytes)}（含可回收的文件缓存）\n` +
+    `当前可用内存：${avail}\n\n` +
+    (tight
+      ? "⚠ 可用内存低于预计新增，载入可能失败或导致系统变慢。\n\n"
+      : "") +
+    "载入完成后排序通常只需几秒。";
+  const v = await modal("启用排序（载入内存）", body, [
+    { text: "取消", value: false },
+    { text: "载入并排序", value: true, primary: true },
+  ]);
+  return v === true;
+}
+
+/**
+ * 进度条模态（大文件保存/列操作物理重写/排序载入）。
+ * 非阻塞：返回句柄由调用方驱动 set/close（进度经事件推送）。
  * 阶段文字 + 已用秒数走 UI 侧时钟（250ms 刷新）：即使引擎被写盘 IO 硬卡住
  * 发不出事件，界面也在持续刷新，不会出现"进度条定住像死机"的观感。
  *
  * @param {string} title - 标题文本。
+ * @param {{phases?: string[], cancelText?: string, onCancel?: Function}} [opts] -
+ *   阶段文字（缺省为保存流程）、取消按钮文字与回调；不传则无取消按钮。
  * @returns {{set: (done: number, total: number, phase?: number, rows?: number) => void,
  *            finish: () => Promise<void>, close: () => void}}
  */
-export function progressDialog(title) {
+export function progressDialog(title, opts = {}) {
   /** 阶段文字（与引擎 PHASE_* 常量对应）。 */
-  const PHASES = ["正在重写文件…", "正在落盘替换原文件…", "正在重建行索引…"];
+  const PHASES = opts.phases ?? ["正在重写文件…", "正在落盘替换原文件…", "正在重建行索引…"];
   const mask = document.createElement("div");
   mask.className = "modal-mask";
   const box = document.createElement("div");
@@ -104,6 +156,19 @@ export function progressDialog(title) {
   label.className = "progress-label";
   label.textContent = "准备中…";
   body.append(bar, label);
+  let cancelBtn = null;
+  if (opts.cancelText) {
+    cancelBtn = document.createElement("button");
+    cancelBtn.textContent = opts.cancelText;
+    cancelBtn.style.marginTop = "8px";
+    cancelBtn.addEventListener("click", () => {
+      if (cancelBtn.disabled) return;
+      cancelBtn.disabled = true;
+      cancelBtn.textContent = "正在取消…";
+      opts.onCancel?.();
+    });
+    body.appendChild(cancelBtn);
+  }
   box.append(head, body);
   mask.appendChild(box);
   document.body.appendChild(mask);
@@ -217,6 +282,30 @@ export async function confirmDiscardDialog() {
     { text: "取消", value: "cancel" },
     { text: "放弃", value: "discard" },
     { text: "保存", value: "save", primary: true },
+  ]);
+  return v ?? "cancel";
+}
+
+/**
+ * 退出排序模式三选（保存并退出 / 放弃排序 / 取消）。
+ *
+ * 「放弃排序」只恢复排序前的行顺序并释放内存，单元格修改仍保留在会话里，
+ * 因此文案明确区分“放弃排序”而非“放弃修改”。
+ *
+ * @returns {Promise<"save" | "discard" | "cancel">} 用户选择。
+ */
+export async function confirmExitSortDialog() {
+  const body = document.createElement("div");
+  body.style.whiteSpace = "pre-line";
+  body.textContent =
+    "当前排序尚未写入磁盘。\n\n" +
+    "• 保存并退出：按当前排序顺序重写文件。\n" +
+    "• 放弃排序：恢复排序前的行顺序并释放排序内存；" +
+    "已做的单元格修改仍会保留。";
+  const v = await modal("退出排序", body, [
+    { text: "取消", value: "cancel" },
+    { text: "放弃排序", value: "discard" },
+    { text: "保存并退出", value: "save", primary: true },
   ]);
   return v ?? "cancel";
 }
