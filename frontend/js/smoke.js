@@ -2149,11 +2149,14 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       const t = document.getElementById("status-text").textContent;
       return /首屏\s*\d+\s*ms/.test(t) && /索引\s/.test(t);
     }, "状态栏耗时摘要");
-    // 吸顶表头遮住顶部若干行：取「表头下第一行」作为用户看到的锚点。
-    const headRows = Math.ceil(grid._originY() / grid._uniformRowH);
-    const anchorNow = grid._rowAt(sc.scrollTop - grid._originY()) + headRows;
+    // 不变量：索引推进/完成不得移动视口内容——以「视口顶锚点行」为准
+    // （含被吸顶表头遮住的行）。历史缺陷：恢复时按「表头下对齐」，每次进度
+    // 事件净下移一个表头高——本地 1 次事件恰好被旧测量公式的 +headRows
+    // 抵消，CI 慢盘 2 次事件净 −3（49997）。现在恢复是不动点，任意次事件
+    // 后仍精确等于 anchorRow；±2 只吸收浏览器滚动条的设备像素吸附。
+    const anchorNow = grid._rowAt(sc.scrollTop - grid._originY());
     assert(Math.abs(anchorNow - anchorRow) <= 2,
-      `索引完成后表头下首行 ${anchorNow} 应≈${anchorRow}（不得因行数增长跳走）`);
+      `索引完成后视口顶锚点行 ${anchorNow} 应≈${anchorRow}（不得因行数增长跳走）`);
     assert(grid._yScale > 1, `yScale=${grid._yScale} 应已启用虚拟缩放`);
     const cv = sc.firstElementChild;
     const styleH = parseFloat(cv.style.height);

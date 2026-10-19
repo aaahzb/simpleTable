@@ -408,7 +408,8 @@ export class Grid {
    * 锚点 = round(行区滚动位置×_yScale/行高)。_renderRows/_rowAt/_paintTop 共用，
    * 保证渲染、命中测试、编辑器定位同一几何。
    *
-   * @returns {{sv: number, anchor: number, h: number}} 行区滚动位置/锚点行/行高。
+   * @returns {{sv: number, anchor: number, h: number, pos: number}}
+   *   行区滚动位置/锚点行（整数）/行高/小数锚点位置（索引恢复不动点用）。
    */
   _yAnchor() {
     const h = this._uniformRowH;
@@ -432,18 +433,21 @@ export class Grid {
       // 按比例四舍五入会停在 span 之前（1550 万行实测差 2 行），末尾行被画
       // 到视口下缘之外，用户滚到底也永远看不见。
       const atBottom = maxSv > 0 && maxSv - sv < 1;
-      const anchor = maxSv > 0
-        ? (atBottom ? span : Math.round((sv / maxSv) * span))
+      // pos：小数锚点（行单位）。索引恢复用 pos 做不动点换算——若捕获时
+      // 就量化成整数行，每次进度事件都会损失子行位置并累积漂移。
+      const pos = maxSv > 0
+        ? (atBottom ? span : Math.min(span, (sv / maxSv) * span))
         : 0;
-      return { sv, anchor: Math.max(0, Math.min(n - 1, anchor)), h };
+      const anchor = Math.max(0, Math.min(n - 1, Math.round(pos)));
+      return { sv, anchor, h, pos };
     }
     // 未压缩路径同理：贴底时 rawSv/h 的小数部分会把锚点四舍五入到下一行，
     // 末行下缘最多超出视口近一行。吸附到 n-_rowSpan，末行整体可见。
     const maxSv = Math.max(0, this._maxScroll - oy);
-    const anchor = maxSv > 0 && rawSv >= maxSv - 1
+    const pos = maxSv > 0 && rawSv >= maxSv - 1
       ? Math.max(0, n - this._rowSpan)
-      : Math.max(0, Math.min(n - 1, Math.round(rawSv / h)));
-    return { sv: rawSv, anchor, h };
+      : Math.max(0, Math.min(n - 1, rawSv / h));
+    return { sv: rawSv, anchor: Math.round(pos), h, pos };
   }
 
   /**
@@ -473,13 +477,16 @@ export class Grid {
     if (anchor <= 0) return 0;
     const oy = this._originY();
     if (this._yScale <= 1) {
-      return Math.max(0, Math.min(this._maxScroll, this._rowTop(anchor)));
+      // 与 _yAnchor 未压缩分支严格互逆（rawSv = scrollTop - oy）；
+      // 既有调用方都包在 yScale>1 分支里，此分支只服务索引锚点恢复。
+      return Math.max(0, Math.min(this._maxScroll, oy + this._rowTop(anchor)));
     }
     const maxSv = Math.max(0, this._maxScroll - oy);
     if (maxSv <= 0) return 0;
     const span = Math.max(1, this.visCount() - this._rowSpan);
-    return Math.max(0, Math.min(this._maxScroll,
-      oy + Math.round((anchor / span) * maxSv)));
+    // 不取整：浏览器接受小数 scrollTop；取整是纯精度损失，会让索引恢复
+    // 在每个进度事件上累积量化漂移。
+    return Math.max(0, Math.min(this._maxScroll, oy + (anchor / span) * maxSv));
   }
 
   /**
@@ -861,12 +868,14 @@ export class Grid {
    */
   _onModelData(structural) {
     // 大模式索引推进：行数增长会改变画布总高与 _yScale，同一 scrollTop 可能
-    // 落到别的行——先记住视口锚点行，重排后把它送回视口顶（顶部用户不打扰）。
-    let anchor = null;
+    // 落到别的行——先记住视口锚点位置（小数行号），重排后原位送回。
+    // 必须按「视口顶锚点」原位恢复（不动点）：若按「表头下对齐」恢复，每次
+    // 进度事件都净下移一个表头高，事件次数随索引速度变（CI 实测两次 −3 行）。
+    let anchorPos = null;
     const rowsBefore = this._lastVisCount;
     if (structural && this.model.isBig && !this.visibleRows) {
-      const a = this._yAnchor().anchor;
-      if (a > 0 && a < rowsBefore) anchor = a;
+      const pos = this._yAnchor().pos;
+      if (pos > 0 && pos < rowsBefore) anchorPos = pos;
     }
     if (structural) {
       if (!this.model.isBig) {
@@ -885,9 +894,9 @@ export class Grid {
     }
     this._refilter();
     this.renderAll();
-    if (anchor !== null && this.visCount() > rowsBefore) {
-      // 行数增长会改变压缩比例/滚动范围：把原锚点行重新对齐到表头下方。
-      const top = this._scrollTopForRowTop(anchor);
+    if (anchorPos !== null && this.visCount() > rowsBefore) {
+      // 行数增长会改变压缩比例/滚动范围：把原锚点位置精确送回（不动点）。
+      const top = this._scrollTopForAnchor(anchorPos);
       if (Math.abs(this.scrollEl.scrollTop - top) > 1) {
         this.scrollEl.scrollTop = top;
         this._renderRows();

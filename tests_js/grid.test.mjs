@@ -97,3 +97,44 @@ test("未缩放滚动到底：末行不得被视口下缘裁掉", () => {
   assert.equal(anchor, n - g._rowSpan,
     `贴底时锚点应为 n-_rowSpan=${n - g._rowSpan}，实际 ${anchor}`);
 });
+
+test("锚点精确性：_yAnchor 暴露小数位置 pos（未压缩整行精确）", () => {
+  // 渐进索引首批（<20 万行）不压缩：scrollTop = 表头 + 行号×行高，
+  // pos 必须精确等于行号（捕获不含量化损失是恢复不动点的前提）。
+  const g = makeStaleLayoutGrid({ oldN: 104_858, h: 20, oy: 52, viewH: 700 });
+  assert.equal(g._yScale, 1, "首批行数不应触发压缩");
+  g.scrollEl.scrollTop = g._originY() + 50_000 * 20;
+
+  const { pos, anchor } = g._yAnchor();
+
+  assert.equal(pos, 50_000, `未压缩 pos 应精确等于 50000，实际 ${pos}`);
+  assert.equal(anchor, 50_000);
+});
+
+test("锚点恢复不动点：行数增长后恢复再捕获位置不变（CI 漂移根因回归）", () => {
+  // CI 实测：索引完成报 49997（期望 50000）。根因是恢复时刻意把锚点
+  // 移到表头下方（_scrollTopForRowTop），每次进度事件净下移一个表头高
+  // （本地 1 次事件恰好被测量公式抵消、CI 2 次事件漂 3 行）。
+  // 恢复必须是不动点：capture → 换新布局 → restore → 再 capture 得到同一位置，
+  // 重复多少次都不漂移。
+  const n1 = 104_858;   // 首批（未压缩）
+  const n2 = 1_000_001; // 索引完成（Y_CLAMP 压缩）
+  const ga = makeStaleLayoutGrid({ oldN: n1, h: 20, oy: 52, viewH: 700 });
+  ga.scrollEl.scrollTop = ga._originY() + 50_000 * 20;
+  const pos0 = ga._yAnchor().pos;
+
+  // 第一次进度事件：布局换成 n2，恢复后重捕获
+  const gb = makeStaleLayoutGrid({ oldN: n2, h: 20, oy: 52, viewH: 700 });
+  gb.scrollEl.scrollTop = gb._scrollTopForAnchor(pos0);
+  const pos1 = gb._yAnchor().pos;
+  assert.ok(Math.abs(pos1 - pos0) <= 0.3,
+    `行数增长恢复后位置应保持 50000，实际 ${pos1}`);
+
+  // 第二次进度事件（CI 情形：慢盘会捕获中间行数）：必须仍是不动点
+  gb.scrollEl.scrollTop = gb._scrollTopForAnchor(pos1);
+  const pos2 = gb._yAnchor().pos;
+  assert.ok(Math.abs(pos2 - pos1) <= 1e-6,
+    `重复恢复不得漂移：${pos1} → ${pos2}`);
+  assert.ok(Math.abs(pos2 - pos0) <= 0.3,
+    `两次事件后位置仍应≈50000，实际 ${pos2}`);
+});
