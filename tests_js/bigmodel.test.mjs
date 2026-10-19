@@ -846,3 +846,122 @@ test("findVerticalEdge 空表返回 null", async () => {
   await model.open("/x.csv");
   assert.equal(await model.findVerticalEdge(0, 0, true), null);
 });
+
+/**
+ * 可控取页引擎：big_rows 返回手动落定的 Promise，用来模拟机械盘慢读、
+ * 拖动途中请求乱序返回。其他命令同步返回。
+ *
+ * @param {{rows?: number, cols?: number}} [opts] - 夹具规模。
+ * @returns {{model: BigModel, pending: Array<{page: number, from: number,
+ *   resolve: Function}>, resolvePage: (page: number) => Promise<void>}}
+ */
+function makeDeferredEngine({ rows = 100 * BIG_PAGE, cols = 2 } = {}) {
+  const data = Array.from({ length: rows }, (_, r) =>
+    Array.from({ length: cols }, (_, c) => `r${r}c${c}`),
+  );
+  const meta = {
+    rows, cols, headers: Array.from({ length: cols }, (_, c) => `h${c}`),
+    encoding: "utf-8", pending_cols: false, can_undo: false, can_redo: false,
+    headerless: false, indexing: false, indexed_bytes: 1024, total_bytes: 1024,
+    open_ms: 1, index_ms: 1, elapsed_ms: 1,
+  };
+  const pending = [];
+  const model = new BigModel({
+    invoke: (cmd, args = {}) => {
+      switch (cmd) {
+        case "big_open":
+        case "big_meta":
+          return Promise.resolve({ ...meta });
+        case "big_rows": {
+          const from = Number(args.from);
+          const count = Number(args.count);
+          return new Promise((resolve) => {
+            pending.push({
+              page: Math.floor(from / BIG_PAGE),
+              from,
+              resolve: () => resolve(data.slice(from, from + count)),
+            });
+          });
+        }
+        default:
+          return Promise.resolve(null);
+      }
+    },
+    listen: async () => () => {},
+  });
+  /**
+   * 落定某一页的请求并等一个宏任务，让 then/finally/后续调度跑完。
+   *
+   * @param {number} page - 页号。
+   * @returns {Promise<void>}
+   */
+  const resolvePage = async (page) => {
+    const i = pending.findIndex((p) => p.page === page);
+    assert.notEqual(i, -1, `第 ${page} 页应已有在飞请求，实际 ${pending.map((p) => p.page)}`);
+    const [req] = pending.splice(i, 1);
+    req.resolve();
+    await tick();
+  };
+  return { model, pending, resolvePage };
+}
+
+test("快速拖动：迟到的旧页响应不得逐出当前视口页", async () => {
+  const { model, resolvePage } = makeDeferredEngine({ rows: 30 * BIG_PAGE });
+  await model.open("/x.csv");
+  // 拖动途中经过第 5 页：请求已发出但还没落定
+  model.prefetchRange(5 * BIG_PAGE, 5 * BIG_PAGE);
+  // 视口继续跳到第 10 页并先落定
+  model.prefetchRange(10 * BIG_PAGE, 10 * BIG_PAGE);
+  await resolvePage(10);
+  assert.equal(model.hasData(10 * BIG_PAGE, 0), true);
+  // 旧页迟到：换出窗口必须跟随当前视口，而不是迟到响应的页号
+  await resolvePage(5);
+  assert.equal(model.hasData(10 * BIG_PAGE, 0), true,
+    "迟到的第 5 页响应不得把当前视口第 10 页逐出缓存");
+  assert.equal(model.displayData(10 * BIG_PAGE, 0), `r${10 * BIG_PAGE}c0`);
+});
+
+test("快速拖动：排队中的旧页被丢弃，当前视口页优先发出", async () => {
+  const { model, pending, resolvePage } = makeDeferredEngine({ rows: 100 * BIG_PAGE });
+  await model.open("/x.csv");
+  // 模拟拖动途中扫过第 0..30 页：请求不应全部同时发出
+  model.prefetchRange(0, 30 * BIG_PAGE - 1);
+  assert.ok(pending.length <= 3,
+    `拖动途中同时发出的取页请求应受限，实际 ${pending.length} 个：${pending.map((p) => p.page)}`);
+  // 视口最终跳到第 60 页：旧页排队应被清掉
+  model.prefetchRange(60 * BIG_PAGE, 60 * BIG_PAGE);
+  await resolvePage(0);
+  await resolvePage(1);
+  assert.deepEqual(pending.map((p) => p.page), [60],
+    `旧页排队应被丢弃，仅保留当前视口页，实际 ${pending.map((p) => p.page)}`);
+  await resolvePage(60);
+  assert.equal(model.hasData(60 * BIG_PAGE, 0), true);
+});
+
+test("prefetchRange 跨页边界：视口起点在页中时也要拉下一页", async () => {
+  const { model, pending } = makeDeferredEngine({ rows: 10 * BIG_PAGE });
+  await model.open("/x.csv");
+  // 视口从第 5 页中部开始，末尾越过分页线进入第 6 页
+  const first = 5 * BIG_PAGE + 150;
+  const last = first + 100;
+  model.prefetchRange(first, last);
+  const pages = pending.map((p) => p.page).sort((a, b) => a - b);
+  assert.deepEqual(pages, [5, 6],
+    `跨页视口应同时拉第 5、6 页，实际 ${pages}`);
+});
+
+test("快速拖动：被丢弃的排队页回滚视口后仍能重新拉取", async () => {
+  const { model, pending, resolvePage } = makeDeferredEngine({ rows: 100 * BIG_PAGE });
+  await model.open("/x.csv");
+  // 拖动扫过第 0..30 页后跳到第 60 页：第 0..30 页的排队被丢弃
+  model.prefetchRange(0, 30 * BIG_PAGE - 1);
+  model.prefetchRange(60 * BIG_PAGE, 60 * BIG_PAGE);
+  await resolvePage(0);
+  await resolvePage(1);
+  await resolvePage(60);
+  // 再滚回第 10 页：必须重新发出取页请求（丢弃队列时若只删队列不删
+  // inflight，这页会被去重逻辑永久挡住，表现为滚回去也一直空白）
+  model.prefetchRange(10 * BIG_PAGE, 10 * BIG_PAGE);
+  assert.ok(pending.some((p) => p.page === 10),
+    `回到第 10 页应重新拉取，实际在飞 ${pending.map((p) => p.page)}`);
+});

@@ -157,10 +157,35 @@ export class Grid {
 
   // ============ 几何 ============
 
-  /** @returns {number} 行号列实际像素宽（em → px，随缩放） */
+  /**
+   * 行号列实际像素宽：按当前总行数的位数足以完整显示行号。
+   *
+   * 行号列（.row-head）在 flex 布局里默认 min-width:auto，长行号会把
+   * 它撑得比表头角块宽，数据列随之外移，视觉上列名整体偏左。这里按
+   * 最大行号文本实测宽度给出固定 px（同时经 --row-header-w 下发给角块
+   * 与行号列），并用 CSS min-width:0 禁止内容再撑宽。
+   *
+   * @returns {number} 行号列宽（px，含 1px 余量）。
+   */
   _rowHeadW() {
-    const fontPx = parseFloat(getComputedStyle(this.canvasEl.parentElement.parentElement).fontSize);
-    return Math.round(3.2 * fontPx);
+    const area = this.canvasEl.parentElement.parentElement;
+    const cs = getComputedStyle(area);
+    const fontPx = parseFloat(cs.fontSize);
+    const base = Math.round(3.2 * fontPx);
+    const total = Math.max(1, Number(this.model.rowCount?.() ?? 0));
+    const label = String(total);
+    if (!this._headCtx) this._headCtx = document.createElement("canvas").getContext("2d");
+    if (!this._headCtx) return base; // 无 2D 上下文时退回固定宽
+    const key = `${fontPx}|${cs.fontFamily}|${cs.fontWeight}|${label}`;
+    if (this._headMeasureKey !== key) {
+      // 行号列 font-size 是 0.92em（见 index.html），按同一字体测量
+      this._headCtx.font =
+        `${cs.fontStyle} ${cs.fontWeight} ${0.92 * fontPx}px ${cs.fontFamily}`;
+      this._headMeasure = this._headCtx.measureText(label).width;
+      this._headMeasureKey = key;
+    }
+    // +2px 吸收 measureText 与 DOM 实际排版/取整的细微差异
+    return Math.max(base, Math.ceil(this._headMeasure) + 2);
   }
 
   /**

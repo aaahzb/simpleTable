@@ -145,10 +145,12 @@ body.split #vsplit { display: block; }
 #corner, #corner2 {
   flex: 0 0 var(--row-header-w); position: sticky; left: 0; z-index: 7;
   background: var(--header-bg); border-right: 1px solid #a0a0a0;
+  min-width: 0;
 }
 .col-head-cell {
   flex: 0 0 auto; position: relative; overflow: visible;
   border-right: 1px solid var(--border);
+  min-width: 0;
 }
 .col-name {
   height: var(--header-text-band); display: flex; align-items: center;
@@ -178,6 +180,8 @@ body.split #vsplit { display: block; }
   border-bottom: 1px solid var(--border);
   display: flex; align-items: center; justify-content: center;
   color: #555; font-size: 0.92em; user-select: none;
+  /* 关键：默认 min-width:auto 会让长行号把行号列撑宽，数据列相对表头右移 */
+  min-width: 0;
 }
 .row-resize {
   position: absolute; left: 0; bottom: -3px; height: 7px; width: 100%;

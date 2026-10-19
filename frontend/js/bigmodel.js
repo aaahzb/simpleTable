@@ -14,6 +14,11 @@
 /** 取页大小（行）。与引擎窗口一致；±2 屏缓存约 5 页 ≈ 1000 行。 */
 export const BIG_PAGE = 200;
 
+/** 同时在飞的取页请求数上限。拖动途中视口会掠过大量页，全部并发会把
+ * 机械盘/引擎 I/O 队列塞满，反而让最终视口页迟到；限流后结合队列裁剪，
+ * 只把带宽留给当前视口附近的页。 */
+export const PAGE_PARALLEL = 2;
+
 /** 大文件模式阈值（字节）：≥ 走大模式。依据 target/bench/bench_node.mjs：
  * 100MB 装载 ~1.5s/RSS 1.3GB、按键筛选 ~350ms；500MB V8 直接 OOM。
  * 50MiB 时筛选 ≤ ~175ms、RSS < 1GB，仍在"键入即筛"的舒适区。 */
@@ -52,8 +57,16 @@ export class BigModel {
     this._meta = null;
     /** @type {Map<string, string[][]>} 页缓存，键 `${"f"|""}${pageIdx}` */
     this._cache = new Map();
-    /** @type {Set<string>} 正在拉取的页 */
+    /** @type {Set<string>} 正在拉取或排队中的页 */
     this._inflight = new Set();
+    /** @type {number[]} 待拉取页队列（按离视口远近取用，可随时裁剪） */
+    this._queue = [];
+    /** @type {number} 当前在飞请求数（≤ PAGE_PARALLEL） */
+    this._active = 0;
+    /** @type {number | null} 最近一次渲染的视口起始行 */
+    this._viewFirst = null;
+    /** @type {number | null} 最近一次渲染的视口结束行 */
+    this._viewLast = null;
     /** @type {Set<string>} 索引中拉取的"部分页"（页尾尚未索引，行数增长后须重拉） */
     this._partial = new Set();
     /** @type {number} 代际号：结构变化后旧响应作废 */
@@ -591,13 +604,37 @@ export class BigModel {
    * @returns {void}
    */
   prefetchRange(first, last) {
-    for (let r = Math.max(0, first); r <= last; r += BIG_PAGE) {
-      this._schedule(Math.floor(r / BIG_PAGE));
+    const f = Math.max(0, first);
+    const l = Math.max(f, last);
+    this._viewFirst = f;
+    this._viewLast = l;
+    const loPage = Math.floor(f / BIG_PAGE) - 2;
+    const hiPage = Math.floor(l / BIG_PAGE) + 2;
+    // 快速拖动：丢弃离新视口已远的排队页，避免中间页把 I/O 队列塞满。
+    // inflight 里的占位必须一并移除，否则这些页永远无法重新调度。
+    if (this._queue.length > 0) {
+      const keep = [];
+      for (const p of this._queue) {
+        if (p >= loPage && p <= hiPage) {
+          keep.push(p);
+        } else {
+          this._inflight.delete(this._key(p));
+        }
+      }
+      this._queue = keep;
     }
+    // 按页边界枚举而不是从 first 按 200 行步进：视口起点在页中、末尾
+    // 跨到下一页时，步进会直接越过下一页，导致视口底部整段空白。
+    const firstPage = Math.floor(f / BIG_PAGE);
+    const lastPage = Math.floor(l / BIG_PAGE);
+    for (let p = firstPage; p <= lastPage; p += 1) {
+      this._schedule(p);
+    }
+    this._pump();
   }
 
   /**
-   * 调度拉一页（去重；响应落定后经 onData 触发重绘）。
+   * 调度拉一页：去重后入队，由 _pump 按并发上限与视口距离发出。
    *
    * @param {number} page - 页号。
    * @returns {void}
@@ -606,8 +643,69 @@ export class BigModel {
     const key = this._key(page);
     if (this._cache.has(key) || this._inflight.has(key)) return;
     this._inflight.add(key);
+    this._queue.push(page);
+    this._pump();
+  }
+
+  /**
+   * 发出排队中的取页请求，直到达到并发上限。
+   *
+   * @returns {void}
+   */
+  _pump() {
+    while (this._active < PAGE_PARALLEL && this._queue.length > 0) {
+      this._active += 1;
+      this._fetch(this._takeNearest());
+    }
+  }
+
+  /**
+   * 取队列中离当前视口最近的一页（同等距离按入队顺序）。
+   *
+   * @returns {number} 页号。
+   */
+  _takeNearest() {
+    let best = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i < this._queue.length; i += 1) {
+      const d = this._pageDistance(this._queue[i]);
+      if (d < bestDist) {
+        best = i;
+        bestDist = d;
+        if (d === 0) break; // 已在视口内，不可能更近
+      }
+    }
+    return this._queue.splice(best, 1)[0];
+  }
+
+  /**
+   * 页到当前视口页范围的间距（页数）；视口未知时视为 0。
+   *
+   * @param {number} page - 页号。
+   * @returns {number} 距视口页范围的页数（视口内为 0）。
+   */
+  _pageDistance(page) {
+    if (this._viewFirst === null || this._viewLast === null) return 0;
+    const first = Math.floor(this._viewFirst / BIG_PAGE);
+    const last = Math.floor(this._viewLast / BIG_PAGE);
+    if (page < first) return first - page;
+    if (page > last) return page - last;
+    return 0;
+  }
+
+  /**
+   * 真正拉取一页（调用方已完成去重与计数）。
+   *
+   * @param {number} page - 页号。
+   * @returns {void}
+   */
+  _fetch(page) {
+    const key = this._key(page);
     const gen = this._gen;
     const from = page * BIG_PAGE;
+    // 本请求是否因行数增长而重新排队：重排后 key 由新请求占用，
+    // finally 不能再删除它的 inflight 占位。
+    let rescheduled = false;
     // 拉取时的行数上限：页尾是否已索引，决定这一页落定后是否算"部分页"
     const atRows = this._filterOn ? this._filterCount : Number(this._meta?.rows ?? 0);
     const req = this._filterOn
@@ -621,6 +719,7 @@ export class BigModel {
         const nowRows = this._filterOn ? this._filterCount : Number(this._meta?.rows ?? 0);
         if (nowRows > atRows) {
           // 飞行期间行数增长：本页响应缺尾部行，丢弃后按新行数重拉
+          rescheduled = true;
           this._inflight.delete(key);
           this._schedule(page);
           return;
@@ -634,22 +733,34 @@ export class BigModel {
     }).catch(() => {
       // 拉取失败静默：下次渲染重试（编辑冲突另有错误通道）
     }).finally(() => {
-      this._inflight.delete(key);
+      // 代际已变（_invalidate 清空过占位）或被重排时，占位归新请求所有
+      if (!rescheduled && gen === this._gen) this._inflight.delete(key);
+      this._active -= 1;
+      this._pump();
     });
   }
 
   /**
-   * 缓存换出：只保留当前页 ±2 页（约 5 页 = 1000 行）。
+   * 缓存换出：保留当前视口 ±2 页（约 5 页 = 1000 行）。
    *
-   * @param {number} around - 以此页为中心。
+   * 必须以视口为中心而不是以刚落定的页为中心：快速拖动时旧页响应会迟到
+   * 落定，若按该页裁剪，恰好位于视口的页会被逐出，界面整屏空白。
+   *
+   * @param {number} around - 无视口信息时的回退中心页。
    * @returns {void}
    */
   _trim(around) {
     const prefix = this._filterOn ? "f" : "";
+    let lo = around - 2;
+    let hi = around + 2;
+    if (this._viewFirst !== null && this._viewLast !== null) {
+      lo = Math.floor(this._viewFirst / BIG_PAGE) - 2;
+      hi = Math.floor(this._viewLast / BIG_PAGE) + 2;
+    }
     for (const key of this._cache.keys()) {
       if (!key.startsWith(prefix)) continue;
       const p = Number(key.slice(prefix.length));
-      if (p < around - 2 || p > around + 2) {
+      if (p < lo || p > hi) {
         this._cache.delete(key);
         this._partial.delete(key);
       }
@@ -665,7 +776,10 @@ export class BigModel {
     this._gen += 1;
     this._cache.clear();
     this._inflight.clear();
+    this._queue = [];
     this._partial.clear();
+    this._viewFirst = null;
+    this._viewLast = null;
   }
 
   // ---- 编辑 ----

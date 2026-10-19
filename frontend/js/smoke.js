@@ -2147,6 +2147,76 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const midR = midKids.getBoundingClientRect();
     assert(midR.bottom > scRect.top && midR.top < scRect.bottom,
       `底部中段行屏幕矩形 ${Math.round(midR.top)}..${Math.round(midR.bottom)} 应在视口内`);
+    // 回归：行号列宽曾按固定 3.2em（约 42px）给出，7~8 位行号把 .row-head
+    // 的 min-content 撑到 49~57px，数据列随之外移，列名整体偏左。
+    assertColsAligned("#grid-area", "大行号（100 万行底部 7 位）");
+  });
+
+  check("大模式：迟到的旧页响应不得逐出当前视口", async () => {
+    // 用户现场：拖动滚动条到远端后整屏空白，点一下空白处才瞬间渲染。
+    // 根因是缓存换出以「刚落定的页」为中心：拖动途中经过的中间页响应迟到
+    // 落定后，会把当前视口页逐出缓存。这里人为延迟中间页复现该时序。
+    const m = bigM();
+    const g = grid;
+    const sc = document.getElementById("grid-scroll");
+    const PAGE = 200;
+    const n = m.rowCount();
+    assert(n > 200000, `夹具行数 ${n}`);
+    const rowA = Math.floor(n * 0.1);
+    const rowB = Math.floor(n * 0.9);
+    const pageA = Math.floor(rowA / PAGE);
+    const pageB = Math.floor(rowB / PAGE);
+    assert(pageA !== pageB, "两处应落在不同页");
+    const orig = m._invoke.bind(m);
+    let bCalls = 0;
+    m._invoke = (cmd, args) => {
+      const req = orig(cmd, args);
+      if (cmd !== "big_rows") return req;
+      const page = Math.floor(Number(args.from) / PAGE);
+      if (page === pageA) {
+        // 拖动途中的旧页：慢 600ms 才落定
+        return req.then((rows) => new Promise((res) => {
+          setTimeout(() => res(rows), 600);
+        }));
+      }
+      if (page === pageB) {
+        bCalls += 1;
+        // 视口页若被错误逐出，其重拉同样慢，避免“自愈”掩盖缺陷
+        if (bCalls > 1) {
+          return req.then((rows) => new Promise((res) => {
+            setTimeout(() => res(rows), 1200);
+          }));
+        }
+      }
+      return req;
+    };
+    try {
+      // 先滚到 10% 并渲染（其取页请求被延迟），再立刻跳到 90%
+      sc.scrollTop = g._scrollTopForRowTop(rowA);
+      g._renderRows();
+      await sleep(30);
+      sc.scrollTop = g._scrollTopForRowTop(rowB);
+      g._renderRows();
+      await waitFor(() => m.hasData(rowB, 0), "当前视口页落定").catch((e) => {
+        const a = g._yAnchor();
+        throw new Error(`${e.message}; rowB=${rowB} page=${pageB} bCalls=${bCalls}`
+          + ` scrollTop=${Math.round(sc.scrollTop)} anchor=${a.anchor}`
+          + ` cache=[${[...m._cache.keys()].join(",")}]`
+          + ` inflight=[${[...m._inflight].join(",")}]`
+          + ` active=${m._active} queue=[${m._queue.join(",")}]`);
+      });
+      // 等迟到的旧页落定，此时视口页仍须在缓存中
+      await sleep(900);
+      assert(m.hasData(rowB, 0),
+        `迟到的第 ${pageA} 页不得逐出视口第 ${pageB} 页（视口页重拉 ${bCalls} 次）`);
+      const cells = [...g.rowsEl.querySelectorAll('.cell[data-col="0"]')];
+      assert(cells.length > 0, "应有渲染行");
+      const blank = cells.filter((el) => !el.textContent).length;
+      assert(blank === 0,
+        `迟到旧页落定后可见格应保持有数据，空白 ${blank}/${cells.length}`);
+    } finally {
+      m._invoke = orig;
+    }
   });
 
   check("大模式：虚拟缩放下 Ctrl+↑/↓ 把目标行完整滚入视口", async () => {
