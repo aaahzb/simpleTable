@@ -71,6 +71,19 @@ export class Grid {
     this.scrollEl = scrollEl;
     this.canvasEl = canvasEl;
     this.headerEl = headerEl;
+    /**
+     * 表头左上角块（行号列 × 列名带的空方块）。
+     * 表头重建必须保留它：主/副网格的 id 不同（corner / corner2），
+     * 不能按固定 id 判断，否则副网格的角块会被吞掉、列名整体左移。
+     * @type {HTMLElement}
+     */
+    this.cornerEl = headerEl.querySelector(".corner");
+    if (!this.cornerEl) {
+      // 兜底：旧 DOM 或测试夹具缺角块时补一个，保证两带表头结构完整
+      this.cornerEl = document.createElement("div");
+      this.cornerEl.className = "corner";
+      headerEl.prepend(this.cornerEl);
+    }
     this.rowsEl = rowsEl;
     this.editorEl = editorEl;
     // --grid-zoom 的挂载面（分屏时两侧各自缩放；缺省回退全局 #grid-area）
@@ -243,7 +256,12 @@ export class Grid {
     this._lastVisCount = n;
     const oy = this._originY();
     const viewH = this.scrollEl.clientHeight;
-    const totalW = this._rowHeadW() + this._effWidths().reduce((a, b) => a + b, 0);
+    const rowHeadW = this._rowHeadW();
+    // 行号列宽统一由 JS 取整后以 px 下发：CSS 的 3.2em 在表头角块（13px）
+    // 与行号（0.92em ≈ 11.96px）里会解析出两个不同宽度（41.6 vs 38.3），
+    // 造成数据列整体比表头左移。px 变量让角块/行号列/JS 几何完全一致。
+    this.areaEl.style.setProperty("--row-header-w", `${rowHeadW}px`);
+    const totalW = rowHeadW + this._effWidths().reduce((a, b) => a + b, 0);
     this.canvasEl.style.width = `${Math.max(totalW, this.scrollEl.clientWidth)}px`;
     const h = this._uniformRowH;
     this._yUniform = this.model.isBig || this.rowH.every((v) => v === h);
@@ -490,9 +508,12 @@ export class Grid {
     this._headerKeyCache = this._headerKey();
     // 大模式后台索引期间：筛选框禁用并显示"索引中…"（EmEditor 式进度语义）
     const indexing = this.model.isBig && this.model.indexing?.() === true;
-    // 保留 corner，重建列单元格
+    // 保留本侧角块（主/副网格 id 不同），重建列单元格
     for (const el of [...this.headerEl.children]) {
-      if (el.id !== "corner") el.remove();
+      if (el !== this.cornerEl) el.remove();
+    }
+    if (this.cornerEl.parentElement !== this.headerEl) {
+      this.headerEl.prepend(this.cornerEl);
     }
     const widths = this._effWidthsCache;
     this.colOrder.forEach((srcCol, pos) => {

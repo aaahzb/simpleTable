@@ -98,6 +98,42 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await window.__app.smokeLoadSmall(headers, rows.map((r) => r.slice()));
   };
 
+  /**
+   * 断言某一侧的表头列与数据列逐列对齐（左缘与宽度），并校验左上角块
+   * 与行号列同宽。
+   *
+   * @param {string} area - 区域选择器（"#grid-area" 或 "#grid-area2"）。
+   * @param {string} label - 断言标签，失败时指明场景。
+   * @returns {void}
+   */
+  function assertColsAligned(area, label) {
+    const header = document.querySelector(`${area} [id^="col-header"]`);
+    assert(header, `${label}: 应存在列头容器`);
+    const headCells = [...header.querySelectorAll(":scope > .col-head-cell")];
+    const row = document.querySelector(`${area} .row`);
+    assert(row, `${label}: 应存在已渲染数据行`);
+    const cells = [...row.querySelectorAll(":scope > .cell")];
+    assert(cells.length > 0 && headCells.length === cells.length,
+      `${label}: 列头 ${headCells.length} 与数据列 ${cells.length} 数量应一致`);
+    const scEl = document.querySelector(`${area} [id^="grid-scroll"]`);
+    const meta = `${label}（scrollLeft=${scEl?.scrollLeft ?? "?"}）`;
+    for (let i = 0; i < headCells.length; i += 1) {
+      const h = headCells[i].getBoundingClientRect();
+      const d = cells[i].getBoundingClientRect();
+      assert(Math.abs(h.left - d.left) <= 1 && Math.abs(h.width - d.width) <= 1,
+        `${meta}: 第 ${i} 列列头 x=${h.left.toFixed(1)}/w=${h.width.toFixed(1)}，`
+        + `数据 x=${d.left.toFixed(1)}/w=${d.width.toFixed(1)}，应逐列对齐`);
+    }
+    const corner = header.firstElementChild;
+    const rowHead = row.querySelector(".row-head");
+    assert(corner && rowHead, `${label}: 角块与行号列都应存在`);
+    const cr = corner.getBoundingClientRect();
+    const rr = rowHead.getBoundingClientRect();
+    assert(Math.abs(cr.width - rr.width) <= 1 && Math.abs(cr.right - rr.right) <= 1,
+      `${meta}: 角块 ${cr.left.toFixed(1)}..${cr.right.toFixed(1)}，`
+      + `行号列 ${rr.left.toFixed(1)}..${rr.right.toFixed(1)}，应同宽同位`);
+  }
+
   // ========== Rust 命令层 ==========
 
   check("版本号非空且为 beta/release 格式", async () => {
@@ -368,6 +404,28 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const cell = document.querySelector(".col-head-cell");
     const input = cell.querySelector(".col-filter input");
     assert(cell && input, "筛选输入框应在列头单元格内（共用网格坐标系）");
+  });
+
+  check("几何：表头列与数据列逐列对齐（宽表/横向滚动/缩放）", async () => {
+    // 回归：表头与数据行是两套 DOM（列头 flex / 行 flex），任何宽度或
+    // 行号列换算不一致都会让列名与筛选框整体偏移。
+    const wideHeaders = Array.from({ length: 20 }, (_, i) => `列${i}`);
+    const wideRows = [Array.from({ length: 20 }, (_, i) => `值${i}`)];
+    await window.__app.smokeLoadSmall(wideHeaders, wideRows);
+    grid.resetScroll();
+    grid.ensureVisible(0, 0);
+    grid._renderRows();
+    assertColsAligned("#grid-area", "初始");
+    const sc = document.getElementById("grid-scroll");
+    sc.scrollLeft = 137;
+    await sleep(50);
+    assertColsAligned("#grid-area", "横向滚动 137px");
+    sc.scrollLeft = 0;
+    grid.setZoom(1.15);
+    await sleep(30);
+    assertColsAligned("#grid-area", "缩放 115%");
+    grid.setZoom(1);
+    await loadBasic(); // 还原基础小表，供后续用例使用
   });
 
   check("列插入后筛选条件清空", async () => {
@@ -877,6 +935,15 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(window.__app.tabs().find((x) => x.active)?.id === ta.id, "活动签应保持 a（焦点未动）");
     await waitFor(() => sideCellText("A", 0, 0) === "甲A", "主侧应显示活动签 a");
     await waitFor(() => sideCellText("B", 0, 0) === "乙B", "副侧应显示分屏签 b");
+  });
+
+  check("分屏：副网格角块存在，两侧列头与数据列逐列对齐", async () => {
+    // 回归：_renderHeader 只认 id="corner"，副网格的 #corner2 每次重建都被
+    // 删掉，导致副侧列名/筛选框整体左移一个行号列宽。
+    assert(document.getElementById("corner"), "主侧角块 #corner 应存在");
+    assert(document.getElementById("corner2"), "副侧角块 #corner2 不应被表头重建删除");
+    assertColsAligned("#grid-area", "分屏主侧");
+    assertColsAligned("#grid-area2", "分屏副侧");
   });
 
   check("分屏：活动签可直接入分屏——主侧自动切显邻签", async () => {
