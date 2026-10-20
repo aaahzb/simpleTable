@@ -273,11 +273,14 @@ export function busyDialog(title) {
 /**
  * 未保存修改三选（保存/放弃/取消），对齐 _confirm_discard。
  *
+ * @param {string} [name] - 档名（关闭后台页签时指明是哪一档；缺省指当前表格）。
  * @returns {Promise<"save" | "discard" | "cancel">} 用户选择。
  */
-export async function confirmDiscardDialog() {
+export async function confirmDiscardDialog(name) {
   const body = document.createElement("div");
-  body.textContent = "当前表格有未保存的修改，是否保存？";
+  body.textContent = name
+    ? `「${name}」有未保存的修改，是否保存？`
+    : "当前表格有未保存的修改，是否保存？";
   const v = await modal("未保存的修改", body, [
     { text: "取消", value: "cancel" },
     { text: "放弃", value: "discard" },

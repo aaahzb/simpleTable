@@ -910,7 +910,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     for (let i = 0; i < 24; i += 1) await writeText(names[i], `目的地\r\n行${i}\r\n`);
     await window.__app.openPathsAsTabs(names);
     const bar = document.getElementById("tabbar");
-    const scroll = document.getElementById("tab-scroll");
+    const scroll = document.getElementById("tab-group-a"); // 双组渲染后滚动发生在组容器
     const next = document.getElementById("tab-next");
     assert(bar.classList.contains("overflow") || scroll.scrollWidth > scroll.clientWidth,
       "页签超出宽度应进入溢出态");
@@ -950,8 +950,12 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     item.click();
     await sleep(80); // openSplit 为 async：setModel 绑定在微任务里落定
     const sp = window.__app.split();
-    assert(sp.on === true && sp.splitTabId === tb.id && sp.focused === "A",
+    assert(sp.on === true && sp.curB === tb.id && sp.focused === "A",
       `分屏态应就绪 ${JSON.stringify(sp)}`);
+    assert(JSON.stringify(sp.b) === JSON.stringify([tb.id]), `右组应只有 b 签 ${JSON.stringify(sp)}`);
+    assert(tabEl("b.csv")?.closest("#tab-group-b"), "b 签元素应在右组容器");
+    assert(tabEl("a.csv")?.closest("#tab-group-a"), "a 签元素应在左组容器");
+    assert(window.__app.tabs().find((x) => x.id === tb.id)?.side === "B", "b 签 side 应为 B");
     assert(getComputedStyle(document.getElementById("grid-area2")).display !== "none",
       "副网格应可见");
     assert(document.getElementById("grid-area2").offsetWidth > 0, "副网格应有实际宽度");
@@ -985,13 +989,21 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     item.click();
     await sleep(80);
     const sp = window.__app.split();
-    assert(sp.on === true && sp.splitTabId === ta.id && sp.focused === "A",
-      `活动签入分屏态应就绪 ${JSON.stringify(sp)}`);
-    assert(window.__app.tabs().find((x) => x.active)?.id === tb.id, "主侧应换显邻签 b");
+    const actId = window.__app.tabs().find((x) => x.active)?.id;
+    const lastId = window.__app.tabs().at(-1)?.id;
+    const aInB = !!tabEl("a.csv")?.closest("#tab-group-b");
     await waitFor(() => sideCellText("B", 0, 0) === "甲A", "副侧应显示原活动签 a");
     await waitFor(() => sideCellText("A", 0, 0) === "乙B", "主侧应显示邻签 b");
     await window.__app.closeSplit();
     await window.__app.activateTab(ta.id); // 还原：焦点回 a（单视图）
+    // 断言放在还原之后：RED 期失败也不污染后续用例的现场
+    assert(sp.on === true && sp.curB === ta.id && sp.focused === "A",
+      `活动签入分屏态应就绪 ${JSON.stringify(sp)}`);
+    assert(JSON.stringify(sp.b) === JSON.stringify([ta.id]), `右组应只有原活动签 a ${JSON.stringify(sp)}`);
+    assert(actId === tb.id, "主侧应换显邻签 b");
+    assert(sp.curA === tb.id, "左组当前签应为邻签 b");
+    assert(aInB, "a 签元素应移入右组容器");
+    assert(lastId === ta.id, "组邻接：右组签应排在页签数组末尾");
   });
 
   check("分屏：点副侧焦点交换——内容稳定，编辑落副签", async () => {
@@ -1058,7 +1070,6 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     item.click();
     await waitFor(() => window.__app.split().on === true, "双大档应建立分屏");
     const sp = window.__app.split();
-    assert(sp.splitTabId === tb.id && sp.focused === "A", `分屏态 ${JSON.stringify(sp)}`);
     await waitFor(() => sideCellText("A", 0, 0) === "大甲"
       && sideCellText("B", 0, 0) === "大乙", "两侧大档首行落定");
     // 独立会话：改副侧档，主侧内容与脏态不受影响
@@ -1081,6 +1092,9 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const fa = `${TMP}/sv/a.csv`;
     const back = window.__app.tabs().find((x) => x.path === fa);
     if (back) await window.__app.activateTab(back.id);
+    // 断言放在清理之后：RED 期失败也不残留现场
+    assert(sp.curB === tb.id && sp.focused === "A", `分屏态 ${JSON.stringify(sp)}`);
+    assert(JSON.stringify(sp.b) === JSON.stringify([tb.id]), `右组应只有 big2 ${JSON.stringify(sp)}`);
   });
 
   check("分屏：拖 #vsplit 分隔条调整两侧宽度，关闭后复位", async () => {
@@ -1130,6 +1144,9 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(getComputedStyle(document.getElementById("grid-area2")).display === "none",
       "副网格应隐藏");
     assert(window.__app.tabs().some((x) => x.id === tb.id), "关闭分屏不应关签");
+    assert(window.__app.tabs().find((x) => x.id === tb.id)?.side === "A",
+      "收屏后原右组签应并入左组");
+    assert(window.__app.tabs().at(-1)?.id === tb.id, "并入左组后应保持相对序（数组末尾）");
     // 再建分屏后关掉分屏签（b 签仍脏）→ 弹三选，放弃后关签、分屏自动关
     await window.__app.openSplit(tb.id);
     const p = window.__app.closeTab(tb.id);
@@ -1139,6 +1156,229 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(window.__app.split().on === false, "关掉分屏签应自动关闭分屏");
     assert(getComputedStyle(document.getElementById("grid-area2")).display === "none",
       "副网格应隐藏");
+  });
+
+  // ========== 分屏页签分组（左右两组 + 拖拽换侧）==========
+
+  /** 关掉全部页签（脏签一律放弃），回到无签空表。 */
+  async function closeAllTabs() {
+    for (let guard = 0; guard < 80; guard += 1) {
+      const t = window.__app.tabs();
+      if (!t.length) {
+        assert(window.__app.split().on === false, "全关后不应残留分屏");
+        return;
+      }
+      const p = window.__app.closeTab(t[t.length - 1].id);
+      await sleep(80); // 等脏签确认框挂载
+      clickDiscardDialog("放弃");
+      await p;
+    }
+    throw new Error("closeAllTabs 超轮次");
+  }
+
+  check("分组页签 N1：组内重排——moveTab 直调，顺序与绑定同步", async () => {
+    await closeAllTabs();
+    const f1 = `${TMP}/grp/r1.csv`; const f2 = `${TMP}/grp/r2.csv`; const f3 = `${TMP}/grp/r3.csv`;
+    for (const [p, v] of [[f1, "排一"], [f2, "排二"], [f3, "排三"]]) {
+      await writeText(p, `目的地\r\n${v}\r\n`);
+    }
+    await window.__app.openPathsAsTabs([f1, f2, f3]); // 激活 r1
+    const t0 = window.__app.tabs();
+    const id1 = t0.find((x) => x.path === f1).id;
+    const id3 = t0.find((x) => x.path === f3).id;
+    const activeBefore = t0.find((x) => x.active).id;
+    const ok = await window.__app.moveTab(id3, "A", 0);
+    assert(ok === true, "组内移动应成功");
+    const ids = window.__app.tabs().map((x) => x.id);
+    assert(ids.indexOf(id3) < ids.indexOf(id1), `重排后 r3 应排在 r1 前 ${ids}`);
+    assert(window.__app.tabs().find((x) => x.active)?.id === activeBefore, "组内重排不应改活动签");
+    const domIds = [...document.querySelectorAll("#tab-group-a .tab")].map((x) => x.dataset.id);
+    assert(JSON.stringify(domIds) === JSON.stringify(ids.map(String)),
+      `DOM 顺序应与 tabs() 一致 ${domIds} vs ${ids}`);
+  });
+
+  check("分组页签 N2：moveTab 换侧——后台签入右组立分屏，焦点不动", async () => {
+    // 前置：N1 留下 r1-r3 三签（未分屏，活动签 r1）
+    const t0 = window.__app.tabs();
+    const r1 = t0.find((x) => x.path?.endsWith("r1.csv"));
+    const r3 = t0.find((x) => x.path?.endsWith("r3.csv"));
+    await window.__app.activateTab(r1.id);
+    const ok = await window.__app.moveTab(r3.id, "B");
+    assert(ok === true, "换侧应成功");
+    const sp = window.__app.split();
+    assert(sp.on === true && sp.focused === "A", `换侧应立分屏且焦点留 A ${JSON.stringify(sp)}`);
+    assert(sp.curB === r3.id && JSON.stringify(sp.b) === JSON.stringify([r3.id]),
+      `r3 应成右组唯一签且为当前签 ${JSON.stringify(sp)}`);
+    assert(sp.curA === r1.id, "左组当前签应保持 r1");
+    await waitFor(() => sideCellText("A", 0, 0) === "排一", "左格应仍显 r1");
+    await waitFor(() => sideCellText("B", 0, 0) === "排三", "右格应显被移签 r3");
+    assert(tabEl("r3.csv")?.closest("#tab-group-b"), "r3 签元素应在右组容器");
+  });
+
+  check("分组页签 N3：拖拽事件通路——合成 DnD 完成一次换侧", async () => {
+    // 前置：N2 后分屏中（A: r1,r2；B: r3），焦点 A。只测一条事件通路，
+    // 逻辑全排列由 moveTab 直调用例覆盖（合成 DragEvent 的行为与真拖可能有出入）。
+    const r2 = window.__app.tabs().find((x) => x.path?.endsWith("r2.csv"));
+    const r3 = window.__app.tabs().find((x) => x.path?.endsWith("r3.csv"));
+    const el = tabEl("r2.csv");
+    assert(el?.closest("#tab-group-a"), "r2 应在左组");
+    const groupB = document.getElementById("tab-group-b");
+    const rect = tabEl("r3.csv").getBoundingClientRect();
+    const dt = new DataTransfer();
+    el.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: dt }));
+    groupB.dispatchEvent(new DragEvent("dragover", {
+      bubbles: true, cancelable: true, clientX: rect.right + 4, clientY: rect.top + 5, dataTransfer: dt,
+    }));
+    groupB.dispatchEvent(new DragEvent("drop", {
+      bubbles: true, cancelable: true, clientX: rect.right + 4, clientY: rect.top + 5, dataTransfer: dt,
+    }));
+    el.dispatchEvent(new DragEvent("dragend", { bubbles: true, cancelable: true, dataTransfer: dt }));
+    await sleep(100); // drop 里 moveTab 是 async
+    const sp = window.__app.split();
+    assert(sp.on === true && JSON.stringify(sp.b) === JSON.stringify([r3.id, r2.id]),
+      `r2 应移到右组末尾 ${JSON.stringify(sp)}`);
+    assert(sp.curB === r2.id, "被拖签应成右组当前签");
+    await waitFor(() => sideCellText("B", 0, 0) === "排二", "右格应显 r2");
+    const ind = document.getElementById("tab-insert");
+    assert(!ind || getComputedStyle(ind).display === "none", "拖拽后插入指示器应隐藏");
+  });
+
+  check("分组页签 N4：右组拖空自动收起分屏", async () => {
+    // 前置：N3 后 A:[r1] B:[r3,r2]，焦点 A
+    const t0 = window.__app.tabs();
+    const r2 = t0.find((x) => x.path?.endsWith("r2.csv"));
+    const r3 = t0.find((x) => x.path?.endsWith("r3.csv"));
+    await window.__app.moveTab(r3.id, "A");
+    assert(window.__app.split().on === true, "右组还有 r2，分屏应保持");
+    await window.__app.moveTab(r2.id, "A");
+    const sp = window.__app.split();
+    assert(sp.on === false, `右组拖空应自动收屏 ${JSON.stringify(sp)}`);
+    assert(getComputedStyle(document.getElementById("grid-area2")).display === "none", "副网格应隐藏");
+    const t1 = window.__app.tabs();
+    assert(t1.every((x) => x.side === "A"), "收屏后全部签应归左组");
+    const ids = t1.map((x) => x.id);
+    assert(ids.indexOf(r3.id) < ids.indexOf(r2.id), "回原右组相对序应保持");
+    assert(t1.find((x) => x.active)?.id === r2.id, "移入焦点组的签应成为活动签");
+  });
+
+  check("分组页签 N5：禁止拖空左组——moveTab 拒绝且状态不变", async () => {
+    // 前置：N4 后未分屏，活动签 r2。先摆出 1A+2B
+    const t0 = window.__app.tabs();
+    const r1 = t0.find((x) => x.path?.endsWith("r1.csv"));
+    const r2 = t0.find((x) => x.path?.endsWith("r2.csv"));
+    const r3 = t0.find((x) => x.path?.endsWith("r3.csv"));
+    await window.__app.moveTab(r2.id, "B");
+    await window.__app.moveTab(r3.id, "B");
+    const before = JSON.stringify(window.__app.tabs().map((x) => x.id));
+    const spBefore = window.__app.split();
+    assert(spBefore.on === true && spBefore.a.length === 1, `前置应为 1A+2B ${JSON.stringify(spBefore)}`);
+    const ok = await window.__app.moveTab(r1.id, "B");
+    assert(ok === false, "拖空左组应被拒绝");
+    assert(JSON.stringify(window.__app.tabs().map((x) => x.id)) === before, "拒绝后页签顺序不变");
+    assert(JSON.stringify(window.__app.split()) === JSON.stringify(spBefore), "拒绝后分屏态不变");
+  });
+
+  check("分组页签 N6：关左组最后一签——右组整体补位升格", async () => {
+    // 前置：N5 后 1A(r1)+2B(r2,r3)
+    const t0 = window.__app.tabs();
+    const r1 = t0.find((x) => x.path?.endsWith("r1.csv"));
+    const r2 = t0.find((x) => x.path?.endsWith("r2.csv"));
+    const r3 = t0.find((x) => x.path?.endsWith("r3.csv"));
+    const curB = window.__app.split().curB;
+    await window.__app.closeTab(r1.id); // r1 干净，无确认
+    const sp = window.__app.split();
+    assert(sp.on === false, `左组关空应收屏 ${JSON.stringify(sp)}`);
+    const t1 = window.__app.tabs();
+    assert(t1.length === 2 && t1.every((x) => x.side === "A"), "右组两签应并入左组");
+    const ids = t1.map((x) => x.id);
+    assert(ids.indexOf(r2.id) < ids.indexOf(r3.id), "补位应保持原相对序");
+    assert(t1.find((x) => x.active)?.id === curB, "活动档应为原右组当前签");
+    await waitFor(() => model.rawData(0, 0) === (curB === r2.id ? "排二" : "排三"),
+      "主格应显原右组当前签内容");
+  });
+
+  check("分组页签 N7：点右组背景签——右格换显该签，焦点归右", async () => {
+    // 前置：N6 后未分屏 A:[r2,r3]，活动签=原 curB(r3)
+    const t0 = window.__app.tabs();
+    const r2 = t0.find((x) => x.path?.endsWith("r2.csv"));
+    const r3 = t0.find((x) => x.path?.endsWith("r3.csv"));
+    await window.__app.moveTab(r3.id, "B"); // A:[r2] B:[r3]
+    await waitFor(() => sideCellText("A", 0, 0) === "排二", "左格显 r2");
+    const f4 = `${TMP}/grp/r4.csv`;
+    await writeText(f4, "目的地\r\n排四\r\n");
+    await window.__app.openPathsAsTabs([f4]); // 落焦点组 A 并成当前签
+    await waitFor(() => sideCellText("A", 0, 0) === "排四", "新签落焦点侧(A)并显示");
+    await window.__app.moveTab(r2.id, "B"); // B=[r3,r2]，r3 成右组背景签
+    const el = tabEl("r3.csv");
+    assert(el?.closest("#tab-group-b"), "r3 签应在右组");
+    el.click();
+    await sleep(120); // 重绑 + 焦点交换
+    const sp = window.__app.split();
+    assert(sp.focused === "B" && sp.curB === r3.id, `点右组签后焦点归右 ${JSON.stringify(sp)}`);
+    await waitFor(() => sideCellText("B", 0, 0) === "排三", "右格应换显 r3");
+    assert(sideCellText("A", 0, 0) === "排四", "左格内容应稳定");
+    assert(tabEl("r3.csv").classList.contains("active"), "右组当前签应有 active 类");
+    await window.__app.activateTab(window.__app.tabs().find((x) => x.path?.endsWith("r4.csv")).id);
+  });
+
+  check("分组页签 N8：新文件落焦点侧组", async () => {
+    // 前置：N7 后分屏 A:[r4] B:[r3,r2]，焦点 A
+    const r3 = window.__app.tabs().find((x) => x.path?.endsWith("r3.csv"));
+    await window.__app.activateTab(r3.id); // r3 是右组当前签 → 纯焦点交换到 B
+    assert(window.__app.split().focused === "B", "焦点应在 B");
+    const f5 = `${TMP}/grp/r5.csv`;
+    await writeText(f5, "目的地\r\n排五\r\n");
+    await window.__app.openPathsAsTabs([f5]);
+    const id5 = window.__app.tabs().find((x) => x.path === f5)?.id;
+    const sp = window.__app.split();
+    assert(sp.b.includes(id5), `新签应落焦点组 B ${JSON.stringify(sp)}`);
+    assert(sp.curB === id5, "新签应成焦点组当前签");
+    await waitFor(() => sideCellText("B", 0, 0) === "排五", "右格应显新档");
+    // 还原焦点回 A（r4 是左组当前签 → 纯焦点交换）
+    await window.__app.activateTab(window.__app.tabs().find((x) => x.path?.endsWith("r4.csv")).id);
+  });
+
+  check("分组页签 N9：关左组当前签——同组邻居补位，右侧不动", async () => {
+    // 前置：N8 后 A:[r4] B:[r3,r2,r5]，焦点 A。先把 r2 移回 A 凑两签
+    const t0 = window.__app.tabs();
+    const r2 = t0.find((x) => x.path?.endsWith("r2.csv"));
+    const r4 = t0.find((x) => x.path?.endsWith("r4.csv"));
+    await window.__app.moveTab(r2.id, "A"); // A=[r4,r2]，被移签成 A 当前签
+    const spB = window.__app.split();
+    assert(spB.curA === r2.id && spB.focused === "A", `前置 ${JSON.stringify(spB)}`);
+    await window.__app.closeTab(r2.id); // 干净签，无确认
+    const sp = window.__app.split();
+    assert(sp.on === true && sp.curA === r4.id, `A 当前签应补位到同组邻居 r4 ${JSON.stringify(sp)}`);
+    assert(JSON.stringify(sp.b) === JSON.stringify(spB.b) && sp.curB === spB.curB, "右组应完全不动");
+    await waitFor(() => sideCellText("A", 0, 0) === "排四", "左格应显补位邻居 r4");
+    assert(sideCellText("B", 0, 0) === "排五", "右格内容应稳定");
+  });
+
+  check("分组页签 N10：两组各自溢出——滚轮只滚悬停组，按钮滚焦点组", async () => {
+    // 前置：N9 后 A:[r4] B:[r3,r5]。再开 32 档，16 档移右组
+    const names = [];
+    for (let i = 0; i < 32; i += 1) names.push(`${TMP}/grp/ov_${i}.csv`);
+    for (let i = 0; i < 32; i += 1) await writeText(names[i], `目的地\r\n溢${i}\r\n`);
+    await window.__app.openPathsAsTabs(names); // 全落焦点组 A
+    const t0 = window.__app.tabs();
+    for (let i = 0; i < 16; i += 1) {
+      await window.__app.moveTab(t0.find((x) => x.path === names[i]).id, "B");
+    }
+    const ga = document.getElementById("tab-group-a");
+    const gb = document.getElementById("tab-group-b");
+    assert(ga.scrollWidth > ga.clientWidth + 1, "左组应溢出");
+    assert(gb.scrollWidth > gb.clientWidth + 1, "右组应溢出");
+    assert(document.getElementById("tabbar").classList.contains("overflow"), "任一溢出即出滚动按钮");
+    const la = ga.scrollLeft;
+    const lb = gb.scrollLeft;
+    gb.dispatchEvent(new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: 240 }));
+    assert(gb.scrollLeft > lb, "悬停右组滚轮应滚右组");
+    assert(ga.scrollLeft === la, "悬停右组时左组不滚");
+    const next = document.getElementById("tab-next");
+    const la2 = ga.scrollLeft;
+    next.click();
+    assert(ga.scrollLeft > la2, "按钮应滚焦点组(A)");
+    await closeAllTabs();
   });
 
   check("Del 立即清除选区内容（无确认）", async () => {

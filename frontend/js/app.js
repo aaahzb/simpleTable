@@ -190,6 +190,7 @@ function markDirty() {
  * @property {TableModel | BigModel | null} model - 小档恒为模型实例；大档仅引擎驻留期间有效。
  * @property {boolean} dirty - 未保存修改。
  * @property {boolean} headerless - 首行是否为数据（列名自动生成），按档/文件独立。
+ * @property {"A" | "B"} side - 所属页签组（未分屏恒 "A"）。
  */
 /** @type {DocTab[]} */
 let tabs = [];
@@ -198,17 +199,22 @@ let activeId = null;
 let tabSeq = 1;
 
 // ---- 分屏视图 ----
-// 副侧（B）网格常驻实例，分屏时展示"分屏签"；焦点侧（focusedSide）独占键盘、
-// 工具栏、编辑窗格与状态栏，非分屏时恒为 "A"。两侧绑定内容稳定：点另一侧
-// 仅交换焦点（活动签跟随焦点侧），网格不重绑；激活任一侧之外的页签才把焦点
-// 侧重绑到新签。引擎按页签多会话：切换页签只换模型，不重开、不重建索引。
+// 分屏时页签栏分左(A)/右(B)两组，与左右网格一一对应：每组有自己的「组当前签」
+// （sideTab），该组网格恒显示其组当前签；页签可拖到任意一侧换组。焦点侧
+// （focusedSide）独占键盘、工具栏、编辑窗格与状态栏，非分屏恒 "A"。点另一组
+// 的组当前签 = 纯焦点交换（两侧绑定不动）；点另一组的其他签 = 该组重绑到该签
+// 且焦点过去。引擎按页签多会话：切换页签只换模型，不重开、不重建索引。
+// 不变量：
+//  I1 组邻接：tabs 数组中 A 组签全部排在 B 组签之前；组内顺序 = 数组相对顺序。
+//  I2 splitOn ⇔ 存在 side="B" 的签 ⇔ sideTab.B !== null。
+//  I3 分屏期间 A 组非空且 sideTab.A !== null（A 是主组，禁止拖空；关空则 B 升格）。
+//  I4 sideTab[S] 恒为 S 组成员且是该组网格显示内容；activeId === sideTab[focusedSide]。
+//  I5 未分屏 ⇒ 全部 side="A"、sideTab.B=null、focusedSide="A"。
 /** @type {boolean} 分屏开关 */
 let splitOn = false;
-/** @type {number | null} 副侧（分屏签）页签 id */
-let splitTabId = null;
 /** @type {"A" | "B"} 焦点侧：工具栏/快捷键/编辑窗格的作用侧 */
 let focusedSide = "A";
-/** 分屏各侧绑定的页签 id（非分屏恒 null；焦点侧绑定 = 活动签） */
+/** 各组的组当前签 id（该组网格正显示的签；非分屏 B 恒 null，焦点侧 = 活动签） */
 const sideTab = {
   A: /** @type {number | null} */ (null),
   B: /** @type {number | null} */ (null),
@@ -227,12 +233,32 @@ function activeTab() {
   return tabs.find((t) => t.id === activeId) ?? null;
 }
 
-/** @returns {"A" | "B" | null} 页签绑定侧（未分屏返回 null） */
+/** @returns {"A" | "B" | null} 页签所属组（未分屏返回 null） */
 function sideOfTab(id) {
   if (!splitOn) return null;
-  if (sideTab.A === id) return "A";
-  if (sideTab.B === id) return "B";
-  return null;
+  return tabs.find((t) => t.id === id)?.side ?? null;
+}
+
+/** @returns {DocTab[]} 指定组的页签（组内顺序 = 数组相对顺序） */
+function groupTabs(side) {
+  return tabs.filter((t) => t.side === side);
+}
+
+/**
+ * 把页签插入指定组的指定位置（维护 I1 组邻接：A 组恒在 B 组之前）。
+ * 调用前须保证 t 不在数组中（新建或已摘除）。
+ *
+ * @param {DocTab} t - 待插入页签。
+ * @param {"A" | "B"} side - 目标组。
+ * @param {number} [index] - 组内插入位（越界夹取），默认末尾。
+ * @returns {void}
+ */
+function insertTabIntoGroup(t, side, index = Infinity) {
+  t.side = side;
+  const groupLen = groupTabs(side).length;
+  const i = Math.max(0, Math.min(index === Infinity ? groupLen : index, groupLen));
+  const abs = (side === "B" ? groupTabs("A").length : 0) + i;
+  tabs.splice(abs, 0, t);
 }
 
 /** 当前档状态写回活动页签（切换/渲染前调用，live 变量 ↔ 页签镜像同步） */
@@ -245,26 +271,33 @@ function syncActiveTab() {
   t.model = model;
 }
 
-/** 当前档装入页签体系（保持内容/脏态不变；幂等） */
+/** 当前档装入页签体系（保持内容/脏态不变；幂等；分屏时落焦点侧组） */
 function ensureTabbed() {
   if (activeId !== null) return;
   const t = {
     id: tabSeq++, title: tabTitleOf(path), path, kind: model.isBig ? "big" : "small",
     model, dirty,
     headerless: model.isHeaderless?.() === true,
+    side: "A",
   };
-  tabs.push(t);
+  insertTabIntoGroup(t, splitOn ? focusedSide : "A");
   activeId = t.id;
+  if (splitOn) sideTab[focusedSide] = t.id; // I4：当前档即焦点组当前签
 }
 
-/** 重建页签条 DOM 并刷新溢出态；激活页签自动滚入可视区 */
+/** 重建页签条 DOM（分屏时左右两组）并刷新溢出态；激活页签自动滚入可视区 */
 function renderTabbar() {
   tabbarEl.classList.toggle("show", tabs.length >= 2);
-  tabScrollEl.textContent = "";
-  for (const t of tabs) {
+  tabbarEl.classList.toggle("split", splitOn);
+  const groupA = document.getElementById("tab-group-a");
+  const groupB = document.getElementById("tab-group-b");
+  groupA.textContent = "";
+  groupB.textContent = "";
+  const otherCur = splitOn ? sideTab[focusedSide === "A" ? "B" : "A"] : null;
+  for (const t of tabs) { // I1 组邻接：A 组恒在 B 组之前，一趟遍历自然分段
     const el = document.createElement("div");
     el.className = "tab" + (t.id === activeId ? " active" : "")
-      + (splitOn && t.id === splitTabId ? " split-side" : "");
+      + (t.id === otherCur ? " split-side" : ""); // 绿条 = 另一侧网格正显示的组当前签
     el.title = t.path || t.title;
     el.dataset.id = String(t.id);
     const label = document.createElement("span");
@@ -292,31 +325,162 @@ function renderTabbar() {
       e.preventDefault();
       showTabMenu(t, e.clientX, e.clientY);
     });
-    tabScrollEl.appendChild(el);
+    el.draggable = true; // 拖拽换组/重排：事件层只做坐标换算，逻辑全在 moveTab
+    el.addEventListener("dragstart", (e) => onTabDragStart(e, t.id));
+    el.addEventListener("dragend", onTabDragEnd);
+    (splitOn && t.side === "B" ? groupB : groupA).appendChild(el);
   }
   updateTabOverflow();
   tabScrollEl.querySelector(".tab.active")
     ?.scrollIntoView({ block: "nearest", inline: "nearest" });
 }
 
-/** 溢出态：页签总宽超可视宽 → 显示 ◀▶ 滚动按钮并按位置禁用 */
-function updateTabOverflow() {
-  const ov = tabScrollEl.scrollWidth > tabScrollEl.clientWidth + 1;
-  tabbarEl.classList.toggle("overflow", ov);
-  document.getElementById("tab-prev").disabled = tabScrollEl.scrollLeft <= 0;
-  document.getElementById("tab-next").disabled =
-    tabScrollEl.scrollLeft + tabScrollEl.clientWidth >= tabScrollEl.scrollWidth - 1;
+/** @returns {HTMLElement} 焦点组的滚动容器（◀▶ 按钮的作用对象） */
+function focusedGroupEl() {
+  return document.getElementById(splitOn && focusedSide === "B" ? "tab-group-b" : "tab-group-a");
 }
 
-document.getElementById("tab-prev").addEventListener("click", () => tabScrollEl.scrollBy({ left: -180 }));
-document.getElementById("tab-next").addEventListener("click", () => tabScrollEl.scrollBy({ left: 180 }));
-tabScrollEl.addEventListener("wheel", (e) => {
-  if (tabScrollEl.scrollWidth <= tabScrollEl.clientWidth + 1) return;
+/** 溢出态：任一组页签总宽超可视宽 → 显示 ◀▶ 按钮；禁用态按焦点组滚动位置 */
+function updateTabOverflow() {
+  const ga = document.getElementById("tab-group-a");
+  const gb = document.getElementById("tab-group-b");
+  const ov = ga.scrollWidth > ga.clientWidth + 1 || gb.scrollWidth > gb.clientWidth + 1;
+  tabbarEl.classList.toggle("overflow", ov);
+  const sc = focusedGroupEl();
+  document.getElementById("tab-prev").disabled = sc.scrollLeft <= 0;
+  document.getElementById("tab-next").disabled =
+    sc.scrollLeft + sc.clientWidth >= sc.scrollWidth - 1;
+}
+
+document.getElementById("tab-prev").addEventListener("click", () => focusedGroupEl().scrollBy({ left: -180 }));
+document.getElementById("tab-next").addEventListener("click", () => focusedGroupEl().scrollBy({ left: 180 }));
+// 滚轮横滚只作用于悬停组；滚动/尺寸变化刷新 ◀▶ 禁用态
+for (const gid of ["tab-group-a", "tab-group-b"]) {
+  const sc = document.getElementById(gid);
+  sc.addEventListener("wheel", (e) => {
+    if (sc.scrollWidth <= sc.clientWidth + 1) return;
+    e.preventDefault();
+    sc.scrollLeft += e.deltaY || e.deltaX;
+  }, { passive: false });
+  sc.addEventListener("scroll", updateTabOverflow);
+  new ResizeObserver(updateTabOverflow).observe(sc);
+}
+
+// ---- 页签拖拽换组（HTML5 DnD）----
+// 事件层只做「坐标 → (side, index)」换算，全部状态逻辑在 moveTab（可冒烟直调）。
+// dataTransfer 在 dragover 里读不到数据（规范限制），被拖签 id 走模块级 dragTabId。
+
+/** @type {number | null} 被拖签 id */
+let dragTabId = null;
+/** @type {{ side: "A" | "B", index: number } | null} 当前 dragover 算出的投放点 */
+let dropTarget = null;
+
+/** 隐藏插入位置指示器 */
+function hideInsertIndicator() {
+  document.getElementById("tab-insert").style.display = "none";
+}
+
+/**
+ * 开始拖拽：记录被拖签；未分屏时亮出空的右组投放区（拖出分屏的入口）。
+ *
+ * @param {DragEvent} e - 事件。
+ * @param {number} id - 被拖签 id。
+ * @returns {void}
+ */
+function onTabDragStart(e, id) {
+  dragTabId = id;
+  e.dataTransfer.effectAllowed = "move";
+  e.dataTransfer.setData("text/plain", String(id)); // 双保险（合成事件/跨窗口场景）
+  if (!splitOn) tabbarEl.classList.add("dragpeek");
+}
+
+/** 拖拽结束（投放或取消）：清理全部拖拽态（真实序列 drop → dragend，清理幂等）。 */
+function onTabDragEnd() {
+  dragTabId = null;
+  dropTarget = null;
+  tabbarEl.classList.remove("dragpeek");
+  hideInsertIndicator();
+}
+
+/**
+ * 组容器上悬停：按 midX 算插入位（排除被拖签）并定位插入指示器。
+ * 左组单签对右组不亮指示器且 dropEffect="none"（与 moveTab 的拖空保护一致）。
+ *
+ * @param {DragEvent} e - 事件（须 preventDefault 才允许投放）。
+ * @param {"A" | "B"} side - 悬停组。
+ * @returns {void}
+ */
+function onGroupDragOver(e, side) {
+  if (dragTabId === null) return;
+  const t = tabs.find((x) => x.id === dragTabId);
+  if (!t) return;
+  if (side === "B" && t.side === "A" && groupTabs("A").length === 1) {
+    e.dataTransfer.dropEffect = "none"; // 左组是主组，禁止拖空（I3）
+    dropTarget = null;
+    hideInsertIndicator();
+    return;
+  }
+  e.preventDefault(); // 允许 drop
+  e.dataTransfer.dropEffect = "move";
+  const group = document.getElementById(side === "B" ? "tab-group-b" : "tab-group-a");
+  const kids = [...group.querySelectorAll(".tab")]
+    .filter((el) => Number(el.dataset.id) !== dragTabId);
+  let index = kids.length; // 默认末尾
+  for (let i = 0; i < kids.length; i += 1) {
+    const r = kids[i].getBoundingClientRect();
+    if (e.clientX < r.left + r.width / 2) { index = i; break; }
+  }
+  dropTarget = { side, index };
+  // 插入指示器：#tab-scroll 内绝对定位（CSS 隐藏态，此处只管显示与横坐标）
+  const wrapR = tabScrollEl.getBoundingClientRect();
+  let x;
+  if (index < kids.length) {
+    x = kids[index].getBoundingClientRect().left - wrapR.left - 1;
+  } else if (kids.length) {
+    x = kids[kids.length - 1].getBoundingClientRect().right - wrapR.left - 1;
+  } else {
+    x = group.getBoundingClientRect().left - wrapR.left + 2; // 空组（dragpeek）：指组首
+  }
+  const ind = document.getElementById("tab-insert");
+  ind.style.left = `${x}px`;
+  ind.style.display = "block";
+}
+
+/**
+ * 拖离组容器：藏指示器（进入组内子元素不算拖离）。
+ *
+ * @param {DragEvent} e - 事件。
+ * @returns {void}
+ */
+function onGroupDragLeave(e) {
+  if (e.relatedTarget && e.currentTarget.contains(e.relatedTarget)) return;
+  dropTarget = null;
+  hideInsertIndicator();
+}
+
+/**
+ * 投放：按 dragover 算好的 (side, index) 调 moveTab。
+ *
+ * @param {DragEvent} e - 事件。
+ * @param {"A" | "B"} side - 投放组。
+ * @returns {void}
+ */
+function onGroupDrop(e, side) {
   e.preventDefault();
-  tabScrollEl.scrollLeft += e.deltaY || e.deltaX;
-}, { passive: false });
-tabScrollEl.addEventListener("scroll", updateTabOverflow);
-new ResizeObserver(updateTabOverflow).observe(tabScrollEl);
+  const id = dragTabId ?? (Number(e.dataTransfer.getData("text/plain")) || null);
+  const target = dropTarget;
+  onTabDragEnd(); // 投放即结束：清理拖拽态（真实拖拽随后还有 dragend，幂等）
+  if (id === null || !target || target.side !== side) return;
+  void moveTab(id, side, target.index);
+}
+
+// 组容器拖拽监听（静态挂接一次；页签的 dragstart/dragend 在 renderTabbar 里随签挂）
+for (const [gid, side] of [["tab-group-a", "A"], ["tab-group-b", "B"]]) {
+  const g = document.getElementById(gid);
+  g.addEventListener("dragover", (e) => onGroupDragOver(e, side));
+  g.addEventListener("dragleave", onGroupDragLeave);
+  g.addEventListener("drop", (e) => onGroupDrop(e, side));
+}
 
 /**
  * 打开一个独立的大文件引擎会话（每个页签一个，互不腾退）。
@@ -423,7 +587,9 @@ function applyDocToCurrent(doc, p) {
 
 /**
  * 切换活动页签：状态写回旧签 → 引擎仲裁 → 换绑视图。
- * 分屏下点另一侧的签 = 纯焦点交换（内容稳定）；点侧外签 = 焦点侧重绑新签。
+ * 分屏下点另一组的组当前签 = 纯焦点交换（两侧绑定不动）；点另一组的其他签
+ * = 该组先静默重绑到目标签（bindSide），焦点再交换过去（顺序不能反：
+ * focusSide 从 sideTab 取签）。点焦点组内其他签/未分屏 = 现状换绑路径。
  *
  * @param {number} id - 目标页签 id。
  * @returns {Promise<boolean>} true = 已切换；false = 用户取消或打开失败。
@@ -435,7 +601,16 @@ async function activateTab(id) {
   syncActiveTab();
   const side = sideOfTab(id);
   if (side && side !== focusedSide) {
-    focusSide(side); // 目标签在另一侧：交换焦点即可，两侧绑定不动
+    if (sideTab[side] !== id) {
+      // 另一组的背景签：该组先静默重绑到目标签，再交换焦点
+      if (t.kind === "big" && !t.model) {
+        const bm = await openBigEngineFor(t.id, t.path, t.headerless);
+        if (!bm) return false;
+        t.model = bm;
+      }
+      bindSide(side, t);
+    }
+    focusSide(side);
     return true;
   }
   if (t.kind === "big" && !t.model) {
@@ -468,7 +643,7 @@ async function activateTab(id) {
 async function loadIntoNewTab(p, opts = {}) {
   const t = {
     id: tabSeq++, title: tabTitleOf(p), path: p,
-    kind: "big", model: null, dirty: false, headerless: false,
+    kind: "big", model: null, dirty: false, headerless: false, side: "A",
   };
   // 不记忆解读方式：每次打开都从「首行是列名」开始
   const doc = await loadDoc(p, t.id);
@@ -476,7 +651,7 @@ async function loadIntoNewTab(p, opts = {}) {
   t.kind = doc.kind;
   t.model = doc.model;
   t.headerless = doc.model.isHeaderless?.() === true;
-  tabs.push(t);
+  insertTabIntoGroup(t, splitOn ? focusedSide : "A"); // 新签落焦点侧组（I1 组邻接）
   if (opts.activate !== false) {
     await activateTab(t.id);
     if (doc.warnings?.length) {
@@ -528,40 +703,66 @@ async function openPathsAsTabs(paths) {
 }
 
 /**
- * 关闭页签：脏档弹 保存/放弃/取消（非活动脏签先切过去，所见即所关）；
- * 活动签关闭后激活相邻签；最后一签关闭后回空表。
+ * 关闭页签：不抢焦点、不重绑任何网格（双组模型下点另一组的签不应换显本侧）。
+ * 脏签按标题弹三选确认：「保存」先激活该签走既有保存流程（成功才继续关）、
+ * 「放弃」直接关、「取消」不动。被关的是组当前签 → 同组右邻（无则左邻）补位；
+ * 右组关空 → 自动收屏；左组关空且右组非空 → 右组整体升格补位（promoteGroupB）。
  *
  * @param {number} id - 页签 id。
- * @returns {Promise<boolean>} true = 已关闭；false = 用户取消。
+ * @returns {Promise<boolean>} true = 已关闭（或本就不存在）；false = 用户取消/保存失败。
  */
 async function closeTab(id) {
-  if (!tabs.some((t) => t.id === id)) return true;
-  if (id !== activeId && !(await activateTab(id))) return false;
-  if (!(await confirmDiscard())) return false; // 脏 → 保存/放弃/取消
-  const t = activeTab();
-  const idx = tabs.indexOf(t);
+  const t = tabs.find((x) => x.id === id);
+  if (!t) return true;
+  const wasSide = splitOn ? t.side : "A";
+  // 脏确认：活动签走 live 路径；后台脏签按标题确认，选「保存」才激活走既有保存流
+  if (id === activeId) {
+    if (!(await confirmDiscard())) return false;
+  } else if (t.dirty) {
+    const v = await confirmDiscardDialog(t.title);
+    if (v === "cancel") return false;
+    if (v === "save") {
+      if (!(await activateTab(id))) return false;
+      await saveFile();
+      if (dirty) return false; // 保存失败/取消另存为：中止关签
+    }
+  }
+  const closingActive = id === activeId; // 「保存」路径可能刚激活了目标签
+  const group = groupTabs(wasSide);
+  const neighbor = group[group.indexOf(t) + 1] ?? group[group.indexOf(t) - 1] ?? null;
   if (t.kind === "big") {
     // 只关闭本页签的引擎会话，其他页签不受影响
     try { await t.model?.close?.(); } catch { /* 会话已关闭 */ }
   }
-  tabs.splice(idx, 1);
-  if (splitOn && splitTabId !== null && !tabs.some((x) => x.id === splitTabId)) {
-    closeSplit(); // 分屏签被关：分屏随之收起（其余页签保留）
-  }
+  tabs.splice(tabs.indexOf(t), 1);
   if (!tabs.length) {
     resetToEmpty();
     return true;
   }
-  activeId = null; // 强制 activateTab 走完整换绑
-  const ok = await activateTab(tabs[Math.min(idx, tabs.length - 1)].id);
+  if (splitOn && groupTabs("B").length === 0) {
+    closeSplit(); // 右组关空：自动收屏（焦点在 B 时左组当前签接管）
+    return true;
+  }
+  if (splitOn && groupTabs("A").length === 0) {
+    promoteGroupB(); // 左组关空：右组整体升格补位
+    return true;
+  }
+  if (closingActive || (splitOn && sideTab[wasSide] === id)) {
+    // （组）当前签被关：同组右邻（无则左邻）补位
+    if (!splitOn || wasSide === focusedSide) {
+      activeId = null; // 强制 activateTab 走完整换绑
+      await activateTab(neighbor.id);
+    } else {
+      bindSide(wasSide, neighbor);
+    }
+  }
   renderTabbar();
-  return ok;
+  return true;
 }
 
 /** 全部页签关闭后回空表（对齐启动态） */
 function resetToEmpty() {
   splitOn = false;
-  splitTabId = null;
   sideTab.A = null;
   sideTab.B = null;
   focusedSide = "A";
@@ -727,70 +928,140 @@ function focusSide(side) {
 }
 
 /**
- * 建立分屏：目标签上副侧（B 网格），焦点留在主侧。
- * 目标签为活动签时同样允许（VS Code 行为）：主侧先换显右邻签，原活动签入副侧。
- * 每个页签都有独立引擎会话，两侧可同时打开两个大文件。
+ * 副侧静默重绑：网格换显指定页签，不触外壳状态（编辑窗格/状态栏/计数/焦点）。
+ * 视图重置对齐 applyViewState 顺序：上次内容的筛选/选区不残留。
+ * 仅用于非焦点侧；焦点侧换绑走 activateTab（live 变量交换 + applyViewState）。
+ *
+ * @param {"A" | "B"} side - 目标侧。
+ * @param {DocTab} t - 目标页签（model 须已就绪）。
+ * @returns {void}
+ */
+function bindSide(side, t) {
+  const g = gridOfSide(side);
+  g.clearFilters();
+  g.clearSelection();
+  g.setModel(t.model);
+  g.scrollEl.scrollTop = 0;
+  g.scrollEl.scrollLeft = 0;
+  sideTab[side] = t.id;
+}
+
+/**
+ * 移动页签到目标组指定位置：拖拽/右键菜单/冒烟共用的唯一原语。
+ * 同组移动 = 纯重排（两侧绑定不动）；跨组移动时被移签成为目标组的组当前签；
+ * 被移签原是来源组当前签时，来源组改显同组右邻（无右邻取左邻）。
+ * 右组被拖空 → 自动收屏；左组是主组（I3），禁止拖空（返回 false）。
+ * 焦点恒留原焦点组。
+ *
+ * @param {number} id - 待移动页签 id。
+ * @param {"A" | "B"} targetSide - 目标组。
+ * @param {number} [index] - 目标组内插入位（先摘除被移签后计），默认末尾。
+ * @returns {Promise<boolean>} false = 被拒绝（拖空左组 / 签不存在 / 引擎重开失败）。
+ */
+async function moveTab(id, targetSide, index = Infinity) {
+  const t = tabs.find((x) => x.id === id);
+  if (!t) return false;
+  const srcSide = splitOn ? t.side : "A";
+  if (srcSide === targetSide) {
+    // 同组移动：纯重排，两侧绑定不动
+    tabs.splice(tabs.indexOf(t), 1);
+    insertTabIntoGroup(t, targetSide, index);
+    renderTabbar();
+    return true;
+  }
+  // 左组保护：A 是主组，不允许拖空（未分屏仅一签时入 B 同此拒绝，对齐旧 openSplit）
+  if (targetSide === "B" && groupTabs("A").length === 1) return false;
+  if (t.kind === "big" && !t.model) {
+    // 防御：模型缺失（异常/旧状态）时按该签当前模式重开引擎
+    const bm = await openBigEngineFor(t.id, t.path, t.headerless);
+    if (!bm) return false;
+    t.model = bm;
+  }
+  if (!splitOn) {
+    // 未分屏 → B：立分屏（拖出分屏/「在分屏中打开」共用此路径）
+    splitOn = true;
+    sideTab.A = activeId;
+    document.body.classList.add("split");
+  }
+  syncActiveTab(); // live 状态先写回（被移签可能就是活动签）
+  const srcGroup = groupTabs(srcSide);
+  const neighbor = srcGroup[srcGroup.indexOf(t) + 1] ?? srcGroup[srcGroup.indexOf(t) - 1] ?? null;
+  tabs.splice(tabs.indexOf(t), 1);
+  if (sideTab[srcSide] === id && neighbor) {
+    // 来源组善后：组当前签被移走，同组右邻（无则左邻）补位
+    if (srcSide === focusedSide) {
+      activeId = null; // 强制 activateTab 走完整换绑（live 交换 + 视图重置）
+      await activateTab(neighbor.id);
+    } else {
+      bindSide(srcSide, neighbor);
+    }
+  }
+  if (srcSide === "B" && groupTabs("B").length === 0) {
+    closeSplit(); // 右组被拖空：自动收屏（被移签尚处摘除态，收屏不受影响）
+  }
+  insertTabIntoGroup(t, targetSide, index);
+  sideTab[targetSide] = t.id;
+  if (targetSide === focusedSide) {
+    // 移入焦点组：成为活动签（live 交换 + 视图重置）
+    activeId = null;
+    await activateTab(t.id);
+  } else {
+    bindSide(targetSide, t);
+  }
+  renderTabbar();
+  return true;
+}
+
+/**
+ * 建立分屏：目标签入右组（B 网格），焦点留在左组。
+ * 薄包装：语义全部由 moveTab 提供（活动签入右组时左组自动改显右邻签；
+ * 仅一签时被左组保护拒绝）。每个页签都有独立引擎会话，两侧可同时开两个大文件。
  *
  * @param {number} id - 目标页签 id。
  * @returns {Promise<boolean>} true = 分屏已建立。
  */
 async function openSplit(id) {
   if (splitOn) return false;
-  const t = tabs.find((x) => x.id === id);
-  if (!t) return false;
-  if (id === activeId) {
-    // 活动签入分屏：主侧改显右邻签（末尾回卷首个），分屏签 = 原活动签
-    if (tabs.length < 2) return false;
-    const idx = tabs.indexOf(t);
-    const next = tabs[(idx + 1) % tabs.length];
-    if (!(await activateTab(next.id))) return false; // 主侧重绑邻签
-  }
-  syncActiveTab();
-  if (t.kind === "big" && !t.model) {
-    const bm = await openBigEngineFor(t.id, t.path, t.headerless);
-    if (!bm) return false;
-    t.model = bm;
-  }
-  splitOn = true;
-  splitTabId = id;
-  sideTab.A = activeId;
-  sideTab.B = id;
-  document.body.classList.add("split");
-  // 副侧视图重置（对齐 applyViewState 顺序）：上次分屏的筛选/选区不残留
-  gridB.clearFilters();
-  gridB.clearSelection();
-  gridB.setModel(t.model);
-  gridB.scrollEl.scrollTop = 0;
-  gridB.scrollEl.scrollLeft = 0;
-  renderTabbar();
-  return true;
+  return moveTab(id, "B");
 }
 
 /**
- * 关闭分屏：副网格隐藏、页签保留（含分屏签），焦点归主侧。
- * 焦点在副侧时主网格接管活动签（视图重置，对齐换档语义）。
+ * 关闭分屏：右组签依原相对序并入左组（I1 组邻接：本就在数组尾，视觉顺序不变），
+ * 副网格隐藏、页签全保留。焦点在右组时左组当前签接管活动档（focusSide 从
+ * sideTab.A 无条件重取：关签触发的收屏 activeId 可能残留已删签）。
  *
  * @returns {void}
  */
 function closeSplit() {
   if (!splitOn) return;
   splitOn = false;
-  splitTabId = null;
-  sideTab.A = null;
+  for (const t of tabs) t.side = "A";
   sideTab.B = null;
   document.body.classList.remove("split");
   document.getElementById("grid-area").style.flex = ""; // 清掉分屏拖拽残留的主侧定宽
   if (focusedSide !== "A") {
-    focusedSide = "A";
-    if (activeTab()) applyViewState(gridA);
+    focusSide("A"); // 左组当前签接管活动档（live 交换 + 外壳状态还原）
   }
+  if (!tabs.some((t) => t.id === sideTab.A)) sideTab.A = activeId; // I5 兜底
   renderTabbar();
 }
 
 /**
- * 页签右键菜单：未分屏给「在分屏中打开」（只有一个签时禁用；双大档由动作层
- * 点击后拒绝并提示原因，避免灰着不给说法）；分屏态点分屏签给「关闭分屏」；
- * 其余场景不出菜单。
+ * 左组被关空且右组非空：右组整体升格为左组并收屏（关签不能拒绝，补位结果确定）。
+ * 借 closeSplit 的「焦点在 B」接管路径：升格后左组/主网格显原右组当前签。
+ *
+ * @returns {void}
+ */
+function promoteGroupB() {
+  sideTab.A = sideTab.B; // 右组当前签升格为全局当前
+  focusedSide = "B"; // 借 closeSplit 的焦点接管路径完成 live 交换
+  closeSplit();
+}
+
+/**
+ * 页签右键菜单：未分屏给「在分屏中打开」（只有一个签时禁用）；分屏态对任意签
+ * 给「移到右侧/移到左侧」（与拖拽共用 moveTab 原语；A 组单签时「移到右侧」禁用，
+ * 与拖空保护一致）外加「关闭分屏」。
  *
  * @param {DocTab} t - 目标页签。
  * @param {number} x - 菜单位置 x。
@@ -806,9 +1077,15 @@ function showTabMenu(t, x, y) {
     }]);
     return;
   }
-  if (t.id === splitTabId) {
-    showMenu(x, y, [{ label: "关闭分屏", onClick: () => closeSplit() }]);
-  }
+  const toB = t.side === "A";
+  showMenu(x, y, [
+    {
+      label: toB ? "移到右侧" : "移到左侧",
+      disabled: toB && groupTabs("A").length === 1, // 左组是主组，禁止拖空（I3）
+      onClick: () => void moveTab(t.id, toB ? "B" : "A"),
+    },
+    { label: "关闭分屏", onClick: () => closeSplit() },
+  ]);
 }
 
 // ============ 大文件模式 UI（按钮显隐/筛选执行/列操作 pending） ============
@@ -1293,9 +1570,9 @@ async function newFile() {
   ensureTabbed();
   const t = {
     id: tabSeq++, title: "未命名", path: null, kind: "small", model: m, dirty: false,
-    headerless: true,
+    headerless: true, side: "A",
   };
-  tabs.push(t);
+  insertTabIntoGroup(t, splitOn ? focusedSide : "A"); // 新签落焦点侧组（I1 组邻接）
   await activateTab(t.id);
 }
 
@@ -1996,15 +2273,24 @@ window.__app = {
   toggleHeaderless,
   // 冒烟专用：复位页签会话后装载内存小表（新建表格路径）
   smokeLoadSmall,
-  // 多档页签：快照 / 切换 / 关闭 / 批量拖入
+  // 多档页签：快照 / 切换 / 关闭 / 批量拖入 / 移组
   tabs: () => tabs.map((t) => ({
     id: t.id, title: t.title, path: t.path, kind: t.kind,
     dirty: t.id === activeId ? dirty : t.dirty,
     active: t.id === activeId,
     headerless: t.id === activeId ? model.isHeaderless?.() === true : t.headerless,
+    side: t.side,
+    current: splitOn && sideTab[t.side] === t.id,
   })),
-  activateTab, closeTab, openPathsAsTabs,
+  activateTab, closeTab, openPathsAsTabs, moveTab,
   // 分屏视图：状态快照 / 建立 / 关闭
-  split: () => ({ on: splitOn, splitTabId, focused: focusedSide }),
+  split: () => ({
+    on: splitOn,
+    focused: focusedSide,
+    a: groupTabs("A").map((t) => t.id),
+    b: splitOn ? groupTabs("B").map((t) => t.id) : [],
+    curA: sideTab.A,
+    curB: sideTab.B,
+  }),
   openSplit, closeSplit,
 };

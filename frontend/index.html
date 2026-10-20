@@ -262,9 +262,32 @@ body.split #vsplit { display: block; }
 #tabbar > button:disabled { color: #c0c0c0; cursor: default; }
 #tab-scroll {
   flex: 1 1 auto; min-width: 0; display: flex; align-items: stretch;
-  overflow-x: auto; scrollbar-width: none;
+  overflow: hidden; scrollbar-width: none; position: relative;
 }
 #tab-scroll::-webkit-scrollbar { display: none; }
+/* 页签左右两组（分屏时与左右网格一一对应）：组容器各自横滚，滚动条隐藏 */
+.tab-group {
+  display: flex; align-items: stretch; min-width: 0;
+  overflow-x: auto; scrollbar-width: none;
+}
+.tab-group::-webkit-scrollbar { display: none; }
+#tab-group-a { flex: 1 1 auto; }
+/* 右组：分屏才显示，左缘 2px 分隔；左组吃满剩余弹性空间 */
+#tab-group-b {
+  flex: 0 1 auto; display: none;
+  border-left: 2px solid #b5b5b5; background: #e2e2e2;
+}
+#tabbar.split #tab-group-b { display: flex; }
+/* 未分屏拖拽进行中：亮出空的右组投放区（拖出分屏的入口） */
+#tabbar.dragpeek #tab-group-b {
+  display: flex; flex: 0 0 90px;
+  outline: 1px dashed #8a8a8a; outline-offset: -3px;
+}
+/* 拖拽插入位置指示器（绝对定位，跟随 dragover 计算结果） */
+#tab-insert {
+  position: absolute; top: 0; bottom: 0; width: 2px;
+  background: var(--accent); display: none; pointer-events: none; z-index: 5;
+}
 .tab {
   flex: 0 0 auto; display: flex; align-items: center; gap: 5px;
   padding: 0 6px 0 10px; min-width: 90px; max-width: 200px;
@@ -394,7 +417,11 @@ body.split #vsplit { display: block; }
   </div>
   <div id="tabbar">
     <button id="tab-prev" title="向左滚动页签">◀</button>
-    <div id="tab-scroll"></div>
+    <div id="tab-scroll">
+      <div id="tab-group-a" class="tab-group"></div>
+      <div id="tab-group-b" class="tab-group"></div>
+      <div id="tab-insert"></div>
+    </div>
     <button id="tab-next" title="向右滚动页签">▶</button>
   </div>
   <div id="statusbar">
