@@ -350,6 +350,7 @@ function updateTabOverflow() {
   document.getElementById("tab-prev").disabled = sc.scrollLeft <= 0;
   document.getElementById("tab-next").disabled =
     sc.scrollLeft + sc.clientWidth >= sc.scrollWidth - 1;
+  if (splitOn) syncTabSplit(); // ◀▶ 显隐平移滚区左缘 22px，需重对齐
 }
 
 document.getElementById("tab-prev").addEventListener("click", () => focusedGroupEl().scrollBy({ left: -180 }));
@@ -365,6 +366,27 @@ for (const gid of ["tab-group-a", "tab-group-b"]) {
   sc.addEventListener("scroll", updateTabOverflow);
   new ResizeObserver(updateTabOverflow).observe(sc);
 }
+
+/**
+ * 页签组界与网格分界像素对齐：分屏时左组定宽 = 左网格右缘 − 页签滚区左缘 + 2px
+ *（右组左缘的 2px 分隔线对到 5px vsplit 中心）。滚区左缘取实时 rect：◀▶ 按钮
+ * 出现时滚区右挤 22px 仍对齐。未分屏清定宽恢复弹性全宽。
+ *
+ * @returns {void}
+ */
+function syncTabSplit() {
+  const ga = document.getElementById("tab-group-a");
+  if (!splitOn) {
+    if (ga.style.flex) ga.style.flex = ""; // 收屏/回空：恢复弹性全宽
+    return;
+  }
+  const gridR = document.getElementById("grid-area").getBoundingClientRect();
+  const scrollL = document.getElementById("tab-scroll").getBoundingClientRect().left;
+  const v = `0 0 ${Math.max(60, Math.round(gridR.right - scrollL + 2))}px`;
+  if (ga.style.flex !== v) ga.style.flex = v; // 同值不写，阻断 RO 回路
+}
+// 窗口缩放/编辑窗格开合/分隔条拖拽等一切左网格尺寸变化，兜底同步页签组界
+new ResizeObserver(() => syncTabSplit()).observe(document.getElementById("grid-area"));
 
 // ---- 页签拖拽换组（HTML5 DnD）----
 // 事件层只做「坐标 → (side, index)」换算，全部状态逻辑在 moveTab（可冒烟直调）。
@@ -768,6 +790,7 @@ function resetToEmpty() {
   focusedSide = "A";
   document.body.classList.remove("split");
   document.getElementById("grid-area").style.flex = ""; // 清掉分屏拖拽残留的主侧定宽
+  syncTabSplit(); // 页签左组定宽同步复位
   model = new TableModel();
   bindModelEvents(model);
   path = null;
@@ -982,6 +1005,7 @@ async function moveTab(id, targetSide, index = Infinity) {
     splitOn = true;
     sideTab.A = activeId;
     document.body.classList.add("split");
+    syncTabSplit(); // 页签组界对到网格分界（取分屏后网格实宽）
   }
   syncActiveTab(); // live 状态先写回（被移签可能就是活动签）
   const srcGroup = groupTabs(srcSide);
@@ -1039,6 +1063,7 @@ function closeSplit() {
   sideTab.B = null;
   document.body.classList.remove("split");
   document.getElementById("grid-area").style.flex = ""; // 清掉分屏拖拽残留的主侧定宽
+  syncTabSplit(); // 页签左组定宽同步复位
   if (focusedSide !== "A") {
     focusSide("A"); // 左组当前签接管活动档（live 交换 + 外壳状态还原）
   }
@@ -2181,6 +2206,7 @@ document.addEventListener("keydown", (e) => {
       const maxW = window.innerWidth - document.getElementById("pane").offsetWidth - 240 - 10;
       const w = Math.min(Math.max(startW + (ev.clientX - startX), 240), maxW);
       gridArea.style.flex = `0 0 ${w}px`;
+      syncTabSplit(); // 页签组界跟随分隔条
     };
     const up = () => {
       document.removeEventListener("mousemove", move);

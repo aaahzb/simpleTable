@@ -272,9 +272,9 @@ body.split #vsplit { display: block; }
 }
 .tab-group::-webkit-scrollbar { display: none; }
 #tab-group-a { flex: 1 1 auto; }
-/* 右组：分屏才显示，左缘 2px 分隔；左组吃满剩余弹性空间 */
+/* 右组：分屏才显示，左缘 2px 分隔；左组由 JS 按网格分界定宽，右组吃余量、组内页签靠左 */
 #tab-group-b {
-  flex: 0 1 auto; display: none;
+  flex: 1 1 0; display: none;
   border-left: 2px solid #b5b5b5; background: #e2e2e2;
 }
 #tabbar.split #tab-group-b { display: flex; }

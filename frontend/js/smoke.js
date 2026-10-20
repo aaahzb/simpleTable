@@ -1381,6 +1381,38 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await closeAllTabs();
   });
 
+  check("分组页签 N11：页签组界跟随网格分界——拖 vsplit 同步、收屏复位", async () => {
+    const fa = `${TMP}/grp/al_a.csv`; const fb = `${TMP}/grp/al_b.csv`;
+    await writeText(fa, "h\r\n甲\r\n"); await writeText(fb, "h\r\n乙\r\n");
+    await window.__app.openPathsAsTabs([fa, fb]);
+    const tb = window.__app.tabs().find((x) => x.path === fb);
+    await window.__app.openSplit(tb.id);
+    const gaGrid = document.getElementById("grid-area");
+    const tga = document.getElementById("tab-group-a");
+    const tgb = document.getElementById("tab-group-b");
+    // 页签分界 = 右组左缘；网格分界 = 左网格右缘 + 2（组界 2px 线对到 5px vsplit 中心）
+    const gap = () => Math.abs(tgb.getBoundingClientRect().left
+      - (gaGrid.getBoundingClientRect().right + 2));
+    const gap0 = gap(); // 默认对半
+    const left0 = tgb.getBoundingClientRect().left;
+    const vs = document.getElementById("vsplit");
+    const sx = vs.getBoundingClientRect().left + 2;
+    mouse(vs, "mousedown", { clientX: sx, clientY: 200 });
+    mouse(document, "mousemove", { clientX: sx + 120, clientY: 200 });
+    mouse(document, "mouseup", { clientX: sx + 120, clientY: 200 });
+    const gap1 = gap(); // 拖后仍对齐
+    const moved = tgb.getBoundingClientRect().left - left0;
+    await window.__app.closeSplit();
+    const flexAfter = tga.style.flex;
+    await closeAllTabs();
+    // 断言放在清理之后：RED 期失败也不残留现场
+    assert(gap0 <= 2, `默认对半分界应对齐（差 ${gap0}px）`);
+    assert(left0 < window.innerWidth * 0.8, "右组页签应靠组界左排，不应漂到窗口最右端");
+    assert(Math.abs(moved - 120) <= 2, `组界应随 vsplit 右移 120px（实移 ${moved}）`);
+    assert(gap1 <= 2, `拖拽后分界仍应对齐（差 ${gap1}px）`);
+    assert(flexAfter === "", "收屏后左组应清定宽恢复弹性");
+  });
+
   check("Del 立即清除选区内容（无确认）", async () => {
     await loadBasic();
     grid.select([0, 0]);
