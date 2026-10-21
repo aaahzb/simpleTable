@@ -56,7 +56,7 @@ const cur = (grid) => grid.sel.current;
  * 运行冒烟套件。
  *
  * @param {object} ctx - 外壳上下文。
- * @param {import("./model.js").TableModel} ctx.model - 模型。
+ * @param {import("./bigmodel.js").BigModel} ctx.model - 模型。
  * @param {import("./grid.js").Grid} ctx.grid - 网格。
  * @param {import("./pane.js").EditPane} ctx.pane - 编辑窗格。
  * @param {(cmd: string, args?: object) => Promise<any>} ctx.invoke - Tauri invoke。
@@ -86,10 +86,10 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     ["洱海", "5", ""],
   ];
   /**
-   * 装载基础小表（新建表格路径）。
+   * 装载基础小表（内存引擎夹具）。
    *
-   * 统一大引擎后磁盘文件都走 BigModel；本套件前半段验证的是内存小模型
-   * （新建表格）的网格/键位/排序行为，故经冒烟钩子复位页签并装载小表。
+   * 统一大引擎后所有表格都是 BigModel 会话；经冒烟钩子复位页签，
+   * 由内存字节源建会话并预热，预热后同步 rawData/visCount 断言立即可读。
    *
    * @returns {Promise<void>}
    */
@@ -148,6 +148,8 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       sc.clientWidth, sc.clientHeight, sc.scrollWidth, sc.scrollHeight,
       cv.style.width, cv.style.height,
     ].join("|");
+    // 统一大引擎后启动渲染链全异步（RO/版本号/事件），先等空闲落定再测不动点
+    await sleep(80);
     grid.renderAll();
     const first = snap();
     grid.renderAll();
@@ -197,16 +199,14 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
   });
 
   check("虚拟滚动：8000 行只渲染可视行", async () => {
-    model.load(["a"], Array.from({ length: 8000 }, (_, i) => [`v${i}`]));
-    grid.renderAll();
+    await window.__app.smokeLoadSmall(["a"], Array.from({ length: 8000 }, (_, i) => [`v${i}`]));
     const n = document.querySelectorAll("#rows .row").length;
     assert(n < 100, `可视行应 < 100，实际 ${n}`);
     assert(model.rowCount() === 8000, "总行数应保留 8000");
   });
 
   check("显示文本压平换行/Tab（单行不变形）", async () => {
-    model.load(["a"], [["line1\nline2\ttail"]]);
-    grid.renderAll();
+    await window.__app.smokeLoadSmall(["a"], [["line1\nline2\ttail"]]);
     const cell = document.querySelector(".cell");
     assert(cell.textContent === "line1 line2 tail", `压平结果: ${cell.textContent}`);
   });
@@ -278,38 +278,32 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
   });
 
   check("Ctrl+↓/↑：按 Excel 语义跳到当前列数据边缘", async () => {
-    await loadBasic();
-    model.load(["值"], [["1"], ["2"], [""], ["3"], ["4"]]);
-    grid.renderAll();
+    await window.__app.smokeLoadSmall(["值"], [["1"], ["2"], [""], ["3"], ["4"]]);
     const scroller = document.getElementById("grid-scroll");
     scroller.focus();
+    const jump = async (k, expect, label) => {
+      key(scroller, k, { ctrlKey: true });
+      await waitFor(() => cur(grid)?.[0] === expect, label);
+    };
     grid.select([0, 0]);
-    key(scroller, "ArrowDown", { ctrlKey: true });
-    assert(cur(grid)?.[0] === 1, "连续块末格应为 1");
-    key(scroller, "ArrowDown", { ctrlKey: true });
-    assert(cur(grid)?.[0] === 3, "块边缘再按应越过空档到 3");
-    key(scroller, "ArrowDown", { ctrlKey: true });
-    assert(cur(grid)?.[0] === 4, "下一条块末格应为 4");
-    key(scroller, "ArrowDown", { ctrlKey: true });
+    await jump("ArrowDown", 1, "连续块末格应为 1");
+    await jump("ArrowDown", 3, "块边缘再按应越过空档到 3");
+    await jump("ArrowDown", 4, "下一条块末格应为 4");
+    key(scroller, "ArrowDown", { ctrlKey: true }); // 末行再按应停住（无异步落定可等，sleep 后断言）
+    await sleep(150);
     assert(cur(grid)?.[0] === 4, "末行再按应停住");
-    key(scroller, "ArrowUp", { ctrlKey: true });
-    assert(cur(grid)?.[0] === 3, "向上到连续块首格");
-    key(scroller, "ArrowUp", { ctrlKey: true });
-    assert(cur(grid)?.[0] === 1, "向上越过空档到上块末格");
-    key(scroller, "ArrowUp", { ctrlKey: true });
-    assert(cur(grid)?.[0] === 0, "上块首格");
+    await jump("ArrowUp", 3, "向上到连续块首格");
+    await jump("ArrowUp", 1, "向上越过空档到上块末格");
+    await jump("ArrowUp", 0, "上块首格");
     grid.select([2, 0]);
-    key(scroller, "ArrowDown", { ctrlKey: true });
-    assert(cur(grid)?.[0] === 3, "空格向下找下一个非空");
+    await jump("ArrowDown", 3, "空格向下找下一个非空");
     grid.select([2, 0]);
-    key(scroller, "ArrowUp", { ctrlKey: true });
-    assert(cur(grid)?.[0] === 1, "空格向上找上一个非空");
+    await jump("ArrowUp", 1, "空格向上找上一个非空");
   });
 
   check("跳转行：直达选中并滚入视野，越界夹取", async () => {
     grid.clearFilters();
-    model.load(headers, Array.from({ length: 8000 }, (_, i) => [`R${i}`, String(i), ""]));
-    grid.renderAll();
+    await window.__app.smokeLoadSmall(headers, Array.from({ length: 8000 }, (_, i) => [`R${i}`, String(i), ""]));
     assert(window.__app.gotoRow(3999) === true, "跳转应成功");
     const r = cur(grid)?.[0];
     assert(r != null && grid.visibleIndexOf(r) === 3999, "当前格应位于显示行 4000");
@@ -360,7 +354,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const ed = document.getElementById("cell-editor");
     ed.value = "昆明";
     key(ed, "Enter");
-    assert(model.rawData(0, 0) === "昆明", "Enter 应提交");
+    await waitFor(() => model.rawData(0, 0) === "昆明", "Enter 应提交");
     assert(cur(grid)?.[0] === 1, "提交后应下移");
   });
 
@@ -370,7 +364,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const ed = document.getElementById("cell-editor");
     ed.value = "曲靖";
     key(ed, "Enter", { shiftKey: true });
-    assert(model.rawData(1, 0) === "曲靖");
+    await waitFor(() => model.rawData(1, 0) === "曲靖", "Shift+Enter 应提交");
     assert(cur(grid)?.[0] === 0, "应上移");
   });
 
@@ -380,7 +374,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const ed = document.getElementById("cell-editor");
     ed.value = "99";
     key(ed, "Tab");
-    assert(model.rawData(0, 1) === "99", "Tab 应提交");
+    await waitFor(() => model.rawData(0, 1) === "99", "Tab 应提交");
     assert(cur(grid)?.[1] === 2, "应右移");
     grid.openEditor(0, 2, { selectAll: true });
     key(document.getElementById("cell-editor"), "Tab", { shiftKey: true });
@@ -398,18 +392,18 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     // altKey 时 grid 不拦截不提交，仍处编辑态
     assert(grid.editing, "Alt+Enter 不应提交");
     key(ed, "Enter");
-    assert(model.rawData(0, 2).includes("\n"), "提交后应保留换行");
+    await waitFor(() => model.rawData(0, 2).includes("\n"), "提交后应保留换行");
   });
 
   check("多行内容编辑器加高且不改行高", async () => {
-    const rowHBefore = grid.rowH[2];
+    const rowHBefore = grid._rowH(2);
     grid.openEditor(2, 0, { selectAll: true });
     const ed = document.getElementById("cell-editor");
     ed.value = "a\nb\nc";
     grid._growEditor();
-    assert(parseFloat(ed.style.height) > grid.rowH[2], "编辑器应加高");
+    assert(parseFloat(ed.style.height) > grid._rowH(2), "编辑器应加高");
     key(ed, "Escape");
-    assert(grid.rowH[2] === rowHBefore, "行高不应变");
+    assert(grid._rowH(2) === rowHBefore, "行高不应变");
   });
 
   // ========== 筛选 ==========
@@ -417,10 +411,10 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
   check("筛选：子串忽略大小写 + 状态栏计数", async () => {
     await loadBasic();
     grid.filters.set(0, "洱");
-    grid._refilter();
-    assert(grid.visCount() === 1, `可见行应为 1，实际 ${grid.visCount()}`);
-    assert(document.getElementById("status-text").textContent.includes("显示 1 / 共 3 行"),
-      "状态栏应显示 显示 1 / 共 3 行");
+    await window.__app.runBigFilter();
+    await waitFor(() => grid.visCount() === 1, "可见行应为 1");
+    await waitFor(() => document.getElementById("status-text").textContent.includes("匹配 1 / 共 3 行"),
+      "状态栏应显示 匹配 1 / 共 3 行");
   });
 
   check("筛选输入框与列同宽对齐（结构断言）", async () => {
@@ -453,7 +447,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
 
   check("列插入后筛选条件清空", async () => {
     grid.filters.set(0, "洱");
-    model.insertColumns(0, 1);
+    await model.insertColumns(0, 1);
     grid.clearFilters();
     assert(grid.filters.size === 0, "筛选应已清空");
     assert(grid.visCount() === 3, "清空后应显示全部行");
@@ -463,14 +457,15 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await loadBasic();
     grid.filters.set(1, "1");
     grid.filters.set(0, "丽");
-    grid._refilter();
-    assert(grid.visCount() === 1, "AND 后应只剩丽江");
-    assert(model.rawData(grid.visAt(0), 0) === "丽江");
+    await window.__app.runBigFilter();
+    await waitFor(() => grid.visCount() === 1, "AND 后应只剩丽江");
+    await waitFor(() => model.rawData(grid.visAt(0), 0) === "丽江", "AND 命中丽江");
   });
 
   // ========== 行号语义（S1/S2 小模式钉住） ==========
 
-  check("行号语义：小模式两态行号——corner 恒空、数据行 1 起（表头不占号）", async () => {
+  check("行号语义：corner 恒空、数据行 1 起（表头不占号，两态）", async () => {
+    assert(window.__app.isBigMode() === true, "统一大引擎后应恒大模式");
     await window.__app.smokeLoadSmall(["甲", "乙"], [["A1", "B1"], ["A2", "B2"]]);
     const corner = () => grid.cornerEl?.textContent ?? "?";
     const head0 = () => document.querySelector('.row-head[data-row="0"]')?.textContent;
@@ -480,30 +475,16 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     tbBtn("首行非列名").click();
     await waitFor(() => bigM().rowCount() === 3, "首行非列名切换落定");
     assert(corner() === "", "首行非列名时 corner 仍应为空");
-    assert(grid.model.rawData(0, 0) === "甲", "原列名应成为首行数据");
+    await waitFor(() => grid.model.rawData(0, 0) === "甲", "原列名应成为首行数据");
     assert(head0() === "1",
       `首行非列名时首行（原列名）行号应为 1，实际 "${head0()}"`);
     tbBtn("首行非列名").click(); // 还原列名态
     await waitFor(() => bigM().rowCount() === 2, "还原落定");
   });
 
-  check("行号语义：小模式筛选行号跳号（显示原始行号而非可见序号）", async () => {
-    await window.__app.smokeLoadSmall(
-      ["品", "价"],
-      [["苹果", "1"], ["香蕉", "2"], ["橙子", "3"], ["西瓜", "4"], ["苹果汁", "5"]],
-    );
-    grid.filters.set(0, "苹");
-    grid._refilter();
-    assert(grid.visCount() === 2, `应命中 2 行，实际 ${grid.visCount()}`);
-    const t = (r) => document.querySelector(`.row-head[data-row="${r}"]`)?.textContent;
-    assert(t(0) === "1" && t(4) === "5",
-      `筛选行号应为原始行号 1/5（跳号），实际 ${t(0)}/${t(4)}`);
-    grid.clearFilters();
-  });
-
   // ========== 严格三态开关（~ 包含 → = 等于·不分大小写 → ≡ 等于·区分大小写） ==========
 
-  check("严格三态：按钮常显、点击循环 0→1→2→0、小模式三态命中数", async () => {
+  check("严格三态：按钮常显、点击循环 0→1→2→0、各态命中数", async () => {
     await window.__app.smokeLoadSmall(
       ["品", "码"],
       [["abc", "A1"], ["xabc", "a2"], ["ABC", "A1"]],
@@ -512,17 +493,20 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(btn, "筛选框内应有严格三态按钮");
     assert(btn.dataset.mode === "0" && btn.textContent === "~", "默认应为包含（~）");
     grid.filters.set(0, "abc");
-    grid._refilter();
-    assert(grid.visCount() === 3, `包含 abc 应中 3 行，实际 ${grid.visCount()}`);
+    await window.__app.runBigFilter();
+    await waitFor(() => grid.visCount() === 3, "包含 abc 应中 3 行");
     btn.click(); // → 严格·不分大小写
+    await window.__app.runBigFilter();
     assert(btn.dataset.mode === "1" && btn.textContent === "=", "第一次点击应为 =");
-    assert(grid.visCount() === 2, `严格CI abc 应中 abc/ABC 2 行，实际 ${grid.visCount()}`);
+    await waitFor(() => grid.visCount() === 2, "严格CI abc 应中 abc/ABC 2 行");
     btn.click(); // → 严格·区分大小写
+    await window.__app.runBigFilter();
     assert(btn.dataset.mode === "2" && btn.textContent === "≡", "第二次点击应为 ≡");
-    assert(grid.visCount() === 1, `严格CS abc 应只中 abc 1 行，实际 ${grid.visCount()}`);
+    await waitFor(() => grid.visCount() === 1, "严格CS abc 应只中 abc 1 行");
     btn.click(); // → 回包含
+    await window.__app.runBigFilter();
     assert(btn.dataset.mode === "0", "第三次点击应回包含");
-    assert(grid.visCount() === 3, "回包含后应恢复 3 行");
+    await waitFor(() => grid.visCount() === 3, "回包含后应恢复 3 行");
     await loadBasic(); // 还原基础小表
   });
 
@@ -564,22 +548,24 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
   });
 
   check("多重筛选：勾选列按或逻辑匹配，取消勾选即剔除该列", async () => {
-    model.setData(2, 0, "观山"); // 洱海→观山：与丽江"雪山"分处两列
+    await model.setData(2, 0, "观山"); // 洱海→观山：与丽江"雪山"分处两列
     grid.setMultiText("山");
-    assert(grid.visCount() === 2, "或逻辑应命中两列各一行");
+    await window.__app.runBigFilter();
+    await waitFor(() => grid.visCount() === 2, "或逻辑应命中两列各一行");
     const cb0 = document.querySelector('.col-multi[data-col="0"]');
     assert(cb0 && cb0.checked, "列0复选框应存在且勾选");
     cb0.checked = false;
     cb0.dispatchEvent(new Event("change", { bubbles: true }));
-    assert(grid.visCount() === 1, "取消列0勾选后只应剩备注列命中行");
-    assert(model.rawData(grid.visAt(0), 0) === "丽江");
+    await window.__app.runBigFilter();
+    await waitFor(() => grid.visCount() === 1, "取消列0勾选后只应剩备注列命中行");
+    await waitFor(() => model.rawData(grid.visAt(0), 0) === "丽江", "命中行应为丽江");
   });
 
   check("多重筛选结果可再被列筛选框叠加过滤", async () => {
     grid.filters.set(1, "10");
-    grid._refilter();
-    assert(grid.visCount() === 1, "多重结果应再按列筛选二次过滤");
-    assert(model.rawData(grid.visAt(0), 0) === "丽江");
+    await window.__app.runBigFilter();
+    await waitFor(() => grid.visCount() === 1, "多重结果应再按列筛选二次过滤");
+    await waitFor(() => model.rawData(grid.visAt(0), 0) === "丽江", "叠加命中丽江");
   });
 
   check("多重筛选关闭后恢复：输入框隐藏、复选框移除", async () => {
@@ -590,7 +576,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(document.getElementById("multi-filter-wrap").classList.contains("hidden"),
       "关闭应隐藏输入框");
     assert(document.querySelectorAll(".col-multi").length === 0, "关闭应移除列名前复选框");
-    assert(grid.visCount() === 3, "关闭后应显示全部行");
+    await waitFor(() => grid.visCount() === 3, "关闭后应显示全部行");
   });
 
   check("清除筛选连带清空多重筛选关键字但保留开关", async () => {
@@ -598,9 +584,10 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     btn.click(); // 开
     grid.setMultiText("山");
     grid.filters.set(1, "10");
+    await window.__app.runBigFilter();
     grid.clearFilters();
     assert(grid.multi.text === "" && grid.filters.size === 0, "清除筛选应清空全部条件");
-    assert(grid.visCount() === 3, "清除后应显示全部行");
+    await waitFor(() => grid.visCount() === 3, "清除后应显示全部行");
     assert(grid.multi.on, "开关状态应保留");
     btn.click(); // 关，恢复默认状态供后续用例
     grid.clearFilters();
@@ -610,24 +597,28 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
 
   check("选中变化同步窗格完整内容", async () => {
     await loadBasic();
-    model.setData(0, 2, "line1\nline2");
+    await model.setData(0, 2, "line1\nline2");
     clickCell(grid, 0, 2);
     const pe = document.getElementById("pane-edit");
-    assert(pe.value === "line1\nline2", "窗格应显示完整多行原文");
+    await waitFor(() => pe.value === "line1\nline2", "窗格应显示完整多行原文");
     assert(document.querySelector(".cell").textContent !== pe.value, "网格显示应被压平");
   });
 
-  check("窗格编辑实时写回并合并为一步撤销", async () => {
-    const undoBefore = model.canUndo();
-    void undoBefore;
+  check("窗格编辑实时写回（引擎逐步撤销）", async () => {
     const pe = document.getElementById("pane-edit");
     pe.value = "line1\nline2X";
     pe.dispatchEvent(new Event("input", { bubbles: true }));
-    assert(model.rawData(0, 2) === "line1\nline2X", "写回模型失败");
-    const steps = model._undoStack.length;
+    await waitFor(() => model.rawData(0, 2) === "line1\nline2X", "写回模型失败");
     pe.value = "line1\nline2XY";
     pe.dispatchEvent(new Event("input", { bubbles: true }));
-    assert(model._undoStack.length === steps, "同格连续击键应合并为一步");
+    await waitFor(() => model.rawData(0, 2) === "line1\nline2XY", "二次写回模型失败");
+    // 引擎不合并同格连续击键：逐次撤销，撤到底回到夹具原值（对齐粘贴例的撤到底模式）
+    let steps = 0;
+    while (steps < 20) {
+      try { if (!await model.undo()) break; } catch { break; }
+      steps += 1;
+    }
+    await waitFor(() => model.rawData(0, 2) === "古城", "撤销应复原到夹具原值");
   });
 
   check("窗格 Tab 键入制表符且焦点不逃离（可 Ctrl+Z 撤销）", async () => {
@@ -723,8 +714,8 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const [undoB, redoB] = [document.querySelectorAll("#toolbar button")[4],
       document.querySelectorAll("#toolbar button")[5]];
     assert(undoB.disabled && redoB.disabled, "load 后撤销/重做应置灰");
-    model.setData(0, 0, "x");
-    assert(!undoB.disabled, "改动后撤销应可用");
+    await model.setData(0, 0, "x");
+    await waitFor(() => !undoB.disabled, "改动后撤销应可用");
   });
 
   check("布局：工具栏不撑宽页面，快捷键按钮与编辑窗格都在窗口内", () => {
@@ -793,40 +784,36 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
   });
 
   check("含 Tab/换行的单元格复制时加引号", async () => {
-    model.setData(0, 0, 'a\tb\nc');
+    await model.setData(0, 0, 'a\tb\nc');
+    await waitFor(() => model.rawData(0, 0) === 'a\tb\nc', "写入落定");
     grid.select([0, 0]);
     grid.copySelection();
     assert(grid.lastCopiedText === '"a\tb\nc"\r\n', `引号包裹: ${JSON.stringify(grid.lastCopiedText)}`);
   });
 
-  check("粘贴区域展开 + 超范围自动扩列 + 整块一步撤销", async () => {
+  check("粘贴区域展开：整块内容落定、撤销可复原（引擎逐格撤销）", async () => {
     await loadBasic();
     grid.select([0, 0]);
-    const before = model._undoStack.length;
-    grid.lastCopiedText = "A\tB\r\nC\tD\r\n";
-    // 走内部解析：绕过系统剪贴板，直接调用核心逻辑
-    pasteRegion(grid, model, 0, 0, "A\tB\r\nC\tD\r\n");
-    assert(model.rawData(0, 0) === "A" && model.rawData(1, 1) === "D", "区域粘贴内容错");
-    assert(model._undoStack.length === before + 1, "整块应为一步撤销");
-    model.undo();
-    assert(model.rawData(0, 0) === "大理", "撤销后应复原");
-  });
-
-  check("粘贴自动扩展行列", async () => {
-    model.load(["a"], [["1"], ["2"]]);
-    grid.renderAll();
-    pasteRegion(grid, model, 1, 0, "x\ty\r\nz\tw\r\n");
-    assert(model.columnCount() === 2, "应自动扩到 2 列");
-    assert(model.rowCount() === 3, "应自动扩到 3 行");
-    assert(model.rawData(2, 1) === "w");
+    stubClipboard("A\tB\r\nC\tD\r\n");
+    await grid.pasteClipboard();
+    await waitFor(() => model.rawData(0, 0) === "A" && model.rawData(1, 1) === "D",
+      "区域粘贴内容落定");
+    let steps = 0;
+    while (steps < 20) { // 引擎逐格撤销：撤到底
+      try { if (!await model.undo()) break; } catch { break; }
+      steps += 1;
+    }
+    await waitFor(() => model.rawData(0, 0) === "大理" && model.rawData(1, 1) === "10",
+      "撤销后应整体复原");
   });
 
   check("无 Tab 纯文本整段进当前格（不换行摊开）", async () => {
-    model.load(["a"], [[""], [""]]);
-    grid.renderAll();
-    pastePlain(model, 0, 0, "第一段\n第二段");
-    assert(model.rawData(0, 0) === "第一段\n第二段", "长文应整段进当前格");
-    assert(model.rawData(1, 0) === "", "下一行不应被覆盖");
+    await window.__app.smokeLoadSmall(["a"], [["x"], ["y"]]);
+    grid.select([0, 0]);
+    stubClipboard("第一段\n第二段");
+    await grid.pasteClipboard();
+    await waitFor(() => model.rawData(0, 0) === "第一段\n第二段", "长文应整段进当前格");
+    assert(model.rawData(1, 0) === "y", "下一行不应被覆盖");
   });
 
   check("单格一对多填充：选区>1 且剪贴板为单值 → 全选区填充（Excel）", async () => {
@@ -835,34 +822,37 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     grid._extendTo([1, 1]); // 2×2 选区
     stubClipboard("填充值\r\n"); // 内部复制的单格格式（带行尾）
     await grid.pasteClipboard();
-    assert(model.rawData(0, 0) === "填充值" && model.rawData(0, 1) === "填充值"
+    await waitFor(() => model.rawData(0, 0) === "填充值" && model.rawData(0, 1) === "填充值"
       && model.rawData(1, 0) === "填充值" && model.rawData(1, 1) === "填充值",
       "选区每个格都应填充为剪贴板单值");
     assert(model.rawData(2, 0) !== "填充值", "选区外的行不应被改");
   });
 
-  check("单格填充合并为一步撤销", async () => {
+  check("单格填充撤销后整体复原（引擎逐格撤销）", async () => {
     await loadBasic();
     grid.select([0, 0]);
     grid._extendTo([1, 1]);
-    const before = model._undoStack.length;
     stubClipboard("X");
     await grid.pasteClipboard();
-    assert(model._undoStack.length === before + 1, "整块填充应为一步撤销");
-    model.undo();
-    assert(model.rawData(0, 0) === "大理" && model.rawData(1, 1) === "10",
+    await waitFor(() => model.rawData(0, 0) === "X" && model.rawData(1, 1) === "X",
+      "填充应落定");
+    let steps = 0;
+    while (steps < 20) { // 引擎逐格撤销：撤到底
+      try { if (!await model.undo()) break; } catch { break; }
+      steps += 1;
+    }
+    await waitFor(() => model.rawData(0, 0) === "大理" && model.rawData(1, 1) === "10",
       "撤销后选区应整体复原");
   });
 
   check("多行文本不触发填充（保持整段进当前格语义）", async () => {
-    model.load(["a"], [["m1"], ["m2"]]);
-    grid.renderAll();
+    await window.__app.smokeLoadSmall(["a"], [["m1"], ["m2"]]);
     grid.select([0, 0]);
     grid._extendTo([1, 0]); // 当前格=扩展终点 [1,0]
     stubClipboard("第一段\n第二段"); // 外部多行纯文本
     await grid.pasteClipboard();
     // 整段进"当前格"（选区扩展终点，对齐 Excel 活动格语义）
-    assert(model.rawData(1, 0) === "第一段\n第二段", "多行文本应整段进当前格");
+    await waitFor(() => model.rawData(1, 0) === "第一段\n第二段", "多行文本应整段进当前格");
     assert(model.rawData(0, 0) === "m1", "多行文本不应填充选区");
   });
 
@@ -1493,7 +1483,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     grid.select([0, 0]);
     grid._extendTo([0, 1]);
     grid.deleteSelection(false);
-    assert(model.rawData(0, 0) === "" && model.rawData(0, 1) === "", "Del 应清除内容");
+    await waitFor(() => model.rawData(0, 0) === "" && model.rawData(0, 1) === "", "Del 应清除内容");
     assert(model.rowCount() === 3, "行结构应保留");
   });
 
@@ -1503,46 +1493,28 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await loadBasic();
     const scroller = document.getElementById("grid-scroll");
     scroller.focus();
-    model.setData(0, 0, "x");
+    await model.setData(0, 0, "x");
     key(scroller, "z", { ctrlKey: true });
-    assert(model.rawData(0, 0) === "大理", "Ctrl+Z 应撤销");
+    await waitFor(() => model.rawData(0, 0) === "大理", "Ctrl+Z 应撤销");
     key(scroller, "y", { ctrlKey: true });
-    assert(model.rawData(0, 0) === "x", "Ctrl+Y 应重做");
+    await waitFor(() => model.rawData(0, 0) === "x", "Ctrl+Y 应重做");
     key(scroller, "Z", { ctrlKey: true, shiftKey: true });
-    assert(model.rawData(0, 0) === "x", "Ctrl+Shift+Z 应重做（对齐 Qt 双绑定）");
+    await waitFor(() => model.rawData(0, 0) === "x", "Ctrl+Shift+Z 应重做（对齐 Qt 双绑定）");
     key(scroller, "z", { ctrlKey: true });
-    assert(model.rawData(0, 0) === "大理", "Ctrl+Z 应撤销");
+    await waitFor(() => model.rawData(0, 0) === "大理", "Ctrl+Z 应撤销");
   });
 
-  check("物理排序：数字方式非数字恒排最后", async () => {
-    model.load(["n"], [["3"], ["x"], ["1"], [""], ["2"]]);
-    grid.renderAll();
-    model.sortRows([[0, "numeric", true]]);
-    assert(JSON.stringify(model.allRows().map((r) => r[0])) ===
-      JSON.stringify(["1", "2", "3", "x", ""]), "数字升序错");
-    model.sortRows([[0, "numeric", false]]);
-    assert(JSON.stringify(model.allRows().map((r) => r[0])) ===
-      JSON.stringify(["3", "2", "1", "x", ""]), "数字降序错");
-  });
-
-  check("多层级排序优先级", async () => {
-    model.load(["a", "b"], [["x", "2"], ["y", "1"], ["x", "1"]]);
-    grid.renderAll();
-    model.sortRows([[0, "text", true], [1, "numeric", true]]);
-    assert(JSON.stringify(model.allRows()) ===
-      JSON.stringify([["x", "1"], ["x", "2"], ["y", "1"]]), "多层级错");
-  });
-
-  check("行列增删清与越界夹取", async () => {
+  check("行增删与越界报错（引擎语义）", async () => {
     await loadBasic();
-    model.insertRows(99, 2);
-    assert(model.rowCount() === 5, "插行夹取到末尾");
-    model.removeRows([0, 99]);
-    assert(model.rowCount() === 4, "删行忽略越界");
-    model.removeColumns([0, 2]);
-    assert(JSON.stringify(model.headers()) === JSON.stringify(["评分"]), "批量删列");
-    model.undo();
-    assert(model.headers().length === 3, "undo 恢复列");
+    await model.insertRows(3, 2);
+    assert(model.rowCount() === 5, "末尾插 2 行后应为 5 行");
+    await model.removeRows([0, 4]);
+    assert(model.rowCount() === 3, "删 2 行后应为 3 行");
+    let err = null;
+    try { await model.removeRows([99]); } catch (e) { err = e; }
+    assert(err !== null, "越界删行应报错（引擎语义，不再夹取/忽略）");
+    await model.undo();
+    assert(model.rowCount() === 5, "一次 remove_rows 调用应为一步撤销");
   });
 
   // ========== 右键菜单 ==========
@@ -1602,15 +1574,18 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(grid.colW[0] === before + 40, `列宽应 +40，实际 ${grid.colW[0] - before}`);
   });
 
-  check("行高拖拽改变高度（最小 10）", async () => {
+  check("行高拖拽在大模式被拒绝（统一行高不变）", async () => {
     grid.ensureVisible(0, 0); // 滚回顶部，确保第 0 行在可视区
     grid._renderRows();
-    const before = grid.rowH[0];
+    const before = grid._uniformRowH;
     const rz = document.querySelector('.row-resize[data-row="0"]');
+    assert(rz, "行高把手应仍渲染");
     mouse(rz, "mousedown", { clientY: 100 });
     mouse(document, "mousemove", { clientY: 130 });
     mouse(document, "mouseup");
-    assert(grid.rowH[0] === before + 30, `行高应 +30，实际 ${grid.rowH[0] - before}`);
+    assert(grid._uniformRowH === before, "大模式行高应不变（拖拽被拒绝）");
+    assert(document.getElementById("status-text").textContent.includes("不支持调整行高"),
+      "应提示大模式不支持调整行高");
   });
 
   check("列拖动改变列顺序", async () => {
@@ -1623,10 +1598,10 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
   check("缩放夹取 0.5–3.0 且列宽行高同步缩放", async () => {
     await loadBasic();
     const w0 = grid.colW[0];
-    const h0 = grid.rowH[0];
+    const h0 = grid._uniformRowH;
     grid.setZoom(2);
     assert(grid.colW[0] === Math.max(24, Math.round(w0 * 2)), "列宽应按比放大");
-    assert(grid.rowH[0] === Math.max(10, Math.round(h0 * 2)), "行高应按比放大");
+    assert(grid._uniformRowH === Math.max(10, Math.round(h0 * 2)), "行高应按比放大");
     grid.setZoom(0.3);
     assert(grid.zoom === 0.5, "应夹取到 0.5");
     grid.setZoom(9);
@@ -1671,44 +1646,6 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       value: { readText: () => Promise.resolve(text), writeText: () => Promise.resolve() },
       configurable: true,
     });
-  }
-
-  /**
-   * 直接走区域粘贴解析核心（模拟含 Tab 内部分区文本的粘贴效果）。
-   *
-   * @param {import("./grid.js").Grid} g - 网格。
-   * @param {import("./model.js").TableModel} m - 模型。
-   * @param {number} r0 - 起始行。
-   * @param {number} c0 - 起始列。
-   * @param {string} text - TSV 文本。
-   */
-  function pasteRegion(g, m, r0, c0, text) {
-    // 与 grid.pasteClipboard 完全一致的解析+扩展+批量写入路径
-    const p = parseCsv(text, "	");
-    const rows2 = p.rows.length ? [p.headers, ...p.rows]
-      : (p.headers.length ? [p.headers] : []);
-    if (!rows2.length) return;
-    const width = Math.max(...rows2.map((row) => row.length));
-    m.batch(() => {
-      const needRows = r0 + rows2.length - m.rowCount();
-      if (needRows > 0) m.insertRows(m.rowCount(), needRows);
-      const needCols = c0 + width - m.columnCount();
-      if (needCols > 0) m.insertColumns(m.columnCount(), needCols);
-      rows2.forEach((row, i) => {
-        row.forEach((val, j) => m.setData(r0 + i, c0 + j, val));
-      });
-    });
-    void g;
-  }
-
-  /**
-   * 纯文本整段粘贴核心验证。
-   *
-   * @param {import("./model.js").TableModel} m - 模型。
-   * @param {number} r - 行。 @param {number} c - 列。 @param {string} text - 文本。
-   */
-  function pastePlain(m, r, c, text) {
-    m.setData(r, c, text.replace(/\r\n/g, "\n").replace(/[\r\n]+$/, ""));
   }
 
   check("显示符号：¶ 在行尾且换行保留（行结构不塌）", () => {
@@ -2900,47 +2837,6 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(JSON.stringify(model.headers()) === JSON.stringify(["目的地", "评分"]),
       `关闭后表头 ${model.headers()}`);
     assert(model.rawData(0, 0) === "起点", `关闭后首条数据 ${model.rawData(0, 0)}`);
-  });
-
-  check("首行非列名：新建表格（小模型）开关、首行筛选、编辑后关闭成列名", async () => {
-    // 统一大引擎后小模型只剩「新建表格」路径：经冒烟钩子复位后装载内存表
-    await window.__app.smokeLoadSmall(["甲", "1"], [["乙", "2"]]);
-    assert(window.__app.isBigMode() === false, "新建表格应走内存小模型");
-    assert(model.rowCount() === 1, `默认数据行数 ${model.rowCount()}`);
-
-    const btn = tbBtn("首行非列名");
-    btn.click();
-    await waitFor(() => window.__app.isHeaderless() === true, "小模式切换开启");
-    assert(model.rowCount() === 2, `开启后行数 ${model.rowCount()}`);
-    assert(JSON.stringify(model.headers()) === JSON.stringify(["列1", "列2"]),
-      `无列名表头 ${model.headers()}`);
-    assert(model.rawData(0, 0) === "甲", "首行应作为数据");
-    assert(window.__app.isDirty() === false, "切换开关不应标脏");
-
-    // 首行参与筛选
-    grid.filters.set(0, "甲");
-    grid.refilter();
-    assert(grid.visCount() === 1 && grid.visAt(0) === 0, "筛选应命中首行");
-    grid.clearFilters();
-
-    // 编辑首行 → 关闭：编辑后的当前首行成为列名
-    model.setData(0, 0, "丙");
-    assert(window.__app.isDirty() === true, "编辑应标脏");
-    btn.click();
-    await waitFor(() => window.__app.isHeaderless() === false, "小模式切换关闭");
-    assert(model.rowCount() === 1, `关闭后行数 ${model.rowCount()}`);
-    assert(model.headers()[0] === "丙", `列名应为编辑后的首行 ${model.headers()[0]}`);
-    assert(model.rawData(0, 0) === "乙", "原第二行成为首条数据");
-
-    // 不持久化：再次开启不得写入 localStorage
-    const prefBefore = localStorage.getItem("simpletable.headerless.v1");
-    btn.click();
-    await waitFor(() => window.__app.isHeaderless() === true, "再次开启");
-    assert(localStorage.getItem("simpletable.headerless.v1") === prefBefore,
-      "小模式开关也不应写入本地存储");
-    assert(btn.classList.contains("on"), "再次开启后按钮应为开启态");
-    // 复位为空小表（本测试的编辑未保存，避免污染下一项的未入签脏档确认）
-    await window.__app.smokeLoadSmall([], []);
   });
 
   check("首行非列名：两个大档各自独立，切签按钮状态随之恢复", async () => {

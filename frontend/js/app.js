@@ -6,7 +6,6 @@
  */
 
 import { serializeCsv, serializeRecords } from "./csv.js";
-import { TableModel } from "./model.js";
 import { BigModel } from "./bigmodel.js";
 import { Grid } from "./grid.js";
 import { EditPane } from "./pane.js";
@@ -23,10 +22,13 @@ const invoke = (cmd, args) => tauri.core.invoke(cmd, args);
 
 // ============ 全局状态 ============
 
-/** 当前模型：小模式 TableModel / 大模式 BigModel，打开文件时热交换 */
-let model = new TableModel();
+/** 当前模型：统一 BigModel（启动为无会话占位空表；打开/新建时替换或复用） */
+let model = new BigModel();
 let path = null;      // 当前文件路径（null = 未命名）
 let dirty = false;    // 未保存修改
+// 工具栏就绪旗标：gridA 构造期（const tb 初始化前）refreshBigUi/refreshHeaderlessUi
+// 可被 bigFilterStatus 钩子触发——占位 BigModel 恒 isBig，大分支会走到工具栏刷新。
+let tbReady = false;
 /** @type {number} 大模式最近一次筛选用时（ms），状态栏展示 */
 let lastFilterMs = 0;
 /** @type {[number, number] | null} 编辑窗格跟踪的源坐标 */
@@ -791,23 +793,22 @@ function resetToEmpty() {
   document.body.classList.remove("split");
   document.getElementById("grid-area").style.flex = ""; // 清掉分屏拖拽残留的主侧定宽
   syncTabSplit(); // 页签左组定宽同步复位
-  model = new TableModel();
+  model = new BigModel();
   bindModelEvents(model);
   path = null;
   activeId = null;
   applyViewState(fgrid());
-  model.load([], []);
   setDirty(false);
   renderTabbar();
   updateStatusText();
 }
 
 /**
- * 冒烟专用：关掉全部页签的大引擎会话，回到空表后装入内存小表。
+ * 冒烟专用：关掉全部页签的大引擎会话，回到空表；有数据则经内存字节源建会话并预热。
  *
- * 统一大引擎后，磁盘 CSV 不再走内存 TableModel；只有「新建表格」仍用小模型。
- * 本钩子让小模型相关的 UI/键位/排序冒烟用例不必真的走新建对话框，并能确保
- * 前序页签会话全部释放，避免旧事件落到新视图。
+ * 统一大引擎后所有表格（含新建）都是 BigModel 会话；本钩子经 create + warmup
+ * 装入内存小表，预热后同步 rawData 断言立即可读，且能确保前序页签会话全部释放，
+ * 避免旧事件落到新视图。
  *
  * @param {string[]} headers - 列名。
  * @param {string[][]} rows - 数据行。
@@ -821,8 +822,19 @@ async function smokeLoadSmall(headers, rows) {
     }
   }
   tabs.length = 0;
-  resetToEmpty(); // 生成新 TableModel、清页签/分屏/计数
-  model.load(headers.map(String), rows.map((row) => row.map(String)));
+  resetToEmpty(); // 裸 BigModel 占位、清页签/分屏/计数
+  if (headers.length || rows.length) {
+    // 引擎化装载：内存字节源建会话（首行是列名），预热后同步 rawData 可读。
+    // 单列空单元格必须落成 '""'：引擎跳过空白行，纯空行会被 from_bytes 丢掉（对齐 newFile 特判）。
+    const hs = headers.map(String);
+    const rs = rows.map((row) => row.map(String));
+    const esc1 = (v) => (/[",\r\n]/.test(v) || v === "" ? `"${v.replace(/"/g, '""')}"` : v);
+    const text = hs.length === 1
+      ? [hs[0], ...rs.map((r) => esc1(r[0]))].join("\r\n") + "\r\n"
+      : serializeCsv(hs, rs);
+    await model.create(text, { headerless: false });
+    await model.warmup();
+  }
   fgrid().renderAll();
   onCountsChanged(model.rowCount(), model.rowCount());
   refreshBigUi();
@@ -879,7 +891,7 @@ const gridA = new Grid({
 // 副网格挂独立空模型：不镜像活动档（否则隐藏副网格也在渲染，双份 DOM 会
 // 污染全局类选择器的断言/交互）；分屏建立时经 setModel 换绑分屏签。
 const gridB = new Grid({
-  model: new TableModel(),
+    model: new BigModel(),
   scrollEl: document.getElementById("grid-scroll2"),
   canvasEl: document.getElementById("grid-canvas2"),
   headerEl: document.getElementById("col-header2"),
@@ -1119,6 +1131,7 @@ function showTabMenu(t, x, y) {
 
 /** 按引擎状态刷新专属按钮显隐与可用态（占位空表无会话：按钮恒隐藏） */
 function refreshBigUi() {
+  if (!tbReady) return; // 工具栏创建前（gridA 构造期）的钩子触发静默忽略
   const big = !!model.isBig;
   // 大模式现支持排序（需载入内存）；索引完成前不可点。
   // 列操作两按钮仅 pending 时出现。
@@ -1135,6 +1148,7 @@ function refreshBigUi() {
 
 /** 刷新「首行非列名」按钮：开启态、可用性、说明 */
 function refreshHeaderlessUi() {
+  if (!tbReady) return; // 同上：构造期静默
   if (!tb.headerless) return;
   const on = model.isHeaderless?.() === true;
   const pending = model.isBig && model.colOpsPending?.() === true;
@@ -1453,6 +1467,8 @@ tb.symbols = btnSymbols;
 tb.symbols.title = "在编辑窗格显示空格(·)、Tab(→)、换行符(¶)，类似 Notepad++";
 tb.undo.disabled = true;
 tb.redo.disabled = true;
+tbReady = true;
+refreshBigUi(); // 确立占位空表初始按钮态（显隐/可用）
 
 /** 按撤销栈状态刷新工具栏按钮（对齐 _update_undo_actions） */
 function updateUndoButtons() {
@@ -2202,7 +2218,6 @@ const gridLive = new Proxy(/** @type {any} */ ({}), {
 (async () => {
   const version = await invoke("get_version");
   document.getElementById("status-version").textContent = version;
-  model.load([], []); // 起始空表
   updateStatusText();
   refreshHeaderlessUi();
   // 初始标题保持 "simpleTable"（对齐 Qt：首次标脏/文件操作后才刷新标题）

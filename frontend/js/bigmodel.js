@@ -170,6 +170,25 @@ export class BigModel {
   }
 
   /**
+   * 预热全部数据页入缓存（冒烟夹具专用）：create/open 后同步 rawData 立即可读。
+   *
+   * 直走 _invoke + _cache.set，不经过 _fetch 落定回调，因此不会触发 _trim
+   * 的视口逐出；会话中途被换（_session 变）时立即作废退出。
+   *
+   * @returns {Promise<void>}
+   */
+  async warmup() {
+    const session = this._session;
+    const n = this.rowCount();
+    for (let from = 0; from < n; from += BIG_PAGE) {
+      if (session !== this._session) return; // 会话已换，预热作废
+      const rows = await this._invoke("big_rows", { from, count: BIG_PAGE });
+      this._cache.set(this._key(Math.floor(from / BIG_PAGE)), { rows, vrows: null });
+    }
+    if (session === this._session) this._emitData(false, "fetch");
+  }
+
+  /**
    * 关闭大文件会话（打开新文件/退出时）。
    *
    * @returns {Promise<void>}
@@ -554,7 +573,10 @@ export class BigModel {
    * @returns {string}
    */
   displayData(row, col) {
-    return this._cell(row, col);
+    // 对齐小模式 TableModel.displayData：网格两条渲染路径共用本方法，
+    // 显示文本必须压平（原文 rawData 不动，编辑/保存仍用原值）
+    return this._cell(row, col)
+      .replace(/\r/g, " ").replace(/\n/g, " ").replace(/\t/g, " ");
   }
 
   /**

@@ -1127,3 +1127,29 @@ test("create：替换既有会话后行列数与缓存即刻切换", async () =>
   assert.deepEqual(model.headers(), ["x", "y", "z"]);
   assert.equal(model.meta().has_path, false, "create 后应无磁盘路径");
 });
+
+test("warmup：预热后同步 rawData 命中（对齐 smoke 小夹具语义）", async () => {
+  const { model } = makeFakeEngine();
+  await model.create("a,b\r\n1,2\r\n3,4\r\n", {});
+  await model.warmup();
+  assert.equal(model.rawData(0, 0), "1");
+  assert.equal(model.rawData(1, 1), "4");
+  assert.equal(model.rowCount(), 2);
+});
+
+test("warmup：跨页夹具末页也能同步命中", async () => {
+  const rows = BIG_PAGE * 2 + 10;
+  const { model } = makeFakeEngine({ rows, cols: 2 });
+  await model.open("/x.csv");
+  await model.warmup();
+  assert.equal(model.rawData(rows - 1, 1), "r" + (rows - 1) + "c1");
+  assert.equal(model.rawData(0, 0), "r0c0");
+});
+
+test("displayData：显示文本压平 \r\n\t（对齐小模式 TableModel 语义）", async () => {
+  const { model } = makeFakeEngine({ rows: 1, cols: 1, data: [["a\nb\tc\rd"]] });
+  await model.open("/x.csv");
+  await model.warmup();
+  assert.equal(model.rawData(0, 0), "a\nb\tc\rd"); // 原文不动（编辑/保存仍用原值）
+  assert.equal(model.displayData(0, 0), "a b c d"); // 显示压平
+});
