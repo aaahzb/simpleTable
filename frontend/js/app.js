@@ -110,38 +110,34 @@ function bigOpenSummary(m) {
     ` · ${idxText}`;
 }
 
-/** 刷新左侧状态（显示 X / 共 Y 行；大模式索引中显示进度与耗时） */
+/** 刷新左侧状态（显示 X / 共 Y 行；索引中显示进度与耗时） */
 function updateStatusText() {
-  if (model.isBig) {
-    const meta = model.meta();
-    // 渐进索引进行中：百分比 + 已可用行数 + 首屏/已用耗时（EmEditor 式反馈）
-    if (meta?.indexing) {
-      const total = Number(meta.total_bytes) || 0;
-      const pct = total
-        ? Math.min(99, Math.floor((Number(meta.indexed_bytes) || 0) * 100 / total))
-        : 0;
-      const first = model.firstPaintMs?.() || meta.open_ms || 0;
-      statusText.textContent =
-        `索引中 ${pct}% · 已可用 ${Number(meta.rows).toLocaleString()} 行` +
-        (first ? ` · 首屏 ${fmtDuration(first)}` : "") +
-        ` · 已用 ${fmtDuration(meta.elapsed_ms)}（筛选/跳转稍后可用）`;
-      return;
-    }
-    // 排序视图：明确提示数据在内存、尚未落盘（保存时才按当前顺序重写）。
-    const sortSuffix = meta?.sorted
-      ? ` · 已排序（内存 ${fmtBytes(meta.total_bytes)}，未保存）`
-      : "";
-    if (model.filterActive()) {
-      statusText.textContent = `匹配 ${lastCounts[0]} / 共 ${meta?.rows ?? lastCounts[1]} 行` +
-        (lastFilterMs ? ` · 用时 ${fmtDuration(lastFilterMs)}` : "") +
-        sortSuffix;
-      return;
-    }
+  const meta = model.meta();
+  // 渐进索引进行中：百分比 + 已可用行数 + 首屏/已用耗时（EmEditor 式反馈）
+  if (meta?.indexing) {
+    const total = Number(meta.total_bytes) || 0;
+    const pct = total
+      ? Math.min(99, Math.floor((Number(meta.indexed_bytes) || 0) * 100 / total))
+      : 0;
+    const first = model.firstPaintMs?.() || meta.open_ms || 0;
     statusText.textContent =
-      `显示 ${lastCounts[0]} / 共 ${lastCounts[1]} 行${bigTimingSuffix(model)}${sortSuffix}`;
+      `索引中 ${pct}% · 已可用 ${Number(meta.rows).toLocaleString()} 行` +
+      (first ? ` · 首屏 ${fmtDuration(first)}` : "") +
+      ` · 已用 ${fmtDuration(meta.elapsed_ms)}（筛选/跳转稍后可用）`;
     return;
   }
-  statusText.textContent = `显示 ${lastCounts[0]} / 共 ${lastCounts[1]} 行`;
+  // 排序视图：明确提示数据在内存、尚未落盘（保存时才按当前顺序重写）。
+  const sortSuffix = meta?.sorted
+    ? ` · 已排序（内存 ${fmtBytes(meta.total_bytes)}，未保存）`
+    : "";
+  if (model.filterActive()) {
+    statusText.textContent = `匹配 ${lastCounts[0]} / 共 ${meta?.rows ?? lastCounts[1]} 行` +
+      (lastFilterMs ? ` · 用时 ${fmtDuration(lastFilterMs)}` : "") +
+      sortSuffix;
+    return;
+  }
+  statusText.textContent =
+    `显示 ${lastCounts[0]} / 共 ${lastCounts[1]} 行${bigTimingSuffix(model)}${sortSuffix}`;
 }
 
 /**
@@ -180,7 +176,7 @@ function markDirty() {
 
 // ============ 多文件页签 ============
 // 所有磁盘 CSV 页签各自持有一个 Rust 引擎会话（按会话号隔离）：切换页签
-// 不关闭、不重开文件，数据/撤销/脏态随签保留。新建表格仍用内存 TableModel。
+// 不关闭、不重开文件，数据/撤销/脏态随签保留。新建表格为内存引擎档（Ram，无路径）。
 // 切换页签时视图重置（筛选/选区/滚动不随签保留，v1 边界）。
 
 /**
@@ -189,7 +185,7 @@ function markDirty() {
  * @property {string} title - 显示名（文件名/未命名）。
  * @property {string | null} path - 文件路径（null = 未命名）。
  * @property {"small" | "big"} kind - 文档类型。
- * @property {TableModel | BigModel | null} model - 小档恒为模型实例；大档仅引擎驻留期间有效。
+ * @property {BigModel | null} model - 统一大引擎模型（懒重开期间可暂为 null）。
  * @property {boolean} dirty - 未保存修改。
  * @property {boolean} headerless - 首行是否为数据（列名自动生成），按档/文件独立。
  * @property {"A" | "B"} side - 所属页签组（未分屏恒 "A"）。
@@ -533,7 +529,7 @@ async function openBigEngineFor(tabId, p, headerless = false, reuseModel = null)
 /**
  * 装载文档：所有磁盘 CSV 一律走大引擎（mmap + 渐进索引）。
  *
- * 只有「新建表格」（无磁盘文件）仍用内存 TableModel；排序需要把大引擎
+ * 「新建表格」（无磁盘文件）为内存引擎档（Ram，无路径）；排序需要把大引擎
  * 载入内存，属于排序模式自己的事（见 openSortDialog）。
  *
  * @param {string} p - 文件路径。
@@ -1132,14 +1128,12 @@ function showTabMenu(t, x, y) {
 /** 按引擎状态刷新专属按钮显隐与可用态（占位空表无会话：按钮恒隐藏） */
 function refreshBigUi() {
   if (!tbReady) return; // 工具栏创建前（gridA 构造期）的钩子触发静默忽略
-  const big = !!model.isBig;
-  // 大模式现支持排序（需载入内存）；索引完成前不可点。
-  // 列操作两按钮仅 pending 时出现。
+  // 排序需载入内存；索引完成前不可点。列操作两按钮仅 pending 时出现。
   // 「执行筛选」按钮已移除：筛选框键入即筛，回车立即执行。
   tb.sort.classList.remove("hidden");
-  tb.sort.disabled = big && model.indexing?.() === true;
-  const pending = big && model.colOpsPending?.() === true;
-  const sorted = big && model.meta?.()?.sorted === true;
+  tb.sort.disabled = model.indexing?.() === true;
+  const pending = model.colOpsPending?.() === true;
+  const sorted = model.meta?.()?.sorted === true;
   tb.exitSort?.classList.toggle("hidden", !sorted);
   tb.execColOps.classList.toggle("hidden", !pending);
   tb.cancelColOps.classList.toggle("hidden", !pending);
@@ -1151,8 +1145,8 @@ function refreshHeaderlessUi() {
   if (!tbReady) return; // 同上：构造期静默
   if (!tb.headerless) return;
   const on = model.isHeaderless?.() === true;
-  const pending = model.isBig && model.colOpsPending?.() === true;
-  const sorted = model.isBig && model.meta?.()?.sorted === true;
+  const pending = model.colOpsPending?.() === true;
+  const sorted = model.meta?.()?.sorted === true;
   tb.headerless.classList.toggle("on", on);
   // 无列（无法生成列1..N）、列操作待执行或排序视图中（切换会错位）时禁用
   tb.headerless.disabled = headerlessBusy || model.columnCount() === 0 || pending || sorted;
@@ -1170,7 +1164,7 @@ function refreshHeaderlessUi() {
  */
 async function toggleHeaderless() {
   if (headerlessBusy) return model.isHeaderless?.() === true;
-  if (model.isBig && model.colOpsPending?.()) {
+  if (model.colOpsPending?.()) {
     statusMsg("列操作待执行：请先执行或撤销列操作", 3000);
     return model.isHeaderless?.() === true;
   }
@@ -1181,8 +1175,8 @@ async function toggleHeaderless() {
     // 1) 未提交的格内编辑与窗格异步写回先落定（行坐标即将 ±1）
     await fgrid().commitEdit();
     await paneWrite;
-    // 2) 大模式先退出筛选：旧命中行号在切换后的坐标系里会错位
-    if (model.isBig && model.filterActive()) {
+    // 2) 先退出筛选：旧命中行号在切换后的坐标系里会错位
+    if (model.filterActive()) {
       try { await model.clearFilter(); } catch { /* 会话已关闭：继续切换 */ }
     }
     // 3) 清视图（筛选框/多重输入/选区/滚动/窗格）
@@ -1242,7 +1236,6 @@ function collectBigFilter() {
  * @returns {void}
  */
 function scheduleBigFilter() {
-  if (!model.isBig) return;
   if (model.indexing?.()) {
     statusMsg("文件仍在索引中，暂不支持筛选（已可用 " +
       `${Number(model.meta()?.rows ?? 0).toLocaleString()} 行）`, 2500);
@@ -1267,7 +1260,6 @@ function scheduleBigFilter() {
  * @returns {Promise<void>}
  */
 async function runBigFilter(opts = {}) {
-  if (!model.isBig) return; // 兜底：小模式此按钮隐藏，防御误触调用小模型不存在的 runFilter
   if (model.indexing?.()) {
     statusMsg("文件仍在索引中，暂不支持筛选（已可用 " +
       `${Number(model.meta()?.rows ?? 0).toLocaleString()} 行）`, 2500);
@@ -1305,7 +1297,7 @@ async function runBigFilter(opts = {}) {
 
 /** 执行 pending 列操作（物理重写 + 进度条） */
 async function applyColOps() {
-  if (!model.isBig || !model.colOpsPending()) return;
+  if (!model.colOpsPending()) return;
   if (model.indexing?.()) {
     statusMsg("文件仍在索引中，暂不支持列操作", 2500);
     return;
@@ -1335,7 +1327,6 @@ async function applyColOps() {
 
 /** 撤销（放弃）全部 pending 列操作 */
 async function cancelColOps() {
-  if (!model.isBig) return; // 兜底：小模式此按钮隐藏，防御误触调用小模型不存在的 clearColOps
   try {
     await model.clearColOps();
     statusMsg("已放弃列操作预览，恢复原结构", 3000);
@@ -1513,7 +1504,7 @@ let resetPending = false;
  * 触碰共享外壳状态（脏点/编辑窗格/状态栏），副侧事件仅驱动其自身网格重绘
  * （网格在 setModel 里自行订阅，不经此处）。
  *
- * @param {TableModel | BigModel} m - 模型实例。
+ * @param {BigModel} m - 模型实例。
  * @returns {void}
  */
 function bindModelEvents(m) {
@@ -1528,35 +1519,34 @@ function bindModelEvents(m) {
   m.onData((structural, origin) => {
     if (m !== model) return; // 副侧数据/预取落定：不得改写焦点侧外壳状态
     if (resetPending) resetPending = false;
-    // 视图属性变更（首行非列名开关）不标脏；大模式预取页落定（origin="fetch"）
+    // 视图属性变更（首行非列名开关）不标脏；预取页落定（origin="fetch"）
     // 也是纯重绘，打开/滚动不得误标脏
-    else if (origin !== "view" && !(m.isBig && origin === "fetch")) markDirty();
-    if (m.isBig) refreshBigUi();
-    else refreshHeaderlessUi();
+    else if (origin !== "view" && origin !== "fetch") markDirty();
+    refreshBigUi();
     if (currentCell === null) return;
     const [r, c] = currentCell;
     if (structural) {
       // 行列增删/排序：越界清空，否则重载内容
       if (r >= m.rowCount() || c >= m.columnCount()) clearDock();
       else {
-        // 大模式未命中（页被换出）保留窗格旧内容，数据到齐再收敛
-        const t = m.isBig && m.peekData ? (m.peekData(r, c) ?? null) : m.rawData(r, c);
+        // 页未命中（页被换出）保留窗格旧内容，数据到齐再收敛
+        const t = m.peekData(r, c) ?? null;
         if (t !== null) pane.setText(t);
       }
       return;
     }
     // 编辑窗格自己发起的写回不再回灌（避免光标跳动）
     if (dockOrigin) return;
-    // 大模式：当前格页被换出时 rawData 会读成空串、还顺手重拉该页——与缓存
+    // 当前格页被换出时 rawData 会读成空串、还顺手重拉该页——与缓存
     // trim 形成乒乓驱逐循环，且把窗格刷空造成频闪。peekData 未命中时保留旧内容。
-    const newText = m.isBig && m.peekData ? (m.peekData(r, c) ?? null) : m.rawData(r, c);
+    const newText = m.peekData(r, c) ?? null;
     if (newText !== null && pane.editEl.value !== newText) pane.setText(newText);
   });
   m.onUndoStack(() => {
     if (m !== model) return;
     updateUndoButtons();
   });
-  // 大模式渐进索引：轮询进度刷新状态栏；完成瞬间报一次首屏/索引耗时
+  // 渐进索引：轮询进度刷新状态栏；完成瞬间报一次首屏/索引耗时
   let wasIndexing = m.indexing?.() === true;
   m.onIndexProgress?.((meta) => {
     if (m !== model) return; // 副侧进度不得改写焦点侧状态栏
@@ -1647,7 +1637,7 @@ async function openPath(p, opts = {}) {
     // 沿用当前档的「首行非列名」解读，避免外部改动重载后视图含义突变。
     if (!opts.noConfirm && !(await confirmDiscard())) return false;
     const headerless = model.isHeaderless?.() === true;
-    const reuse = model.isBig ? model : null;
+    const reuse = model;
     const doc = await loadDoc(p, activeId, headerless, reuse);
     if (!doc) return false;
     applyDocToCurrent(doc, p);
@@ -1712,7 +1702,7 @@ async function runBigWrite(write, action, okMsg, hint) {
  */
 async function saveFile() {
   // 启动占位空表（无会话）：没有可保存的东西
-  if (!model.isBig) {
+  if (!model.meta()) {
     statusMsg("空表格无需保存：请先新建或打开文件", 2500);
     return false;
   }
@@ -1744,7 +1734,7 @@ async function saveFile() {
  * @returns {Promise<boolean>} true = 已写入成功。
  */
 async function saveFileAs(target = null) {
-  if (!model.isBig) {
+  if (!model.meta()) {
     statusMsg("空表格无需保存：请先新建或打开文件", 2500);
     return false;
   }
@@ -1790,7 +1780,7 @@ async function confirmDiscard() {
 
 // ---- 大文件外部改动检测：窗口重新聚焦时校验 mtime/大小 ----
 window.addEventListener("focus", async () => {
-  if (!model.isBig || !path) return;
+  if (!path) return;
   try {
     if (await model.stale()) {
       const reload = await confirmDialog(
@@ -1830,7 +1820,7 @@ tauri.event.listen("close-request", async () => {
  * @returns {Promise<boolean>} true = 已进入排序视图。
  */
 async function applyBigSort(levels, opts = {}) {
-  if (!model.isBig || !levels?.length) return false;
+  if (!model.meta() || !levels?.length) return false;
   if (model.indexing?.()) {
     statusMsg("文件仍在索引中，请稍候再排序", 2500);
     return false;
@@ -1915,7 +1905,7 @@ async function openSortDialog() {
  * @returns {Promise<boolean>} true = 已退出（或保存成功）。
  */
 async function exitSortMode() {
-  if (!model.isBig || model.meta?.()?.sorted !== true) return false;
+  if (model.meta?.()?.sorted !== true) return false;
   await fgrid().commitEdit();
   await paneWrite;
   const choice = await confirmExitSortDialog();
@@ -2023,7 +2013,7 @@ function gotoRow(vi) {
 
 /** 跳转行对话框（工具栏"跳转行…" / Ctrl+G）：输入 1 基显示行号直达。 */
 async function gotoRowDialog() {
-  if (model.isBig && model.indexing?.()) {
+  if (model.indexing?.()) {
     statusMsg("文件仍在索引中，暂不支持跳转行（已可用 " +
       `${Number(model.meta()?.rows ?? 0).toLocaleString()} 行）`, 2500);
     return;

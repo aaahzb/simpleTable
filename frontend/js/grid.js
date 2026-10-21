@@ -1,29 +1,26 @@
 /**
  * 虚拟网格视图：两带式表头 + 可视行渲染 + 选区模型 + 格内编辑器 +
- * 列宽/行高拖拽 + 列拖动排序 + 剪贴板 + Ctrl+滚轮缩放。
+ * 列宽拖拽 + 列拖动排序 + 剪贴板 + Ctrl+滚轮缩放。
  *
  * 对齐 Qt 版 ZoomableTableView + FilterHeaderView 行为：
- * - 行虚拟滚动（前缀和定位），列全量渲染（列数通常远小于行数）
+ * - 行虚拟滚动（等行高 O(1) 定位 + 虚拟缩放），列全量渲染（列数通常远小于行数）
  * - 选区 = 若干矩形块 + 当前格；Ctrl 多块、Shift 块选、拖选、行列头整选
  * - 编辑键位：Enter 下移 / Shift+Enter 上移 / Tab 右移 / Shift+Tab 左移 /
  *   Alt+Enter 换行 / Esc 取消 / 打字即编辑（替换式）
  * - 缩放 0.5–3.0 步进 1.15：列宽按比缩放（最小 24），行高按比缩放（最小 10），
  *   表头/筛选带随 em 自动跟随
- * - 大文件模式（model.isBig）：visibleRows 恒等快路径（null = 无筛选，不建数组）、
- *   统一行高（行高数组不随总行数膨胀）、筛选改为按钮触发（引擎整表扫描）、
+ * - 统一大引擎：visibleRows 恒等快路径（null = 无筛选，不建数组）、
+ *   统一行高（行高数组不随总行数膨胀）、筛选走引擎整表扫描（键入即筛）、
  *   大选区复制/矩形选区大小设防（防 30M 行选整列卡死）
  */
 
 import { parseCsv, serializeRecords } from "./csv.js";
-import { findVerticalEdge } from "./nav.js";
 
 export const ZOOM_MIN = 0.5;
 export const ZOOM_MAX = 3.0;
 export const ZOOM_STEP = 1.15;
 const MIN_COL_W = 24;
 const MIN_ROW_H = 10;
-/** 行数超过此值时筛选输入防抖（每击键全表扫描代价高） */
-const FILTER_DEBOUNCE_ROWS = 50000;
 /** 严格三态开关符号：0 包含 / 1 严格等于·不分大小写 / 2 严格等于·区分大小写 */
 const STRICT_GLYPHS = ["~", "=", "≡"];
 /** 严格三态按钮悬停文案（与 STRICT_GLYPHS 同序） */
@@ -33,21 +30,6 @@ const STRICT_TITLES = [
   "严格等于·区分大小写——点击切回「包含」",
 ];
 
-/**
- * 单元格三态匹配（与引擎 FieldScan::end_field 语义对齐）。
- *
- * @param {string} text - 单元格文本。
- * @param {string} kwRaw - 关键字原样（mode 2 比较用）。
- * @param {string} kwLower - 关键字小写（mode 0/1 比较用，调用方预计算）。
- * @param {number} mode - 0 包含 / 1 严格等于·不分大小写 / 2 严格等于·区分大小写。
- * @returns {boolean} 是否命中。
- */
-export function cellHit(text, kwRaw, kwLower, mode) {
-  if (mode === 2) return text === kwRaw;
-  const t = text.toLowerCase();
-  if (mode === 1) return t === kwLower;
-  return t.includes(kwLower);
-}
 /**
  * 画布压缩上限（纵向虚拟缩放，见 _yScale）：4,000,000px。
  * 两条 WebView2 实测绘制墙决定不能更大：
@@ -67,7 +49,7 @@ const Y_CLAMP = 4_000_000;
 export class Grid {
   /**
    * @param {object} opts - 构造参数。
-   * @param {import("./model.js").TableModel} opts.model - 数据模型。
+   * @param {import("./bigmodel.js").BigModel} opts.model - 数据模型。
    * @param {HTMLElement} opts.scrollEl - 滚动容器（#grid-scroll）。
    * @param {HTMLElement} opts.canvasEl - 画布（#grid-canvas）。
    * @param {HTMLElement} opts.headerEl - 列头容器（#col-header）。
@@ -117,10 +99,6 @@ export class Grid {
     this.zoom = 1;
     /** @type {number[]} 每列宽度（当前缩放下 px，按源列号索引） */
     this.colW = [];
-    /** @type {number[]} 每行高度（当前缩放下 px） */
-    this.rowH = [];
-    /** @type {number[]} 可见行行顶前缀和（px，筛选后重算；等行高模式下为 null，走 O(1) 公式） */
-    this.visTops = [0];
     /**
      * 纵向虚拟缩放：画布真实总行高超过 Y_CLAMP 时为 真实行高/压缩后行高，否则为 1。
      * 压缩后滚动条坐标 = 真实坐标 / _yScale，行位置以当前滚动位置锚定（见 _rowTop/_rowAt）。
@@ -137,8 +115,6 @@ export class Grid {
     this._maxScroll = 0;
     /** @type {number} 一屏行数 floor(clientHeight / 行高)，至少 1 */
     this._rowSpan = 1;
-    /** @type {boolean} 等行高模式（大模式恒为 true；小模式行高未被手动调整时为 true） */
-    this._yUniform = false;
     /** @type {number[]} 列顺序（源列号数组，位置即显示顺序） */
     this.colOrder = [];
     /** @type {Map<number, string>} 列号 → 筛选关键字 */
@@ -150,7 +126,7 @@ export class Grid {
     this.multi = { on: false, text: "", cols: new Set() };
     /** @type {number[] | null} 可见源行号（筛选后）；null = 恒等快路径（无筛选） */
     this.visibleRows = null;
-    /** @type {number} 大文件模式统一行高 px（rebuildStructure 计算） */
+    /** @type {number} 统一行高 px（rebuildStructure 计算） */
     this._uniformRowH = 20;
     /** @type {number} 上一次布局的可见行数（渐进索引行数增长判定） */
     this._lastVisCount = 0;
@@ -238,10 +214,10 @@ export class Grid {
   }
 
   /**
-   * 热交换模型（小/大模式切换）：订阅新模型数据通知并重建设置。
+   * 热交换模型（装载/新建/切档）：订阅新模型数据通知并重建设置。
    * 旧模型随订阅一并废弃（其后再无改动来源，残留闭包无副作用）。
    *
-   * @param {object} m - 新模型（TableModel / BigModel）。
+   * @param {object} m - 新模型（BigModel）。
    * @returns {void}
    */
   setModel(m) {
@@ -264,15 +240,9 @@ export class Grid {
     const kept = this.colW;
     this.colW = Array.from({ length: n }, (_, i) =>
       i < kept.length ? kept[i] : Math.round(100 * this.zoom));
-    // 大模式：行高数组不随总行数膨胀（30M 行 = 240MB 空数组），统一行高
+    // 统一行高（30M 行也不建行高数组）
     this._uniformRowH = Math.max(
       MIN_ROW_H, Math.round(1.8 * parseFloat(getComputedStyle(this.scrollEl).fontSize)));
-    if (!this.model.isBig) {
-      const rows = this.model.rowCount();
-      const keptH = this.rowH;
-      this.rowH = Array.from({ length: rows }, (_, i) =>
-        i < keptH.length ? keptH[i] : this._uniformRowH);
-    }
     this._rebuildFilterInputs();
     // 列结构变化：多重筛选的勾选列重置为全勾（默认勾选，对齐普通筛选清空的策略）
     this.multi.cols = new Set(this.colOrder);
@@ -308,22 +278,19 @@ export class Grid {
   }
 
   /**
-   * 行高（大文件模式统一行高；小模式按行查表）。
+   * 行高（统一大引擎：恒为统一行高）。
    *
-   * @param {number} r - 源行号。
    * @returns {number} 行高 px。
    */
-  _rowH(r) {
-    return this.model.isBig ? this._uniformRowH : (this.rowH[r] ?? this._uniformRowH);
+  _rowH() {
+    return this._uniformRowH;
   }
 
   /**
    * 重算可见行布局与画布尺寸（筛选后画布只含可见行，无空隙）。
    *
-   * 等行高模式（大文件模式，或小模式行高未被手动调整）：跳过 O(n) 前缀和数组，
-   * 直接按 行数×行高 计算；真实总行高超过 Y_CLAMP 时启用纵向虚拟缩放，
-   * 把画布高度压到上限以内（等行高保证缩放映射精确，无累积误差）。
-   * 非等行高（用户手动调过行高）：维持前缀和路径。
+   * 统一行高：直接按 行数×行高 计算；真实总行高超过 Y_CLAMP 时启用纵向
+   * 虚拟缩放，把画布高度压到上限以内（等行高保证缩放映射精确，无累积误差）。
    */
   _layout() {
     const n = this.visCount();
@@ -339,29 +306,13 @@ export class Grid {
     const totalW = rowHeadW + this._effWidths().reduce((a, b) => a + b, 0);
     this.canvasEl.style.width = `${Math.max(totalW, vp.w)}px`;
     const h = this._uniformRowH;
-    this._yUniform = this.model.isBig || this.rowH.every((v) => v === h);
-    if (this._yUniform) {
-      const real = n * h;
-      this._yScale = real > Y_CLAMP ? real / Y_CLAMP : 1;
-      this.visTops = null;
-      const compressed = real / this._yScale;
-      this._rowSpan = Math.max(1, Math.floor(viewH / h));
-      // 画布高 = 吸顶表头 + 全部行（行是 #rows 内绝对定位，#rows 紧随表头之后）
-      this.canvasEl.style.height = `${Math.max(oy + compressed, viewH)}px`;
-      this._maxScroll = Math.max(0, oy + compressed - viewH);
-      return;
-    }
-    this._yScale = 1;
-    const tops = [0];
-    let t = 0;
-    for (let vi = 0; vi < n; vi += 1) {
-      t += this._rowH(this.visAt(vi));
-      tops.push(t);
-    }
-    this.visTops = tops;
-    this.canvasEl.style.height = `${Math.max(oy + t, viewH)}px`;
-    this._maxScroll = Math.max(0, oy + t - viewH);
+    const real = n * h;
+    this._yScale = real > Y_CLAMP ? real / Y_CLAMP : 1;
+    const compressed = real / this._yScale;
     this._rowSpan = Math.max(1, Math.floor(viewH / h));
+    // 画布高 = 吸顶表头 + 全部行（行是 #rows 内绝对定位，#rows 紧随表头之后）
+    this.canvasEl.style.height = `${Math.max(oy + compressed, viewH)}px`;
+    this._maxScroll = Math.max(0, oy + compressed - viewH);
   }
 
   /** @returns {number} 行区起始 y（吸顶列头高度，行坐标系与画布坐标系的偏移）。 */
@@ -387,8 +338,7 @@ export class Grid {
   /**
    * 行顶 y（行区坐标，不含吸顶表头偏移）。
    *
-   * 非等行高（手动调过行高）：走前缀和数组 visTops。
-   * 等行高：vi×行高/_yScale（_yScale 只是把坐标压进 Y_CLAMP，映射全局精确；
+   * 统一行高：vi×行高/_yScale（_yScale 只是把坐标压进 Y_CLAMP，映射全局精确；
    * 未缩放时退化为 vi×行高，逐像素平滑）。
    *
    * 注意：返回值可远超 2^22（WebView2 实测：绝对定位子元素偏移 ~4.2M px 即不绘制）。
@@ -398,7 +348,6 @@ export class Grid {
    * @param {number} vi - 可见行序号。 @returns {number} 行顶 px（行区全局坐标）。
    */
   _rowTop(vi) {
-    if (!this._yUniform) return this.visTops[vi];
     return (vi * this._uniformRowH) / this._yScale;
   }
 
@@ -409,27 +358,17 @@ export class Grid {
    * 而滚动条坐标经 _yScale 压缩（1 滚动条 px ≈ scale 真实 px），
    * 必须经锚点还原才与 _renderRows 的画法一致（全局逆映射 floor(y·scale/h)
    * 会把窗口拉成 ~视口×scale/h 行、且与真实行高渲染重叠）。
-   * 非等行高：前缀和数组 visTops 二分（_yScale 恒 1）。
    *
    * @param {number} y - 行区 y 坐标。 @returns {number} 可见行序号（夹取）。
    */
   _rowAt(y) {
-    if (this._yUniform) {
-      const { sv, anchor, h } = this._yAnchor();
-      const n = this.visCount();
-      return Math.max(0, Math.min(n - 1, anchor + Math.floor((y - sv) / h)));
-    }
-    const tops = this.visTops;
-    let lo = 0, hi = Math.max(0, tops.length - 2);
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >> 1;
-      if (tops[mid] <= y) lo = mid; else hi = mid - 1;
-    }
-    return lo;
+    const { sv, anchor, h } = this._yAnchor();
+    const n = this.visCount();
+    return Math.max(0, Math.min(n - 1, anchor + Math.floor((y - sv) / h)));
   }
 
   /**
-   * 当前滚动位置的渲染锚点（仅等行高路径用）。
+   * 当前滚动位置的渲染锚点。
    *
    * 行以真实行高连续排布、锚点行对齐视口顶；滚动条坐标经 _yScale 压缩，
    * 锚点 = round(行区滚动位置×_yScale/行高)。_renderRows/_rowAt/_paintTop 共用，
@@ -443,10 +382,8 @@ export class Grid {
     // 渐进索引期间模型行数会先增长、renderAll/_layout 才更新 _yScale/_maxScroll：
     // 此刻必须继续按"上一次布局的行数"换算锚点，否则同一 scrollTop 会被新行数
     // 放大（CI 实测 50,000 → 79,470 的跳走）。首次布局前 _lastVisCount 为 0，
-    // 回退当前可见行数；小模式不走该镜像（筛选会即时改变可见行数）。
-    const n = this.model.isBig && this._lastVisCount > 0
-      ? this._lastVisCount
-      : this.visCount();
+    // 回退当前可见行数。
+    const n = this._lastVisCount > 0 ? this._lastVisCount : this.visCount();
     const oy = this._originY();
     const rawSv = Math.max(0, this.scrollEl.scrollTop - oy);
     if (this._yScale > 1) {
@@ -486,21 +423,20 @@ export class Grid {
    * @param {number} vi - 可见行序号。 @returns {number} 画布 y px。
    */
   _paintTop(vi) {
-    if (!this._yUniform) return this._originY() + this.visTops[vi];
     const { sv, anchor, h } = this._yAnchor();
     return this._originY() + sv + (vi - anchor) * h;
   }
 
   /**
-   * 行号列文本：大模式筛选态显示原始数据行号（1 起——命中的内容散布文件
+   * 行号列文本：筛选态显示原始数据行号（1 起——命中的内容散布文件
    * 各处，行号应跳号而非 1,2,3… 连编）；页未缓存给空串占位，落定后同帧
-   * 收敛。其余 = 行索引+1（小模式 r 已是源行号，天然跳号）。
+   * 收敛。其余 = 行索引+1。
    *
-   * @param {number} r - 源行号（大模式筛选态=命中序号）。
+   * @param {number} r - 源行号（筛选态=命中序号）。
    * @returns {string}
    */
   _rowHeadText(r) {
-    if (this.model.isBig && this.model.filterActive?.()) {
+    if (this.model.filterActive?.()) {
       const rn = this.model.rowNumber(r);
       return rn === null || rn === undefined ? "" : String(rn + 1);
     }
@@ -535,41 +471,24 @@ export class Grid {
   /**
    * 取消筛选前的视口锚点快照（须在坐标系切换前捕获）。
    *
-   * 锚 = 选中行（选中存源坐标：大模式筛选态源坐标即命中序号；小模式经
-   * visibleRows 反查命中序号，不在命中集回落视口顶行）；无选中锚视口顶行。
+   * 锚 = 选中行（选中存源坐标，筛选态源坐标即命中序号）；无选中锚视口顶行。
    * delta = k − pos（含行内小数——恢复时行内偏移精确保留）。
-   * 非等行高+筛选的布局陈旧属现状缺陷：返回 null，调用方保持 scrollTop 不动。
    *
-   * @returns {{k: number, col: number | null, delta: number, srcRow?: number} | null}
-   *   k=命中序号锚；col=选中列（无选中 null）；delta=视口内行偏移（小数）；
-   *   srcRow=小模式预存的源行号（恢复时无需引擎查询）。
+   * @returns {{k: number, col: number | null, delta: number} | null}
+   *   k=命中序号锚；col=选中列（无选中 null）；delta=视口内行偏移（小数）。
    */
   _captureClearAnchor() {
-    if (!this._yUniform || !this.visCount()) return null;
+    if (!this.visCount()) return null;
     const pos = this._yAnchor().pos;
     let k = Math.floor(pos);
     let col = null;
     const cur = this.sel?.current;
     if (cur) {
-      if (this.model.isBig) {
-        // 大模式筛选态：visAt 恒等，选中源坐标即命中序号
-        k = cur[0];
-        col = cur[1];
-      } else if (this.visibleRows) {
-        const idx = this.visibleRows.indexOf(cur[0]);
-        // 不在命中集：回落视口顶行（k/col 保持默认）
-        if (idx >= 0) {
-          k = idx;
-          col = cur[1];
-        }
-      }
+      // 筛选态 visAt 恒等，选中源坐标即命中序号
+      k = cur[0];
+      col = cur[1];
     }
-    const cap = { k, col, delta: k - pos };
-    // 小模式（visibleRows 路径）预存锚的源行号：清筛后全量视图行号就是它
-    if (this.visibleRows) {
-      cap.srcRow = this.visibleRows[Math.min(k, this.visibleRows.length - 1)];
-    }
-    return cap;
+    return { k, col, delta: k - pos };
   }
 
   /**
@@ -604,7 +523,7 @@ export class Grid {
     if (this._yScale > 1) {
       return this._scrollTopForAnchor(Math.max(0, vi - this._rowSpan + 1));
     }
-    const rh = this._yUniform ? this._uniformRowH : this._rowH(this.visAt(vi));
+    const rh = this._uniformRowH;
     return Math.max(0, Math.min(this._maxScroll,
       this._rowTop(vi) + rh - (viewH - oy)));
   }
@@ -674,16 +593,16 @@ export class Grid {
       this.colOrder,
       this.colOrder.map((c) => this.model.headers()[c] ?? ""),
       widths,
-      // 大模式索引中/完成：筛选框禁用态与占位文案不同，完成瞬间须重建一次
-      this.model.isBig ? this.model.indexing?.() === true : false,
+      // 索引中/完成：筛选框禁用态与占位文案不同，完成瞬间须重建一次
+      this.model.indexing?.() === true,
     ]);
   }
 
   /** 重绘列头（列名带 + 筛选带） */
   _renderHeader() {
     this._headerKeyCache = this._headerKey();
-    // 大模式后台索引期间：筛选框禁用并显示"索引中…"（EmEditor 式进度语义）
-    const indexing = this.model.isBig && this.model.indexing?.() === true;
+    // 后台索引期间：筛选框禁用并显示"索引中…"（EmEditor 式进度语义）
+    const indexing = this.model.indexing?.() === true;
     // 保留本侧角块（主/副网格 id 不同），重建列单元格
     for (const el of [...this.headerEl.children]) {
       if (el !== this.cornerEl) el.remove();
@@ -765,77 +684,21 @@ export class Grid {
       return;
     }
     const viewH = this._viewportSize().h;
-    const top = this.scrollEl.scrollTop;
-    // 行画在吸顶表头之下；窗口与基准分两套几何：
-    // - 等行高：锚点窗口——行以真实行高连续排布、锚点行对齐视口顶，base 为行区滚动位置
-    //   加首行与锚点的真实行高差（渲染几何，非全局虚拟坐标）；
-    // - 非等行高（_yScale 恒 1）：视口上下沿取窗口，base 为首行前缀和。
-    const oy = this._originY();
-    let first;
-    let last;
-    let base;
-    let topAt;
-    if (this._yUniform) {
-      const { sv, anchor, h } = this._yAnchor();
-      first = Math.max(0, anchor - 5);
-      last = Math.min(n - 1, anchor + Math.ceil(viewH / h) + 5);
-      base = sv + (first - anchor) * h;
-      topAt = (vi) => (vi - first) * h;
-    } else {
-      const y0 = Math.max(0, top - oy);
-      const y1 = Math.max(0, top + viewH - oy);
-      first = Math.max(0, this._rowAt(y0) - 5);
-      last = Math.min(n - 1, this._rowAt(y1) + 5);
-      base = this.visTops[first];
-      topAt = (vi) => this.visTops[vi] - base;
-    }
-    // 大模式：滚动渲染前预热窗口缓存（±2 屏预取由 BigModel 调度）
+    // 行画在吸顶表头之下；等行高锚点窗口：行以真实行高连续排布、锚点行
+    // 对齐视口顶，base 为行区滚动位置加首行与锚点的真实行高差（渲染几何，
+    // 非全局虚拟坐标）。
+    const { sv, anchor, h } = this._yAnchor();
+    const first = Math.max(0, anchor - 5);
+    const last = Math.min(n - 1, anchor + Math.ceil(viewH / h) + 5);
+    const base = sv + (first - anchor) * h;
+    const topAt = (vi) => (vi - first) * h;
+    // 滚动渲染前预热窗口缓存（±2 屏预取由 BigModel 调度）
     this.model.prefetchRange?.(this.visAt(first), this.visAt(last));
     const widths = this._effWidthsCache;
     const cc = this.model.columnCount();
     // 行内偏移 = 全局坐标 - 基准（≤ 窗口高 + 10 行，不过 2^22），大偏移由容器 transform 承担
     host.style.transform = `translateY(${base}px)`;
-    if (!this._yUniform) {
-      // 非等行高（小文件）：数据全在内存，全量重建即可
-      host.textContent = "";
-      const frag = document.createDocumentFragment();
-      for (let vi = first; vi <= last; vi += 1) {
-        const r = this.visAt(vi);
-        const row = document.createElement("div");
-        row.className = "row";
-        // .row 的包含块是 #rows（其顶边已在吸顶表头之下），行内坐标即行区坐标（窗口局部）
-        row.style.top = `${topAt(vi)}px`;
-        row.style.height = `${this._rowH(r)}px`;
-        row.style.width = `${this._rowHeadW() + widths.reduce((a, b) => a + b, 0)}px`;
-        const head = document.createElement("div");
-        head.className = "row-head";
-        head.textContent = String(r + 1);
-        head.dataset.row = String(r);
-        const rz = document.createElement("div");
-        rz.className = "row-resize";
-        rz.dataset.row = String(r);
-        head.appendChild(rz);
-        row.appendChild(head);
-        this.colOrder.forEach((srcCol, pos) => {
-          const cell = document.createElement("div");
-          cell.className = "cell";
-          cell.style.width = `${widths[pos]}px`;
-          cell.dataset.row = String(r);
-          cell.dataset.col = String(srcCol);
-          const key = r * cc + srcCol;
-          if (this.selectedSet.has(key)) cell.classList.add("sel");
-          if (this.sel.current && this.sel.current[0] === r && this.sel.current[1] === srcCol) {
-            cell.classList.add("cur");
-          }
-          cell.textContent = this.model.displayData(r, srcCol);
-          row.appendChild(cell);
-        });
-        frag.appendChild(row);
-      }
-      host.appendChild(frag);
-      return;
-    }
-    // 等行高（含大模式虚拟缩放）：键控复用行元素。大模式页未命中时保留旧内容
+    // 等行高（含虚拟缩放）：键控复用行元素。页未命中时保留旧内容
     // （stale-while-revalidate）——全部重建会把已填的格子刷成空白占位，拖动滚动条
     // 每帧白闪（频闪根因）。列数/列序/列宽变化（shape 键）时整窗重建。
     const shape = `${cc}|${this.colOrder.join(",")}|${widths.join(",")}`;
@@ -859,10 +722,6 @@ export class Grid {
         const head = document.createElement("div");
         head.className = "row-head";
         head.dataset.row = String(r); // 行号列自身带行号（菜单/探针读它）
-        const rz = document.createElement("div");
-        rz.className = "row-resize";
-        rz.dataset.row = String(r);
-        head.appendChild(rz);
         row.appendChild(head);
         for (const srcCol of this.colOrder) {
           const cell = document.createElement("div");
@@ -878,9 +737,7 @@ export class Grid {
       row.style.height = `${this._rowH(r)}px`;
       row.style.width = `${totalW}px`;
       const head = row.firstChild;
-      const rz = head.lastElementChild; // textContent 赋值会清空子节点，把手先取出
       head.textContent = this._rowHeadText(r);
-      head.appendChild(rz);
       const kids = row.children;
       for (let pos = 0; pos < this.colOrder.length; pos += 1) {
         const srcCol = this.colOrder[pos];
@@ -927,92 +784,42 @@ export class Grid {
 
   _refilter() {
     const cc = this.model.columnCount();
-    const kws = [];
-    for (const [col, kw] of this.filters) {
-      // kwLower 预计算：逐行匹配不再重复小写化关键字（680 万行规模）
-      if (col < cc && kw) {
-        kws.push([col, kw, kw.toLowerCase(), this.filterModes.get(col) ?? 0]);
-      }
+    // 条件存在性：逐列筛选框有有效关键字，或多重筛选开且有关键字
+    const hasColKw = [...this.filters].some(([col, kw]) => col < cc && kw);
+    const hasMulti = this.multi.on && !!this.multi.text;
+    const hasCond = hasColKw || hasMulti;
+    // 统一大引擎：整表扫描在 Rust 引擎（键入即筛/回车触发），前端只维护视图状态。
+    // 取消筛选锚定：捕获必须在坐标系切换（筛选态）之前；
+    // 结构性清筛（clearFilters({anchor:false})）不捕获，回落旧回顶行为
+    const cap = (!hasCond && this.model.filterActive()
+      && this._clearAnchorPref !== false)
+      ? this._captureClearAnchor()
+      : null;
+    this.visibleRows = null;
+    if (!hasCond && this.model.filterActive()) {
+      // 条件清空 → 自动回全量。锚定路径：先查归位行号再清筛（命中集清后
+      // 即失），落定后把选中行/视口顶行送回原来的位置（用户无感）；
+      // 被抢断/无锚/越界回落回顶。
+      // _suppressIndexAnchor：落定触发的 _onModelData 会把 visCount 增长
+      // 误判成索引推进而抢恢复——锚定期间压住它。
+      this._suppressIndexAnchor = true;
+      Promise.resolve(this.model.clearFilter(cap ? cap.k : null))
+        .then((res) => {
+          if (!res?.applied) return; // 被新筛选/清筛抢断：锚点作废
+          if (cap && res.target !== null && res.target !== undefined) {
+            this._restoreClearAnchor(cap, res.target);
+          } else {
+            this.resetScroll();
+            this._renderRows();
+          }
+        })
+        .catch(() => {})
+        .finally(() => { this._suppressIndexAnchor = false; });
     }
-    // 多重筛选：关键字在勾选列中命中任意一列即通过（列间"或"），
-    // 与各列自身筛选框（列间"并且"）叠加——先过多重，再过逐列。
-    const mKw = this.multi.on && this.multi.text
-      ? this.multi.text.toLowerCase() : "";
-    const mCols = mKw
-      ? [...this.multi.cols].filter((c) => c < cc) : [];
-    const hasCond = kws.length > 0 || !!mKw;
-    // 大文件模式：整表扫描在 Rust 引擎（按钮/回车触发），前端只维护视图状态
-    if (this.model.isBig) {
-      // 取消筛选锚定：捕获必须在坐标系切换（visibleRows/筛选态）之前；
-      // 结构性清筛（clearFilters({anchor:false})）不捕获，回落旧回顶行为
-      const cap = (!hasCond && this.model.filterActive()
-        && this._clearAnchorPref !== false)
-        ? this._captureClearAnchor()
-        : null;
-      this.visibleRows = null;
-      if (!hasCond && this.model.filterActive()) {
-        // 条件清空 → 自动回全量。锚定路径：先查归位行号再清筛（命中集清后
-        // 即失），落定后把选中行/视口顶行送回原来的位置（用户无感）；
-        // 被抢断/无锚/越界回落回顶。
-        // _suppressIndexAnchor：落定触发的 _onModelData 会把 visCount 增长
-        // 误判成索引推进而抢恢复——锚定期间压住它。
-        this._suppressIndexAnchor = true;
-        Promise.resolve(this.model.clearFilter(cap ? cap.k : null))
-          .then((res) => {
-            if (!res?.applied) return; // 被新筛选/清筛抢断：锚点作废
-            if (cap && res.target !== null && res.target !== undefined) {
-              this._restoreClearAnchor(cap, res.target);
-            } else {
-              this.resetScroll();
-              this._renderRows();
-            }
-          })
-          .catch(() => {})
-          .finally(() => { this._suppressIndexAnchor = false; });
-      }
-      this.hooks.bigFilterStatus?.(hasCond);
-      this._clampSelection();
-      this._renderRows();
-      this.hooks.countsChanged(this.visCount(), this.model.rowCount());
-      return;
-    }
-    // 无筛选：恒等快路径，不建 N 元素数组（680 万行也零开销）
-    if (!hasCond) {
-      // 从筛选态切回全量：锚点捕获必须在 visibleRows 置 null 之前；
-      // 恢复前必须 renderAll——_refilter 不重布局，visTops/行高还是筛选态的
-      const cap = (this.visibleRows && this._clearAnchorPref !== false)
-        ? this._captureClearAnchor()
-        : null;
-      this.visibleRows = null;
-      if (cap) this.renderAll();
-      this._clampSelection();
-      if (cap && cap.srcRow !== null && cap.srcRow !== undefined) {
-        this._restoreClearAnchor(cap, cap.srcRow);
-      } else {
-        this._renderRows();
-      }
-      this.hooks.countsChanged(this.visCount(), this.model.rowCount());
-      return;
-    }
-    const vis = [];
-    for (let r = 0; r < this.model.rowCount(); r += 1) {
-      let ok = true;
-      if (mKw && !mCols.some((c) =>
-        this.model.rawData(r, c).toLowerCase().includes(mKw))) {
-        ok = false;
-      }
-      for (const [col, kwRaw, kwLower, mode] of kws) {
-        if (!cellHit(this.model.rawData(r, col), kwRaw, kwLower, mode)) {
-          ok = false;
-          break;
-        }
-      }
-      if (ok) vis.push(r);
-    }
-    this.visibleRows = vis;
+    this.hooks.bigFilterStatus?.(hasCond);
     this._clampSelection();
     this._renderRows();
-    this.hooks.countsChanged(vis.length, this.model.rowCount());
+    this.hooks.countsChanged(this.visCount(), this.model.rowCount());
   }
 
   /**
@@ -1021,27 +828,17 @@ export class Grid {
    * @param {boolean} structural - 是否结构变化（行列增删/排序/装载）。
    */
   _onModelData(structural) {
-    // 大模式索引推进：行数增长会改变画布总高与 _yScale，同一 scrollTop 可能
+    // 索引推进：行数增长会改变画布总高与 _yScale，同一 scrollTop 可能
     // 落到别的行——先记住视口锚点位置（小数行号），重排后原位送回。
     // 必须按「视口顶锚点」原位恢复（不动点）：若按「表头下对齐」恢复，每次
     // 进度事件都净下移一个表头高，事件次数随索引速度变（CI 实测两次 −3 行）。
     let anchorPos = null;
     const rowsBefore = this._lastVisCount;
-    if (structural && this.model.isBig && !this.visibleRows
-      && !this._suppressIndexAnchor) {
+    if (structural && !this._suppressIndexAnchor) {
       const pos = this._yAnchor().pos;
       if (pos > 0 && pos < rowsBefore) anchorPos = pos;
     }
     if (structural) {
-      if (!this.model.isBig) {
-        const rows = this.model.rowCount();
-        if (rows !== this.rowH.length) {
-          // 行结构变化：补齐/截断行高（fontSize 已含缩放）
-          const kept = this.rowH;
-          this.rowH = Array.from({ length: rows }, (_, i) =>
-            i < kept.length ? kept[i] : this._uniformRowH);
-        }
-      }
       if (this.model.columnCount() !== this.colW.length) {
         this.rebuildStructure();
         return;
@@ -1152,9 +949,9 @@ export class Grid {
   _rebuildSelectedSet() {
     const cc = this.model.columnCount();
     const set = new Set();
-    // 大模式：逐格集合爆炸上限（选整列 30M 行 × N 列会卡死 JS），
+    // 逐格集合爆炸上限（选整列 30M 行 × N 列会卡死 JS），
     // 超限时按行截断到首个块（矩形语义不变，范围收敛）
-    const cap = this.model.isBig ? Math.max(1, Math.floor(200000 / Math.max(1, cc))) : Infinity;
+    const cap = Math.max(1, Math.floor(200000 / Math.max(1, cc)));
     for (const [r1, c1, r2, c2] of this.sel.blocks) {
       const ra = Math.min(r1, r2);
       const rb = Math.min(Math.max(r1, r2), ra + cap - 1);
@@ -1215,19 +1012,10 @@ export class Grid {
 
   // ============ 事件绑定 ============
 
-  /** 筛选条件变化统一尾段：大模式刷新状态并走引擎防抖链；小模式超阈值防抖。 */
+  /** 筛选条件变化统一尾段：刷新状态并走引擎防抖链。 */
   _filterCondChanged() {
-    if (this.model.isBig) {
-      this._refilter(); // 刷新状态；条件清空时 _refilter 会自动清引擎筛选
-      this.hooks.bigFilterInput?.(); // 键入即筛（app 侧防抖 + 可中断扫描）
-      return;
-    }
-    clearTimeout(this._filterTimer);
-    if (this.model.rowCount() > FILTER_DEBOUNCE_ROWS) {
-      this._filterTimer = setTimeout(() => this._refilter(), 200);
-    } else {
-      this._refilter();
-    }
+    this._refilter(); // 刷新状态；条件清空时 _refilter 会自动清引擎筛选
+    this.hooks.bigFilterInput?.(); // 键入即筛（app 侧防抖 + 可中断扫描）
   }
 
   _bindEvents() {
@@ -1253,7 +1041,7 @@ export class Grid {
         return;
       }
       const rh = e.target.closest(".row-head");
-      if (rh && !e.target.classList.contains("row-resize")) {
+      if (rh) {
         const r = Number(rh.dataset.row);
         if (e.shiftKey) {
           this._extendTo([r, this.model.columnCount() - 1]);
@@ -1312,12 +1100,6 @@ export class Grid {
         this._renderHeader();
         this._layout();
         this._renderRows();
-      } else if (this._drag.kind === "row-resize") {
-        const d = this._drag;
-        const h = Math.max(MIN_ROW_H, d.startH + e.clientY - d.startY);
-        this.rowH[d.row] = Math.round(h);
-        this._layout();
-        this._renderRows();
       }
     });
 
@@ -1352,22 +1134,10 @@ export class Grid {
         e.stopPropagation();
         return;
       }
-      const rrz = e.target.closest(".row-resize");
-      if (rrz) {
-        if (this.model.isBig) {
-          this.hooks.statusMsg("大文件模式不支持调整行高", 2000);
-          return;
-        }
-        const row = Number(rrz.dataset.row);
-        this._drag = { kind: "row-resize", row, startY: e.clientY, startH: this.rowH[row] };
-        e.preventDefault();
-        e.stopPropagation();
-      }
     }, true);
 
     // ---- 筛选输入 ----
-    // 小表即时筛选（手感优先，行数超阈值防抖）；大表条件进 grid 后
-    // 由 app 侧防抖触发引擎扫描（键入即筛），回车跳过防抖立即执行
+    // 条件进 grid 后由 app 侧防抖触发引擎扫描（键入即筛），回车跳过防抖立即执行
     this.headerEl.addEventListener("input", (e) => {
       if (this._suppressFilterInput) return;
       const input = e.target.closest(".col-filter input");
@@ -1388,13 +1158,13 @@ export class Grid {
       st.dataset.mode = String(mode);
       st.textContent = STRICT_GLYPHS[mode];
       st.title = STRICT_TITLES[mode];
-      // 该列有条件文本时与输入等效触发重筛（大模式走 app 侧防抖链）
+      // 该列有条件文本时与输入等效触发重筛（走 app 侧防抖链）
       if (this.filters.get(col)) this._filterCondChanged();
     });
 
-    // 大模式：筛选框内回车 = 跳过防抖立即执行一次
+    // 筛选框内回车 = 跳过防抖立即执行一次
     this.headerEl.addEventListener("keydown", (e) => {
-      if (e.key !== "Enter" || !this.model.isBig) return;
+      if (e.key !== "Enter") return;
       if (e.target.closest(".col-filter input")) {
         // 输入法组合态的 Enter 是"选词/上屏"，必须放行给输入法，
         // 否则会拿未上屏的拼音串提前触发筛选。
@@ -1411,7 +1181,7 @@ export class Grid {
       const col = Number(cb.dataset.col);
       if (cb.checked) this.multi.cols.add(col); else this.multi.cols.delete(col);
       this._refilter();
-      if (this.model.isBig) this.hooks.bigFilterInput?.(); // 勾选列变化也影响命中集
+      this.hooks.bigFilterInput?.(); // 勾选列变化也影响命中集
     });
 
     // ---- 右键菜单 ----
@@ -1603,41 +1373,15 @@ export class Grid {
     const [row, col] = cur;
     const seq = ++this._navSeq;
     let target;
-    if (model.isBig) {
-      try {
-        target = await model.findVerticalEdge(row, col, down);
-      } catch (err) {
-        if (seq === this._navSeq) {
-          this.hooks.statusMsg?.(`查找数据边缘失败：${err}`, 4000);
-        }
-        return;
+    try {
+      target = await model.findVerticalEdge(row, col, down);
+    } catch (err) {
+      if (seq === this._navSeq) {
+        this.hooks.statusMsg?.(`查找数据边缘失败：${err}`, 4000);
       }
-      if (seq !== this._navSeq || model !== this.model || this.editing) return;
-    } else {
-      const total = this.visCount();
-      if (!total) return;
-      let start = this.visibleIndexOf(row);
-      if (start < 0 && this.visibleRows) {
-        // 当前格被筛掉：从该方向最近的可见行起算（二分找插入点）
-        let lo = 0;
-        let hi = this.visibleRows.length;
-        while (lo < hi) {
-          const mid = (lo + hi) >> 1;
-          if (this.visibleRows[mid] < row) lo = mid + 1;
-          else hi = mid;
-        }
-        start = down ? lo : lo - 1;
-      }
-      if (start < 0 || start >= total) return;
-      const targetVi = findVerticalEdge(
-        (vi) => this.model.rawData(this.visAt(vi), col) !== "",
-        start,
-        total,
-        down,
-      );
-      if (targetVi < 0) return;
-      target = this.visAt(targetVi);
+      return;
     }
+    if (seq !== this._navSeq || model !== this.model || this.editing) return;
     if (target === null || target === undefined) return;
     const now = this.sel.current;
     if (!now || now[0] !== row || now[1] !== col) return;
@@ -1673,7 +1417,7 @@ export class Grid {
       // 未压缩：行区坐标即滚动坐标。吸顶表头占视口顶部 oy，可见区域是
       // [scrollTop, scrollTop+viewH-oy]；对齐全按这个区间计算。
       const top = this._rowTop(vi);
-      const rh = this._yUniform ? this._uniformRowH : this._rowH(r);
+      const rh = this._uniformRowH;
       if (top < viewTop) this.scrollEl.scrollTop = Math.max(0, top);
       else if (top + rh > viewTop + viewH - oy) {
         this.scrollEl.scrollTop = Math.max(0, top + rh - (viewH - oy));
@@ -1802,9 +1546,9 @@ export class Grid {
     const rows = this.selectedRows();
     const cols = this.selectedCols();
     const cc = this.model.columnCount();
-    // 大模式：完整矩形且超过逐格上限 → 引擎流式序列化（前端不取数）
+    // 完整矩形且超过逐格上限 → 引擎流式序列化（前端不取数）
     const fullRect = this.selectedSet.size === rows.length * cols.length;
-    if (this.model.isBig && fullRect && this.selectedSet.size > 20000) {
+    if (fullRect && this.selectedSet.size > 20000) {
       Promise.resolve(this.model.copyRows(rows[0], rows[rows.length - 1] + 1,
         cols[0], cols[cols.length - 1] + 1)).then((text) => {
         this.lastCopiedText = text;
@@ -1816,7 +1560,7 @@ export class Grid {
       });
       return;
     }
-    if (this.model.isBig && !fullRect && this.selectedSet.size > 20000) {
+    if (!fullRect && this.selectedSet.size > 20000) {
       this.hooks.statusMsg("大文件模式：大型选区仅支持完整矩形复制", 3000);
       return;
     }
@@ -1901,47 +1645,30 @@ export class Grid {
       : (parsed.headers.length ? [parsed.headers] : []);
     if (!rows.length) return;
     const width = Math.max(...rows.map((row) => row.length));
-    if (this.model.isBig) {
-      // 大模式：粘贴不会自动扩列（列结构走 pending 列操作）；行可扩展。
-      // 逐格异步写引擎（块内并发由 BigModel 调度），顺序：先扩行再写格。
-      if (c0 + width > this.model.columnCount()) {
+    // 粘贴超宽二态：无路径内存档自动 pending 插列 + 立即执行（内存内重建毫秒级，
+    // 本次粘贴的撤销栈随之清空）；有路径大档拒绝（物理重写代价大，请先手动加列）。
+    // 行方向始终自动扩（_pasteBig 内引擎插行）。
+    if (c0 + width > this.model.columnCount()) {
+      const meta = this.model.meta?.();
+      if (!meta || meta.has_path !== false || meta.sorted === true) {
         this.hooks.statusMsg("大文件模式：粘贴宽度超出现有列，已取消（可先用列操作加列）", 3000);
         return;
       }
-      this._pasteBig(r0, c0, rows, width);
-      return;
-    }
-    // 扩展行列 + 逐格写入合并为一步撤销（Excel：粘贴是单个操作）
-    this.model.batch(() => {
-      const needRows = r0 + rows.length - this.model.rowCount();
-      if (needRows > 0) this.model.insertRows(this.model.rowCount(), needRows);
       const needCols = c0 + width - this.model.columnCount();
-      if (needCols > 0) this.model.insertColumns(this.model.columnCount(), needCols);
-      rows.forEach((row, i) => {
-        row.forEach((val, j) => {
-          this.model.setData(r0 + i, c0 + j, val);
-        });
-      });
-    });
-    // 选中刚粘贴的区域（Excel 行为；被筛掉的行不选）
-    const visSet = this.visibleRows ? new Set(this.visibleRows) : null;
-    let selMade = false;
-    for (let i = 0; i < rows.length; i += 1) {
-      if (!visSet || visSet.has(r0 + i)) {
-        this.select([r0, c0], { silent: true });
-        this._extendTo([r0 + rows.length - 1, c0 + width - 1]);
-        selMade = true;
-        break;
+      try {
+        await this.model.insertColumns(this.model.columnCount(), needCols);
+        await this.model.applyColOps();
+      } catch (err) {
+        this.hooks.statusMsg(String(err?.message ?? err), 3000);
+        return;
       }
     }
-    if (!selMade) this.select([r0, c0]);
-    this.hooks.statusMsg(`已粘贴 ${rows.length} 行`, 2000);
+    await this._pasteBig(r0, c0, rows, width);
   }
 
   /**
    * 一对多填充：把单值写入选区每一格（Excel 行为，选区保持不动）。
-   * 小模式整块合并为一步撤销；大模式逐格异步（引擎撤销逐条，与 _pasteBig
-   * 一致），同值格跳过以免撤销日志刷屏。
+   * 引擎逐格异步写（撤销逐条，与 _pasteBig 一致），同值格跳过以免撤销日志刷屏。
    *
    * @param {string} value - 填充值。
    * @returns {Promise<void>}
@@ -1949,29 +1676,23 @@ export class Grid {
   async _fillSelection(value) {
     const cells = this.selectedCells();
     if (!cells.length) return;
-    if (this.model.isBig) {
-      try {
-        await this.model.batch(async () => {
-          for (const [r, c] of cells) {
-            if (this.model.rawData(r, c) === value) continue;
-            // eslint-disable-next-line no-await-in-loop
-            await this.model.setData(r, c, value);
-          }
-        });
-      } catch (err) {
-        this.hooks.statusMsg(String(err?.message ?? err), 3000);
-        return;
-      }
-    } else {
-      this.model.batch(() => {
-        for (const [r, c] of cells) this.model.setData(r, c, value);
+    try {
+      await this.model.batch(async () => {
+        for (const [r, c] of cells) {
+          if (this.model.rawData(r, c) === value) continue;
+          // eslint-disable-next-line no-await-in-loop
+          await this.model.setData(r, c, value);
+        }
       });
+    } catch (err) {
+      this.hooks.statusMsg(String(err?.message ?? err), 3000);
+      return;
     }
     this.hooks.statusMsg(`已填充 ${cells.length} 个单元格`, 2000);
   }
 
   /**
-   * 大文件模式粘贴：先扩行（引擎插入），再逐格写（BigModel 分块并发）。
+   * 引擎粘贴：先扩行（引擎插入），再逐格写（BigModel 分块并发）。
    *
    * @param {number} r0 - 起始行。
    * @param {number} c0 - 起始列。
@@ -2042,7 +1763,7 @@ export class Grid {
     }
     this._renderHeader();
     this._refilter();
-    if (this.model.isBig) this.hooks.bigFilterInput?.(); // 开/关多重筛选改变匹配语义
+    this.hooks.bigFilterInput?.(); // 开/关多重筛选改变匹配语义
   }
 
   /**
@@ -2053,7 +1774,7 @@ export class Grid {
   setMultiText(text) {
     this.multi.text = text;
     this._refilter();
-    if (this.model.isBig) this.hooks.bigFilterInput?.();
+    this.hooks.bigFilterInput?.();
   }
 
   /** @returns {number} 生效的筛选条件数 */
@@ -2072,11 +1793,7 @@ export class Grid {
     const ratio = factor / this.zoom;
     this.zoom = factor;
     this.colW = this.colW.map((w) => Math.max(MIN_COL_W, Math.round(w * ratio)));
-    if (this.model.isBig) {
-      this._uniformRowH = Math.max(MIN_ROW_H, Math.round(this._uniformRowH * ratio));
-    } else {
-      this.rowH = this.rowH.map((h) => Math.max(MIN_ROW_H, Math.round(h * ratio)));
-    }
+    this._uniformRowH = Math.max(MIN_ROW_H, Math.round(this._uniformRowH * ratio));
     this.areaEl.style.setProperty("--grid-zoom", String(factor));
     this.renderAll();
     this.hooks.zoomed(factor);

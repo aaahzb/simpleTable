@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { Grid, cellHit } from "../frontend/js/grid.js";
+import { Grid } from "../frontend/js/grid.js";
 
 /** 与 grid.js 的 Y_CLAMP 同步（未导出，仅测试用）。 */
 const Y_CLAMP = 4_000_000;
@@ -23,7 +23,6 @@ function makeStaleLayoutGrid({ oldN, h = 20, oy = 52, viewH = 700 }) {
   const g = Object.create(Grid.prototype);
   const real = oldN * h;
   g._uniformRowH = h;
-  g._yUniform = true; // 等行高布局（_rowTop/_captureClearAnchor 读它）
   g._yScale = real > Y_CLAMP ? real / Y_CLAMP : 1;
   g._rowSpan = Math.max(1, Math.floor(viewH / h));
   g._maxScroll = Math.max(0, oy + real / g._yScale - viewH);
@@ -140,26 +139,6 @@ test("锚点恢复不动点：行数增长后恢复再捕获位置不变（CI �
     `两次事件后位置仍应≈50000，实际 ${pos2}`);
 });
 
-test("cellHit 三态真值表（0 包含 / 1 等于·不分大小写 / 2 等于·区分大小写）", () => {
-  // mode 0：包含（折叠子串，现状语义）
-  assert.equal(cellHit("xabc", "xABC", "xabc", 0), true);
-  assert.equal(cellHit("xyz", "abc", "abc", 0), false);
-  // mode 1：严格等于·不分大小写（折叠后整字段相等）
-  assert.equal(cellHit("AbC", "abc", "abc", 1), true);
-  assert.equal(cellHit("xabc", "abc", "abc", 1), false);
-  // mode 2：严格等于·区分大小写（原样比较 kwRaw）
-  assert.equal(cellHit("AbC", "AbC", "abc", 2), true);
-  assert.equal(cellHit("AbC", "abc", "abc", 2), false);
-  // CJK 无大小写：三态一致（等于只在整字段相同时命中）
-  assert.equal(cellHit("北京", "北京", "北京", 1), true);
-  assert.equal(cellHit("北京市", "北京", "北京", 1), false);
-  assert.equal(cellHit("北京", "北京", "北京", 2), true);
-  // 空串：空文本等于空关键字（三态同）
-  assert.equal(cellHit("", "", "", 0), true);
-  assert.equal(cellHit("", "", "", 1), true);
-  assert.equal(cellHit("", "", "", 2), true);
-});
-
 test("取消筛选锚定（未压缩）：无选中锚视口顶行，行内小数偏移保持", () => {
   // oy=52、h=20、yScale=1：scrollTop=oy+(100+0.3)h → pos=100.3
   const g = makeStaleLayoutGrid({ oldN: 10_000, h: 20, oy: 52, viewH: 700 });
@@ -230,34 +209,4 @@ test("_rowHeadText：筛选态取原始行号（未缓存空串占位），非�
   assert.equal(g._rowHeadText(3), "", "页未缓存给空串占位（落定后同帧收敛）");
   g.model = { isBig: true, filterActive: () => false, rowNumber: () => null };
   assert.equal(g._rowHeadText(7), "8", "非筛选大模式=行索引+1");
-  g.model = { isBig: false, filterActive: () => false, rowNumber: () => null };
-  assert.equal(g._rowHeadText(7), "8", "小模式=源行号+1（r 已是源行号）");
-});
-
-test("取消筛选锚定（小模式）：选中在命中集锚选中，否则回落视口顶行", () => {
-  const g = Object.create(Grid.prototype);
-  g._yUniform = true;
-  g._uniformRowH = 20;
-  g._yScale = 1;
-  g._rowSpan = 35;
-  g._maxScroll = 52 + 50 * 20 - 700; // 全量 50 行
-  g._lastVisCount = 0;
-  g.visibleRows = [2, 5, 9]; // 筛选命中 3 行（源行号）
-  g.model = { isBig: false, rowCount: () => 50 };
-  g.headerEl = { offsetHeight: 52 };
-  g.scrollEl = { scrollTop: 52 + 1 * 20 }; // 视口顶=命中序号 1（源行 5）
-
-  // 选中源行 5（在命中集，命中序号 1）
-  g.sel = { current: [5, 1], anchor: [5, 1], blocks: [] };
-  const cap = g._captureClearAnchor();
-  assert.equal(cap.k, 1, "选中源行 5 → 命中序号 1");
-  assert.equal(cap.col, 1);
-  assert.equal(cap.srcRow, 5, "小模式预存源行号（恢复时无需引擎查询）");
-
-  // 选中源行 7（不在命中集）→ 回落视口顶行
-  g.sel = { current: [7, 0], anchor: [7, 0], blocks: [] };
-  const cap2 = g._captureClearAnchor();
-  assert.equal(cap2.k, 1, "不在命中集 → 回落视口顶行（命中序号 1）");
-  assert.equal(cap2.col, null);
-  assert.equal(cap2.srcRow, 5, "回落锚的源行号=visibleRows[k]");
 });

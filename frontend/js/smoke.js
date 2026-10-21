@@ -807,6 +807,29 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       "撤销后应整体复原");
   });
 
+  check("内存档粘贴超宽自动扩列（pending 插列 + 立即执行），另存为成功", async () => {
+    await window.__app.smokeLoadSmall([], []);
+    tbBtn("新建").click();
+    await waitFor(() => document.querySelector(".modal-mask"), "新建对话框");
+    const mask = document.querySelector(".modal-mask");
+    mask.querySelector("#newtable-cols").value = "2";
+    mask.querySelector("#newtable-rows").value = "3";
+    assert(clickModalButton("确定"), "新建确定");
+    await waitFor(() => window.__app.isBigMode() && model.rowCount() === 3,
+      "新建 2×3 落定（内存档）");
+    assert(window.__app.getPath() === null, "新建档应无磁盘路径");
+    grid.select([0, 0]);
+    stubClipboard("A\tB\tC\tD\r\nE\tF\tG\tH\r\n"); // 4 列 > 现有 2 列
+    await grid.pasteClipboard();
+    await waitFor(() => model.columnCount() === 4
+      && model.rawData(0, 3) === "D" && model.rawData(1, 3) === "H",
+      "超宽粘贴应自动扩列并落定");
+    const target = `${TMP}/paste-expand-saveas.csv`;
+    assert(await window.__app.saveFileAs(target) === true, "扩列后另存为应成功");
+    const txt = (await invoke("read_csv_file", { path: target })).text;
+    assert(txt.includes("A,B,C,D") && txt.includes("E,F,G,H"), "落盘内容应含扩列数据");
+  });
+
   check("无 Tab 纯文本整段进当前格（不换行摊开）", async () => {
     await window.__app.smokeLoadSmall(["a"], [["x"], ["y"]]);
     grid.select([0, 0]);
@@ -1574,18 +1597,12 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(grid.colW[0] === before + 40, `列宽应 +40，实际 ${grid.colW[0] - before}`);
   });
 
-  check("行高拖拽在大模式被拒绝（统一行高不变）", async () => {
-    grid.ensureVisible(0, 0); // 滚回顶部，确保第 0 行在可视区
+  check("行高把手已退役（统一行高、无拖拽把手）", async () => {
+    grid.ensureVisible(0, 0);
     grid._renderRows();
-    const before = grid._uniformRowH;
-    const rz = document.querySelector('.row-resize[data-row="0"]');
-    assert(rz, "行高把手应仍渲染");
-    mouse(rz, "mousedown", { clientY: 100 });
-    mouse(document, "mousemove", { clientY: 130 });
-    mouse(document, "mouseup");
-    assert(grid._uniformRowH === before, "大模式行高应不变（拖拽被拒绝）");
-    assert(document.getElementById("status-text").textContent.includes("不支持调整行高"),
-      "应提示大模式不支持调整行高");
+    assert(!document.querySelector(".row-resize"), "行高把手应不再渲染");
+    assert(grid._rowH(0) === grid._uniformRowH && grid._rowH(5) === grid._uniformRowH,
+      "行高应恒为统一行高");
   });
 
   check("列拖动改变列顺序", async () => {
@@ -2868,6 +2885,13 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(snap.find((x) => x.path === p1)?.headerless === true
       && snap.find((x) => x.path === p2)?.headerless === false,
     "页签快照中的开关状态应各自独立");
+  });
+
+  check("占位空表：保存被婉拒且不弹另存为（无会话守卫）", async () => {
+    await window.__app.smokeLoadSmall([], []); // 回占位空表（无会话）
+    assert((await window.__app.saveFile()) === false, "占位空表保存应被婉拒");
+    assert(document.getElementById("status-text").textContent.includes("空表格无需保存"),
+      "应提示空表格无需保存");
   });
 
   check("新建表格：只定列数×行数，默认 60 行并处于首行非列名", async () => {

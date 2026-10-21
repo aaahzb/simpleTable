@@ -1153,3 +1153,11 @@ test("displayData：显示文本压平 \r\n\t（对齐小模式 TableModel 语�
   assert.equal(model.rawData(0, 0), "a\nb\tc\rd"); // 原文不动（编辑/保存仍用原值）
   assert.equal(model.displayData(0, 0), "a b c d"); // 显示压平
 });
+
+test("空构造无会话：meta/indexing/filterActive/peekData 全部安全假值（保存守卫锚）", () => {
+  const m = new BigModel();
+  assert.equal(m.meta(), null); // 无会话判定锚（app 保存守卫依赖）
+  assert.ok(!m.indexing());
+  assert.ok(!m.filterActive());
+  assert.equal(m.peekData(0, 0), undefined);
+});

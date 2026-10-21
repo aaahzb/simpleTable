@@ -195,10 +195,6 @@ body.split #vsplit { display: block; }
   /* 关键：默认 min-width:auto 会让长行号把行号列撑宽，数据列相对表头右移 */
   min-width: 0;
 }
-.row-resize {
-  position: absolute; left: 0; bottom: -3px; height: 7px; width: 100%;
-  cursor: row-resize; z-index: 4;
-}
 .cell {
   flex: 0 0 auto; overflow: hidden; white-space: nowrap;
   text-overflow: ellipsis;             /* C2 省略号截断 */
