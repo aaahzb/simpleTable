@@ -13,7 +13,7 @@
 //! - 撤销 = 逆操作日志（全表快照在大文件上不可行）。
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -1627,7 +1627,7 @@ mod tests {
         fs::remove_file(&p).ok();
     }
 
-    // ---- Part 4：大文件秒筛（字节路径 + 列投影缓存 + 收窄 + 中断） ----
+    // ---- Part 4：大文件秒筛（字节直扫 + 收窄 + 中断） ----
 
     fn spec_one(col: u32, kw: &str) -> FilterSpec {
         FilterSpec {
@@ -1719,43 +1719,255 @@ mod tests {
         fs::remove_file(&p).ok();
     }
 
-    /// 列缓存：首次全扫建缓存；后续同列筛选直接走缓存；前缀收窄只扫旧命中。
+    // ---- Part 4b：FieldScan 特征化（钉住标量语义，SIMD 快路径必须逐位一致） ----
+
+    /// 直调 FieldScan 扫一条记录（特征化/对拍共用；ncols 给足 32 覆盖超界列）。
+    fn scan_one(spec: &FilterSpec, enc: Encoding, rec: &[u8]) -> bool {
+        let overlay: HashMap<(u32, u32), String> = HashMap::new();
+        let mut fs = FieldScan::new(spec, enc, &overlay, 32);
+        fs.record_matches(0, rec)
+    }
+
+    /// 字段边界 / 空字段 / 超界列 / 孤 \r / 无尾换行 / 大小写折叠 / 多列 AND。
     #[test]
-    fn big_filter_cache_reuse_and_prefix_narrowing() {
+    fn field_scan_char_boundaries_and_case() {
+        let u = Encoding::Utf8;
+        // 基础三列
+        assert!(scan_one(&spec_one(1, "b"), u, b"a,b,c\r\n"));
+        assert!(!scan_one(&spec_one(1, "x"), u, b"a,b,c\r\n"));
+        assert!(scan_one(&spec_one(0, "a"), u, b"a,b,c\r\n"));
+        assert!(scan_one(&spec_one(2, "c"), u, b"a,b,c\r\n"));
+        // 超界列：字段不存在，needle 永不命中
+        assert!(!scan_one(&spec_one(3, "c"), u, b"a,b,c\r\n"));
+        assert!(!scan_one(&spec_one(9, "x"), u, b"a,b,c\r\n"));
+        // 空字段不中非空关键字；邻列不受影响
+        assert!(scan_one(&spec_one(0, "a"), u, b"a,,c\r\n"));
+        assert!(!scan_one(&spec_one(1, "x"), u, b"a,,c\r\n"));
+        assert!(scan_one(&spec_one(2, "c"), u, b"a,,c\r\n"));
+        // 尾逗号（末尾空字段）
+        assert!(scan_one(&spec_one(1, "b"), u, b"a,b,\r\n"));
+        assert!(!scan_one(&spec_one(2, "x"), u, b"a,b,\r\n"));
+        // 无尾换行与 LF 结尾
+        assert!(scan_one(&spec_one(1, "b"), u, b"a,b"));
+        assert!(scan_one(&spec_one(1, "b"), u, b"a,b\n"));
+        // 孤 \r 即记录结束，其后字节不属于本记录
+        assert!(scan_one(&spec_one(1, "b"), u, b"a,b\rc"));
+        assert!(!scan_one(&spec_one(2, "c"), u, b"a,b\rc"));
+        // 大小写折叠（ASCII）
+        assert!(scan_one(&spec_one(0, "alice"), u, b"ALICE,BeiJing\r\n"));
+        assert!(scan_one(&spec_one(1, "beijing"), u, b"ALICE,BeiJing\r\n"));
+        // 多列 AND：两列都中才中；前列不中则整行不中（提前退出结果不变式）
+        let and2 = FilterSpec {
+            cols: vec![(2, "c2".into()), (6, "c6".into())],
+            multi_cols: vec![],
+            multi_text: String::new(),
+        };
+        assert!(scan_one(&and2, u, b"c0,c1,c2,c3,c4,c5,c6,c7\r\n"));
+        let and2miss = FilterSpec {
+            cols: vec![(2, "nope".into()), (6, "c6".into())],
+            multi_cols: vec![],
+            multi_text: String::new(),
+        };
+        assert!(!scan_one(&and2miss, u, b"c0,c1,c2,c3,c4,c5,c6,c7\r\n"));
+    }
+
+    /// 引号全形态：整字段带引、引号内界符、转义对、奇偶连引、未闭合、中段裸引号。
+    #[test]
+    fn field_scan_char_quotes() {
+        let u = Encoding::Utf8;
+        // 引号内逗号是内容不是界符
+        assert!(scan_one(&spec_one(0, "hello, world"), u, b"\"hello, world\",x\r\n"));
+        assert!(scan_one(&spec_one(1, "x"), u, b"\"hello, world\",x\r\n"));
+        // 引号内换行属于同一字段
+        assert!(scan_one(&spec_one(1, "line2"), u, b"a,\"line1\nline2\",c\r\n"));
+        assert!(scan_one(&spec_one(2, "c"), u, b"a,\"line1\nline2\",c\r\n"));
+        // "" 转义 → 一个字面引号
+        assert!(scan_one(&spec_one(0, "say \"hi\""), u, b"\"say \"\"hi\"\"\",x\r\n"));
+        // 四连引 = 开 + 转义对 + 关：内容恰一个引号，后续逗号仍是界符
+        assert!(scan_one(&spec_one(0, "\""), u, b"\"\"\"\",x\r\n"));
+        assert!(scan_one(&spec_one(1, "x"), u, b"\"\"\"\",x\r\n"));
+        // 六连引 = 开 + 两个转义对 + 关：内容两个引号
+        assert!(scan_one(&spec_one(0, "\"\""), u, b"\"\"\"\"\"\",x\r\n"));
+        assert!(scan_one(&spec_one(1, "x"), u, b"\"\"\"\"\"\",x\r\n"));
+        // 字段起点的 "" = 空引用段（开 + 关），内容为空
+        assert!(scan_one(&spec_one(1, "x"), u, b"\"\",x\r\n"));
+        assert!(!scan_one(&spec_one(0, "\""), u, b"\"\",x\r\n"));
+        // 中段裸引号成对：剥离后拼接（ab"cd"ef → abcdef）
+        assert!(scan_one(&spec_one(0, "abcdef"), u, b"ab\"cd\"ef,x\r\n"));
+        assert!(!scan_one(&spec_one(0, "ab\"cd"), u, b"ab\"cd\"ef,x\r\n"));
+        // 三连引后接逗号：转义对发生在引号态内 → 引号未关，逗号是内容
+        assert!(scan_one(&spec_one(0, "\",x"), u, b"\"\"\",x"));
+        assert!(!scan_one(&spec_one(1, "x"), u, b"\"\"\",x"));
+        // 五连引：开 + 两个转义对，未闭合 → 吞掉后续全部字节（含逗号与换行）
+        assert!(scan_one(&spec_one(0, "\"\",x"), u, b"\"\"\"\"\",x\r\n"));
+        assert!(!scan_one(&spec_one(1, "x"), u, b"\"\"\"\"\",x\r\n"));
+        // 未闭合引号：吞到记录尾，col1 不存在
+        assert!(scan_one(&spec_one(0, "abc,def"), u, b"\"abc,def\r\n"));
+        assert!(!scan_one(&spec_one(1, "def"), u, b"\"abc,def\r\n"));
+    }
+
+    /// UTF-8 CJK / GBK 双字节 / 覆盖层优先 / 多重 OR 及其与 AND 的组合。
+    #[test]
+    fn field_scan_char_encoding_overlay_multi() {
+        let u = Encoding::Utf8;
+        // UTF-8 CJK 关键字；CJK 记录里的 ASCII 折叠
+        assert!(scan_one(&spec_one(0, "北京"), u, "北京,备ABC\r\n".as_bytes()));
+        assert!(scan_one(&spec_one(1, "备"), u, "北京,备ABC\r\n".as_bytes()));
+        assert!(scan_one(&spec_one(1, "abc"), u, "北京,备ABC\r\n".as_bytes()));
+        // GBK 纯 ASCII 记录：与 UTF-8 结果一致
+        assert!(scan_one(&spec_one(0, "a"), Encoding::Gbk, b"a,b\r\n"));
+        assert!(!scan_one(&spec_one(1, "x"), Encoding::Gbk, b"a,b\r\n"));
+        // GBK 双字节记录：引导字节吞次字节，界符落在整对之后
+        let gbk = encoding_rs::GBK.encode("名字,值\r\n").0.into_owned();
+        assert!(scan_one(&spec_one(0, "名字"), Encoding::Gbk, &gbk));
+        assert!(scan_one(&spec_one(1, "值"), Encoding::Gbk, &gbk));
+        assert!(!scan_one(&spec_one(1, "名"), Encoding::Gbk, &gbk));
+        // 覆盖层优先于原始字节（同列同 rec）
+        let mut ov: HashMap<(u32, u32), String> = HashMap::new();
+        ov.insert((0, 0), "zzz".to_string());
+        let mut fs = FieldScan::new(&spec_one(0, "zzz"), u, &ov, 32);
+        assert!(fs.record_matches(0, b"a,b\r\n"));
+        let mut fs = FieldScan::new(&spec_one(0, "a"), u, &ov, 32);
+        assert!(!fs.record_matches(0, b"a,b\r\n"));
+        // 多重 OR：任一勾选列命中即中
+        assert!(scan_one(&spec_multi(vec![0, 2], "x"), u, b"a,b,x\r\n"));
+        assert!(scan_one(&spec_multi(vec![0, 2], "x"), u, b"x,b,c\r\n"));
+        assert!(!scan_one(&spec_multi(vec![0, 2], "x"), u, b"a,b,c\r\n"));
+        // AND + OR 组合：逐列 AND 全部命中且 OR 至少中一列
+        let combo = FilterSpec {
+            cols: vec![(0, "a".into())],
+            multi_cols: vec![1, 2],
+            multi_text: "b".into(),
+        };
+        assert!(scan_one(&combo, u, b"a,x,b\r\n"));
+        assert!(!scan_one(&combo, u, b"x,x,b\r\n"));
+        assert!(!scan_one(&combo, u, b"a,x,c\r\n"));
+    }
+
+    // ---- Part 4c：快/慢路径对拍（SIMD 快路径的正确性闸门） ----
+
+    /// 固定种子 LCG（确定性复现；不引新依赖）。
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+
+        /// 生成一个随机筛选条件：0-2 根列 needle + 约三成概率多重。
+        fn spec(&mut self) -> FilterSpec {
+            const KW: &[u8] = b"abz09\", ";
+            let mut spec = FilterSpec {
+                cols: vec![],
+                multi_cols: vec![],
+                multi_text: String::new(),
+            };
+            for _ in 0..self.next() % 3 {
+                let kl = 1 + self.next() % 2;
+                let kw: String = (0..kl)
+                    .map(|_| KW[self.next() as usize % KW.len()] as char)
+                    .collect();
+                spec.cols.push((self.next() % 4, kw));
+            }
+            if self.next() % 10 < 3 {
+                spec.multi_cols = vec![self.next() % 3, self.next() % 4];
+                spec.multi_text = "a".to_string();
+            }
+            spec
+        }
+    }
+
+    /// 同一记录分别走强分发 / 强制快路径 / 强制标量，三者必须逐位一致。
+    fn scan_three(spec: &FilterSpec, enc: Encoding, rec: &[u8]) -> (bool, bool, bool) {
+        let overlay: HashMap<(u32, u32), String> = HashMap::new();
+        let mut a = FieldScan::new(spec, enc, &overlay, 32);
+        let mut b = FieldScan::new(spec, enc, &overlay, 32);
+        let mut c = FieldScan::new(spec, enc, &overlay, 32);
+        (
+            a.record_matches(0, rec),
+            b.record_matches_fast(0, rec),
+            c.record_matches_scalar(0, rec),
+        )
+    }
+
+    /// 路由断言：GBK 非 ASCII 记录走标量；GBK 纯 ASCII 与 UTF-8 走快路径。
+    #[test]
+    fn field_scan_gbk_non_ascii_routes_to_scalar() {
+        let overlay: HashMap<(u32, u32), String> = HashMap::new();
+        let gbk = encoding_rs::GBK.encode("名字,值\r\n").0.into_owned();
+        let fs = FieldScan::new(&spec_one(0, "名字"), Encoding::Gbk, &overlay, 32);
+        assert!(!fs.route_fast(&gbk), "GBK 非 ASCII → 标量慢路径");
+        assert!(fs.route_fast(b"a,b\r\n"), "GBK 纯 ASCII → 快路径");
+        let fs = FieldScan::new(&spec_one(0, "a"), Encoding::Utf8, &overlay, 32);
+        assert!(fs.route_fast("北京,a\r\n".as_bytes()), "UTF-8 → 恒快路径");
+    }
+
+    /// 随机对拍：CSV-ish 字节汤 × 随机条件，快路径与标量逐位一致。
+    #[test]
+    fn field_scan_fast_matches_scalar_random() {
+        // 引号与界符权重高，夹杂大小写数字与 UTF-8 片段（可能拼出非法 UTF-8，
+        // 两路径同样逐字节处理，不受影响）
+        const ALPHABET: &[u8] = b"\"\"\" ,,\r\n\r\nabzABZ09;\xE4\xB8\xAD\xE5\x8C\x97";
+        let mut rng = Lcg(0x243F6A8885A308D3);
+        for case in 0..6000u32 {
+            let len = (rng.next() % 48) as usize;
+            let rec: Vec<u8> = (0..len)
+                .map(|_| ALPHABET[rng.next() as usize % ALPHABET.len()])
+                .collect();
+            let spec = rng.spec();
+            let (disp, fast, scalar) = scan_three(&spec, Encoding::Utf8, &rec);
+            assert_eq!(fast, scalar, "case {case} rec={rec:?}");
+            assert_eq!(disp, scalar, "case {case} 分发 rec={rec:?}");
+        }
+        // GBK 纯 ASCII 字节汤（去掉末尾 6 个 ≥0x80 字节）也走快路径
+        let ascii_end = ALPHABET.len() - 6;
+        for case in 0..2000u32 {
+            let len = (rng.next() % 48) as usize;
+            let rec: Vec<u8> = (0..len)
+                .map(|_| ALPHABET[rng.next() as usize % ascii_end])
+                .collect();
+            let spec = rng.spec();
+            let (disp, fast, scalar) = scan_three(&spec, Encoding::Gbk, &rec);
+            assert_eq!(fast, scalar, "gbk case {case} rec={rec:?}");
+            assert_eq!(disp, scalar, "gbk case {case} 分发 rec={rec:?}");
+        }
+    }
+
+    /// 无列投影缓存：同列换关键字整列重扫；前缀收窄只扫旧命中；编辑/撤销后退回全扫。
+    #[test]
+    fn big_filter_no_cache_rescan_and_prefix_narrowing() {
         let p = tmp_csv("fastcache", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
 
         assert_eq!(bf.run_filter(&spec_one(2, "beijing")).unwrap(), 2);
         let st = bf.last_filter_stats();
-        assert!(!st.used_cache, "首次无缓存，应走全表字节扫描");
         assert_eq!(st.scanned_rows, 5);
-        assert_eq!(st.cached_cols, 1, "应只缓存被筛选的列");
-        assert!(st.cache_bytes > 0);
 
-        // 同列新关键字：走缓存（语义相同）
+        // 同列新关键字：无缓存可用，整列重扫（结果不变）
         assert_eq!(bf.run_filter(&spec_one(2, "shang")).unwrap(), 2);
         let st = bf.last_filter_stats();
-        assert!(st.used_cache, "第二次应命中列缓存");
         assert_eq!(st.scanned_rows, 5);
 
         // 前缀收窄：上次 "shang" 命中 2 行，本次只扫这 2 行
         assert_eq!(bf.run_filter(&spec_one(2, "shangha")).unwrap(), 2);
         let st = bf.last_filter_stats();
         assert_eq!(st.scanned_rows, 2, "前缀收窄应只扫旧命中行");
-        assert!(st.used_cache);
 
         // 完全相同条件：直接返回，0 行扫描
         assert_eq!(bf.run_filter(&spec_one(2, "shangha")).unwrap(), 2);
         assert_eq!(bf.last_filter_stats().scanned_rows, 0);
 
-        // 编辑该列（Alice Beijing → Shanghai）→ 缓存失效 + 收窄基准失效，必须全扫
+        // 编辑该列（Alice Beijing → Shanghai）→ 收窄基准失效，必须全扫
         bf.set_cell(0, 2, "Shanghai".into()).unwrap();
         assert_eq!(bf.run_filter(&spec_one(2, "beijing")).unwrap(), 1);
         let st = bf.last_filter_stats();
-        assert!(!st.used_cache, "编辑后该列缓存已丢，应重新全扫");
         assert_eq!(st.scanned_rows, 5, "编辑后应退回全扫，不能用旧命中收窄");
 
-        // 撤销：值回到 Beijing，缓存再失效，重新全扫后命中恢复 2
+        // 撤销：值回到 Beijing，重新全扫后命中恢复 2
         assert!(bf.undo());
         assert_eq!(bf.run_filter(&spec_one(2, "beijing")).unwrap(), 2);
         assert_eq!(bf.last_filter_stats().scanned_rows, 5);
@@ -1763,25 +1975,22 @@ mod tests {
         fs::remove_file(&p).ok();
     }
 
-    /// 多列筛选建多列缓存；插入行不进缓存但仍参与匹配。
+    /// 多列筛选不建任何列缓存；插入行不进索引但仍参与匹配。
     #[test]
-    fn big_filter_cache_multi_column_and_inserted_rows() {
+    fn big_filter_no_cache_multi_column_and_inserted_rows() {
         let p = tmp_csv("fastmulti", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
-        // 建 name+city 两列缓存
         let spec = FilterSpec {
             cols: vec![(0, "a".into()), (2, "beijing".into())],
             multi_cols: vec![],
             multi_text: String::new(),
         };
         assert_eq!(bf.run_filter(&spec).unwrap(), 2);
-        assert_eq!(bf.last_filter_stats().cached_cols, 2);
 
-        // 纯多重筛选走缓存
+        // 纯多重筛选：直扫命中
         assert_eq!(bf.run_filter(&spec_multi(vec![0, 2], "carol")).unwrap(), 1);
-        assert!(bf.last_filter_stats().used_cache);
 
-        // 插入一行（无源记录缓存），仍须被 OR 命中
+        // 插入一行（无源记录），仍须被 OR 命中
         bf.insert_rows(
             bf.meta().rows,
             Some(vec![vec!["carol2".into(), "99".into(), "Beijing".into()]]),
@@ -1939,7 +2148,7 @@ mod tests {
     }
 
     #[test]
-    fn big_headerless_filter_hits_first_row_and_uses_cache() {
+    fn big_headerless_filter_hits_first_row_without_cache() {
         let p = tmp_csv("hlfilter", b"alpha,1\r\nbeta,2\r\ngamma,3\r\n");
         let mut bf = BigFile::open_with(&p, true).unwrap();
         assert_eq!(bf.run_filter(&spec_one(0, "alpha")).unwrap(), 1);
@@ -1950,12 +2159,10 @@ mod tests {
         );
         let st = bf.last_filter_stats();
         assert_eq!(st.scanned_rows, 3);
-        assert_eq!(st.cached_cols, 1);
-        // 同列新关键字走缓存，命中正确
+        // 同列新关键字直扫，命中正确
         assert_eq!(bf.run_filter(&spec_one(0, "bet")).unwrap(), 1);
-        assert!(bf.last_filter_stats().used_cache);
         assert_eq!(bf.filter_page(0, 1)[0], vec!["beta", "2"]);
-        // 编辑首行 → 缓存失效后仍能命中
+        // 编辑首行后仍能命中
         bf.set_cell(0, 0, "ALPHA".into()).unwrap();
         assert_eq!(bf.run_filter(&spec_one(0, "alp")).unwrap(), 1);
         assert_eq!(bf.filter_page(0, 1)[0][0], "ALPHA");
@@ -2069,11 +2276,10 @@ mod tests {
     }
 
     #[test]
-    fn big_headerless_toggle_clears_filter_cache_and_undo() {
+    fn big_headerless_toggle_clears_filter_and_undo() {
         let p = tmp_csv("hlclear", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         assert_eq!(bf.run_filter(&spec_one(2, "beijing")).unwrap(), 2);
-        assert!(bf.last_filter_stats().cached_cols > 0);
         bf.set_cell(0, 1, "31".into()).unwrap();
         assert!(bf.meta().can_undo);
         bf.set_headerless(true).unwrap();
@@ -2081,7 +2287,6 @@ mod tests {
         assert_eq!(bf.filter_len(), 0);
         assert!(!bf.meta().can_undo, "切换清空撤销");
         assert!(!bf.meta().can_redo);
-        assert!(bf.col_cache.is_empty(), "切换丢弃列缓存");
         // 开关是视图属性：不改变文件
         assert_eq!(fs::read(&p).unwrap(), people_csv());
         fs::remove_file(&p).ok();
@@ -2581,22 +2786,62 @@ mod tests {
         fs::remove_file(&p).ok();
     }
 
-    /// 打印一次筛选的耗时与引擎统计。
+    /// 打印一次筛选的耗时与引擎统计（含进程私有内存——验证直扫 mmap 零增长）。
     fn bench_timed(bf: &mut BigFile, spec: &FilterSpec, label: &str) {
         let t = std::time::Instant::now();
         let n = bf.run_filter(spec).unwrap();
         let st = bf.last_filter_stats();
         eprintln!(
-            "{label:<28} 命中 {n:>9} | 扫 {:>9} 行 | cache={} cols={} {:.0}MB | {:?}",
+            "{label:<28} 命中 {n:>9} | 扫 {:>9} 行 | 私有 {:>7.1}MB | {:?}",
             st.scanned_rows,
-            st.used_cache,
-            st.cached_cols,
-            st.cache_bytes as f64 / (1u64 << 20) as f64,
+            private_bytes() as f64 / (1u64 << 20) as f64,
             t.elapsed()
         );
     }
 
-    /// 大文件筛选基准：首筛建缓存 / 缓存复用 / 前缀收窄 / 中文关键字。
+    /// 当前进程私有提交内存（字节）。Windows 走 K32GetProcessMemoryInfo
+    ///（kernel32，无新依赖）；其他平台恒 0（基准只在本机手工跑）。
+    #[cfg(windows)]
+    fn private_bytes() -> u64 {
+        #[repr(C)]
+        struct Pmc {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_nonpaged_pool_usage: usize,
+            quota_nonpaged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+        }
+        extern "C" {
+            fn GetCurrentProcess() -> *mut core::ffi::c_void;
+            fn K32GetProcessMemoryInfo(
+                process: *mut core::ffi::c_void,
+                counters: *mut Pmc,
+                cb: u32,
+            ) -> i32;
+        }
+        let mut pmc: Pmc = unsafe { std::mem::zeroed() };
+        pmc.cb = std::mem::size_of::<Pmc>() as u32;
+        let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) };
+        if ok != 0 {
+            pmc.pagefile_usage as u64
+        } else {
+            0
+        }
+    }
+
+    /// 非 Windows 平台占位（基准只在本机手工跑）。
+    #[cfg(not(windows))]
+    fn private_bytes() -> u64 {
+        0
+    }
+
+    /// 大文件筛选基准：首筛直扫 / 同列重扫 / 前缀收窄 / 中文关键字。
+    /// 每次筛选打印进程私有内存——无列投影缓存，多列筛选后增量应 ≈ 0。
     /// `cargo test --release --lib bench_big_filter -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -2606,21 +2851,21 @@ mod tests {
         let mut bf = BigFile::open(&path).unwrap();
         eprintln!("open: {:?}, rows={}", t.elapsed(), bf.meta().rows);
 
-        // 1) 首筛（无缓存，整表字节扫描 + 建 user 列缓存）
+        // 1) 首筛（整表字节直扫，不建任何投影）
         bench_timed(&mut bf, &spec_one(1, "user-377"), "首筛 ASCII user-377");
-        // 2) 同列再筛（读列缓存）
-        bench_timed(&mut bf, &spec_one(1, "user-378"), "缓存复用 user-378");
-        // 3) 缓存列上逐字收窄
+        // 2) 同列换关键字：无缓存，整列重扫
+        bench_timed(&mut bf, &spec_one(1, "user-378"), "同列重扫 user-378");
+        // 3) 逐字收窄（只扫上次命中行）
         bench_timed(&mut bf, &spec_one(1, "user-37"), "收窄基 user-37");
         bench_timed(&mut bf, &spec_one(1, "user-377"), "收窄 user-377");
-        // 4) 长备注列（单列缓存超预算 → 永久跳过建缓存）
+        // 4) 长备注列首筛
         bench_timed(&mut bf, &spec_one(6, "batch-777"), "首筛 note batch-777");
         // 5) 前缀收窄（上一轮命中行）
         bench_timed(&mut bf, &spec_one(6, "batch-777 "), "收窄 batch-777 空格");
-        // 6) 中文关键字首筛（无缓存）
+        // 6) 中文关键字首筛
         bench_timed(&mut bf, &spec_one(2, "朝阳"), "首筛 CJK 朝阳");
-        // 7) 中文列缓存复用
-        bench_timed(&mut bf, &spec_one(2, "浦东"), "缓存复用 CJK 浦东");
+        // 7) 中文同列重扫
+        bench_timed(&mut bf, &spec_one(2, "浦东"), "同列重扫 CJK 浦东");
     }
 }
 
@@ -2903,40 +3148,11 @@ pub struct FilterSpec {
     pub multi_text: String,
 }
 
-/// 列投影缓存总预算（仅统计 data + offsets 常驻部分）。
-const COL_CACHE_BUDGET: usize = 512 * 1024 * 1024;
-
-/// 一次筛选的执行统计（状态栏/测试用）。
+/// 一次筛选的执行统计（测试/基准用：直扫 mmap，无任何列投影缓存）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FilterStats {
     /// 实际参与匹配的行数（前缀收窄时小于总行数；完全相同条件为 0）。
     pub scanned_rows: u64,
-    /// 本次是否全走列投影缓存。
-    pub used_cache: bool,
-    /// 当前缓存列数。
-    pub cached_cols: usize,
-    /// 当前缓存占用字节数。
-    pub cache_bytes: usize,
-}
-
-/// 单列投影缓存：源记录值（解码后全小写 UTF-8）拼接 + 每记录起止偏移。
-/// offsets 长度恒为「源记录数 + 1」，源记录号即数据记录下标（不含表头）。
-struct ColCache {
-    data: Vec<u8>,
-    offs: Vec<u32>,
-}
-
-impl ColCache {
-    #[inline]
-    fn get(&self, rec: usize) -> &[u8] {
-        let a = self.offs[rec] as usize;
-        let b = self.offs[rec + 1] as usize;
-        &self.data[a..b]
-    }
-
-    fn size(&self) -> usize {
-        self.data.len() + self.offs.len() * std::mem::size_of::<u32>()
-    }
 }
 
 /// 打开后的元数据。
@@ -2982,38 +3198,9 @@ struct Needle {
     hit: bool,
 }
 
-/// 扫描期间的单列缓存构建器（一个并行块一份）。
-struct BuildTrack {
-    col: u32,
-    values: Vec<u8>,
-    offs: Vec<u32>,
-    first_rec: Option<u32>,
-    last_rec: u32,
-    failed: bool,
-}
-
-/// 并行块产出的缓存片段。
-struct BuildOut {
-    col: u32,
-    first_rec: u32,
-    last_rec: u32,
-    offs: Vec<u32>,
-    values: Vec<u8>,
-}
-
-/// 单列缓存合并结果。
-enum MergedBuild {
-    Cache(ColCache),
-    /// 单列体积超过预算/4 GiB，永久放弃。
-    TooBig,
-    /// 片段越界（理论上不出现），本次放弃。
-    Invalid,
-}
-
 /// 一次分块扫描的结果。
 struct ChunkOut {
     hits: Vec<u32>,
-    builds: Vec<BuildOut>,
     rows: u64,
 }
 
@@ -3041,21 +3228,23 @@ impl RowSource<'_> {
     }
 }
 
-/// 字节级字段扫描器：引号感知解析，逐字段匹配 + 顺带构建列投影缓存。
+/// 字节级字段扫描器：引号感知解析，逐字段匹配（不建任何投影缓存）。
 struct FieldScan<'a> {
     enc: Encoding,
     overlay: &'a HashMap<(u32, u32), String>,
     needles: Vec<Needle>,
     needle_by_col: HashMap<u32, Vec<usize>>,
-    builds: Vec<BuildTrack>,
-    build_by_col: HashMap<u32, usize>,
-    /// 列 → 位标记：1 = 参与匹配，2 = 需要建缓存。
+    /// 列 → 位标记：1 = 参与匹配。
     col_flags: Vec<u8>,
-    /// 字段原始内容（GBK 保留完整双字节对），供建缓存与非 ASCII 匹配解码用。
+    /// 字段原始内容（GBK 保留完整双字节对），供非 ASCII 匹配解码用。
     field_buf: Vec<u8>,
     /// 字段的 ASCII 可匹配字节：GBK 次字节不入内，避免次字节误中 ASCII 关键字。
     match_buf: Vec<u8>,
     has_multi: bool,
+    /// 快路径引号位缓冲（逐记录复用；无引号记录零分配）。
+    quote_pos: Vec<u32>,
+    /// 快路径引号区间表：扁平 (open, close) 对；close == 记录长表示未闭合。
+    quote_iv: Vec<u32>,
 }
 
 impl<'a> FieldScan<'a> {
@@ -3066,13 +3255,11 @@ impl<'a> FieldScan<'a> {
     /// - `enc`: 文件编码（GBK 需要跳过双字节次字节）。
     /// - `overlay`: 单元格覆盖层（编辑值优先于原始字节）。
     /// - `ncols`: 物理列数。
-    /// - `build_cols`: 本次需要构建缓存的物理列。
     fn new(
         spec: &FilterSpec,
         enc: Encoding,
         overlay: &'a HashMap<(u32, u32), String>,
         ncols: usize,
-        build_cols: &[u32],
     ) -> Self {
         let mut needles = Vec::new();
         let mut needle_by_col: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -3106,68 +3293,21 @@ impl<'a> FieldScan<'a> {
                 col_flags[*col as usize] |= 1;
             }
         }
-        let mut builds = Vec::with_capacity(build_cols.len());
-        let mut build_by_col = HashMap::new();
-        for &col in build_cols {
-            let bi = builds.len();
-            builds.push(BuildTrack {
-                col,
-                values: Vec::new(),
-                offs: Vec::new(),
-                first_rec: None,
-                last_rec: 0,
-                failed: false,
-            });
-            build_by_col.insert(col, bi);
-            if (col as usize) < ncols {
-                col_flags[col as usize] |= 2;
-            }
-        }
         Self {
             enc,
             overlay,
             needles,
             needle_by_col,
-            builds,
-            build_by_col,
             col_flags,
             field_buf: Vec::new(),
             match_buf: Vec::new(),
             has_multi: !spec.multi_text.is_empty(),
+            quote_pos: Vec::new(),
+            quote_iv: Vec::new(),
         }
     }
 
-    /// 源记录开始：为删除行留出的空洞补空值偏移。
-    fn begin_src_record(&mut self, rec: u32) {
-        for b in &mut self.builds {
-            if b.failed {
-                continue;
-            }
-            if b.first_rec.is_some() {
-                // 被删除行留下的空洞：每个空洞补一个起止相同的偏移。
-                while b.last_rec + 1 < rec {
-                    b.offs.push(b.values.len() as u32);
-                    b.last_rec += 1;
-                }
-            } else {
-                b.first_rec = Some(rec);
-                b.offs.push(b.values.len() as u32);
-            }
-            // 无论首行还是后续行，都必须推进到当前记录，否则后续空洞计算会多补偏移。
-            b.last_rec = rec;
-        }
-    }
-
-    /// 源记录结束：记录本行在缓存值中的结束偏移。
-    fn finish_src_record(&mut self) {
-        for b in &mut self.builds {
-            if b.first_rec.is_some() && !b.failed {
-                b.offs.push(b.values.len() as u32);
-            }
-        }
-    }
-
-    /// 字段结束：匹配该列关键字（覆盖层优先），并追加缓存值。
+    /// 字段结束：匹配该列关键字（覆盖层优先）。
     fn end_field(&mut self, rec: u32, col: u32) {
         let flag = self
             .col_flags
@@ -3203,29 +3343,11 @@ impl<'a> FieldScan<'a> {
                 }
             }
         }
-        if flag & 2 != 0 {
-            if let Some(&bi) = self.build_by_col.get(&col) {
-                match overlay_val {
-                    Some(v) => append_lower_str(&mut self.builds[bi].values, v),
-                    None => append_lower_bytes(
-                        &mut self.builds[bi].values,
-                        &self.field_buf,
-                        self.enc,
-                    ),
-                }
-                if self.builds[bi].values.len() > u32::MAX as usize {
-                    self.builds[bi].failed = true;
-                    self.builds[bi].values.clear();
-                    self.builds[bi].offs.clear();
-                }
-            }
-        }
         self.field_buf.clear();
         self.match_buf.clear();
     }
 
     /// 已扫描到第 `finalized_col` 列时，是否已可断定本行不匹配。
-    /// 只在不需要建缓存（可以提前退出）时调用。
     fn definitely_fails(&self, finalized_col: u32) -> bool {
         let mut multi_hit = false;
         let mut multi_later = false;
@@ -3259,7 +3381,20 @@ impl<'a> FieldScan<'a> {
     }
 
     /// 扫描一条源记录（`bytes` 为原始字节区间，含结尾换行与引号内换行）。
+    ///
+    /// 两级分发：GBK 且记录含非 ASCII 字节 → 标量状态机（双字节吞字节语义
+    /// 逐字节依赖记录流，只有标量保证逐位一致）；其余 → memchr 驱动快路径。
     fn record_matches(&mut self, rec: u32, bytes: &[u8]) -> bool {
+        if self.enc == Encoding::Gbk && !bytes.is_ascii() {
+            self.record_matches_scalar(rec, bytes)
+        } else {
+            self.record_matches_fast(rec, bytes)
+        }
+    }
+
+    /// 标量状态机（逐字节）。GBK 双字节记录的正确性基准；同时是快路径的
+    /// 对拍参照——任何语义分歧以本函数为准。
+    fn record_matches_scalar(&mut self, rec: u32, bytes: &[u8]) -> bool {
         for n in &mut self.needles {
             n.hit = false;
         }
@@ -3290,7 +3425,7 @@ impl<'a> FieldScan<'a> {
                     // GBK 双字节整体保留（次字节可能落在 ASCII 范围）
                     if self.enc == Encoding::Gbk && b >= 0x81 && i + 1 < n {
                         if collect {
-                            // 缓存/非 ASCII 匹配需要完整双字节；ASCII 匹配只放首字节，
+                            // 非 ASCII 匹配需要完整双字节；ASCII 匹配只放首字节，
                             // 否则次字节可能是 'a'..'z' 造成误中。
                             self.field_buf.push(b);
                             self.field_buf.push(bytes[i + 1]);
@@ -3313,7 +3448,7 @@ impl<'a> FieldScan<'a> {
                     }
                     b',' => {
                         self.end_field(rec, col);
-                        if self.builds.is_empty() && self.definitely_fails(col) {
+                        if self.definitely_fails(col) {
                             return false;
                         }
                         col += 1;
@@ -3348,56 +3483,180 @@ impl<'a> FieldScan<'a> {
         }
     }
 
-    /// 取出本块构建好的缓存片段（丢弃失败的/无源行的列）。
-    fn into_builds(self) -> Vec<BuildOut> {
-        self.builds
-            .into_iter()
-            .filter_map(|b| {
-                if b.failed {
-                    return None;
+    /// 该列是否参与匹配（快路径对未参与列零拷贝跳过）。
+    #[inline]
+    fn participates(&self, col: u32) -> bool {
+        (col as usize) < self.col_flags.len() && self.col_flags[col as usize] != 0
+    }
+
+    /// 测试用：该记录在两级分发中是否走快路径。
+    #[cfg(test)]
+    fn route_fast(&self, bytes: &[u8]) -> bool {
+        !(self.enc == Encoding::Gbk && !bytes.is_ascii())
+    }
+
+    /// memchr 驱动快路径（UTF-8 全部 + GBK 纯 ASCII）：引号区间表 + SIMD 界符
+    /// 搜索，未参与列零拷贝跳过。与 `record_matches_scalar` 语义逐位一致
+    ///（特征化测试 + 固定种子随机对拍双保险）。
+    fn record_matches_fast(&mut self, rec: u32, bytes: &[u8]) -> bool {
+        for nd in &mut self.needles {
+            nd.hit = false;
+        }
+        let n = bytes.len();
+        // 1) 引号位收集（缓冲逐记录复用；无引号记录首个 memchr 即 None，零分配）
+        self.quote_pos.clear();
+        let mut off = 0usize;
+        while let Some(p) = memchr::memchr(b'"', &bytes[off..]) {
+            self.quote_pos.push((off + p) as u32);
+            off += p + 1;
+        }
+        // 2) 引号状态机 → 区间表（take 到局部变量，绕开后续 &mut self 借用）。
+        //    转义对坍缩只在引号态内判定：非引号态的相邻对 = 开 + 关 = 净零切换，
+        //    与标量逐位一致（奇数连引、未闭合截断由特征化测试钉住）。
+        let mut iv = std::mem::take(&mut self.quote_iv);
+        iv.clear();
+        {
+            let mut k = 0usize;
+            let mut open = -1i64;
+            while k < self.quote_pos.len() {
+                let p = self.quote_pos[k] as usize;
+                if open < 0 {
+                    open = p as i64;
+                    k += 1;
+                } else if k + 1 < self.quote_pos.len() && self.quote_pos[k + 1] as usize == p + 1 {
+                    k += 2; // 引号态内相邻对 = "" 转义，留在引号态
+                } else {
+                    iv.push(open as u32);
+                    iv.push(p as u32);
+                    open = -1;
+                    k += 1;
                 }
-                b.first_rec.map(|first| BuildOut {
-                    col: b.col,
-                    first_rec: first,
-                    last_rec: b.last_rec,
-                    offs: b.offs,
-                    values: b.values,
-                })
-            })
-            .collect()
+            }
+            if open >= 0 {
+                iv.push(open as u32);
+                iv.push(n as u32); // 未闭合：吞到记录尾（标量同语义）
+            }
+        }
+        // 3) 界符搜索主循环：memchr3（SIMD）找 , \r \n；落引号区间内的候选
+        //    是内容，跳到闭引号之后续搜（区间游标单调推进，摊还 O(1)）。
+        let mut field_start = 0usize;
+        let mut col = 0u32;
+        let mut pos = 0usize;
+        let mut iv_i = 0usize;
+        let result = loop {
+            let b = match memchr::memchr3(b',', b'\r', b'\n', &bytes[pos..]) {
+                Some(x) => pos + x,
+                None => {
+                    // 尾字段 [field_start, n)：末行无换行也按记录结束处理
+                    if self.participates(col) {
+                        assemble_field(
+                            &mut self.field_buf,
+                            &mut self.match_buf,
+                            bytes,
+                            field_start,
+                            n,
+                            &iv,
+                        );
+                        self.end_field(rec, col);
+                    }
+                    break self.record_result();
+                }
+            };
+            while iv_i + 1 < iv.len() && (iv[iv_i + 1] as usize) < b {
+                iv_i += 2; // 区间整体在候选之前，过
+            }
+            if iv_i + 1 < iv.len() {
+                let (o, c) = (iv[iv_i] as usize, iv[iv_i + 1] as usize);
+                if o < b && b < c {
+                    pos = (c + 1).min(n); // 候选是引号内界符：跳过本区间
+                    continue;
+                }
+            }
+            // 真实界符
+            if self.participates(col) {
+                assemble_field(
+                    &mut self.field_buf,
+                    &mut self.match_buf,
+                    bytes,
+                    field_start,
+                    b,
+                    &iv,
+                );
+                self.end_field(rec, col);
+            }
+            if self.definitely_fails(col) {
+                break false;
+            }
+            col += 1;
+            if bytes[b] == b',' {
+                field_start = b + 1;
+                pos = b + 1;
+            } else {
+                break self.record_result(); // \r 或 \n：记录结束
+            }
+        };
+        self.quote_iv = iv;
+        result
     }
 }
 
-/// 追加全小写 UTF-8 字节（ASCII 走字节折叠快路径）。
-fn append_lower_bytes(dst: &mut Vec<u8>, raw: &[u8], enc: Encoding) {
-    if raw.is_ascii() {
-        dst.extend(raw.iter().map(|b| b.to_ascii_lowercase()));
-        return;
+/// 把 bytes[fs..fe] 的字段内容按标量语义组装进两个缓冲：引号剥离、
+/// "" 对坍缩成单引号、ASCII 逐字节折叠。仅用于 UTF-8 / 纯 ASCII 记录
+///（无 GBK 吞字节）；两缓冲内容相同（与标量非 GBK 分支逐位一致）。
+///
+/// # Parameters
+/// - `field_buf`/`match_buf`: 目标缓冲（追加写入，清空由 end_field 负责）。
+/// - `bytes`: 整条记录原始字节。
+/// - `fs`/`fe`: 字段字节区间（含引号字符）。
+/// - `iv`: 扁平 (open, close) 引号区间表；close == 记录长表示未闭合。
+fn assemble_field(
+    field_buf: &mut Vec<u8>,
+    match_buf: &mut Vec<u8>,
+    bytes: &[u8],
+    fs: usize,
+    fe: usize,
+    iv: &[u32],
+) {
+    let base = field_buf.len();
+    let mut cur = fs;
+    let mut k = 0usize;
+    // 界符必在引号外，故区间不会跨过字段界：要么内包于字段，要么整体在外
+    while k + 1 < iv.len() {
+        let (o, c) = (iv[k] as usize, iv[k + 1] as usize);
+        k += 2;
+        if c < fs {
+            continue;
+        }
+        if o >= fe {
+            break;
+        }
+        debug_assert!(o >= fs, "引号区间不应跨过字段界");
+        if cur < o {
+            field_buf.extend_from_slice(&bytes[cur..o]);
+        }
+        // 引号区内容 (o+1..c)：区间内的引号必为转义对，坍缩成单引号
+        let mut q = o + 1;
+        let qend = c.min(fe);
+        while q < qend {
+            match memchr::memchr(b'"', &bytes[q..qend]) {
+                Some(p) => {
+                    field_buf.extend_from_slice(&bytes[q..q + p]);
+                    field_buf.push(b'"');
+                    q += p + 2;
+                }
+                None => {
+                    field_buf.extend_from_slice(&bytes[q..qend]);
+                    break;
+                }
+            }
+        }
+        cur = c + 1; // 闭引号不入内容
     }
-    let text = decode_slice(enc, raw);
-    if text.is_ascii() {
-        dst.extend(text.bytes().map(|b| b.to_ascii_lowercase()));
-    } else {
-        dst.extend_from_slice(text.to_lowercase().as_bytes());
+    if cur < fe {
+        field_buf.extend_from_slice(&bytes[cur..fe]);
     }
-}
-
-/// 追加字符串的全小写 UTF-8 字节。
-fn append_lower_str(dst: &mut Vec<u8>, s: &str) {
-    if s.is_ascii() {
-        dst.extend(s.bytes().map(|b| b.to_ascii_lowercase()));
-    } else {
-        dst.extend_from_slice(s.to_lowercase().as_bytes());
-    }
-}
-
-/// 条件涉及的物理列集合（多重筛选仅在关键字非空时参与）。
-fn requested_cols(spec: &FilterSpec) -> BTreeSet<u32> {
-    let mut cols: BTreeSet<u32> = spec.cols.iter().map(|(c, _)| *c).collect();
-    if !spec.multi_text.is_empty() {
-        cols.extend(spec.multi_cols.iter().copied());
-    }
-    cols
+    field_buf[base..].make_ascii_lowercase();
+    match_buf.extend_from_slice(&field_buf[base..]);
 }
 
 /// 新条件能否在旧命中集上收窄：列结构一致，且每个关键字都以前一版为前缀。
@@ -3754,12 +4013,6 @@ pub struct BigFile {
     filter: Option<Vec<u32>>,
     /// 上次完成的筛选条件（前缀收窄 / 完全相同条件直接返回）。
     last_spec: Option<FilterSpec>,
-    /// 列投影缓存（物理列号 → 值），LRU 受 `COL_CACHE_BUDGET` 约束。
-    col_cache: HashMap<u32, ColCache>,
-    cache_lru: VecDeque<u32>,
-    cache_bytes: usize,
-    /// 单列体积超过预算、永久放弃缓存的物理列（重载/保存后清空）。
-    cache_skip: std::collections::HashSet<u32>,
     filter_stats: FilterStats,
     undo_stack: Vec<Op>,
     redo_stack: Vec<Op>,
@@ -3859,10 +4112,6 @@ impl BigFile {
             pending_cols: Vec::new(),
             filter: None,
             last_spec: None,
-            col_cache: HashMap::new(),
-            cache_lru: VecDeque::new(),
-            cache_bytes: 0,
-            cache_skip: std::collections::HashSet::new(),
             filter_stats: FilterStats::default(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -4044,10 +4293,6 @@ impl BigFile {
             pending_cols: Vec::new(),
             filter: None,
             last_spec: None,
-            col_cache: HashMap::new(),
-            cache_lru: VecDeque::new(),
-            cache_bytes: 0,
-            cache_skip: std::collections::HashSet::new(),
             filter_stats: FilterStats::default(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -4895,11 +5140,8 @@ impl BigFile {
         if old == value {
             return Ok(());
         }
-        // 收窄基准必然失效；源值变化还要丢掉该列投影缓存
+        // 收窄基准必然失效（下一次筛选退回全扫）
         self.last_spec = None;
-        if matches!(cell, CellId::Src { .. }) {
-            self.cache_drop(col);
-        }
         match cell {
             CellId::Src { rec, col } => {
                 self.overlay.insert((rec, col), value.clone());
@@ -5084,8 +5326,7 @@ impl BigFile {
     /// 撤销。
     pub fn undo(&mut self) -> bool {
         let Some(op) = self.undo_stack.pop() else { return false };
-        // 覆盖层/行结构都可能回退：缓存与收窄基准一律作废
-        self.cache_clear_all();
+        // 覆盖层/行结构都可能回退：收窄基准作废
         self.last_spec = None;
         let restored = self.apply_inverse(&op);
         self.redo_stack.push(restored);
@@ -5096,7 +5337,6 @@ impl BigFile {
     /// 重做。
     pub fn redo(&mut self) -> bool {
         let Some(op) = self.redo_stack.pop() else { return false };
-        self.cache_clear_all();
         self.last_spec = None;
         let normalized = self.apply(&op);
         self.undo_stack.push(normalized);
@@ -5268,12 +5508,7 @@ impl BigFile {
 
         // 完全相同条件：直接复用上次结果（编辑/插删/撤销都会清空 last_spec）
         if self.filter.is_some() && self.last_spec.as_ref() == Some(&spec) {
-            self.filter_stats = FilterStats {
-                scanned_rows: 0,
-                used_cache: self.cache_covers(&spec),
-                cached_cols: self.col_cache.len(),
-                cache_bytes: self.cache_bytes,
-            };
+            self.filter_stats = FilterStats { scanned_rows: 0 };
             return Ok(Some(self.filter_len()));
         }
 
@@ -5282,12 +5517,7 @@ impl BigFile {
             let all: Vec<u32> = (0..total as u32).collect();
             self.filter = Some(all);
             self.last_spec = Some(spec);
-            self.filter_stats = FilterStats {
-                scanned_rows: total,
-                used_cache: false,
-                cached_cols: self.col_cache.len(),
-                cache_bytes: self.cache_bytes,
-            };
+            self.filter_stats = FilterStats { scanned_rows: total };
             return Ok(Some(total as u32));
         }
 
@@ -5295,16 +5525,9 @@ impl BigFile {
         if !spec.multi_text.is_empty() && spec.multi_cols.is_empty() {
             self.filter = Some(Vec::new());
             self.last_spec = Some(spec);
-            self.filter_stats = FilterStats {
-                scanned_rows: 0,
-                used_cache: false,
-                cached_cols: self.col_cache.len(),
-                cache_bytes: self.cache_bytes,
-            };
+            self.filter_stats = FilterStats { scanned_rows: 0 };
             return Ok(Some(0));
         }
-
-        let use_cache = self.cache_covers(&spec);
 
         // 前缀收窄：同列结构 + 关键字逐字追加 → 只扫上次命中行
         let narrow = self
@@ -5312,23 +5535,6 @@ impl BigFile {
             .as_ref()
             .filter(|prev| can_narrow(prev, &spec))
             .and_then(|_| self.filter.take());
-        let narrowing = narrow.is_some();
-
-        // 缺缓存且本次是全扫：顺带建缓存（收窄只有命中行，建不出全列缓存）。
-        // 排序视图按显示顺序扫描，物理记录号是无序的；列缓存构建器/合并器
-        // 假定记录号递增，故排序时只读已有缓存、不新建（否则会写入空投影，
-        // 下一次筛选命中数变成 0）。缓存键是物理记录号，排序前建好的仍可复用。
-        let build_cols: Vec<u32> = if self.order.is_some() || narrowing || use_cache {
-            Vec::new()
-        } else {
-            requested_cols(&spec)
-                .into_iter()
-                .filter(|&c| (c as usize) < self.base_ncols)
-                .filter(|c| {
-                    !self.col_cache.contains_key(c) && !self.cache_skip.contains(c)
-                })
-                .collect()
-        };
 
         let source = match narrow.as_deref() {
             Some(rows) => RowSource::Subset(rows),
@@ -5341,7 +5547,7 @@ impl BigFile {
             .map(|ci| {
                 let start = ci as u64 * chunk;
                 let end = (start + chunk).min(source.len());
-                self.scan_chunk(&spec, use_cache, &build_cols, gate, source, start, end)
+                self.scan_chunk(&spec, gate, source, start, end)
             })
             .collect();
 
@@ -5354,36 +5560,16 @@ impl BigFile {
         }
 
         let mut all: Vec<u32> = Vec::new();
-        let mut builds: HashMap<u32, Vec<BuildOut>> = HashMap::new();
         let mut scanned = 0u64;
         for part in parts.into_iter().flatten() {
             scanned += part.rows;
             all.extend(part.hits);
-            for b in part.builds {
-                builds.entry(b.col).or_default().push(b);
-            }
-        }
-
-        // 合并块内片段 → 装入列缓存（LRU/预算由 cache_put 负责）
-        for (col, chunks) in builds {
-            match self.merge_builds(&chunks) {
-                MergedBuild::Cache(cache) => self.cache_put(col, cache),
-                MergedBuild::TooBig => {
-                    self.cache_skip.insert(col);
-                }
-                MergedBuild::Invalid => {}
-            }
         }
 
         let n = all.len() as u32;
         self.filter = Some(all);
         self.last_spec = Some(spec);
-        self.filter_stats = FilterStats {
-            scanned_rows: scanned,
-            used_cache: use_cache,
-            cached_cols: self.col_cache.len(),
-            cache_bytes: self.cache_bytes,
-        };
+        self.filter_stats = FilterStats { scanned_rows: scanned };
         Ok(Some(n))
     }
 
@@ -5391,49 +5577,13 @@ impl BigFile {
     fn scan_chunk(
         &self,
         spec: &FilterSpec,
-        use_cache: bool,
-        build_cols: &[u32],
         gate: Option<(&AtomicU64, u64)>,
         source: RowSource,
         start: u64,
         end: u64,
     ) -> Option<ChunkOut> {
         let mut hits = Vec::new();
-        if use_cache {
-            for i in start..end {
-                if let Some((g, id)) = gate {
-                    if i & 0xFFF == 0 && g.load(Ordering::Relaxed) != id {
-                        return None;
-                    }
-                }
-                let d = source.get(i) as u32;
-                if let Some(resolved) = self.seg.resolve(self.orig_vrow(d as u64)) {
-                    let hit = match resolved {
-                        ResolvedRow::Src(rec) => self.cache_match(spec, rec),
-                        // 插入行不在列缓存中：走一次慢路径（通常极少）
-                        ResolvedRow::Ins { .. } => self
-                            .row_at(d as u64)
-                            .is_some_and(|f| spec_matches(spec, &f)),
-                    };
-                    if hit {
-                        hits.push(d); // 命中集统一存显示位置
-                    }
-                }
-            }
-            return Some(ChunkOut {
-                hits,
-                builds: Vec::new(),
-                rows: end - start,
-            });
-        }
-
-        let mut scan = FieldScan::new(
-            spec,
-            self.enc,
-            &self.overlay,
-            self.base_ncols,
-            build_cols,
-        );
+        let mut scan = FieldScan::new(spec, self.enc, &self.overlay, self.base_ncols);
         for i in start..end {
             if let Some((g, id)) = gate {
                 if i & 0xFFF == 0 && g.load(Ordering::Relaxed) != id {
@@ -5447,10 +5597,7 @@ impl BigFile {
                     let (s, e) = self
                         .src_span(rec)
                         .unwrap_or((0, 0));
-                    scan.begin_src_record(rec);
-                    let hit = scan.record_matches(rec, &self.bytes()[s..e]);
-                    scan.finish_src_record();
-                    if hit {
+                    if scan.record_matches(rec, &self.bytes()[s..e]) {
                         hits.push(d);
                     }
                 }
@@ -5467,149 +5614,8 @@ impl BigFile {
         }
         Some(ChunkOut {
             hits,
-            builds: scan.into_builds(),
             rows: end - start,
         })
-    }
-
-    /// 合并一个列的各块缓存片段，得到按源记录号索引的连续投影。
-    fn merge_builds(&self, chunks: &[BuildOut]) -> MergedBuild {
-        let Some(head) = chunks.first() else {
-            return MergedBuild::Invalid;
-        };
-        let col = head.col;
-        // 缓存按物理记录号索引：记录 0 在无列名模式下也是数据。
-        let n_records = self.idx.n_records();
-        let mut data: Vec<u8> = Vec::new();
-        let mut offs = vec![0u32; n_records + 1];
-        let mut filled = 0usize;
-        for b in chunks {
-            if b.col != col {
-                return MergedBuild::Invalid;
-            }
-            let first = b.first_rec as usize;
-            if b.last_rec as usize >= n_records {
-                return MergedBuild::Invalid;
-            }
-            if first > filled {
-                // 块间空洞（被删除的源记录）→ 空值
-                while filled < first {
-                    offs[filled + 1] = data.len() as u32;
-                    filled += 1;
-                }
-            } else if first < filled {
-                return MergedBuild::Invalid; // 块重叠不应出现
-            }
-            for rec in first..=(b.last_rec as usize) {
-                let i = rec - first;
-                let (Some(&s), Some(&e)) = (b.offs.get(i), b.offs.get(i + 1))
-                else {
-                    return MergedBuild::Invalid;
-                };
-                let (s, e) = (s as usize, e as usize);
-                if s > e || e > b.values.len() {
-                    return MergedBuild::Invalid;
-                }
-                data.extend_from_slice(&b.values[s..e]);
-                if data.len() > COL_CACHE_BUDGET || data.len() > u32::MAX as usize {
-                    return MergedBuild::TooBig;
-                }
-                offs[rec + 1] = data.len() as u32;
-                filled = rec + 1;
-            }
-        }
-        while filled < n_records {
-            offs[filled + 1] = data.len() as u32;
-            filled += 1;
-        }
-        MergedBuild::Cache(ColCache { data, offs })
-    }
-
-    /// 条件涉及的所有列是否都已有缓存。
-    fn cache_covers(&self, spec: &FilterSpec) -> bool {
-        let mut any = false;
-        for (col, _) in &spec.cols {
-            any = true;
-            if !self.col_cache.contains_key(col) {
-                return false;
-            }
-        }
-        if !spec.multi_text.is_empty() {
-            any = true;
-            for col in &spec.multi_cols {
-                if !self.col_cache.contains_key(col) {
-                    return false;
-                }
-            }
-        }
-        any
-    }
-
-    /// 按列缓存匹配一条源记录（所有条件列必须已缓存）。
-    fn cache_match(&self, spec: &FilterSpec, rec: u32) -> bool {
-        let rec = rec as usize;
-        for (col, kw) in &spec.cols {
-            let Some(cache) = self.col_cache.get(col) else {
-                return false;
-            };
-            if memchr::memmem::find(cache.get(rec), kw.as_bytes()).is_none() {
-                return false;
-            }
-        }
-        if !spec.multi_text.is_empty() {
-            let mut hit = false;
-            for col in &spec.multi_cols {
-                if let Some(cache) = self.col_cache.get(col) {
-                    if memchr::memmem::find(cache.get(rec), spec.multi_text.as_bytes())
-                        .is_some()
-                    {
-                        hit = true;
-                        break;
-                    }
-                }
-            }
-            if !hit {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// 删除某列缓存（该列发生编辑时）。
-    fn cache_drop(&mut self, col: u32) {
-        if let Some(c) = self.col_cache.remove(&col) {
-            self.cache_bytes = self.cache_bytes.saturating_sub(c.size());
-            self.cache_lru.retain(|&x| x != col);
-        }
-    }
-
-    /// 装入列缓存：按 LRU 腾退，超预算或超 4 GiB 的单列永久放弃。
-    fn cache_put(&mut self, col: u32, cache: ColCache) {
-        let size = cache.size();
-        if size > COL_CACHE_BUDGET {
-            self.cache_skip.insert(col);
-            return;
-        }
-        self.cache_drop(col);
-        while self.cache_bytes + size > COL_CACHE_BUDGET {
-            let Some(old) = self.cache_lru.pop_front() else {
-                break;
-            };
-            if let Some(c) = self.col_cache.remove(&old) {
-                self.cache_bytes = self.cache_bytes.saturating_sub(c.size());
-            }
-        }
-        self.cache_bytes += size;
-        self.cache_lru.push_back(col);
-        self.col_cache.insert(col, cache);
-    }
-
-    /// 清空全部列缓存（重载/撤销重做时）。
-    fn cache_clear_all(&mut self) {
-        self.col_cache.clear();
-        self.cache_lru.clear();
-        self.cache_bytes = 0;
-        self.cache_skip.clear();
     }
 
     /// 是否有生效的筛选结果。
@@ -5622,7 +5628,7 @@ impl BigFile {
         self.filter.as_ref().map_or(0, |f| f.len() as u32)
     }
 
-    /// 清除筛选结果（列缓存保留，下次筛选仍可复用）。
+    /// 清除筛选结果与收窄基准。
     pub fn clear_filter(&mut self) {
         self.filter = None;
         self.last_spec = None;
@@ -5763,10 +5769,9 @@ impl BigFile {
             }
             self.headerless = on;
         }
-        // 开关是视图属性：筛选、收窄基准、列缓存、撤销历史全部作废
+        // 开关是视图属性：筛选、收窄基准、撤销历史全部作废
         self.filter = None;
         self.last_spec = None;
-        self.cache_clear_all();
         self.undo_stack.clear();
         self.redo_stack.clear();
         Ok(())
@@ -6158,7 +6163,6 @@ impl BigFile {
         self.overlay.clear();
         self.filter = None;
         self.last_spec = None;
-        self.cache_clear_all();
         self.base_size = meta.len();
         self.base_mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         Ok(())
