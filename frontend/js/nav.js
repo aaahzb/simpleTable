@@ -1,6 +1,9 @@
 /**
  * Excel 风格键盘导航的纯逻辑（可脱离 DOM/模型单测）。
  *
+ * 生产无引用（P5 注记）：grid 的 Ctrl+↑/↓ 已走引擎 findVerticalEdge；
+ * 本模块保留供 nav.test.mjs 与 bigmodel.test.mjs（伪引擎）单测复用。
+ *
  * Ctrl+↑/↓ 的语义对齐 Excel：
  * - 当前格非空：跳到当前连续非空数据块的上/下边缘；
  * - 当前格已在该边缘：越过空档，跳到下一条非空数据块的第一格；

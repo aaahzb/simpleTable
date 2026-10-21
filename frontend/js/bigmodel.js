@@ -1,7 +1,6 @@
 /**
- * 大文件数据模型（Big File Mode 前端门面）。
+ * 统一数据模型（全表唯一模型——新建内存档与磁盘档同走大引擎）。
  *
- * 与 TableModel 实现同一公共接口子集（排序/即时列结构变更除外），
  * grid/app 通过它透明访问 Rust 引擎（mmap + 行索引 + 覆盖层）：
  * - 取数走 200 行/页的同步窗口缓存，±2 屏预取，落定经 onData 触发重绘；
  * - 编辑/插删/撤销立即异步落引擎，乐观写缓存，失败回滚并抛错；
@@ -573,7 +572,6 @@ export class BigModel {
    * @returns {string}
    */
   displayData(row, col) {
-    // 对齐小模式 TableModel.displayData：网格两条渲染路径共用本方法，
     // 显示文本必须压平（原文 rawData 不动，编辑/保存仍用原值）
     return this._cell(row, col)
       .replace(/\r/g, " ").replace(/\n/g, " ").replace(/\t/g, " ");
@@ -1137,7 +1135,7 @@ export class BigModel {
     this._filterOn = true;
     this._filterCount = n;
     this._invalidate();
-    // origin "fetch"：筛选只切视图不改正文——不得标脏（对齐小模式筛选行为）
+    // origin "fetch"：筛选只切视图不改正文——不得标脏
     this._emitData(true, "fetch");
     return n;
   }
@@ -1333,8 +1331,8 @@ export class BigModel {
   }
 
   /**
-   * batch 兼容：小模式的多步改动合并为一步撤销；大模式每次 invoke
-   * 自身落引擎撤销日志（引擎不做事务），batch 仅保证顺序执行。
+   * 每次 invoke 自身落引擎撤销日志（引擎不做事务），batch 仅保证顺序
+   * 执行（接口保留以兼容既有调用方）。
    *
    * @param {Function} fn - 同步函数（内部可多次调 model 方法）。
    * @returns {Promise<void>} fn 返回的 Promise（如有）。

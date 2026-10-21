@@ -1146,7 +1146,7 @@ test("warmup：跨页夹具末页也能同步命中", async () => {
   assert.equal(model.rawData(0, 0), "r0c0");
 });
 
-test("displayData：显示文本压平 \r\n\t（对齐小模式 TableModel 语义）", async () => {
+test("displayData：显示文本压平 \r\n\t（编辑/保存仍用原值）", async () => {
   const { model } = makeFakeEngine({ rows: 1, cols: 1, data: [["a\nb\tc\rd"]] });
   await model.open("/x.csv");
   await model.warmup();

@@ -11,13 +11,11 @@
  *
  * @param {string} text - 纯文本（已解码）。
  * @param {string} [delimiter] - 字段分隔符，默认 ","；"\t" 用于 TSV 粘贴。
- * @param {{headerless?: boolean}} [opts] - headerless=true 时首行不当作
- *   列名，而是第一条数据；列名虚拟为 列1..列N。
  * @returns {{headers: string[], rows: string[][], warnings: string[]}}
  *   表头、数据行、警告列表。短行补空、长行截断并产生警告；
  *   空文件返回 {headers: [], rows: [], warnings: []}。
  */
-export function parseCsv(text, delimiter = ",", { headerless = false } = {}) {
+export function parseCsv(text, delimiter = ",") {
   /** @type {string[][]} */
   const records = [];
   /** @type {string[]} */
@@ -98,28 +96,22 @@ export function parseCsv(text, delimiter = ",", { headerless = false } = {}) {
   if (records.length === 0) {
     return { headers: [], rows: [], warnings: [] };
   }
-  // 无列名模式：记录 0 是数据，列数由它决定，列名虚拟生成。
-  const headers = headerless
-    ? records[0].map((_, i) => `列${i + 1}`)
-    : records[0];
+  const headers = records[0];
   const ncols = headers.length;
-  const firstData = headerless ? 0 : 1;
-  const refName = headerless ? "首行" : "表头";
   /** @type {string[]} */
   const warnings = [];
   /** @type {string[][]} */
   const rows = [];
-  for (let idx = firstData; idx < records.length; idx += 1) {
+  for (let idx = 1; idx < records.length; idx += 1) {
     let row = records[idx];
-    // 数据行号（从 1 起）：无列名时记录 0 即数据行 1。
-    const iData = headerless ? idx + 1 : idx;
+    // 数据行号（从 1 起）：记录 0 是表头，数据行号 = 记录索引。
     if (row.length < ncols) {
       warnings.push(
-        `数据行 ${iData} 只有 ${row.length} 列（${refName} ${ncols} 列），已补空`);
+        `数据行 ${idx} 只有 ${row.length} 列（表头 ${ncols} 列），已补空`);
       row = row.concat(Array(ncols - row.length).fill(""));
     } else if (row.length > ncols) {
       warnings.push(
-        `数据行 ${iData} 有 ${row.length} 列（${refName} ${ncols} 列），已截断`);
+        `数据行 ${idx} 有 ${row.length} 列（表头 ${ncols} 列），已截断`);
       row = row.slice(0, ncols);
     }
     rows.push(row);

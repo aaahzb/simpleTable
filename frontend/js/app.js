@@ -184,8 +184,8 @@ function markDirty() {
  * @property {number} id - 页签 id。
  * @property {string} title - 显示名（文件名/未命名）。
  * @property {string | null} path - 文件路径（null = 未命名）。
- * @property {"small" | "big"} kind - 文档类型。
- * @property {BigModel | null} model - 统一大引擎模型（懒重开期间可暂为 null）。
+ * @property {BigModel | null} model - 大引擎会话（异常/装载失败时可暂为 null；
+ *   无路径内存档的 model 永不卸载——内存数据离开会话即不可恢复）。
  * @property {boolean} dirty - 未保存修改。
  * @property {boolean} headerless - 首行是否为数据（列名自动生成），按档/文件独立。
  * @property {"A" | "B"} side - 所属页签组（未分屏恒 "A"）。
@@ -273,7 +273,7 @@ function syncActiveTab() {
 function ensureTabbed() {
   if (activeId !== null) return;
   const t = {
-    id: tabSeq++, title: tabTitleOf(path), path, kind: model.isBig ? "big" : "small",
+    id: tabSeq++, title: tabTitleOf(path), path,
     model, dirty,
     headerless: model.isHeaderless?.() === true,
     side: "A",
@@ -536,12 +536,12 @@ async function openBigEngineFor(tabId, p, headerless = false, reuseModel = null)
  * @param {number | null} tabId - 归属页签（多会话定位用；仅调试展示）。
  * @param {boolean} [headerless] - 首行是否作为数据（默认 false = 首行是列名）。
  * @param {BigModel | null} [reuseModel] - 重载时复用原模型（复用会话号，旧会话由引擎替换）。
- * @returns {Promise<{kind: "big", model: BigModel} | null>}
+ * @returns {Promise<{model: BigModel} | null>}
  */
 async function loadDoc(p, tabId, headerless = false, reuseModel = null) {
   const bm = await openBigEngineFor(tabId, p, headerless, reuseModel);
   if (!bm) return null;
-  return { kind: "big", model: bm };
+  return { model: bm };
 }
 
 /**
@@ -570,7 +570,7 @@ function applyViewState(g) {
 /**
  * 把装载好的文档应用到当前档（启动/未入签态/重载共用）。
  *
- * @param {{kind: string, model: any, warnings?: string[]}} doc - 装载结果。
+ * @param {{model: any, warnings?: string[]}} doc - 装载结果。
  * @param {string} p - 文件路径。
  */
 function applyDocToCurrent(doc, p) {
@@ -581,24 +581,21 @@ function applyDocToCurrent(doc, p) {
   const t = activeTab();
   if (t) {
     t.path = p;
-    t.kind = doc.kind;
     t.title = tabTitleOf(p);
     t.model = doc.model;
     t.headerless = doc.model.isHeaderless?.() === true;
   }
   renderTabbar();
   updateStatusText();
-  if (doc.kind === "big") {
-    const meta = model.meta();
-    if (meta.indexing) {
-      // 秒开路径：首批行已可用，其余在后台索引；筛选/跳转完成前不可用
-      statusMsg(
-        `大文件模式：首批 ${Number(meta.rows).toLocaleString()} 行已可查看` +
-        ` · 首屏 ${fmtDuration(model.firstPaintMs?.() || meta.open_ms)}` +
-        " · 后台索引中…（筛选/跳转稍后可用）", 6000);
-    } else {
-      statusMsg(`${bigOpenSummary(model)}，筛选框键入即筛（回车立即执行）`, 8000);
-    }
+  const meta = model.meta();
+  if (meta.indexing) {
+    // 秒开路径：首批行已可用，其余在后台索引；筛选/跳转完成前不可用
+    statusMsg(
+      `大文件模式：首批 ${Number(meta.rows).toLocaleString()} 行已可查看` +
+      ` · 首屏 ${fmtDuration(model.firstPaintMs?.() || meta.open_ms)}` +
+      " · 后台索引中…（筛选/跳转稍后可用）", 6000);
+  } else {
+    statusMsg(`${bigOpenSummary(model)}，筛选框键入即筛（回车立即执行）`, 8000);
   }
   if (doc.warnings?.length) {
     void infoDialog("打开提示", doc.warnings.slice(0, 20).join("\n"));
@@ -623,7 +620,7 @@ async function activateTab(id) {
   if (side && side !== focusedSide) {
     if (sideTab[side] !== id) {
       // 另一组的背景签：该组先静默重绑到目标签，再交换焦点
-      if (t.kind === "big" && !t.model) {
+      if (!t.model) {
         const bm = await openBigEngineFor(t.id, t.path, t.headerless);
         if (!bm) return false;
         t.model = bm;
@@ -633,8 +630,8 @@ async function activateTab(id) {
     focusSide(side);
     return true;
   }
-  if (t.kind === "big" && !t.model) {
-    // 页签模型缺失（异常/旧状态）：按该页签当前模式重新打开
+  if (!t.model) {
+    // 页签模型缺失（异常/旧状态）：按该页签路径重开引擎
     const bm = await openBigEngineFor(t.id, t.path, t.headerless);
     if (!bm) return false;
     t.model = bm;
@@ -663,12 +660,11 @@ async function activateTab(id) {
 async function loadIntoNewTab(p, opts = {}) {
   const t = {
     id: tabSeq++, title: tabTitleOf(p), path: p,
-    kind: "big", model: null, dirty: false, headerless: false, side: "A",
+    model: null, dirty: false, headerless: false, side: "A",
   };
   // 不记忆解读方式：每次打开都从「首行是列名」开始
   const doc = await loadDoc(p, t.id);
   if (!doc) return null;
-  t.kind = doc.kind;
   t.model = doc.model;
   t.headerless = doc.model.isHeaderless?.() === true;
   insertTabIntoGroup(t, splitOn ? focusedSide : "A"); // 新签落焦点侧组（I1 组邻接）
@@ -750,10 +746,8 @@ async function closeTab(id) {
   const closingActive = id === activeId; // 「保存」路径可能刚激活了目标签
   const group = groupTabs(wasSide);
   const neighbor = group[group.indexOf(t) + 1] ?? group[group.indexOf(t) - 1] ?? null;
-  if (t.kind === "big") {
-    // 只关闭本页签的引擎会话，其他页签不受影响
-    try { await t.model?.close?.(); } catch { /* 会话已关闭 */ }
-  }
+  // 只关闭本页签的引擎会话，其他页签不受影响
+  try { await t.model?.close?.(); } catch { /* 会话已关闭 */ }
   tabs.splice(tabs.indexOf(t), 1);
   if (!tabs.length) {
     resetToEmpty();
@@ -803,7 +797,7 @@ function resetToEmpty() {
  * 冒烟专用：关掉全部页签的大引擎会话，回到空表；有数据则经内存字节源建会话并预热。
  *
  * 统一大引擎后所有表格（含新建）都是 BigModel 会话；本钩子经 create + warmup
- * 装入内存小表，预热后同步 rawData 断言立即可读，且能确保前序页签会话全部释放，
+ * 装载内存引擎夹具表，预热后同步 rawData 断言立即可读，且能确保前序页签会话全部释放，
  * 避免旧事件落到新视图。
  *
  * @param {string[]} headers - 列名。
@@ -813,7 +807,7 @@ function resetToEmpty() {
 async function smokeLoadSmall(headers, rows) {
   closeSplit(); // 先收副网格，避免残留旧模型
   for (const t of tabs) {
-    if (t.kind === "big" && t.model) {
+    if (t.model) {
       try { await t.model.close(); } catch { /* 会话可能已关闭 */ }
     }
   }
@@ -1002,8 +996,8 @@ async function moveTab(id, targetSide, index = Infinity) {
   }
   // 左组保护：A 是主组，不允许拖空（未分屏仅一签时入 B 同此拒绝，对齐旧 openSplit）
   if (targetSide === "B" && groupTabs("A").length === 1) return false;
-  if (t.kind === "big" && !t.model) {
-    // 防御：模型缺失（异常/旧状态）时按该签当前模式重开引擎
+  if (!t.model) {
+    // 防御：模型缺失（异常/旧状态）时按该签路径重开引擎
     const bm = await openBigEngineFor(t.id, t.path, t.headerless);
     if (!bm) return false;
     t.model = bm;
@@ -1499,7 +1493,7 @@ function clearDock() {
 let resetPending = false;
 
 /**
- * 绑定模型事件（大小模式热交换时重绑；旧模型连同监听一并废弃）。
+ * 绑定模型事件（换模型时重绑；旧模型连同监听一并废弃）。
  * 分屏下两侧模型都存活且有事件流：只有焦点侧（m === model）的事件允许
  * 触碰共享外壳状态（脏点/编辑窗格/状态栏），副侧事件仅驱动其自身网格重绘
  * （网格在 setModel 里自行订阅，不经此处）。
@@ -1604,7 +1598,7 @@ async function newFile() {
   }
   ensureTabbed();
   const t = {
-    id: tabSeq++, title: "未命名", path: null, kind: "big", model: m, dirty: false,
+    id: tabSeq++, title: "未命名", path: null, model: m, dirty: false,
     headerless: true, side: "A",
   };
   insertTabIntoGroup(t, splitOn ? focusedSide : "A"); // 新签落焦点侧组（I1 组邻接）
@@ -1878,7 +1872,7 @@ async function applyBigSort(levels, opts = {}) {
 /**
  * 打开排序对话框并执行排序；排序前清空选中避免行号失效。
  *
- * 小模式（仅“新建表格”路径）立即物理排序；磁盘文件走
+ * 内存档与磁盘档统一走
  * {@link applyBigSort}（内存估算 + 可取消载入 + 排列层）。
  *
  * @returns {Promise<void>}
@@ -2271,11 +2265,11 @@ window.__app = {
   isBigMode: () => model.isBig === true,
   isHeaderless: () => model.isHeaderless?.() === true,
   toggleHeaderless,
-  // 冒烟专用：复位页签会话后装载内存小表（新建表格路径）
+  // 冒烟专用：复位页签会话后装载内存引擎夹具表
   smokeLoadSmall,
   // 多档页签：快照 / 切换 / 关闭 / 批量拖入 / 移组
   tabs: () => tabs.map((t) => ({
-    id: t.id, title: t.title, path: t.path, kind: t.kind,
+    id: t.id, title: t.title, path: t.path,
     dirty: t.id === activeId ? dirty : t.dirty,
     active: t.id === activeId,
     headerless: t.id === activeId ? model.isHeaderless?.() === true : t.headerless,

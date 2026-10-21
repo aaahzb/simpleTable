@@ -86,7 +86,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     ["洱海", "5", ""],
   ];
   /**
-   * 装载基础小表（内存引擎夹具）。
+   * 装载基础夹具表（内存引擎）。
    *
    * 统一大引擎后所有表格都是 BigModel 会话；经冒烟钩子复位页签，
    * 由内存字节源建会话并预热，预热后同步 rawData/visCount 断言立即可读。
@@ -442,7 +442,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await sleep(30);
     assertColsAligned("#grid-area", "缩放 115%");
     grid.setZoom(1);
-    await loadBasic(); // 还原基础小表，供后续用例使用
+    await loadBasic(); // 还原基础夹具表，供后续用例使用
   });
 
   check("列插入后筛选条件清空", async () => {
@@ -462,7 +462,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await waitFor(() => model.rawData(grid.visAt(0), 0) === "丽江", "AND 命中丽江");
   });
 
-  // ========== 行号语义（S1/S2 小模式钉住） ==========
+  // ========== 行号语义（S1/S2 语义钉住） ==========
 
   check("行号语义：corner 恒空、数据行 1 起（表头不占号，两态）", async () => {
     assert(window.__app.isBigMode() === true, "统一大引擎后应恒大模式");
@@ -507,7 +507,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await window.__app.runBigFilter();
     assert(btn.dataset.mode === "0", "第三次点击应回包含");
     await waitFor(() => grid.visCount() === 3, "回包含后应恢复 3 行");
-    await loadBasic(); // 还原基础小表
+    await loadBasic(); // 还原基础夹具表
   });
 
   check("严格三态：表头重建后按钮态保持，清除筛选复位", async () => {
@@ -909,7 +909,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await writeText(f1, "目的地,评分\r\n甲,1\r\n");
     await writeText(f2, "目的地,评分\r\n乙,2\r\n");
     await writeText(f3, "目的地,评分\r\n丙,3\r\n");
-    // 前置：复位为空的小表并确定性弄脏，验证「未入签脏档换文件先确认」
+    // 前置：复位为空内存表并确定性弄脏，验证「未入签脏档换文件先确认」
     await loadBasic();
     await model.setData(0, 0, "脏");
     await waitFor(() => window.__app.isDirty() === true, "拖入前应先标脏");
@@ -1149,7 +1149,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await waitFor(() => model.rawData(0, 0) === "大甲", "首个大档首行落定");
     const ta = window.__app.tabs().find((x) => x.path === b1);
     const tb = window.__app.tabs().find((x) => x.path === b2);
-    assert(ta?.kind === "big" && tb?.kind === "big", "两档都应是大档");
+    assert(ta && tb, "两档都应已入签（恒为大引擎会话）");
     const el = tabEl("big2.csv");
     el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
     const item = [...document.querySelectorAll(".ctx-menu .mi")]
@@ -2740,7 +2740,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const t = window.__app.tabs();
     const tb1 = t.find((x) => x.path === b1);
     const tb2 = t.find((x) => x.path === b2);
-    assert(tb1?.kind === "big" && tb2?.kind === "big", "两档都应是大档");
+    assert(tb1 && tb2, "两档都应已入签（恒为大引擎会话）");
     assert(tb1.active === true && model.rowCount() === 1500, "首个大档应已激活");
     await waitFor(() => model.rawData(0, 0) === "甲", "第一大档首行落定");
     // 回归：旧实现切签会腾退引擎并重开文件（整份重新索引一遍）。会话号与
@@ -2957,11 +2957,12 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     // 再编辑 → 普通保存直写同路径（若误走另存为会弹原生对话框卡死冒烟）
     await model.setData(2, 1, "直写");
     assert(await window.__app.saveFile() === true, "获得路径后普通保存应直写成功");
-    const back = parseCsv((await invoke("read_csv_file", { path: target })).text,
-      ",", { headerless: true });
-    assert(back.rows.length === 3, `无列名档应为 3 行数据：${back.rows.length}`);
-    assert(back.rows[1][0] === "内存档", `另存内容应含首笔编辑：${back.rows[1]}`);
-    assert(back.rows[2][1] === "直写", `再保存内容应含第二笔编辑：${back.rows[2]}`);
+    // 无列名档落盘无表头行：parseCsv 视首行为表头，合并回来即全部数据行
+    const back = parseCsv((await invoke("read_csv_file", { path: target })).text);
+    const backLines = [back.headers, ...back.rows];
+    assert(backLines.length === 3, `无列名档应为 3 行数据：${backLines.length}`);
+    assert(backLines[1][0] === "内存档", `另存内容应含首笔编辑：${backLines[1]}`);
+    assert(backLines[2][1] === "直写", `再保存内容应含第二笔编辑：${backLines[2]}`);
   });
 
   // ---- 执行（看门狗：整体超时强制收尾，防挂死） ----
