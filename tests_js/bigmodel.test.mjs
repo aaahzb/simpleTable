@@ -96,7 +96,13 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
         }
         case "big_filter_page": {
           const from = Number(args.from);
-          return (filter ?? []).slice(from, from + Number(args.count)).map((r) => data[r]);
+          const hits = (filter ?? []).slice(from, from + Number(args.count));
+          // 对齐引擎 FilterPage：行内容与各命中行的原始行号（0 基）成对下发
+          return { rows: hits.map((r) => data[r]), vrows: hits };
+        }
+        case "big_filter_hit_view_row": {
+          const hit = (filter ?? [])[Number(args.idx)];
+          return hit === undefined ? null : hit;
         }
         case "big_find_edge": {
           const list = args.filtered ? (filter ?? []) : data.map((_, i) => i);
@@ -460,6 +466,63 @@ test("saveAs 把目标路径交给引擎，并按保存语义复位视图", asyn
   assert.equal(model.rowCount(), 200);
   assert.deepEqual(events.at(-1), [true, "view"],
     "另存为后应按 origin=view 重建全量视图");
+});
+
+test("筛选：rowNumber 三态——命中给原始行号，未缓存/非筛选给 null", async () => {
+  const { model, data } = makeFakeEngine({ rows: 200, cols: 1 });
+  await model.open("/x.csv");
+  assert.equal(model.rowNumber(0), null, "非筛选态恒 null");
+  data[7][0] = "needle";
+  data[150][0] = "needle-x";
+  await model.runFilter([[0, "needle"]], [], "");
+  model.prefetchRange(0, 1);
+  await tick();
+  assert.equal(model.rowNumber(0), 7, "命中序号 0 → 原始行号 7");
+  assert.equal(model.rowNumber(1), 150, "命中序号 1 → 原始行号 150");
+  assert.equal(model.rowNumber(500), null, "未缓存页返回 null（纯查缓存，不触发拉取）");
+});
+
+test("筛选：clearFilter(hitRow) 先查归位行号再清筛，返回锚定目标", async () => {
+  const { model, data, calls } = makeFakeEngine({ rows: 200, cols: 1 });
+  await model.open("/x.csv");
+  data[7][0] = "needle";
+  data[150][0] = "needle-x";
+  await model.runFilter([[0, "needle"]], [], "");
+  const res = await model.clearFilter(1); // 命中序号 1 → 原始行号 150
+  assert.deepEqual(res, { applied: true, target: 150 });
+  const names = calls.map(([c]) => c);
+  const iQ = names.lastIndexOf("big_filter_hit_view_row");
+  const iC = names.lastIndexOf("big_clear_filter");
+  assert.ok(iQ >= 0 && iC > iQ,
+    "必须先查询归位行号、后清筛（清后命中集即失，顺序反了锚点丢失）");
+  assert.equal(model.filterActive(), false);
+});
+
+test("筛选：clearFilter 链被新筛选抢断 → applied:false 且不再发清筛", async () => {
+  const { model, data, calls } = makeFakeEngine({ rows: 50, cols: 1 });
+  await model.open("/x.csv");
+  data[7][0] = "needle";
+  await model.runFilter([[0, "needle"]], [], "");
+  const p = model.clearFilter(0);
+  // runFilter 同步段即翻转 _filterGen：clearFilter 第一次 await 返回时发现已过期
+  await model.runFilter([[0, "needle"]], [], "");
+  const res = await p;
+  assert.equal(res.applied, false, "被抢断的清筛不得声称已应用");
+  assert.equal(calls.some(([c]) => c === "big_clear_filter"), false,
+    "抢断后不应再发 big_clear_filter（新筛选才是现状）");
+  assert.equal(model.filterActive(), true);
+});
+
+test("筛选：clearFilter 后 rowNumber 回 null（缓存随 _invalidate 清空）", async () => {
+  const { model, data } = makeFakeEngine({ rows: 200, cols: 1 });
+  await model.open("/x.csv");
+  data[7][0] = "needle";
+  await model.runFilter([[0, "needle"]], [], "");
+  model.prefetchRange(0, 0);
+  await tick();
+  assert.equal(model.rowNumber(0), 7);
+  await model.clearFilter();
+  assert.equal(model.rowNumber(0), null, "非筛选态恒 null");
 });
 
 test("筛选结果中禁止编辑/删除", async () => {

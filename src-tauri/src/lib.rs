@@ -17,7 +17,7 @@ use serde::Serialize;
 use tauri::{Emitter, Manager};
 
 mod engine;
-use engine::{BigFile, BigMeta, ColOp, FilterSpec, SortEstimate, SortLevel};
+use engine::{BigFile, BigMeta, ColOp, FilterPage, FilterSpec, SortEstimate, SortLevel};
 
 /// 读文件结果：解码后的纯文本 + 实际使用的编码名（供状态栏展示）。
 #[derive(Serialize)]
@@ -601,8 +601,18 @@ fn big_filter_page(
     session: u64,
     from: u32,
     count: u32,
-) -> Result<Vec<Vec<String>>, String> {
+) -> Result<FilterPage, String> {
     with_big(&state, session, |bf| Ok(bf.filter_page(from, count)))
+}
+
+/// 命中序号 → 清筛后全量视图行号（取消筛选锚定查询；无筛选/越界返回 None）。
+#[tauri::command]
+fn big_filter_hit_view_row(
+    state: tauri::State<BigShared>,
+    session: u64,
+    idx: u32,
+) -> Result<Option<u32>, String> {
+    with_big(&state, session, |bf| Ok(bf.filter_hit_view_row(idx)))
 }
 
 #[tauri::command]
@@ -868,6 +878,7 @@ pub fn run() {
             big_filter,
             big_filter_count,
             big_filter_page,
+            big_filter_hit_view_row,
             big_clear_filter,
             big_set_headerless,
             big_copy,

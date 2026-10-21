@@ -544,8 +544,8 @@ export class BigModel {
    */
   hasData(row, col) {
     if (!this._meta) return false;
-    const rows = this._cache.get(this._key(Math.floor(row / BIG_PAGE)));
-    return !!rows?.[row % BIG_PAGE];
+    const page = this._cache.get(this._key(Math.floor(row / BIG_PAGE)));
+    return !!page?.rows[row % BIG_PAGE];
   }
 
   /**
@@ -559,9 +559,9 @@ export class BigModel {
    */
   peekData(row, col) {
     if (!this._meta) return undefined;
-    const rows = this._cache.get(this._key(Math.floor(row / BIG_PAGE)));
-    if (!rows) return undefined;
-    const cells = rows[row % BIG_PAGE];
+    const page = this._cache.get(this._key(Math.floor(row / BIG_PAGE)));
+    if (!page) return undefined;
+    const cells = page.rows[row % BIG_PAGE];
     return cells ? (cells[col] ?? "") : undefined;
   }
 
@@ -587,9 +587,9 @@ export class BigModel {
   _cell(row, col) {
     if (!this._meta) return "";
     const page = Math.floor(row / BIG_PAGE);
-    const rows = this._cache.get(this._key(page));
-    if (rows) {
-      const cells = rows[row % BIG_PAGE];
+    const cached = this._cache.get(this._key(page));
+    if (cached) {
+      const cells = cached.rows[row % BIG_PAGE];
       return cells ? (cells[col] ?? "") : "";
     }
     this._schedule(page);
@@ -711,7 +711,7 @@ export class BigModel {
     const req = this._filterOn
       ? this._invoke("big_filter_page", { from, count: BIG_PAGE })
       : this._invoke("big_rows", { from, count: BIG_PAGE });
-    req.then((rows) => {
+    req.then((payload) => {
       // 结构已变化（代际不同/筛选态翻转）→ 旧响应作废
       if (gen !== this._gen || this._key(page) !== key) return;
       const fullAtFetch = from + BIG_PAGE <= atRows;
@@ -727,7 +727,13 @@ export class BigModel {
         // 页尾尚未索引：登记为部分页，后续行数增长时整体失效
         this._partial.add(key);
       }
-      this._cache.set(key, rows);
+      // 筛选页载荷是 FilterPage {rows, vrows}（行内容与原始行号成对）；
+      // 全量页是行数组。按捕获的 key 前缀判定解析——飞行期间 _filterOn
+      // 可能已翻转，读当前态会把全量页误当筛选页（或反之）错位落定。
+      const entry = key[0] === "f"
+        ? { rows: payload.rows ?? [], vrows: payload.vrows ?? null }
+        : { rows: payload, vrows: null };
+      this._cache.set(key, entry);
       this._trim(page);
       this._emitData(false, "fetch"); // 纯预取落定：重绘即可，不得标脏
     }).catch(() => {
@@ -827,8 +833,8 @@ export class BigModel {
     // 乐观写：有缓存页则原地更新，重绘立即反映
     const page = Math.floor(row / BIG_PAGE);
     const cached = this._cache.get(this._key(page));
-    if (cached && cached[row % BIG_PAGE]) {
-      const cells = cached[row % BIG_PAGE];
+    if (cached && cached.rows[row % BIG_PAGE]) {
+      const cells = cached.rows[row % BIG_PAGE];
       if (col < cells.length) cells[col] = value;
     }
     try {
@@ -836,8 +842,8 @@ export class BigModel {
       await this._refreshMeta();
       this._emitData(false);
     } catch (err) {
-      if (cached && cached[row % BIG_PAGE] && col < cached[row % BIG_PAGE].length) {
-        cached[row % BIG_PAGE][col] = oldValue;
+      if (cached && cached.rows[row % BIG_PAGE] && col < cached.rows[row % BIG_PAGE].length) {
+        cached.rows[row % BIG_PAGE][col] = oldValue;
       }
       throw new Error(`${BIG_EDIT_ERR}：${err}`);
     }
@@ -1046,6 +1052,20 @@ export class BigModel {
   }
 
   /**
+   * 筛选态行号：命中序号 → 原始数据行号（0 基；随筛选分页 FilterPage 下发）。
+   * 纯查缓存不触发拉取——未缓存/非筛选态返回 null（网格给空串占位，
+   * 页落定后经 onData 重绘收敛）。
+   *
+   * @param {number} row - 命中序号（筛选视图行号）。
+   * @returns {number | null} 原始数据行号；未缓存/非筛选态 null。
+   */
+  rowNumber(row) {
+    if (!this._filterOn) return null;
+    const cached = this._cache.get(this._key(Math.floor(row / BIG_PAGE)));
+    return cached?.vrows?.[row % BIG_PAGE] ?? null;
+  }
+
+  /**
    * 执行一次筛选（引擎 rayon 全表扫描）。
    *
    * @param {Array<[number, string, number?]>} cols - (列号, 关键字, 模式) AND 组合；
@@ -1081,17 +1101,29 @@ export class BigModel {
   /**
    * 清除筛选，回到全量视图。
    *
-   * @returns {Promise<void>}
+   * @param {number | null} [hitRow] - 取消筛选锚点（命中序号）。给了就先查它在
+   *   清筛后全量视图中的行号（必须先于 big_clear_filter——清后命中集即失），
+   *   供网格把视口/选中锚回原来的行。
+   * @returns {Promise<{applied: boolean, target: number | null}>}
+   *   applied=false 表示期间被新筛选/清筛抢断（本次未生效）；target 为锚定目标
+   *   行号（hitRow 为空/越界/被抢断时为 null）。
    */
-  async clearFilter() {
+  async clearFilter(hitRow = null) {
     const gen = ++this._filterGen;
+    let target = null;
+    if (hitRow !== null && hitRow !== undefined && this._filterOn) {
+      target = await this._invoke("big_filter_hit_view_row", { idx: hitRow });
+      // 查询期间被新筛选/清筛抢断：本次清筛作废（新请求才是现状）
+      if (gen !== this._filterGen) return { applied: false, target: null };
+    }
     await this._invoke("big_clear_filter");
-    if (gen !== this._filterGen) return; // 期间又发起了新筛选：以新请求为准
+    if (gen !== this._filterGen) return { applied: false, target: null }; // 同上
     this._filterOn = false;
     this._filterCount = 0;
     this._invalidate();
     // 同 runFilter：视图恢复，不标脏
     this._emitData(true, "fetch");
+    return { applied: true, target };
   }
 
   // ---- 列操作（pending 预览 → 执行物理重写） ----

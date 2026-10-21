@@ -23,6 +23,7 @@ function makeStaleLayoutGrid({ oldN, h = 20, oy = 52, viewH = 700 }) {
   const g = Object.create(Grid.prototype);
   const real = oldN * h;
   g._uniformRowH = h;
+  g._yUniform = true; // 等行高布局（_rowTop/_captureClearAnchor 读它）
   g._yScale = real > Y_CLAMP ? real / Y_CLAMP : 1;
   g._rowSpan = Math.max(1, Math.floor(viewH / h));
   g._maxScroll = Math.max(0, oy + real / g._yScale - viewH);
@@ -157,4 +158,106 @@ test("cellHit 三态真值表（0 包含 / 1 等于·不分大小写 / 2 等于�
   assert.equal(cellHit("", "", "", 0), true);
   assert.equal(cellHit("", "", "", 1), true);
   assert.equal(cellHit("", "", "", 2), true);
+});
+
+test("取消筛选锚定（未压缩）：无选中锚视口顶行，行内小数偏移保持", () => {
+  // oy=52、h=20、yScale=1：scrollTop=oy+(100+0.3)h → pos=100.3
+  const g = makeStaleLayoutGrid({ oldN: 10_000, h: 20, oy: 52, viewH: 700 });
+  g.sel = { current: null, anchor: null, blocks: [] };
+  g._renderRows = () => { g._rendered = (g._rendered ?? 0) + 1; };
+  g.scrollEl.scrollTop = 52 + (100 + 0.3) * 20;
+
+  const cap = g._captureClearAnchor();
+  assert.equal(cap.k, 100);
+  assert.equal(cap.col, null);
+  assert.ok(Math.abs(cap.delta - (-0.3)) < 1e-6, `delta=${cap.delta}`);
+
+  g._restoreClearAnchor(cap, 2999); // 命中序号 100 → 清筛后全量行号 2999
+  const want = 52 + (2999 + 0.3) * 20;
+  assert.ok(Math.abs(g.scrollEl.scrollTop - want) < 1e-6,
+    `scrollTop=${g.scrollEl.scrollTop}，期望 ${want}（行内偏移 0.3 行保持）`);
+  assert.ok(g._rendered >= 1, "无选中列时应走 _renderRows 重绘");
+});
+
+test("取消筛选锚定（压缩坐标系）：视口内行偏移经压缩往返保持", () => {
+  const g = makeStaleLayoutGrid({ oldN: 629_470 }); // _yScale≈3.147
+  g.sel = { current: null, anchor: null, blocks: [] };
+  g._renderRows = () => {};
+  const oy = g.headerEl.offsetHeight;
+  const maxSv = g._maxScroll - oy;
+  g.scrollEl.scrollTop = oy + maxSv * 0.6007; // 深滚，pos 带小数
+  const { pos: pos0, anchor: anchor0 } = g._yAnchor();
+
+  const cap = g._captureClearAnchor();
+  assert.equal(cap.k, Math.floor(pos0));
+
+  const T = 400_000; // 清筛后全量视图行号
+  g._restoreClearAnchor(cap, T);
+  const { anchor: anchor1 } = g._yAnchor();
+  assert.equal(T - anchor1, cap.k - anchor0,
+    `视口内行偏移应保持 ${cap.k - anchor0}，实际 ${T - anchor1}`);
+  assert.ok(g.scrollEl.scrollTop > oy + maxSv * 0.63,
+    "恢复应把视口移到 target（≈63.6%）附近");
+});
+
+test("取消筛选锚定：选中优先于视口顶，select 联动 currentChanged", () => {
+  const g = makeStaleLayoutGrid({ oldN: 10_000 });
+  g.sel = { current: [5, 2], anchor: [5, 2], blocks: [] };
+  g.hooks = { currentChanged: (r, c) => { g._cc = [r, c]; } };
+  g.select = (f) => { g._selArg = f; g.hooks.currentChanged(f[0], f[1]); };
+  g.scrollEl.scrollTop = 52 + 80 * 20; // 视口顶行 80——不应被用作锚
+
+  const cap = g._captureClearAnchor();
+  assert.equal(cap.k, 5, "有选中时锚=选中行（命中序号）");
+  assert.equal(cap.col, 2);
+
+  g._restoreClearAnchor(cap, 2999);
+  assert.deepEqual(g._selArg, [2999, 2], "选中应 remap 到清筛后行号");
+  assert.deepEqual(g._cc, [2999, 2], "编辑窗格应收到 currentChanged 联动");
+  const want = 52 + 3074 * 20; // posG = 2999 - (5-80)
+  assert.ok(Math.abs(g.scrollEl.scrollTop - want) < 1e-6,
+    `scrollTop=${g.scrollEl.scrollTop}，期望 ${want}（选中行视口位置保持）`);
+});
+
+test("_rowHeadText：筛选态取原始行号（未缓存空串占位），非筛选连续号", () => {
+  const g = Object.create(Grid.prototype);
+  g.model = {
+    isBig: true,
+    filterActive: () => true,
+    rowNumber: (r) => (r === 3 ? null : 100 + r),
+  };
+  assert.equal(g._rowHeadText(0), "101", "筛选态行号=原始行号+1");
+  assert.equal(g._rowHeadText(3), "", "页未缓存给空串占位（落定后同帧收敛）");
+  g.model = { isBig: true, filterActive: () => false, rowNumber: () => null };
+  assert.equal(g._rowHeadText(7), "8", "非筛选大模式=行索引+1");
+  g.model = { isBig: false, filterActive: () => false, rowNumber: () => null };
+  assert.equal(g._rowHeadText(7), "8", "小模式=源行号+1（r 已是源行号）");
+});
+
+test("取消筛选锚定（小模式）：选中在命中集锚选中，否则回落视口顶行", () => {
+  const g = Object.create(Grid.prototype);
+  g._yUniform = true;
+  g._uniformRowH = 20;
+  g._yScale = 1;
+  g._rowSpan = 35;
+  g._maxScroll = 52 + 50 * 20 - 700; // 全量 50 行
+  g._lastVisCount = 0;
+  g.visibleRows = [2, 5, 9]; // 筛选命中 3 行（源行号）
+  g.model = { isBig: false, rowCount: () => 50 };
+  g.headerEl = { offsetHeight: 52 };
+  g.scrollEl = { scrollTop: 52 + 1 * 20 }; // 视口顶=命中序号 1（源行 5）
+
+  // 选中源行 5（在命中集，命中序号 1）
+  g.sel = { current: [5, 1], anchor: [5, 1], blocks: [] };
+  const cap = g._captureClearAnchor();
+  assert.equal(cap.k, 1, "选中源行 5 → 命中序号 1");
+  assert.equal(cap.col, 1);
+  assert.equal(cap.srcRow, 5, "小模式预存源行号（恢复时无需引擎查询）");
+
+  // 选中源行 7（不在命中集）→ 回落视口顶行
+  g.sel = { current: [7, 0], anchor: [7, 0], blocks: [] };
+  const cap2 = g._captureClearAnchor();
+  assert.equal(cap2.k, 1, "不在命中集 → 回落视口顶行（命中序号 1）");
+  assert.equal(cap2.col, null);
+  assert.equal(cap2.srcRow, 5, "回落锚的源行号=visibleRows[k]");
 });

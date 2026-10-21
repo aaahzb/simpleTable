@@ -492,6 +492,22 @@ export class Grid {
   }
 
   /**
+   * 行号列文本：大模式筛选态显示原始数据行号（1 起——命中的内容散布文件
+   * 各处，行号应跳号而非 1,2,3… 连编）；页未缓存给空串占位，落定后同帧
+   * 收敛。其余 = 行索引+1（小模式 r 已是源行号，天然跳号）。
+   *
+   * @param {number} r - 源行号（大模式筛选态=命中序号）。
+   * @returns {string}
+   */
+  _rowHeadText(r) {
+    if (this.model.isBig && this.model.filterActive?.()) {
+      const rn = this.model.rowNumber(r);
+      return rn === null || rn === undefined ? "" : String(rn + 1);
+    }
+    return String(r + 1);
+  }
+
+  /**
    * 锚点行对齐视口顶部（吸顶表头之下）所需的 scrollTop。
    *
    * 压缩滚动（_yScale > 1）按 _yAnchor 的等比映射反解；未压缩时行区坐标
@@ -514,6 +530,66 @@ export class Grid {
     // 不取整：浏览器接受小数 scrollTop；取整是纯精度损失，会让索引恢复
     // 在每个进度事件上累积量化漂移。
     return Math.max(0, Math.min(this._maxScroll, oy + (anchor / span) * maxSv));
+  }
+
+  /**
+   * 取消筛选前的视口锚点快照（须在坐标系切换前捕获）。
+   *
+   * 锚 = 选中行（选中存源坐标：大模式筛选态源坐标即命中序号；小模式经
+   * visibleRows 反查命中序号，不在命中集回落视口顶行）；无选中锚视口顶行。
+   * delta = k − pos（含行内小数——恢复时行内偏移精确保留）。
+   * 非等行高+筛选的布局陈旧属现状缺陷：返回 null，调用方保持 scrollTop 不动。
+   *
+   * @returns {{k: number, col: number | null, delta: number, srcRow?: number} | null}
+   *   k=命中序号锚；col=选中列（无选中 null）；delta=视口内行偏移（小数）；
+   *   srcRow=小模式预存的源行号（恢复时无需引擎查询）。
+   */
+  _captureClearAnchor() {
+    if (!this._yUniform || !this.visCount()) return null;
+    const pos = this._yAnchor().pos;
+    let k = Math.floor(pos);
+    let col = null;
+    const cur = this.sel?.current;
+    if (cur) {
+      if (this.model.isBig) {
+        // 大模式筛选态：visAt 恒等，选中源坐标即命中序号
+        k = cur[0];
+        col = cur[1];
+      } else if (this.visibleRows) {
+        const idx = this.visibleRows.indexOf(cur[0]);
+        // 不在命中集：回落视口顶行（k/col 保持默认）
+        if (idx >= 0) {
+          k = idx;
+          col = cur[1];
+        }
+      }
+    }
+    const cap = { k, col, delta: k - pos };
+    // 小模式（visibleRows 路径）预存锚的源行号：清筛后全量视图行号就是它
+    if (this.visibleRows) {
+      cap.srcRow = this.visibleRows[Math.min(k, this.visibleRows.length - 1)];
+    }
+    return cap;
+  }
+
+  /**
+   * 取消筛选后的锚点恢复：target 行回到捕获时的视口内位置（delta 含行内
+   * 小数；_scrollTopForAnchor 不取整，压缩/未压缩坐标系通吃）。有选中列时
+   * select remap（联动 hooks.currentChanged → 编辑窗格；多块选区收敛单格，
+   * 严格优于回顶现状），否则仅重绘。
+   *
+   * @param {{k: number, col: number | null, delta: number}} cap - 捕获的锚点。
+   * @param {number} target - 锚在清筛后全量视图中的行号（0 基）。
+   * @returns {void}
+   */
+  _restoreClearAnchor(cap, target) {
+    const posG = Math.max(0, target - cap.delta);
+    this.scrollEl.scrollTop = this._scrollTopForAnchor(posG);
+    if (cap.col !== null && cap.col !== undefined) {
+      this.select([target, cap.col]);
+    } else {
+      this._renderRows();
+    }
   }
 
   /**
@@ -803,7 +879,7 @@ export class Grid {
       row.style.width = `${totalW}px`;
       const head = row.firstChild;
       const rz = head.lastElementChild; // textContent 赋值会清空子节点，把手先取出
-      head.textContent = String(r + 1);
+      head.textContent = this._rowHeadText(r);
       head.appendChild(rz);
       const kids = row.children;
       for (let pos = 0; pos < this.colOrder.length; pos += 1) {
@@ -867,13 +943,32 @@ export class Grid {
     const hasCond = kws.length > 0 || !!mKw;
     // 大文件模式：整表扫描在 Rust 引擎（按钮/回车触发），前端只维护视图状态
     if (this.model.isBig) {
+      // 取消筛选锚定：捕获必须在坐标系切换（visibleRows/筛选态）之前；
+      // 结构性清筛（clearFilters({anchor:false})）不捕获，回落旧回顶行为
+      const cap = (!hasCond && this.model.filterActive()
+        && this._clearAnchorPref !== false)
+        ? this._captureClearAnchor()
+        : null;
       this.visibleRows = null;
       if (!hasCond && this.model.filterActive()) {
-        // 条件清空 → 自动回全量（fire-and-forget；落定后 onData 再收敛）。
-        // 先回顶再切视图：坐标系从命中画布切回全量画布（可能启用压缩），
-        // 旧 scrollTop 在新坐标系无意义（锚点反推自锁，见 runBigFilter 注释）。
-        this.resetScroll();
-        Promise.resolve(this.model.clearFilter()).catch(() => {});
+        // 条件清空 → 自动回全量。锚定路径：先查归位行号再清筛（命中集清后
+        // 即失），落定后把选中行/视口顶行送回原来的位置（用户无感）；
+        // 被抢断/无锚/越界回落回顶。
+        // _suppressIndexAnchor：落定触发的 _onModelData 会把 visCount 增长
+        // 误判成索引推进而抢恢复——锚定期间压住它。
+        this._suppressIndexAnchor = true;
+        Promise.resolve(this.model.clearFilter(cap ? cap.k : null))
+          .then((res) => {
+            if (!res?.applied) return; // 被新筛选/清筛抢断：锚点作废
+            if (cap && res.target !== null && res.target !== undefined) {
+              this._restoreClearAnchor(cap, res.target);
+            } else {
+              this.resetScroll();
+              this._renderRows();
+            }
+          })
+          .catch(() => {})
+          .finally(() => { this._suppressIndexAnchor = false; });
       }
       this.hooks.bigFilterStatus?.(hasCond);
       this._clampSelection();
@@ -883,9 +978,19 @@ export class Grid {
     }
     // 无筛选：恒等快路径，不建 N 元素数组（680 万行也零开销）
     if (!hasCond) {
+      // 从筛选态切回全量：锚点捕获必须在 visibleRows 置 null 之前；
+      // 恢复前必须 renderAll——_refilter 不重布局，visTops/行高还是筛选态的
+      const cap = (this.visibleRows && this._clearAnchorPref !== false)
+        ? this._captureClearAnchor()
+        : null;
       this.visibleRows = null;
+      if (cap) this.renderAll();
       this._clampSelection();
-      this._renderRows();
+      if (cap && cap.srcRow !== null && cap.srcRow !== undefined) {
+        this._restoreClearAnchor(cap, cap.srcRow);
+      } else {
+        this._renderRows();
+      }
       this.hooks.countsChanged(this.visCount(), this.model.rowCount());
       return;
     }
@@ -922,7 +1027,8 @@ export class Grid {
     // 进度事件都净下移一个表头高，事件次数随索引速度变（CI 实测两次 −3 行）。
     let anchorPos = null;
     const rowsBefore = this._lastVisCount;
-    if (structural && this.model.isBig && !this.visibleRows) {
+    if (structural && this.model.isBig && !this.visibleRows
+      && !this._suppressIndexAnchor) {
       const pos = this._yAnchor().pos;
       if (pos > 0 && pos < rowsBefore) anchorPos = pos;
     }
@@ -1893,8 +1999,15 @@ export class Grid {
 
   // ============ 筛选（D2/D3） ============
 
-  /** 清空全部筛选条件与输入框（含多重筛选关键字；多重筛选开关状态保留） */
-  clearFilters() {
+  /**
+   * 清空全部筛选条件与输入框（含多重筛选关键字；多重筛选开关状态保留）。
+   *
+   * @param {object} [opts] - 选项。
+   * @param {boolean} [opts.anchor=true] - 用户主动取消筛选时锚定视口/选中
+   *   （回到原行原位）；结构性清筛（装载/换档/列操作/保存/首行切换）传 false。
+   * @returns {void}
+   */
+  clearFilters({ anchor = true } = {}) {
     this.filters.clear();
     this.filterModes.clear();
     this.multi.text = "";
@@ -1908,7 +2021,13 @@ export class Grid {
       btn.title = STRICT_TITLES[0];
     }
     this._suppressFilterInput = false;
-    this._refilter();
+    // 经临时旗标传给 _refilter（同步读完即复位；未初始化(undefined)视为锚定）
+    this._clearAnchorPref = anchor;
+    try {
+      this._refilter();
+    } finally {
+      this._clearAnchorPref = true;
+    }
   }
 
   /**

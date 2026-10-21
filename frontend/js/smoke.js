@@ -468,6 +468,39 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(model.rawData(grid.visAt(0), 0) === "丽江");
   });
 
+  // ========== 行号语义（S1/S2 小模式钉住） ==========
+
+  check("行号语义：小模式两态行号——corner 恒空、数据行 1 起（表头不占号）", async () => {
+    await window.__app.smokeLoadSmall(["甲", "乙"], [["A1", "B1"], ["A2", "B2"]]);
+    const corner = () => grid.cornerEl?.textContent ?? "?";
+    const head0 = () => document.querySelector('.row-head[data-row="0"]')?.textContent;
+    assert(corner() === "", `列名行最左格应恒空，实际 "${corner()}"`);
+    assert(head0() === "1", `首行是列名时数据首行行号应为 1，实际 "${head0()}"`);
+    // 切「首行非列名」：原列名成为首行数据，行号仍是 1（表头从不占号）
+    tbBtn("首行非列名").click();
+    await waitFor(() => bigM().rowCount() === 3, "首行非列名切换落定");
+    assert(corner() === "", "首行非列名时 corner 仍应为空");
+    assert(grid.model.rawData(0, 0) === "甲", "原列名应成为首行数据");
+    assert(head0() === "1",
+      `首行非列名时首行（原列名）行号应为 1，实际 "${head0()}"`);
+    tbBtn("首行非列名").click(); // 还原列名态
+    await waitFor(() => bigM().rowCount() === 2, "还原落定");
+  });
+
+  check("行号语义：小模式筛选行号跳号（显示原始行号而非可见序号）", async () => {
+    await window.__app.smokeLoadSmall(
+      ["品", "价"],
+      [["苹果", "1"], ["香蕉", "2"], ["橙子", "3"], ["西瓜", "4"], ["苹果汁", "5"]],
+    );
+    grid.filters.set(0, "苹");
+    grid._refilter();
+    assert(grid.visCount() === 2, `应命中 2 行，实际 ${grid.visCount()}`);
+    const t = (r) => document.querySelector(`.row-head[data-row="${r}"]`)?.textContent;
+    assert(t(0) === "1" && t(4) === "5",
+      `筛选行号应为原始行号 1/5（跳号），实际 ${t(0)}/${t(4)}`);
+    grid.clearFilters();
+  });
+
   // ========== 严格三态开关（~ 包含 → = 等于·不分大小写 → ≡ 等于·区分大小写） ==========
 
   check("严格三态：按钮常显、点击循环 0→1→2→0、小模式三态命中数", async () => {
@@ -2089,8 +2122,11 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     grid.filters.set(0, "大理");
     await window.__app.runBigFilter();
     const page = await invoke("big_filter_page", { from: 0, count: 5, session: bm.sessionId });
-    assert(page.length === 5, `筛选页行数 ${page.length}`);
-    assert(page[4][0] === "大理" && page[4][1] === "3", `筛选页内容 ${page[4]}`);
+    assert(page.rows.length === 5, `筛选页行数 ${page.rows.length}`);
+    assert(page.rows[4][0] === "大理" && page.rows[4][1] === "3", `筛选页内容 ${page.rows[4]}`);
+    // FilterPage 协议：vrows 与 rows 等长，未排序时即原始行号（严格递增）
+    assert(page.vrows.length === 5 && page.vrows[0] < page.vrows[4],
+      `vrows 应与 rows 成对且递增 ${page.vrows}`);
     grid.clearFilters();
     await sleep(150);
     assert(bm.filterActive() === false, "清除筛选后应回全量");
@@ -2387,6 +2423,79 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(tbHidden("退出排序") && !tbHidden("排序…"), "按钮状态应复原");
   });
 
+  check("行号语义：大模式筛选行号跳号（原始行号随命中页下发）", async () => {
+    // 夹具：表头 + 20×(480 昆明+20 大理) = 10000 行；筛「大理」命中 400 行，
+    // 命中 vrow = i*500+480..499（i=0..19）——hit#0=vrow480、hit#20=vrow980
+    const p = `${TMP}/big_rownum.csv`;
+    await invoke("smoke_write_repeat", { path: p, line: "目的地,评分,备注\r\n", times: 1, append: false });
+    for (let i = 0; i < 20; i += 1) {
+      await invoke("smoke_write_repeat", { path: p, line: "昆明,4,新城\r\n", times: 480, append: true });
+      await invoke("smoke_write_repeat", { path: p, line: "大理,3,古城\r\n", times: 20, append: true });
+    }
+    // 前序用例（单格一对多填充）留脏态：换文件先弹未保存确认，点掉
+    const pendingOpen = window.__app.openPath(p);
+    await sleep(150);
+    assert(clickDiscardDialog("放弃") === true, "未入签脏档换文件应先弹未保存确认");
+    await pendingOpen;
+    assert(window.__app.isBigMode() === true, "夹具应走统一大引擎");
+    const bm = bigM();
+    grid.filters.set(0, "大理");
+    await window.__app.runBigFilter();
+    await waitFor(() =>
+      document.querySelector('.row-head[data-row="20"]')?.textContent === "981",
+      "筛选页行号落定（hit#20=vrow980→981）");
+    const t = (r) => document.querySelector(`.row-head[data-row="${r}"]`)?.textContent;
+    assert(t(0) === "481", `hit#0 行号应为 481（vrow480+1），实际 "${t(0)}"`);
+    assert(t(20) === "981", `hit#20 行号应为 981（跳号），实际 "${t(20)}"`);
+  });
+
+  check("行号语义：取消筛选锚定——选中行回到原位置且视口内位置不变", async () => {
+    // 承接上一用例的筛选态（400 命中）
+    const bm = bigM();
+    await waitFor(() => bm.filterActive(), "筛选态延续");
+    const sc = document.getElementById("grid-scroll");
+    const oy = grid._originY();
+    const h = grid._uniformRowH;
+    // 选中命中序号 5（=原始行 485 的大理）
+    clickCell(grid, 5, 0);
+    assert(cur(grid)?.[0] === 5, `应选中命中序号 5，实际 ${cur(grid)}`);
+    // 视口顶压到命中序号 5.5（选中行在视口顶上方半行处——行内偏移也须保持）
+    sc.scrollTop = oy + 5.5 * h;
+    grid._renderRows();
+    // 用户路径：工具栏「清除筛选」（默认锚定）
+    tbBtn("清除筛选").click();
+    await waitFor(() => !bm.filterActive() && cur(grid)?.[0] === 485,
+      "清除筛选后选中应 remap 到原始行号 485");
+    const want = oy + 485.5 * h; // hit#5=vrow485，delta=-0.5
+    assert(Math.abs(sc.scrollTop - want) < 2,
+      `视口应保持原位（scrollTop≈${want}），实际 ${sc.scrollTop}`);
+    // 选中处上下行号连续（全量视图）
+    const t = (r) => document.querySelector(`.row-head[data-row="${r}"]`)?.textContent;
+    assert(t(484) === "485" && t(485) === "486" && t(486) === "487",
+      `选中处上下行号应连续：${t(484)},${t(485)},${t(486)}`);
+  });
+
+  check("行号语义：取消筛选锚定——无选中时锚视口顶行", async () => {
+    const bm = bigM();
+    // 重新进入筛选态（上一用例已清筛）
+    grid.filters.set(0, "大理");
+    await window.__app.runBigFilter();
+    await waitFor(() => bm.filterActive() && bm.rowCount() === 400, "重筛落定");
+    grid.clearSelection();
+    const sc = document.getElementById("grid-scroll");
+    const oy = grid._originY();
+    const h = grid._uniformRowH;
+    sc.scrollTop = oy + 7.25 * h; // 视口顶=命中序号 7.25
+    grid._renderRows();
+    tbBtn("清除筛选").click();
+    const want = oy + 487.25 * h; // hit#7=vrow487，delta=-0.25
+    await waitFor(() => !bm.filterActive() && Math.abs(sc.scrollTop - want) < 2,
+      "清除筛选锚定到 vrow487.25 处");
+    assert(cur(grid) === null, "无选中不应产生选中");
+    assert(Math.abs(sc.scrollTop - want) < 2,
+      `视口顶应锚在 487.25 行处（scrollTop≈${want}），实际 ${sc.scrollTop}`);
+  });
+
   check("大模式：筛选后回顶显示结果（旧滚动位置不串坐标系）", async () => {
     // 回归：筛选把坐标系从全量画布切到命中画布，旧 scrollTop 在新坐标系无意义。
     // 渲染锚点由 scrollTop 反推——旧值把锚点夹到末行、transform 把 #rows 推到画布
@@ -2398,11 +2507,11 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     for (let i = 0; i < 19; i += 1) {
       await invoke("smoke_write_repeat", { path: p, line: "昆明,4,新城\r\n", times: 1000, append: true });
     }
-    // 上一项（单格一对多填充）把未入签的当前档留在脏态；换文件前应先确认，
-    // 与真实交互一致地点掉（放弃夹具编辑），否则 openPath 永远等模态
+    // 前序用例可能把未入签的当前档留在脏态（行号语义 S3 已点掉一次时则无弹窗）；
+    // 有则与真实交互一致地点掉（放弃夹具编辑），否则 openPath 永远等模态
     const pendingOpen = window.__app.openPath(p);
     await sleep(150);
-    assert(clickDiscardDialog("放弃") === true, "未入签脏档换文件应先弹未保存确认");
+    clickDiscardDialog("放弃");
     await pendingOpen;
     assert(window.__app.isBigMode() === true, "夹具应走统一大引擎");
     const sc = document.getElementById("grid-scroll");
@@ -2420,9 +2529,17 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await waitFor(() =>
       document.querySelector('.cell[data-row="0"][data-col="0"]')?.textContent === "大理",
       "筛选结果首行渲染");
+    // 新语义（需求 3）：清除筛选不再回顶——锚定筛选视图的视口顶行，
+    // 回到它在全量视图的原位置（前 100 行都是大理：hit#50 = vrow50）
+    sc.scrollTop = oy + 50 * h; // 视口顶=命中序号 50
+    grid._renderRows();
     grid.clearFilters();
-    await sleep(250);
-    assert(Math.round(sc.scrollTop) <= 1, "清除筛选回全量后也应回顶");
+    const wantBack = oy + 50 * h;
+    await waitFor(() => !bigM().filterActive() && Math.abs(sc.scrollTop - wantBack) < 2,
+      "清除筛选锚定到 vrow50");
+    assert(Math.abs(sc.scrollTop - wantBack) < 2,
+      `清除筛选应锚定在原位置（scrollTop≈${wantBack}），实际 ${sc.scrollTop}`);
+    assert(sc.scrollTop > 100, "清除筛选不应回顶");
   });
 
   check("统一大引擎：小于旧阈值的小文件仍走大模式", async () => {

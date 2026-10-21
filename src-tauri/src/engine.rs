@@ -1153,7 +1153,7 @@ mod tests {
         assert_eq!(bf.find_vertical_edge(4, 1, true, true).unwrap(), Some(4));
         assert_eq!(bf.find_vertical_edge(4, 1, false, true).unwrap(), Some(1));
         assert_eq!(
-            bf.filter_page(4, 1)[0][0],
+            bf.filter_page(4, 1).rows[0][0],
             "keepF",
             "命中序号 4 应映射到 keepF"
         );
@@ -1301,9 +1301,63 @@ mod tests {
         assert_eq!(bf.filter_len(), 2);
         // 快速拖动后迟到的旧页请求会带着筛选前的行号（如 19000）进来：
         // 起点越界必须返回空页，不能切片 panic（WebView2 进程直接崩溃）。
-        assert!(bf.filter_page(19000, 200).is_empty());
+        assert!(bf.filter_page(19000, 200).rows.is_empty());
         // 部分越界：只返回剩余命中
-        assert_eq!(bf.filter_page(1, 200).len(), 1);
+        assert_eq!(bf.filter_page(1, 200).rows.len(), 1);
+        fs::remove_file(&p).ok();
+    }
+
+    /// 筛选分页附带原始行号：未排序时 vrows 即命中 vrow，且与 rows 逐行对齐。
+    #[test]
+    fn filter_page_returns_orig_vrows() {
+        let p = tmp_csv("filter_page_vrows", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.run_filter(&spec_one(2, "beijing")).unwrap(); // Alice(0)、Carol(2)
+        let page = bf.filter_page(0, 200);
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.vrows, vec![0, 2], "命中行的原始行号");
+        assert_eq!(page.rows[0][0], "Alice");
+        assert_eq!(page.rows[1][0], "Carol");
+        assert_eq!(page.rows.len(), page.vrows.len(), "rows/vrows 必须等长对齐");
+        fs::remove_file(&p).ok();
+    }
+
+    /// 排序+筛选共存：vrows 必须经 orig_vrow 换算回原始行号（命中集存显示位置）。
+    #[test]
+    fn filter_page_vrows_sorted_mapped_to_orig() {
+        let p = tmp_csv("filter_page_vrows_sort", &sort_fixture());
+        let mut bf = load_ram(&p);
+        assert_eq!(bf.run_filter(&spec_one(2, "foo")).unwrap(), 3); // a,c,e
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+            .unwrap(); // id 降序 e,d,c,b,a → 命中显示位置 e=0,c=2,a=4
+        let page = bf.filter_page(0, 3);
+        assert_eq!(
+            page.rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
+            vec!["e", "c", "a"]
+        );
+        assert_eq!(page.vrows, vec![4, 2, 0], "行号应为原始 vrow 而非显示位置");
+        fs::remove_file(&p).ok();
+    }
+
+    /// 命中序号 → 清筛后全量视图行号（取消筛选锚定用）：边界与排序态。
+    #[test]
+    fn filter_hit_view_row_bounds_and_sorted() {
+        let p = tmp_csv("filter_hit_view_row", &sort_fixture());
+        let mut bf = load_ram(&p);
+        assert_eq!(bf.filter_hit_view_row(0), None, "无筛选态恒 None");
+        assert_eq!(bf.run_filter(&spec_one(2, "foo")).unwrap(), 3); // 未排序命中 [0,2,4]
+        assert_eq!(bf.filter_hit_view_row(0), Some(0));
+        assert_eq!(bf.filter_hit_view_row(2), Some(4));
+        assert_eq!(bf.filter_hit_view_row(3), None, "越界 None");
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+            .unwrap(); // 命中集换算为显示位置 [0,2,4]（e,c,a）
+        assert_eq!(
+            bf.filter_hit_view_row(1),
+            Some(2),
+            "返回显示位置原值（= 清筛后全量视图行号）"
+        );
+        bf.clear_filter();
+        assert_eq!(bf.filter_hit_view_row(0), None, "清筛后 None");
         fs::remove_file(&p).ok();
     }
 
@@ -1348,13 +1402,13 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         // 命中页
-        let page = bf.filter_page(0, 10);
+        let page = bf.filter_page(0, 10).rows;
         assert_eq!(page.len(), 1);
         assert_eq!(page[0][0], "Carol");
         assert!(bf.has_filter());
         // 筛选结果对源行编辑立即生效（覆盖层参与）
         bf.set_cell(2, 0, "carolina".into()).unwrap();
-        let page = bf.filter_page(0, 10);
+        let page = bf.filter_page(0, 10).rows;
         assert_eq!(page[0][0], "carolina");
         // 清除
         bf.clear_filter();
@@ -1676,7 +1730,7 @@ mod tests {
         // 多重筛选 OR
         assert_eq!(bf.run_filter(&spec_multi(vec![0, 2], "carol")).unwrap(), 1);
 
-        let page = bf.filter_page(0, 10);
+        let page = bf.filter_page(0, 10).rows;
         assert_eq!(page[0][0], "carol");
         fs::remove_file(&p).ok();
     }
@@ -2222,7 +2276,7 @@ mod tests {
             .unwrap();
         assert_eq!(r, None, "代数不匹配应立即放弃");
         assert_eq!(bf.filter_len(), 2, "取消不得覆盖旧结果");
-        assert_eq!(bf.filter_page(0, 10).len(), 2);
+        assert_eq!(bf.filter_page(0, 10).rows.len(), 2);
 
         let r = bf
             .run_filter_cancelable(&spec_one(2, "shanghai"), &gate, 7)
@@ -2358,7 +2412,7 @@ mod tests {
         let mut bf = BigFile::open_with(&p, true).unwrap();
         assert_eq!(bf.run_filter(&spec_one(0, "alpha")).unwrap(), 1);
         assert_eq!(
-            bf.filter_page(0, 10)[0],
+            bf.filter_page(0, 10).rows[0],
             vec!["alpha", "1"],
             "首行参与筛选"
         );
@@ -2366,11 +2420,11 @@ mod tests {
         assert_eq!(st.scanned_rows, 3);
         // 同列新关键字直扫，命中正确
         assert_eq!(bf.run_filter(&spec_one(0, "bet")).unwrap(), 1);
-        assert_eq!(bf.filter_page(0, 1)[0], vec!["beta", "2"]);
+        assert_eq!(bf.filter_page(0, 1).rows[0], vec!["beta", "2"]);
         // 编辑首行后仍能命中
         bf.set_cell(0, 0, "ALPHA".into()).unwrap();
         assert_eq!(bf.run_filter(&spec_one(0, "alp")).unwrap(), 1);
-        assert_eq!(bf.filter_page(0, 1)[0][0], "ALPHA");
+        assert_eq!(bf.filter_page(0, 1).rows[0][0], "ALPHA");
         fs::remove_file(&p).ok();
     }
 
@@ -2783,7 +2837,7 @@ mod tests {
         bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
             .unwrap();
         assert_eq!(bf.filter_len(), 3, "排序后命中集不应丢失");
-        let page = bf.filter_page(0, 3);
+        let page = bf.filter_page(0, 3).rows;
         assert_eq!(
             page.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
             vec!["e", "c", "a"],
@@ -2796,7 +2850,7 @@ mod tests {
             multi_text: String::new(),
         };
         assert_eq!(bf.run_filter(&spec2).unwrap(), 2);
-        let page2 = bf.filter_page(0, 2);
+        let page2 = bf.filter_page(0, 2).rows;
         assert_eq!(
             page2.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
             vec!["d", "b"]
@@ -2825,7 +2879,7 @@ mod tests {
             1,
             "清筛+编辑后重筛仍应命中 b"
         );
-        assert_eq!(bf.filter_page(0, 1)[0][0], "b");
+        assert_eq!(bf.filter_page(0, 1).rows[0][0], "b");
         fs::remove_file(&p).ok();
     }
 
@@ -3357,6 +3411,14 @@ pub struct FilterSpec {
     /// 多重筛选：勾选列 + 小写关键字（空串 = 未启用），列间 OR（恒为包含匹配）。
     pub multi_cols: Vec<u32>,
     pub multi_text: String,
+}
+
+/// 筛选命中页：行内容与各命中行的原始数据行号（0 基）成对下发。
+/// vrows 与 rows 等长、逐行对齐；排序态经 orig_vrow 换算回原始行号（未排序恒等）。
+#[derive(Clone, Default, serde::Serialize)]
+pub struct FilterPage {
+    pub rows: Vec<Vec<String>>,
+    pub vrows: Vec<u32>,
 }
 
 /// 一次筛选的执行统计（测试/基准用：直扫 mmap，无任何列投影缓存）。
@@ -5912,17 +5974,28 @@ impl BigFile {
         self.last_spec = None;
     }
 
-    /// 筛选命中分页取行。
-    pub fn filter_page(&self, from: u32, count: u32) -> Vec<Vec<String>> {
-        let Some(f) = &self.filter else { return Vec::new() };
+    /// 筛选命中分页取行：行内容与各命中行的原始数据行号（0 基）成对下发。
+    pub fn filter_page(&self, from: u32, count: u32) -> FilterPage {
+        let Some(f) = &self.filter else { return FilterPage::default() };
         // 起点也要夹取：筛选切换时，筛选前排队的深页请求（如 from=19000）
         // 可能晚到；此时命中集可能只有几十行，直接切片会 panic 崩掉整个进程。
         let lo = (from as usize).min(f.len());
         let hi = (lo + count as usize).min(f.len());
-        f[lo..hi]
-            .iter()
-            .filter_map(|&v| self.row_at(v as u64))
-            .collect()
+        let mut page = FilterPage::default();
+        for &d in &f[lo..hi] {
+            // pairwise 推入：row_at 掉行时 rows/vrows 也不致错位
+            if let Some(r) = self.row_at(d as u64) {
+                page.vrows.push(self.orig_vrow(d as u64) as u32);
+                page.rows.push(r);
+            }
+        }
+        page
+    }
+
+    /// 命中序号 → 清筛后全量视图中的行号（取消筛选锚定用）。
+    /// 命中集存的就是该值（未排序=原始 vrow；排序=排序显示位置），直接返回。
+    pub fn filter_hit_view_row(&self, idx: u32) -> Option<u32> {
+        self.filter.as_ref()?.get(idx as usize).copied()
     }
 
     // ---- 复制（大选区走引擎） ----

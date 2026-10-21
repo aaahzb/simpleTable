@@ -552,7 +552,7 @@ async function loadDoc(p, tabId, headerless = false, reuseModel = null) {
  * @param {Grid} g - 目标网格（焦点侧；分屏焦点交换不调用本函数）。
  */
 function applyViewState(g) {
-  g.clearFilters();
+  g.clearFilters({ anchor: false });
   g.clearSelection();
   g.setModel(model);
   g.scrollEl.scrollTop = 0;
@@ -961,7 +961,7 @@ function focusSide(side) {
  */
 function bindSide(side, t) {
   const g = gridOfSide(side);
-  g.clearFilters();
+  g.clearFilters({ anchor: false });
   g.clearSelection();
   g.setModel(t.model);
   g.scrollEl.scrollTop = 0;
@@ -1178,7 +1178,7 @@ async function toggleHeaderless() {
       try { await model.clearFilter(); } catch { /* 会话已关闭：继续切换 */ }
     }
     // 3) 清视图（筛选框/多重输入/选区/滚动/窗格）
-    fgrid().clearFilters();
+    fgrid().clearFilters({ anchor: false });
     fgrid().clearSelection();
     fgrid().resetScroll();
     multiInput.value = "";
@@ -1268,10 +1268,10 @@ async function runBigFilter(opts = {}) {
   clearTimeout(bigFilterTimer);
   const { kws, mKw, mCols } = collectBigFilter();
   if (!kws.length && !mKw) {
-    // 无条件下执行筛选（如回车）= 回到全量（通常已由 grid 自动清空，此处兜底）
-    try {
-      await model.clearFilter();
-    } catch { /* 会话已关闭等：保持现状 */ }
+    // 无条件下执行筛选（如回车）= 回到全量（通常已由 grid 自动清空，此处兜底）；
+    // 走 grid.clearFilters 统一锚定路径（选中行/视口回到原位置，不回顶）。
+    // 会话已关闭时 filterActive 为 false 短路，链路无 invoke，不会抛。
+    fgrid().clearFilters();
     return;
   }
   const seq = ++bigFilterSeq;
@@ -1678,7 +1678,7 @@ async function runBigWrite(write, action, okMsg, hint) {
   setDirty(false);
   // 引擎重开文件后不再保留筛选结果：同步清掉筛选框，避免"框里有条件、
   // 视图却是全量"的错位（只在保存前确有筛选时动它，不误清多重筛选输入）。
-  if (hadFilter) fgrid().clearFilters();
+  if (hadFilter) fgrid().clearFilters({ anchor: false });
   // 排序保存会按当前顺序物理重写并退出排序视图：按钮/状态随之刷新。
   refreshBigUi();
   onCountsChanged(model.rowCount(), model.meta()?.rows ?? model.rowCount());
@@ -2097,7 +2097,7 @@ async function clearRows(rows) {
  */
 function insertColumnsAt(cols) {
   op(model.insertColumns(Math.min(...cols), cols.length));
-  fgrid().clearFilters();
+  fgrid().clearFilters({ anchor: false });
 }
 
 /**
@@ -2108,7 +2108,7 @@ function insertColumnsAt(cols) {
 async function deleteColumns(cols) {
   if (cols.length && await confirmDialog(`确定删除选中的 ${cols.length} 列及其全部数据？（列操作将预览，需点「执行列操作」生效）`)) {
     op(model.removeColumns(cols));
-    fgrid().clearFilters();
+    fgrid().clearFilters({ anchor: false });
   }
 }
 
