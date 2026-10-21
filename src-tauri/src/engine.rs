@@ -3130,6 +3130,163 @@ mod tests {
         // 9) 严格等于 CS：raw_buf 填充路径
         bench_timed(&mut bf, &spec_mode(1, "user-377", 2), "首筛严格CS user-377");
     }
+
+    // ---- Part 24：内存字节源建表（统一大引擎，新建表格不写盘） ----
+
+    /// from_bytes：内存字节直接建会话——无路径、Ram 后备、同步索引，
+    /// meta/读路径与磁盘打开完全一致。
+    #[test]
+    fn from_bytes_meta_matches_disk_open() {
+        let bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        let m = bf.meta();
+        assert_eq!(m.rows, 5);
+        assert_eq!(m.cols, 3);
+        assert_eq!(m.headers, vec!["name", "age", "city"]);
+        assert_eq!(m.encoding, "utf-8");
+        assert!(!m.headerless && !m.indexing && m.index_sync);
+        assert!(m.ram_backed && !m.has_path);
+        assert!(bf.is_ram_backed());
+        assert!(!bf.has_path());
+        assert!(!bf.stale(), "无路径内存档不参与外部改动检测");
+        assert_eq!(bf.rows(0, 1)[0], vec!["Alice", "30", "Beijing"]);
+    }
+
+    /// from_bytes 无列名：首条记录是数据，列名用「列N」虚拟表头。
+    #[test]
+    fn from_bytes_headerless_first_record_is_data() {
+        let bf = BigFile::from_bytes(people_csv(), true).unwrap();
+        let m = bf.meta();
+        assert!(m.headerless);
+        assert_eq!(m.rows, 6);
+        assert_eq!(m.headers, vec!["列1", "列2", "列3"]);
+        assert_eq!(bf.rows(0, 1)[0], vec!["name", "age", "city"]);
+    }
+
+    /// from_bytes：空缓冲与磁盘空文件同语义拒绝。
+    #[test]
+    fn from_bytes_rejects_empty() {
+        assert!(BigFile::from_bytes(Vec::new(), false).is_err());
+        assert!(BigFile::from_bytes(Vec::new(), true).is_err());
+    }
+
+    /// 内存档编辑全链路：改格、插行、撤销、重做——与 mmap 会话行为一致。
+    #[test]
+    fn memory_doc_edit_insert_undo_redo() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.set_cell(0, 1, "31".into()).unwrap();
+        assert_eq!(bf.rows(0, 1)[0], vec!["Alice", "31", "Beijing"]);
+        bf.insert_rows(1, Some(vec![vec!["New".into(), "20".into(), "Xian".into()]]), 0)
+            .unwrap();
+        assert_eq!(bf.meta().rows, 6);
+        assert_eq!(bf.rows(1, 1)[0], vec!["New", "20", "Xian"]);
+        assert!(bf.undo(), "撤销插行");
+        assert_eq!(bf.meta().rows, 5);
+        assert!(bf.undo(), "撤销改格");
+        assert_eq!(bf.rows(0, 1)[0], vec!["Alice", "30", "Beijing"]);
+        assert!(bf.redo(), "重做改格");
+        assert_eq!(bf.rows(0, 1)[0], vec!["Alice", "31", "Beijing"]);
+    }
+
+    /// 内存档筛选/排序/退出排序：无路径档退出排序不得回落 mmap，保持 Ram。
+    #[test]
+    fn memory_doc_filter_sort_exit_keeps_ram() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        let hits = bf.run_filter(&spec_one(2, "beijing")).unwrap();
+        assert_eq!(hits, 2);
+        bf.clear_filter();
+        assert_eq!(bf.meta().rows, 5);
+        bf.sort_by_levels(&[SortLevel { col: 1, numeric: true, asc: false }])
+            .unwrap();
+        assert_eq!(bf.rows(0, 1)[0][1], "35", "年龄降序首行是 Carol");
+        bf.exit_sort_mode(true).unwrap();
+        assert!(bf.is_ram_backed(), "无路径内存档退出排序必须保持 Ram 后备");
+        assert_eq!(bf.rows(0, 1)[0], vec!["Alice", "30", "Beijing"]);
+    }
+
+    /// 内存档切换首行语义：与磁盘档一致，不因无路径报错。
+    #[test]
+    fn memory_doc_set_headerless_toggle() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.set_headerless(true).unwrap();
+        let m = bf.meta();
+        assert!(m.headerless && m.rows == 6);
+        assert_eq!(m.headers, vec!["列1", "列2", "列3"]);
+        bf.set_headerless(false).unwrap();
+        let m = bf.meta();
+        assert!(!m.headerless && m.rows == 5);
+        assert_eq!(m.headers, vec!["name", "age", "city"]);
+    }
+
+    /// 无路径直存：必须报「请先另存为」，不写任何文件。
+    #[test]
+    fn save_without_path_requires_save_as() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.set_cell(0, 1, "31".into()).unwrap();
+        let err = bf.save(|_, _, _, _| {}).unwrap_err();
+        assert!(err.contains("另存为"), "实际错误：{err}");
+    }
+
+    /// 另存为落盘：获得路径并回 mmap；此后 save 直写同一路径。
+    #[test]
+    fn save_as_gains_path_then_save_direct() {
+        let p = tmp_csv("mem_save_as", b"placeholder\n");
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.set_cell(0, 1, "31".into()).unwrap();
+        bf.save_as(&p, |_, _, _, _| {}).unwrap();
+        assert!(bf.has_path());
+        assert!(!bf.is_ram_backed(), "另存为成功后应回到 mmap 后备");
+        bf.set_cell(1, 1, "26".into()).unwrap();
+        bf.save(|_, _, _, _| {}).unwrap();
+        let bf2 = BigFile::open(&p).unwrap();
+        assert_eq!(
+            bf2.rows(0, 2),
+            vec![
+                vec!["Alice".to_string(), "31".to_string(), "Beijing".to_string()],
+                vec!["bob".to_string(), "26".to_string(), "Shanghai".to_string()],
+            ]
+        );
+        fs::remove_file(&p).ok();
+    }
+
+    /// 另存为换名失败（目标被目录占位）：无路径 Ram 档会话必须原样可读
+    /// 可编辑——钉死 replace_with_retry 不得无条件丢弃内存字节。
+    #[test]
+    fn save_as_rename_failure_keeps_memory_session() {
+        let dir = std::env::temp_dir().join(format!("st_engine_memfail_{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.set_cell(0, 1, "31".into()).unwrap();
+        let err = bf.save_as(&dir, |_, _, _, _| {}).unwrap_err();
+        assert!(!err.is_empty());
+        assert!(!bf.has_path() && bf.is_ram_backed());
+        assert_eq!(bf.rows(0, 1)[0], vec!["Alice", "31", "Beijing"]);
+        bf.set_cell(0, 1, "32".into()).unwrap();
+        assert_eq!(bf.rows(0, 1)[0][1], "32");
+        let tmp = std::env::temp_dir()
+            .join(format!("st_engine_memfail_{}.simpletable-tmp", std::process::id()));
+        fs::remove_file(&tmp).ok();
+        fs::remove_dir(&dir).ok();
+    }
+
+    /// 内存档列操作：apply 在内存内重建（不写临时文件），表头/数据正确、
+    /// 仍无路径保持 Ram，且重建后可另存为。
+    #[test]
+    fn memory_doc_apply_col_ops_rebuilds_in_memory() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.push_col_op(ColOp::Insert { pos: 1, name: "gender".into() })
+            .unwrap();
+        bf.apply_col_ops(|_, _, _, _| {}).unwrap();
+        let m = bf.meta();
+        assert_eq!(m.cols, 4);
+        assert_eq!(m.headers, vec!["name", "gender", "age", "city"]);
+        assert!(m.ram_backed && !m.has_path);
+        assert_eq!(bf.rows(0, 1)[0], vec!["Alice", "", "30", "Beijing"]);
+        let p = tmp_csv("mem_colops", b"x\n");
+        bf.save_as(&p, |_, _, _, _| {}).unwrap();
+        let bf2 = BigFile::open(&p).unwrap();
+        assert_eq!(bf2.rows(0, 1)[0], vec!["Alice", "", "30", "Beijing"]);
+        fs::remove_file(&p).ok();
+    }
 }
 
 // ============================================================
@@ -3442,8 +3599,10 @@ pub struct BigMeta {
     pub can_redo: bool,
     /// 后台索引是否仍在进行（true 时 rows 会持续增长）。
     pub indexing: bool,
-    /// 是否已载入私有内存缓冲（排序模式）。
+    /// 是否已载入私有内存缓冲（排序模式或新建内存档）。
     pub ram_backed: bool,
+    /// 会话是否已关联磁盘路径（新建内存档为 false；前端据此决定保存走另存为）。
+    pub has_path: bool,
     /// 当前是否处于排序视图（显示行按 `order` 映射）。
     pub sorted: bool,
     /// 是否存在上次保存后的内容修改（排序本身不算修改）。
@@ -4402,7 +4561,50 @@ impl BigFile {
         let mmap = Arc::new(unsafe {
             memmap2::MmapOptions::new().map(&file).map_err(|e| e.to_string())?
         });
-        let bytes: &[u8] = &mmap;
+        Self::from_parts(
+            path.to_path_buf(),
+            Backing::Mmap(mmap),
+            meta.len(),
+            meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            headerless,
+            t0,
+        )
+    }
+
+    /// 从内存字节直接建会话（新建表格：不写盘、无路径）。
+    ///
+    /// 与磁盘打开共用 from_parts 管线；会话以 Ram 后备持有字节且
+    /// has_path() == false——save 拒绝直存，save_as 落盘后自动获得路径。
+    ///
+    /// # Errors
+    /// 缓冲为空或无记录时返回错误字符串（与磁盘打开同语义）。
+    pub fn from_bytes(buf: Vec<u8>, headerless: bool) -> Result<Self, String> {
+        let t0 = Instant::now();
+        if buf.is_empty() {
+            return Err("空文件".into());
+        }
+        let total = buf.len() as u64;
+        Self::from_parts(
+            PathBuf::new(),
+            Backing::Ram(buf),
+            total,
+            std::time::SystemTime::UNIX_EPOCH,
+            headerless,
+            t0,
+        )
+    }
+
+    /// 打开管线共用收尾：嗅探编码 → 全量索引 → 首记录解析 → 字段装配。
+    /// 整开（mmap）与内存建表（Ram）仅差后备来源与路径/元数据。
+    fn from_parts(
+        path: PathBuf,
+        backing: Backing,
+        total_bytes: u64,
+        base_mtime: std::time::SystemTime,
+        headerless: bool,
+        t0: Instant,
+    ) -> Result<Self, String> {
+        let bytes: &[u8] = backing.bytes();
         let enc = sniff_encoding(bytes);
         // BOM 只对 UTF-8 有意义（GBK 文件可能以相同字节开头纯属巧合）
         let has_bom = enc == Encoding::Utf8 && bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
@@ -4431,8 +4633,8 @@ impl BigFile {
         let base_ncols = headers.len();
         let open_ms = t0.elapsed().as_millis() as u64;
         Ok(Self {
-            path: path.to_path_buf(),
-            backing: Backing::Mmap(mmap),
+            path,
+            backing,
             enc,
             idx,
             partial: None,
@@ -4441,7 +4643,7 @@ impl BigFile {
             open_ms,
             index_ms: open_ms,
             index_sync: true,
-            total_bytes: meta.len(),
+            total_bytes,
             base_ncols,
             base_headers: headers,
             seg: Segments::new(offset, n_data as u32),
@@ -4452,8 +4654,8 @@ impl BigFile {
             filter_stats: FilterStats::default(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
-            base_size: meta.len(),
-            base_mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            base_size: total_bytes,
+            base_mtime,
             has_bom,
             headerless,
             order: None,
@@ -4795,9 +4997,14 @@ impl BigFile {
         self.backing.bytes()
     }
 
-    /// 是否已切换到排序模式的内存后备。
+    /// 是否已切换到内存后备（排序模式或新建内存档）。
     pub fn is_ram_backed(&self) -> bool {
         self.backing.is_ram()
+    }
+
+    /// 会话是否已关联磁盘路径（新建内存档为 false，另存为后转 true）。
+    pub fn has_path(&self) -> bool {
+        !self.path.as_os_str().is_empty()
     }
 
     /// 当前是否处于排序视图。
@@ -4957,7 +5164,8 @@ impl BigFile {
                 self.filter = Some(mapped);
             }
         }
-        if release_ram && self.is_ram_backed() {
+        // 无路径内存档没有可回落的磁盘原文件：保持 Ram 后备。
+        if release_ram && self.is_ram_backed() && self.has_path() {
             // 文件本身未变（编辑都在覆盖层），可直接重建映射与索引。
             self.remap()?;
         }
@@ -5104,6 +5312,7 @@ impl BigFile {
             can_redo: !self.redo_stack.is_empty(),
             indexing,
             ram_backed: self.is_ram_backed(),
+            has_path: self.has_path(),
             sorted: self.is_sorted(),
             modified: self.revision > 0,
             indexed_bytes,
@@ -5117,6 +5326,10 @@ impl BigFile {
 
     /// 外部改动探测（窗口聚焦时前端轮询）。
     pub fn stale(&self) -> bool {
+        // 无路径内存档没有磁盘原文件，不存在外部改动。
+        if !self.has_path() {
+            return false;
+        }
         let Ok(m) = fs::metadata(&self.path) else { return true };
         m.len() != self.base_size || m.modified().ok() != Some(self.base_mtime)
     }
@@ -6135,6 +6348,10 @@ impl BigFile {
     /// 流式 0-70% / 落盘 70-78% / 重建索引至 100%（见 PHASE_* 常量注释）。
     /// 保存后重建 mmap 与索引；撤销栈保留（操作按稳定记录号寻址，仍有效）。
     pub fn save<F: FnMut(u64, u64, u8, u64)>(&mut self, progress: F) -> Result<(), String> {
+        // 新建内存档没有磁盘路径：直存无目标，必须另存为。
+        if !self.has_path() {
+            return Err("未命名表格：请先另存为".into());
+        }
         let dest = self.path.clone();
         self.save_to(&dest, false, progress)
     }
@@ -6358,8 +6575,15 @@ impl BigFile {
 
         let dest = self.path.clone();
         let tmp = tmp_path_for(&dest);
-        let out = fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
-        let mut w = BufWriter::new(out);
+        // 无路径内存档：写入内存缓冲（不落临时文件），apply 后内存内重建。
+        let target = if self.has_path() {
+            ColWriteTarget::File(
+                fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?,
+            )
+        } else {
+            ColWriteTarget::Mem(Vec::new())
+        };
+        let mut w = BufWriter::new(target);
         if self.has_bom {
             w.write_all(&[0xEF, 0xBB, 0xBF]).map_err(|e| e.to_string())?;
         }
@@ -6416,14 +6640,19 @@ impl BigFile {
         }
         // 阶段交接无条件各发一次：小文件也保证契约完整（有阶段 0/1 事件）。
         progress(stream_weighted(done), total, PHASE_STREAM, done);
-        w.flush().map_err(|e| e.to_string())?;
-        drop(w);
+        // into_inner 内含 flush；取出写出目标以分流落盘/内存两条重建路径。
+        let target = w.into_inner().map_err(|e| e.to_string())?;
         progress(flushed_weighted(total), total, PHASE_FLUSH, done);
-        self.replace_with_retry(&tmp, &dest)?;
-        progress(renamed_weighted(total), total, PHASE_FLUSH, done);
-
         // 全量重建：列结构变化，编辑层与撤销历史一并失效；保持首行语义
-        let mut fresh = Self::open_with(&self.path, self.headerless)?;
+        let mut fresh = match target {
+            ColWriteTarget::File(_) => {
+                self.replace_with_retry(&tmp, &dest)?;
+                progress(renamed_weighted(total), total, PHASE_FLUSH, done);
+                Self::open_with(&self.path, self.headerless)?
+            }
+            // 无路径内存档：缓冲直接重建会话，全程不写盘。
+            ColWriteTarget::Mem(buf) => Self::from_bytes(buf, self.headerless)?,
+        };
         fresh.base_headers = new_headers;
         fresh.base_ncols = ncols as usize;
         *self = fresh;
@@ -6434,6 +6663,7 @@ impl BigFile {
     /// 重新映射原文件并重建行索引（不动 Segment/覆盖层/撤销栈）。
     /// 用于保存换名失败后的读路径恢复。
     fn remap(&mut self) -> Result<(), String> {
+        debug_assert!(self.has_path(), "remap 需要磁盘路径（无路径内存档不可达）");
         let t0 = Instant::now();
         let file = fs::File::open(&self.path).map_err(|e| e.to_string())?;
         let mmap = Arc::new(unsafe {
@@ -6456,13 +6686,15 @@ impl BigFile {
     /// 瞬时占用）；仍失败则映回原文件保持会话可用（编辑层/撤销栈不动），
     /// 临时文件原样保留，错误信息给出路径供手动恢复。
     fn replace_with_retry(&mut self, tmp: &Path, dest: &Path) -> Result<(), String> {
-        // 占位匿名映射：mmap 字段不留空，1 字节开销
-        let dummy = memmap2::MmapMut::map_anon(1)
-            .and_then(|m| m.make_read_only())
-            .map_err(|e| e.to_string())?;
-        // 旧映射解除、文件句柄关闭（保存前已 refresh_indexed，无后台线程共享）；
-        // 排序模式的内存缓冲也在此释放，换名成功后由重开路径重建后备。
-        drop(std::mem::replace(&mut self.backing, Backing::Mmap(Arc::new(dummy))));
+        // 有路径 mmap 档：占位匿名映射换出旧映射、关闭文件句柄（保存前已
+        // refresh_indexed，无后台线程共享），1 字节开销；换名成功后由重开
+        // 路径重建后备。无路径 Ram 档的内存字节是唯一副本，绝不在此丢弃。
+        if !self.is_ram_backed() {
+            let dummy = memmap2::MmapMut::map_anon(1)
+                .and_then(|m| m.make_read_only())
+                .map_err(|e| e.to_string())?;
+            drop(std::mem::replace(&mut self.backing, Backing::Mmap(Arc::new(dummy))));
+        }
         let mut last: Option<std::io::Error> = None;
         for _ in 0..5 {
             match fs::rename(tmp, dest) {
@@ -6473,13 +6705,16 @@ impl BigFile {
                 }
             }
         }
-        // 换名失败：映回原文件恢复读路径（seg/覆盖层/撤销栈原样保留）
-        if let Err(re) = self.remap() {
-            return Err(format!(
-                "写入目标文件失败：{}\n且原文件重新映射失败：{}",
-                last.map(|e| e.to_string()).unwrap_or_default(),
-                re
-            ));
+        // 换名失败：有路径档映回原文件恢复读路径（seg/覆盖层/撤销栈原样保留）；
+        // 无路径内存档后备未动、会话原样可用，直接报错即可。
+        if self.has_path() {
+            if let Err(re) = self.remap() {
+                return Err(format!(
+                    "写入目标文件失败：{}\n且原文件重新映射失败：{}",
+                    last.map(|e| e.to_string()).unwrap_or_default(),
+                    re
+                ));
+            }
         }
         Err(format!(
             "写入目标文件失败：{}\n新文件已完整写在临时文件里（数据未丢失）：{}\n\
@@ -6491,6 +6726,7 @@ impl BigFile {
 
     /// 写盘后重建 mmap/索引；编辑层已落盘故清空，撤销栈保留。
     fn reopen_after_write(&mut self) -> Result<(), String> {
+        debug_assert!(self.has_path(), "reopen_after_write 需要磁盘路径（save_to 落位后必达）");
         let t0 = Instant::now();
         let n_data = self.seg.vrow_count();
         let offset = self.record_offset();
@@ -6596,4 +6832,29 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     let mut tmp = name;
     tmp.push(".simpletable-tmp");
     dir.join(tmp)
+}
+
+/// 列操作重写写出目标：有路径档流式落临时文件；无路径内存档写内存缓冲。
+enum ColWriteTarget {
+    File(fs::File),
+    Mem(Vec<u8>),
+}
+
+impl std::io::Write for ColWriteTarget {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(f) => f.write(buf),
+            Self::Mem(v) => {
+                v.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::File(f) => f.flush(),
+            Self::Mem(_) => Ok(()),
+        }
+    }
 }

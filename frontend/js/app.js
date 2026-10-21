@@ -1117,25 +1117,19 @@ function showTabMenu(t, x, y) {
 
 // 注：大模式工具按钮在下方工具栏段（tb 初始化后）创建；此处仅函数定义。
 
-/** 按大模式状态刷新专属按钮显隐与可用态 */
+/** 按引擎状态刷新专属按钮显隐与可用态（占位空表无会话：按钮恒隐藏） */
 function refreshBigUi() {
   const big = !!model.isBig;
   // 大模式现支持排序（需载入内存）；索引完成前不可点。
-  // 列操作两按钮仅 pending 时出现（小模式即时应用，不依赖它们）。
+  // 列操作两按钮仅 pending 时出现。
   // 「执行筛选」按钮已移除：筛选框键入即筛，回车立即执行。
   tb.sort.classList.remove("hidden");
   tb.sort.disabled = big && model.indexing?.() === true;
-  if (big) {
-    const pending = model.colOpsPending();
-    const sorted = model.meta()?.sorted === true;
-    tb.exitSort?.classList.toggle("hidden", !sorted);
-    tb.execColOps.classList.toggle("hidden", !pending);
-    tb.cancelColOps.classList.toggle("hidden", !pending);
-  } else {
-    tb.exitSort?.classList.add("hidden");
-    tb.execColOps.classList.add("hidden");
-    tb.cancelColOps.classList.add("hidden");
-  }
+  const pending = big && model.colOpsPending?.() === true;
+  const sorted = big && model.meta?.()?.sorted === true;
+  tb.exitSort?.classList.toggle("hidden", !sorted);
+  tb.execColOps.classList.toggle("hidden", !pending);
+  tb.cancelColOps.classList.toggle("hidden", !pending);
   refreshHeaderlessUi();
 }
 
@@ -1576,17 +1570,26 @@ bindModelEvents(model);
 async function newFile() {
   const spec = await newTableDialog();
   if (spec === null) return;
-  // 无列名模式下首行也是数据：行数即用户看到的数据行数。
-  const headers = Array.from({ length: spec.cols }, (_, i) => `列${i + 1}`);
+  // 统一大引擎：新建即内存字节源会话（不写盘、无路径，另存为后自动获得路径）。
   const rows = Array.from({ length: spec.rows }, () => Array(spec.cols).fill(""));
-  const m = new TableModel();
-  m.load(headers, rows, { headerless: true });
+  // 单列全空行序列化为 "" 才是非空行（引擎与 parseCsv 一样跳过空白行）：
+  // 逐行加引号的空字段 "" 既非空白行，解析回来仍是一个空串字段。
+  const text = spec.cols === 1
+    ? Array.from({ length: spec.rows }, () => '""').join("\r\n") + "\r\n"
+    : serializeRecords(rows);
+  const m = new BigModel();
+  bindModelEvents(m); // 先绑事件再建会话：与 openBigEngineFor 同序
+  try {
+    await m.create(text, { headerless: true });
+  } catch (err) {
+    await errorDialog("新建失败", String(err?.message ?? err));
+    return;
+  }
   const pristine = tabs.length === 0 && activeId === null && path === null && !dirty
     && model.rowCount() === 0 && model.columnCount() === 0;
   if (pristine) {
-    // 启动空表原位替换（尚未入签体系）
+    // 启动空表原位替换（尚未入签体系；事件已在建会话前绑定）
     model = m;
-    bindModelEvents(m);
     applyViewState(fgrid());
     setDirty(false);
     renderTabbar();
@@ -1595,7 +1598,7 @@ async function newFile() {
   }
   ensureTabbed();
   const t = {
-    id: tabSeq++, title: "未命名", path: null, kind: "small", model: m, dirty: false,
+    id: tabSeq++, title: "未命名", path: null, kind: "big", model: m, dirty: false,
     headerless: true, side: "A",
   };
   insertTabIntoGroup(t, splitOn ? focusedSide : "A"); // 新签落焦点侧组（I1 组邻接）
@@ -1692,59 +1695,44 @@ async function runBigWrite(write, action, okMsg, hint) {
  * @returns {Promise<boolean>} true = 已写入成功。
  */
 async function saveFile() {
-  if (model.isBig && model.indexing?.()) {
+  // 启动占位空表（无会话）：没有可保存的东西
+  if (!model.isBig) {
+    statusMsg("空表格无需保存：请先新建或打开文件", 2500);
+    return false;
+  }
+  if (model.indexing?.()) {
     // 索引未完成时引擎无法流式重写（后台线程仍持有映射），提示稍候
     statusMsg("文件仍在索引中，请稍候再保存", 2500);
     return false;
   }
   if (path === null) {
+    // 未命名内存档：直存无目标，走另存为
     return saveFileAs();
   }
-  if (model.isBig) {
-    return runBigWrite(
-      () => model.save(),
-      "保存",
-      "已保存（大文件模式：流式重写完成）",
-      "文件可能被其他程序占用，可尝试另存为。",
-    );
-  }
-  // 无列名模式没有独立表头：直接序列化全部行；空表会写出无法重开的内容
-  const headerless = model.isHeaderless?.() === true;
-  if (headerless && model.rowCount() === 0) {
-    statusMsg("无列名模式需至少保留一行", 3000);
-    return false;
-  }
-  if (headerless && model.columnCount() === 0) {
-    statusMsg("无列名模式需至少保留一列", 3000);
-    return false;
-  }
-  try {
-    await invoke("write_csv_file", {
-      path,
-      text: headerless
-        ? serializeRecords(model.allRows())
-        : serializeCsv(model.headers(), model.allRows()),
-    });
-  } catch (err) {
-    await errorDialog("保存失败", `${err}\n文件可能被其他程序占用，可尝试另存为。`);
-    return false;
-  }
-  setDirty(false);
-  return true;
+  return runBigWrite(
+    () => model.save(),
+    "保存",
+    "已保存（大文件模式：流式重写完成）",
+    "文件可能被其他程序占用，可尝试另存为。",
+  );
 }
 
 /**
  * 另存为 CSV。
  *
  * 大文件模式把当前视图流式写到新路径（原文件保持不变），成功后引擎会话
- * 与会话路径一并切换；小模式仍走内存序列化。只有写入成功才更新文档身份，
- * 失败时保留原路径，避免“标题已变、磁盘没变”的错位。
+ * 与会话路径一并切换；只有写入成功才更新文档身份，失败时保留原路径，
+ * 避免“标题已变、磁盘没变”的错位。未命名内存档另存为后自动获得路径。
  *
  * @param {string | null} target - 可选目标路径（冒烟测试跳过原生对话框）。
  * @returns {Promise<boolean>} true = 已写入成功。
  */
 async function saveFileAs(target = null) {
-  if (model.isBig && model.indexing?.()) {
+  if (!model.isBig) {
+    statusMsg("空表格无需保存：请先新建或打开文件", 2500);
+    return false;
+  }
+  if (model.indexing?.()) {
     statusMsg("文件仍在索引中，请稍候再另存为", 2500);
     return false;
   }
@@ -1755,24 +1743,13 @@ async function saveFileAs(target = null) {
   }
   if (!p.toLowerCase().endsWith(".csv")) p += ".csv";
 
-  if (model.isBig) {
-    const ok = await runBigWrite(
-      () => model.saveAs(p),
-      "另存为",
-      "已另存为（大文件模式：原文件未改动）",
-      "请检查目标目录是否可写，或换一个位置。",
-    );
-    if (!ok) return false;
-  } else {
-    // 小模式：先写入新路径，失败则回滚身份
-    const prev = path;
-    path = p;
-    const ok = await saveFile();
-    if (!ok) {
-      path = prev;
-      return false;
-    }
-  }
+  const ok = await runBigWrite(
+    () => model.saveAs(p),
+    "另存为",
+    "已另存为",
+    "请检查目标目录是否可写，或换一个位置。",
+  );
+  if (!ok) return false;
   path = p;
   // 另存后当前档的身份（路径/标题）随之变化，同步回页签
   syncActiveTab();
@@ -1902,16 +1879,7 @@ async function applyBigSort(levels, opts = {}) {
  */
 async function openSortDialog() {
   const names = model.headers();
-  if (!names.length) return;
-  if (!model.isBig) {
-    const levels = await sortDialog(names);
-    if (!levels || !levels.length) return;
-    fgrid().clearSelection();
-    clearDock();
-    model.sortRows(levels);
-    markDirty();
-    return;
-  }
+  if (!names.length) return; // 占位空表无列：对话框无从谈起
   if (model.indexing?.()) {
     statusMsg("文件仍在索引中，请稍候再排序", 2500);
     return;

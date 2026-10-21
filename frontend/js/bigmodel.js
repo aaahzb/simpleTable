@@ -148,6 +148,28 @@ export class BigModel {
   }
 
   /**
+   * 以内存文本新建会话（统一大引擎：不写盘、无路径，另存为后获得路径）。
+   *
+   * @param {string} text - CSV 全文（serializeRecords 产出）。
+   * @param {{headerless?: boolean}} [opts] - headerless=true 表示首行也是数据。
+   * @returns {Promise<object>} BigMeta（同步索引完成，indexing=false）。
+   */
+  async create(text, { headerless = false } = {}) {
+    this._stopIndexPolling();
+    this._session += 1;
+    this._openT0 = performance.now();
+    this._firstPaintMs = 0;
+    this._meta = await this._invoke("big_new", { text, headerless: !!headerless });
+    this._invalidate();
+    this._emitReset();
+    this._emitData(true);
+    this._emitUndo();
+    this._emitProgress();
+    this._startIndexPolling();
+    return this._meta;
+  }
+
+  /**
    * 关闭大文件会话（打开新文件/退出时）。
    *
    * @returns {Promise<void>}

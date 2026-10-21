@@ -360,6 +360,34 @@ async fn big_open(
     .map_err(|e| format!("打开任务被取消：{e}"))?
 }
 
+/// 新建内存表格会话（统一大引擎：不写盘、无路径，另存为后自动获得路径）。
+///
+/// text 为前端序列化好的 CSV 全文；headerless 决定首行是否作列名。
+/// 新建数据量小、同步解析毫秒级，仍走 spawn_blocking 与 big_open 形态一致。
+#[tauri::command]
+async fn big_new(
+    text: String,
+    session: u64,
+    headerless: Option<bool>,
+    state: tauri::State<'_, BigShared>,
+) -> Result<BigMeta, String> {
+    let shared = state.inner().clone();
+    let headerless = headerless.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        let bf = BigFile::from_bytes(text.into_bytes(), headerless)?;
+        let meta = bf.meta();
+        let mut guard = shared.lock().map_err(|e| e.to_string())?;
+        // 同一会话号重复新建（重载）：先让旧会话的扫描退出再替换
+        if let Some(old) = guard.remove(&session) {
+            old.bump_gate();
+        }
+        guard.insert(session, BigEntry::new(bf));
+        Ok(meta)
+    })
+    .await
+    .map_err(|e| format!("新建任务被取消：{e}"))?
+}
+
 /// 关闭大文件会话。
 #[tauri::command]
 fn big_close(state: tauri::State<BigShared>, session: u64) {
@@ -860,6 +888,7 @@ pub fn run() {
             quit_app,
             file_size,
             big_open,
+            big_new,
             big_close,
             big_sort_estimate,
             big_sort_load,

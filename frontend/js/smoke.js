@@ -2991,7 +2991,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     colsIn.value = "3";
     rowsIn.value = "2";
     assert(clickModalButton("确定"), "新建对话框应有确定按钮");
-    await waitFor(() => !window.__app.isBigMode() && window.__app.isHeaderless()
+    await waitFor(() => window.__app.isBigMode() && window.__app.isHeaderless()
       && model.columnCount() === 3 && model.rowCount() === 2, "新建 3×2 表格落定");
     assert(JSON.stringify(model.headers()) === JSON.stringify(["列1", "列2", "列3"]),
       `虚拟列名 ${model.headers()}`);
@@ -3006,11 +3006,42 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     mask2.querySelector("#newtable-cols").value = "1";
     mask2.querySelector("#newtable-rows").value = "";
     assert(clickModalButton("确定"), "第二次新建确定");
-    await waitFor(() => window.__app.isHeaderless() && model.rowCount() === 60,
-      "行数留空应默认 60");
+    await waitFor(() => window.__app.isBigMode() && window.__app.isHeaderless()
+      && model.rowCount() === 60, "行数留空应默认 60");
     assert(model.columnCount() === 1, `默认列数应保持 1（实际 ${model.columnCount()}）`);
 
     await window.__app.smokeLoadSmall([], []);
+  });
+
+  check("未命名新建档：另存为获得路径，再保存直写同路径", async () => {
+    await window.__app.smokeLoadSmall([], []);
+    tbBtn("新建").click();
+    await waitFor(() => document.querySelector(".modal-mask"), "新建对话框");
+    const mask = document.querySelector(".modal-mask");
+    mask.querySelector("#newtable-cols").value = "2";
+    mask.querySelector("#newtable-rows").value = "3";
+    assert(clickModalButton("确定"), "新建确定");
+    await waitFor(() => window.__app.isBigMode() && model.rowCount() === 3,
+      "新建 2×3 落定（内存档）");
+    assert(window.__app.getPath() === null, "新建档应无磁盘路径");
+
+    // 编辑标脏 → 另存为（冒烟直传目标路径，跳过原生对话框）
+    await model.setData(1, 0, "内存档");
+    assert(window.__app.isDirty() === true, "编辑应标脏");
+    const target = `${TMP}/newdoc-saveas.csv`;
+    assert(await window.__app.saveFileAs(target) === true, "未命名档另存为应成功");
+    assert(window.__app.getPath() === target,
+      `另存为后获得路径：${window.__app.getPath()}`);
+    assert(window.__app.isDirty() === false, "另存为后应为干净状态");
+
+    // 再编辑 → 普通保存直写同路径（若误走另存为会弹原生对话框卡死冒烟）
+    await model.setData(2, 1, "直写");
+    assert(await window.__app.saveFile() === true, "获得路径后普通保存应直写成功");
+    const back = parseCsv((await invoke("read_csv_file", { path: target })).text,
+      ",", { headerless: true });
+    assert(back.rows.length === 3, `无列名档应为 3 行数据：${back.rows.length}`);
+    assert(back.rows[1][0] === "内存档", `另存内容应含首笔编辑：${back.rows[1]}`);
+    assert(back.rows[2][1] === "直写", `再保存内容应含第二笔编辑：${back.rows[2]}`);
   });
 
   // ---- 执行（看门狗：整体超时强制收尾，防挂死） ----

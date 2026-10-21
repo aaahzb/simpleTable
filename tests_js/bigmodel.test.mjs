@@ -8,7 +8,7 @@ import { findVerticalEdge } from "../frontend/js/nav.js";
 
 /** 造一个内存版"引擎"：N 行 M 列的顺序数据 + 记录 invoke 调用。 */
 function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
-  const data = initial
+  let data = initial
     ? initial.map((r) => r.slice())
     : Array.from({ length: rows }, (_, r) =>
       Array.from({ length: cols }, (_, c) => `r${r}c${c}`),
@@ -16,12 +16,14 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
   const calls = [];
   let headerless = false;
   let ramBacked = false;
+  let hasPath = false; // big_open 置 true、big_new 置 false
   let sorted = false;
+  let ncols = cols; // big_new 后随文本重估列数
   let baseHeaders = Array.from({ length: cols }, (_, c) => `h${c}`);
-  const generic = () => Array.from({ length: cols }, (_, c) => `列${c + 1}`);
+  const generic = () => Array.from({ length: ncols }, (_, c) => `列${c + 1}`);
   const meta = () => ({
     rows: data.length,
-    cols,
+    cols: ncols,
     headers: headerless ? generic() : baseHeaders.slice(),
     encoding: "utf-8",
     pending_cols: false,
@@ -31,6 +33,7 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
     // 渐进索引字段：普通夹具视为"已索引完成"
     indexing: false,
     ram_backed: ramBacked,
+    has_path: hasPath,
     sorted,
     indexed_bytes: 1024,
     total_bytes: 1024,
@@ -45,7 +48,27 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
       switch (cmd) {
         case "big_open":
           headerless = !!args.headerless;
+          hasPath = true;
           return meta();
+        case "big_new": {
+          // 对齐引擎 from_bytes：按行切分、跳过空白行；空文本同语义拒绝
+          const recs = String(args.text).split(/\r\n|\n/)
+            .filter((l) => l.length > 0)
+            .map((l) => l.split(",").map((c) => (c === '""' ? "" : c)));
+          if (!recs.length) throw new Error("空文件");
+          headerless = !!args.headerless;
+          if (headerless) {
+            data = recs;
+          } else {
+            baseHeaders = recs[0].slice();
+            data = recs.slice(1);
+          }
+          ncols = recs[0].length;
+          ramBacked = true;
+          hasPath = false;
+          filter = null;
+          return meta();
+        }
         case "big_set_headerless": {
           const on = !!args.on;
           if (on !== headerless) {
@@ -75,7 +98,7 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
         case "big_insert_rows": {
           const at = Math.min(Number(args.vpos), data.length);
           const n = args.rows ? args.rows.length : Number(args.count);
-          const blank = Array.from({ length: cols }, () => "");
+          const blank = Array.from({ length: ncols }, () => "");
           for (let i = 0; i < n; i += 1) data.splice(at + i, 0, args.rows ? [...args.rows[i]] : [...blank]);
           return null;
         }
@@ -1071,4 +1094,36 @@ test("快速拖动：被丢弃的排队页回滚视口后仍能重新拉取", as
   model.prefetchRange(10 * BIG_PAGE, 10 * BIG_PAGE);
   assert.ok(pending.some((p) => p.page === 10),
     `回到第 10 页应重新拉取，实际在飞 ${pending.map((p) => p.page)}`);
+});
+
+test("create：内存文本建会话（big_new 携带 text/headerless/session）", async () => {
+  const { model, calls } = makeFakeEngine();
+  const meta = await model.create("name,age\r\nAlice,30\r\nbob,25\r\n", { headerless: false });
+  assert.equal(calls[0][0], "big_new");
+  assert.equal(calls[0][1].text, "name,age\r\nAlice,30\r\nbob,25\r\n");
+  assert.equal(calls[0][1].headerless, false);
+  assert.equal(typeof calls[0][1].session, "number");
+  assert.equal(meta.rows, 2);
+  assert.equal(meta.ram_backed, true);
+  assert.equal(meta.has_path, false);
+  assert.deepEqual(model.headers(), ["name", "age"]);
+  assert.equal(model.rowCount(), 2);
+});
+
+test("create：headerless 首记录是数据，列名虚拟化", async () => {
+  const { model } = makeFakeEngine();
+  await model.create("a,1\r\nb,2\r\n", { headerless: true });
+  assert.equal(model.isHeaderless(), true);
+  assert.equal(model.rowCount(), 2);
+  assert.deepEqual(model.headers(), ["列1", "列2"]);
+});
+
+test("create：替换既有会话后行列数与缓存即刻切换", async () => {
+  const { model } = makeFakeEngine({ rows: 500, cols: 2 });
+  await model.open("/x.csv");
+  await model.create("x,y,z\r\n1,2,3\r\n", {});
+  assert.equal(model.columnCount(), 3);
+  assert.equal(model.rowCount(), 1);
+  assert.deepEqual(model.headers(), ["x", "y", "z"]);
+  assert.equal(model.meta().has_path, false, "create 后应无磁盘路径");
 });
