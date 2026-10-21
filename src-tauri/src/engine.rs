@@ -1293,7 +1293,7 @@ mod tests {
         let p = tmp_csv("filter_page_oor", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         bf.run_filter(&FilterSpec {
-            cols: vec![(2, "beijing".into())],
+            cols: vec![(2, "beijing".into(), 0)],
             multi_cols: vec![],
             multi_text: String::new(),
         })
@@ -1314,7 +1314,7 @@ mod tests {
         // 单列 AND：city 含 "beijing"（小写匹配）
         let n = bf
             .run_filter(&FilterSpec {
-                cols: vec![(2, "beijing".into())],
+                cols: vec![(2, "beijing".into(), 0)],
                 multi_cols: vec![],
                 multi_text: String::new(),
             })
@@ -1323,7 +1323,7 @@ mod tests {
         // 双列 AND：name 含 "a" 且 city 含 "beijing" → Alice + Carol
         let n = bf
             .run_filter(&FilterSpec {
-                cols: vec![(0, "a".into()), (2, "beijing".into())],
+                cols: vec![(0, "a".into(), 0), (2, "beijing".into(), 0)],
                 multi_cols: vec![],
                 multi_text: String::new(),
             })
@@ -1332,7 +1332,7 @@ mod tests {
         // 双列 AND 无交集 → 0
         let n = bf
             .run_filter(&FilterSpec {
-                cols: vec![(0, "a".into()), (2, "shanghai".into())],
+                cols: vec![(0, "a".into(), 0), (2, "shanghai".into(), 0)],
                 multi_cols: vec![],
                 multi_text: String::new(),
             })
@@ -1515,7 +1515,7 @@ mod tests {
         // pending 期间编辑/筛选被拒
         assert!(bf.set_cell(0, 0, "x".into()).is_err());
         assert!(bf.run_filter(&FilterSpec {
-            cols: vec![(0, "a".into())],
+            cols: vec![(0, "a".into(), 0)],
             multi_cols: vec![],
             multi_text: String::new(),
         }).is_err());
@@ -1630,8 +1630,13 @@ mod tests {
     // ---- Part 4：大文件秒筛（字节直扫 + 收窄 + 中断） ----
 
     fn spec_one(col: u32, kw: &str) -> FilterSpec {
+        spec_mode(col, kw, 0)
+    }
+
+    /// 单列三态条件：mode 0 包含 / 1 严格等于·不分大小写 / 2 严格等于·区分大小写。
+    fn spec_mode(col: u32, kw: &str, mode: u8) -> FilterSpec {
         FilterSpec {
-            cols: vec![(col, kw.into())],
+            cols: vec![(col, kw.into(), mode)],
             multi_cols: vec![],
             multi_text: String::new(),
         }
@@ -1758,13 +1763,13 @@ mod tests {
         assert!(scan_one(&spec_one(1, "beijing"), u, b"ALICE,BeiJing\r\n"));
         // 多列 AND：两列都中才中；前列不中则整行不中（提前退出结果不变式）
         let and2 = FilterSpec {
-            cols: vec![(2, "c2".into()), (6, "c6".into())],
+            cols: vec![(2, "c2".into(), 0), (6, "c6".into(), 0)],
             multi_cols: vec![],
             multi_text: String::new(),
         };
         assert!(scan_one(&and2, u, b"c0,c1,c2,c3,c4,c5,c6,c7\r\n"));
         let and2miss = FilterSpec {
-            cols: vec![(2, "nope".into()), (6, "c6".into())],
+            cols: vec![(2, "nope".into(), 0), (6, "c6".into(), 0)],
             multi_cols: vec![],
             multi_text: String::new(),
         };
@@ -1835,13 +1840,112 @@ mod tests {
         assert!(!scan_one(&spec_multi(vec![0, 2], "x"), u, b"a,b,c\r\n"));
         // AND + OR 组合：逐列 AND 全部命中且 OR 至少中一列
         let combo = FilterSpec {
-            cols: vec![(0, "a".into())],
+            cols: vec![(0, "a".into(), 0)],
             multi_cols: vec![1, 2],
             multi_text: "b".into(),
         };
         assert!(scan_one(&combo, u, b"a,x,b\r\n"));
         assert!(!scan_one(&combo, u, b"x,x,b\r\n"));
         assert!(!scan_one(&combo, u, b"a,x,c\r\n"));
+    }
+
+    /// 严格等于·不分大小写：折叠后整字段相等（三路径一致）。
+    #[test]
+    fn field_scan_strict_eq_ci() {
+        let u = Encoding::Utf8;
+        // 整字段折叠相等 → 中
+        assert!(scan3(&spec_mode(0, "abc", 1), u, b"AbC,x
+"));
+        // 包含但不等于 → 不中（mode 0 则中）
+        assert!(!scan3(&spec_mode(0, "abc", 1), u, b"xabc,x
+"));
+        assert!(scan3(&spec_mode(0, "abc", 0), u, b"xabc,x
+"));
+        // 空字段 ≠ 非空关键字；尾字段 / 无尾换行同样生效
+        assert!(!scan3(&spec_mode(0, "abc", 1), u, b",x
+"));
+        assert!(scan3(&spec_mode(1, "abc", 1), u, b",AbC"));
+        // 超界列不中
+        assert!(!scan3(&spec_mode(9, "abc", 1), u, b"abc,x
+"));
+    }
+
+    /// 严格等于·区分大小写：比未折叠原始字节（raw_buf 不得被折叠污染）。
+    #[test]
+    fn field_scan_strict_eq_cs() {
+        let u = Encoding::Utf8;
+        assert!(!scan3(&spec_mode(0, "abc", 2), u, b"AbC,x
+"), "CS：大小写不同即不中");
+        assert!(scan3(&spec_mode(0, "AbC", 2), u, b"AbC,x
+"));
+        assert!(scan3(&spec_mode(0, "abc", 2), u, b"abc,x
+"));
+        // CJK 无大小写：原样等于
+        assert!(scan3(&spec_mode(0, "北京", 2), u, "北京,x
+".as_bytes()));
+        assert!(!scan3(&spec_mode(0, "北京", 2), u, "北京市,x
+".as_bytes()));
+    }
+
+    /// 严格等于 × 引号：比较的是剥离引号、坍缩转义后的字段内容。
+    #[test]
+    fn field_scan_strict_quotes() {
+        let u = Encoding::Utf8;
+        // 整字段带引：内容 ab 等于 needle ab
+        assert!(scan3(&spec_mode(0, "ab", 1), u, b"\"ab\",x
+"));
+        assert!(scan3(&spec_mode(0, "ab", 2), u, b"\"ab\",x
+"));
+        // 转义对坍缩："a""b" 的内容是 a"b
+        assert!(scan3(&spec_mode(0, "a\"b", 1), u, b"\"a\"\"b\",x
+"));
+        // 引号内逗号属于内容
+        assert!(scan3(&spec_mode(0, "a,b", 1), u, b"\"a,b\",x
+"));
+        // 未闭合引号吞到记录尾（无尾换行）
+        assert!(scan3(&spec_mode(0, "ab", 1), u, b"\"ab"));
+        // 含引号字符的内容不等于裸 needle
+        assert!(!scan3(&spec_mode(0, "ab", 1), u, b"\"a\"\"b\",x
+"));
+    }
+
+    /// GBK：严格等于下双字节语义不回归；ASCII needle 永不等于含 GBK 字节的字段。
+    ///（GBK 非 ASCII 记录只能走分发/标量，用 scan_one；纯 ASCII 记录可三路径。）
+    #[test]
+    fn field_scan_strict_gbk() {
+        let g = Encoding::Gbk;
+        // GBK 非 ASCII 记录路由标量（严格 mode 同样成立）
+        let gbk_rec = encoding_rs::GBK.encode("北京,ab
+").0.into_owned();
+        let ov: HashMap<(u32, u32), String> = HashMap::new();
+        let fs = FieldScan::new(&spec_mode(0, "北京", 1), g, &ov, 32);
+        assert!(!fs.route_fast(&gbk_rec), "GBK 非 ASCII → 标量（严格模式同）");
+        // 标量路径：CJK 严格相等（无大小写折叠问题）
+        assert!(scan_one(&spec_mode(0, "北京", 1), g, &gbk_rec));
+        assert!(!scan_one(
+            &spec_mode(0, "北京", 1),
+            g,
+            &encoding_rs::GBK.encode("北京市,ab
+").0
+        ));
+        // ASCII needle vs 含 GBK 字节字段：永不相等（引导字节 ≥0x81 天然杜绝）
+        assert!(!scan_one(
+            &spec_mode(0, "ab", 1),
+            g,
+            &encoding_rs::GBK.encode("中ab,x
+").0
+        ));
+        assert!(scan_one(
+            &spec_mode(1, "ab", 1),
+            g,
+            &encoding_rs::GBK.encode("中,AB
+").0
+        ));
+        // GBK 纯 ASCII 记录走快路径：严格 CS 语义不串
+        assert!(scan3(&spec_mode(0, "Ab", 2), g, b"Ab,x
+"));
+        assert!(!scan3(&spec_mode(0, "Ab", 2), g, b"ab,x
+"));
     }
 
     // ---- Part 4c：快/慢路径对拍（SIMD 快路径的正确性闸门） ----
@@ -1860,7 +1964,7 @@ mod tests {
 
         /// 生成一个随机筛选条件：0-2 根列 needle + 约三成概率多重。
         fn spec(&mut self) -> FilterSpec {
-            const KW: &[u8] = b"abz09\", ";
+            const KW: &[u8] = b"abzABZ09\", ";
             let mut spec = FilterSpec {
                 cols: vec![],
                 multi_cols: vec![],
@@ -1871,7 +1975,12 @@ mod tests {
                 let kw: String = (0..kl)
                     .map(|_| KW[self.next() as usize % KW.len()] as char)
                     .collect();
-                spec.cols.push((self.next() % 4, kw));
+                let mode = match self.next() % 4 {
+                    2 => 1,
+                    3 => 2,
+                    _ => 0,
+                };
+                spec.cols.push((self.next() % 4, kw, mode));
             }
             if self.next() % 10 < 3 {
                 spec.multi_cols = vec![self.next() % 3, self.next() % 4];
@@ -1892,6 +2001,16 @@ mod tests {
             b.record_matches_fast(0, rec),
             c.record_matches_scalar(0, rec),
         )
+    }
+
+    /// 三路径（强分发 / 强制快 / 强制标量）一致性断言并返回结果。
+    /// 注意：GBK 非 ASCII 记录不得走 scan3（快路径不处理 GBK 吞字节，
+    /// 生产上由分发兜底），GBK 非 ASCII 用例请用 scan_one。
+    fn scan3(spec: &FilterSpec, enc: Encoding, rec: &[u8]) -> bool {
+        let (a, b, c) = scan_three(spec, enc, rec);
+        assert_eq!(a, b, "强分发 vs 强制快路径不一致");
+        assert_eq!(b, c, "强制快路径 vs 强制标量不一致");
+        a
     }
 
     /// 路由断言：GBK 非 ASCII 记录走标量；GBK 纯 ASCII 与 UTF-8 走快路径。
@@ -1981,7 +2100,7 @@ mod tests {
         let p = tmp_csv("fastmulti", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         let spec = FilterSpec {
-            cols: vec![(0, "a".into()), (2, "beijing".into())],
+            cols: vec![(0, "a".into(), 0), (2, "beijing".into(), 0)],
             multi_cols: vec![],
             multi_text: String::new(),
         };
@@ -2000,6 +2119,92 @@ mod tests {
         assert_eq!(bf.run_filter(&spec_multi(vec![0, 2], "carol")).unwrap(), 2);
         assert_eq!(bf.last_filter_stats().scanned_rows, 6);
 
+        fs::remove_file(&p).ok();
+    }
+
+    /// 严格等于：覆盖层（编辑值）三态——CI 折叠等、CS 原样等。
+    #[test]
+    fn big_filter_strict_overlay() {
+        let p = tmp_csv("strict_ov", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "AbC".into()).unwrap(); // Alice → AbC（覆盖层）
+        // 包含（现状）：折叠子串
+        assert_eq!(bf.run_filter(&spec_mode(0, "abc", 0)).unwrap(), 1);
+        // 严格·不分大小写：折叠后整字段相等
+        assert_eq!(bf.run_filter(&spec_mode(0, "abc", 1)).unwrap(), 1);
+        // 严格·区分大小写：abc ≠ AbC
+        assert_eq!(bf.run_filter(&spec_mode(0, "abc", 2)).unwrap(), 0);
+        assert_eq!(bf.run_filter(&spec_mode(0, "AbC", 2)).unwrap(), 1);
+        fs::remove_file(&p).ok();
+    }
+
+    /// 插入行（无源记录，走 spec_matches）同样遵守三态。
+    #[test]
+    fn big_filter_strict_inserted_row() {
+        let p = tmp_csv("strict_ins", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.insert_rows(
+            bf.meta().rows,
+            Some(vec![vec!["Exact".into(), "1".into(), "Town".into()]]),
+            1,
+        )
+        .unwrap();
+        assert_eq!(bf.run_filter(&spec_mode(0, "exact", 1)).unwrap(), 1, "CI 折叠等应命中插入行");
+        assert_eq!(bf.run_filter(&spec_mode(0, "exact", 2)).unwrap(), 0, "CS 原样等不应命中");
+        assert_eq!(bf.run_filter(&spec_mode(0, "Exact", 2)).unwrap(), 1, "CS 原样等应命中");
+        fs::remove_file(&p).ok();
+    }
+
+    /// 严格等于破坏前缀单调（等于("ab") 与等于("abc") 不相交）：
+    /// 任一侧含严格列 → 禁止收窄，必须全量重扫。
+    #[test]
+    fn big_filter_strict_disables_narrowing() {
+        let p = tmp_csv("strict_narrow", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        // 收窄基准：包含 "ali" → Alice
+        assert_eq!(bf.run_filter(&spec_one(0, "ali")).unwrap(), 1);
+        assert_eq!(bf.last_filter_stats().scanned_rows, 5);
+        // 同关键字切到严格：ali ≠ alice → 0 命中，且必须全扫（不可在 1 行上收窄）
+        assert_eq!(bf.run_filter(&spec_mode(0, "ali", 1)).unwrap(), 0);
+        assert_eq!(bf.last_filter_stats().scanned_rows, 5, "含严格列禁止收窄");
+        // 严格 → 同关键字回包含：同样不可收窄
+        assert_eq!(bf.run_filter(&spec_one(0, "ali")).unwrap(), 1);
+        assert_eq!(bf.last_filter_stats().scanned_rows, 5, "严格切回包含也必须全扫");
+        // 严格下逐字追加：等于("alic") 与等于("alice") 不相交，禁止收窄
+        assert_eq!(bf.run_filter(&spec_mode(0, "alic", 1)).unwrap(), 0);
+        assert_eq!(bf.run_filter(&spec_mode(0, "alice", 1)).unwrap(), 1);
+        assert_eq!(bf.last_filter_stats().scanned_rows, 5, "严格下追加字符也必须全扫");
+        fs::remove_file(&p).ok();
+    }
+
+    /// 同条件短路：spec 相同（含 mode）→ 0 行扫描；mode 翻转是不同条件，必须重扫。
+    #[test]
+    fn big_filter_strict_short_circuit_mode_change() {
+        let p = tmp_csv("strict_sc", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        assert_eq!(bf.run_filter(&spec_mode(0, "alice", 1)).unwrap(), 1);
+        assert_eq!(bf.last_filter_stats().scanned_rows, 5);
+        // 完全相同（含 mode）→ 短路
+        assert_eq!(bf.run_filter(&spec_mode(0, "alice", 1)).unwrap(), 1);
+        assert_eq!(bf.last_filter_stats().scanned_rows, 0, "同 spec 应短路");
+        // mode 1→2：条件变了，必须重扫（即便关键字相同）
+        assert_eq!(bf.run_filter(&spec_mode(0, "alice", 2)).unwrap(), 0, "Alice 原样≠alice");
+        assert_eq!(bf.last_filter_stats().scanned_rows, 5, "mode 变化不得短路");
+        fs::remove_file(&p).ok();
+    }
+
+    /// 列严格 + 多重筛选：multi 恒为包含匹配，不受列严格影响。
+    #[test]
+    fn big_filter_strict_multi_stays_contains() {
+        let p = tmp_csv("strict_multi", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        // city 严格等于 beijing（Alice+Carol）且 name 包含 carol（multi OR）→ Carol
+        let spec = FilterSpec {
+            cols: vec![(2, "beijing".into(), 1)],
+            multi_cols: vec![0],
+            multi_text: "carol".into(),
+        };
+        assert_eq!(bf.run_filter(&spec).unwrap(), 1, "multi 仍是包含：仅 Carol 命中");
         fs::remove_file(&p).ok();
     }
 
@@ -2569,7 +2774,7 @@ mod tests {
         let p = tmp_csv("sort_filter", &sort_fixture());
         let mut bf = load_ram(&p);
         let spec = FilterSpec {
-            cols: vec![(2, "foo".into())],
+            cols: vec![(2, "foo".into(), 0)],
             multi_cols: Vec::new(),
             multi_text: String::new(),
         };
@@ -2586,7 +2791,7 @@ mod tests {
         );
         // 新条件在排序视图上重扫：age 含 2 → d(1), b(3)
         let spec2 = FilterSpec {
-            cols: vec![(1, "2".into())],
+            cols: vec![(1, "2".into(), 0)],
             multi_cols: Vec::new(),
             multi_text: String::new(),
         };
@@ -2607,7 +2812,7 @@ mod tests {
         bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
             .unwrap();
         let spec_b = FilterSpec {
-            cols: vec![(0, "b".into())],
+            cols: vec![(0, "b".into(), 0)],
             multi_cols: Vec::new(),
             multi_text: String::new(),
         };
@@ -2866,6 +3071,10 @@ mod tests {
         bench_timed(&mut bf, &spec_one(2, "朝阳"), "首筛 CJK 朝阳");
         // 7) 中文同列重扫
         bench_timed(&mut bf, &spec_one(2, "浦东"), "同列重扫 CJK 浦东");
+        // 8) 严格等于 CI：长度预检 + memcmp，应不比包含慢
+        bench_timed(&mut bf, &spec_mode(1, "user-377", 1), "首筛严格CI user-377");
+        // 9) 严格等于 CS：raw_buf 填充路径
+        bench_timed(&mut bf, &spec_mode(1, "user-377", 2), "首筛严格CS user-377");
     }
 }
 
@@ -3137,13 +3346,15 @@ pub enum ColOp {
     Rename { col: u32, name: String },
 }
 
-/// 筛选条件（与前端 grid.js _refilter 语义对齐：逐列"并且"子串 +
-/// 多重筛选勾选列"或"叠加；needle/multi_text 均已小写化）。
+/// 筛选条件（与前端 grid.js _refilter 语义对齐：逐列"并且" +
+/// 多重筛选勾选列"或"叠加；mode 0/1 的 needle 与 multi_text 均已小写化，
+/// mode 2 关键字保持原样大小写）。
 #[derive(Clone, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct FilterSpec {
-    /// (列号, 小写关键字)，列间 AND。
-    pub cols: Vec<(u32, String)>,
-    /// 多重筛选：勾选列 + 小写关键字（空串 = 未启用），列间 OR。
+    /// (列号, 关键字, 匹配模式)，列间 AND。
+    /// 模式：0=包含、1=严格等于(不分大小写)、2=严格等于(区分大小写)。
+    pub cols: Vec<(u32, String, u8)>,
+    /// 多重筛选：勾选列 + 小写关键字（空串 = 未启用），列间 OR（恒为包含匹配）。
     pub multi_cols: Vec<u32>,
     pub multi_text: String,
 }
@@ -3189,10 +3400,12 @@ pub struct BigMeta {
     pub elapsed_ms: u64,
 }
 
-/// 单条筛选关键字（已小写）。
+/// 单条筛选关键字（mode 0/1 已小写；mode 2 保持原样大小写）。
 struct Needle {
     col: u32,
     text: String,
+    /// 匹配模式：0 包含 / 1 严格等于·不分大小写 / 2 严格等于·区分大小写。
+    mode: u8,
     ascii: bool,
     multi: bool,
     hit: bool,
@@ -3240,6 +3453,10 @@ struct FieldScan<'a> {
     field_buf: Vec<u8>,
     /// 字段的 ASCII 可匹配字节：GBK 次字节不入内，避免次字节误中 ASCII 关键字。
     match_buf: Vec<u8>,
+    /// 未折叠的字段原始字节：仅 mode 2（区分大小写）比较用，keep_raw 时才填充。
+    raw_buf: Vec<u8>,
+    /// 是否存在 mode 2 needle（无则 raw_buf 全程不填充，默认零开销）。
+    keep_raw: bool,
     has_multi: bool,
     /// 快路径引号位缓冲（逐记录复用；无引号记录零分配）。
     quote_pos: Vec<u32>,
@@ -3263,11 +3480,12 @@ impl<'a> FieldScan<'a> {
     ) -> Self {
         let mut needles = Vec::new();
         let mut needle_by_col: HashMap<u32, Vec<usize>> = HashMap::new();
-        for (col, kw) in &spec.cols {
+        for (col, kw, mode) in &spec.cols {
             let idx = needles.len();
             needles.push(Needle {
                 col: *col,
                 text: kw.clone(),
+                mode: *mode,
                 ascii: kw.is_ascii(),
                 multi: false,
                 hit: false,
@@ -3280,6 +3498,7 @@ impl<'a> FieldScan<'a> {
                 needles.push(Needle {
                     col: *col,
                     text: spec.multi_text.clone(),
+                    mode: 0, // 多重筛选恒为包含匹配
                     ascii: spec.multi_text.is_ascii(),
                     multi: true,
                     hit: false,
@@ -3287,6 +3506,7 @@ impl<'a> FieldScan<'a> {
                 needle_by_col.entry(*col).or_default().push(idx);
             }
         }
+        let keep_raw = needles.iter().any(|n| n.mode == 2);
         let mut col_flags = vec![0u8; ncols];
         for col in needle_by_col.keys() {
             if (*col as usize) < ncols {
@@ -3301,6 +3521,8 @@ impl<'a> FieldScan<'a> {
             col_flags,
             field_buf: Vec::new(),
             match_buf: Vec::new(),
+            raw_buf: Vec::new(),
+            keep_raw,
             has_multi: !spec.multi_text.is_empty(),
             quote_pos: Vec::new(),
             quote_iv: Vec::new(),
@@ -3308,6 +3530,8 @@ impl<'a> FieldScan<'a> {
     }
 
     /// 字段结束：匹配该列关键字（覆盖层优先）。
+    /// 三态：0 包含（折叠子串）/ 1 严格等于·不分大小写（折叠整等）/
+    /// 2 严格等于·区分大小写（比未折叠 raw_buf）。
     fn end_field(&mut self, rec: u32, col: u32) {
         let flag = self
             .col_flags
@@ -3321,23 +3545,44 @@ impl<'a> FieldScan<'a> {
                     if self.needles[i].hit {
                         continue;
                     }
-                    let hit = match overlay_val {
-                        Some(v) => {
-                            if self.needles[i].ascii {
-                                v.to_ascii_lowercase()
-                                    .contains(self.needles[i].text.as_str())
-                            } else {
-                                v.to_lowercase().contains(self.needles[i].text.as_str())
+                    let nd = &self.needles[i];
+                    let hit = match nd.mode {
+                        2 => match overlay_val {
+                            Some(v) => *v == nd.text,
+                            None if nd.ascii => self.raw_buf.as_slice() == nd.text.as_bytes(),
+                            None => decode_slice(self.enc, &self.raw_buf) == nd.text,
+                        },
+                        1 => match overlay_val {
+                            Some(v) => {
+                                if nd.ascii {
+                                    v.to_ascii_lowercase() == nd.text
+                                } else {
+                                    v.to_lowercase() == nd.text
+                                }
                             }
-                        }
-                        None if self.needles[i].ascii => memchr::memmem::find(
-                            &self.match_buf,
-                            self.needles[i].text.as_bytes(),
-                        )
-                        .is_some(),
-                        None => decode_slice(self.enc, &self.field_buf)
-                            .to_lowercase()
-                            .contains(self.needles[i].text.as_str()),
+                            None if nd.ascii => {
+                                self.match_buf.as_slice() == nd.text.as_bytes()
+                            }
+                            None => {
+                                decode_slice(self.enc, &self.field_buf).to_lowercase() == nd.text
+                            }
+                        },
+                        _ => match overlay_val {
+                            Some(v) => {
+                                if nd.ascii {
+                                    v.to_ascii_lowercase().contains(nd.text.as_str())
+                                } else {
+                                    v.to_lowercase().contains(nd.text.as_str())
+                                }
+                            }
+                            None if nd.ascii => {
+                                memchr::memmem::find(&self.match_buf, nd.text.as_bytes())
+                                    .is_some()
+                            }
+                            None => decode_slice(self.enc, &self.field_buf)
+                                .to_lowercase()
+                                .contains(nd.text.as_str()),
+                        },
                     };
                     self.needles[i].hit = hit;
                 }
@@ -3345,6 +3590,7 @@ impl<'a> FieldScan<'a> {
         }
         self.field_buf.clear();
         self.match_buf.clear();
+        self.raw_buf.clear();
     }
 
     /// 已扫描到第 `finalized_col` 列时，是否已可断定本行不匹配。
@@ -3414,6 +3660,9 @@ impl<'a> FieldScan<'a> {
                                 // "" → 一个字面引号
                                 self.field_buf.push(b'"');
                                 self.match_buf.push(b'"');
+                                if self.keep_raw {
+                                    self.raw_buf.push(b'"');
+                                }
                             }
                             i += 2;
                             continue;
@@ -3430,6 +3679,10 @@ impl<'a> FieldScan<'a> {
                             self.field_buf.push(b);
                             self.field_buf.push(bytes[i + 1]);
                             self.match_buf.push(b);
+                            if self.keep_raw {
+                                self.raw_buf.push(b);
+                                self.raw_buf.push(bytes[i + 1]);
+                            }
                         }
                         i += 2;
                         continue;
@@ -3437,6 +3690,9 @@ impl<'a> FieldScan<'a> {
                     if collect {
                         self.field_buf.push(b.to_ascii_lowercase());
                         self.match_buf.push(b.to_ascii_lowercase());
+                        if self.keep_raw {
+                            self.raw_buf.push(b);
+                        }
                     }
                     i += 1;
                     continue;
@@ -3465,12 +3721,19 @@ impl<'a> FieldScan<'a> {
                                 self.field_buf.push(b);
                                 self.field_buf.push(bytes[i + 1]);
                                 self.match_buf.push(b);
+                                if self.keep_raw {
+                                    self.raw_buf.push(b);
+                                    self.raw_buf.push(bytes[i + 1]);
+                                }
                             }
                             i += 2;
                         } else {
                             if collect {
                                 self.field_buf.push(b.to_ascii_lowercase());
                                 self.match_buf.push(b.to_ascii_lowercase());
+                                if self.keep_raw {
+                                    self.raw_buf.push(b);
+                                }
                             }
                             i += 1;
                         }
@@ -3552,6 +3815,7 @@ impl<'a> FieldScan<'a> {
                         assemble_field(
                             &mut self.field_buf,
                             &mut self.match_buf,
+                            self.keep_raw.then_some(&mut self.raw_buf),
                             bytes,
                             field_start,
                             n,
@@ -3577,6 +3841,7 @@ impl<'a> FieldScan<'a> {
                 assemble_field(
                     &mut self.field_buf,
                     &mut self.match_buf,
+                    self.keep_raw.then_some(&mut self.raw_buf),
                     bytes,
                     field_start,
                     b,
@@ -3606,12 +3871,14 @@ impl<'a> FieldScan<'a> {
 ///
 /// # Parameters
 /// - `field_buf`/`match_buf`: 目标缓冲（追加写入，清空由 end_field 负责）。
+/// - `raw_buf`: Some 时追加写入折叠前的原始字节（mode 2 比较用）。
 /// - `bytes`: 整条记录原始字节。
 /// - `fs`/`fe`: 字段字节区间（含引号字符）。
 /// - `iv`: 扁平 (open, close) 引号区间表；close == 记录长表示未闭合。
 fn assemble_field(
     field_buf: &mut Vec<u8>,
     match_buf: &mut Vec<u8>,
+    raw_buf: Option<&mut Vec<u8>>,
     bytes: &[u8],
     fs: usize,
     fe: usize,
@@ -3655,17 +3922,25 @@ fn assemble_field(
     if cur < fe {
         field_buf.extend_from_slice(&bytes[cur..fe]);
     }
+    if let Some(rb) = raw_buf {
+        rb.extend_from_slice(&field_buf[base..]); // 折叠前的原始字节（mode 2 用）
+    }
     field_buf[base..].make_ascii_lowercase();
     match_buf.extend_from_slice(&field_buf[base..]);
 }
 
 /// 新条件能否在旧命中集上收窄：列结构一致，且每个关键字都以前一版为前缀。
 fn can_narrow(prev: &FilterSpec, next: &FilterSpec) -> bool {
+    // 严格等于破坏前缀单调（等于("ab") 与等于("abc") 不相交）：
+    // 任一侧含严格列即不可收窄（严格列上换关键字 = 全量重扫）。
+    if prev.cols.iter().any(|c| c.2 != 0) || next.cols.iter().any(|c| c.2 != 0) {
+        return false;
+    }
     if prev.cols.len() != next.cols.len() {
         return false;
     }
-    let mut pc: Vec<(u32, &str)> = prev.cols.iter().map(|(c, k)| (*c, k.as_str())).collect();
-    let mut nc: Vec<(u32, &str)> = next.cols.iter().map(|(c, k)| (*c, k.as_str())).collect();
+    let mut pc: Vec<(u32, &str)> = prev.cols.iter().map(|(c, k, _)| (*c, k.as_str())).collect();
+    let mut nc: Vec<(u32, &str)> = next.cols.iter().map(|(c, k, _)| (*c, k.as_str())).collect();
     pc.sort_by_key(|x| x.0);
     nc.sort_by_key(|x| x.0);
     for (a, b) in pc.iter().zip(nc.iter()) {
@@ -5501,8 +5776,11 @@ impl BigFile {
 
         // 契约：needle 已小写；再归一化一次防守（成本 O(条件数)）
         let mut spec = spec.clone();
-        for (_, kw) in &mut spec.cols {
-            *kw = kw.to_lowercase();
+        for (_, kw, mode) in &mut spec.cols {
+            // mode 2（严格·区分大小写）关键字保持原样大小写
+            if *mode != 2 {
+                *kw = kw.to_lowercase();
+            }
         }
         spec.multi_text = spec.multi_text.to_lowercase();
 
@@ -6187,11 +6465,13 @@ fn spec_matches(spec: &FilterSpec, fields: &[String]) -> bool {
             return false;
         }
     }
-    for (c, kw) in &spec.cols {
-        if !fields
-            .get(*c as usize)
-            .is_some_and(|f| f.to_lowercase().contains(kw.as_str()))
-        {
+    for (c, kw, mode) in &spec.cols {
+        let hit = fields.get(*c as usize).is_some_and(|f| match *mode {
+            2 => f == kw,                                // 严格·区分大小写
+            1 => f.to_lowercase() == *kw,                // 严格·不分大小写
+            _ => f.to_lowercase().contains(kw.as_str()), // 包含
+        });
+        if !hit {
             return false;
         }
     }

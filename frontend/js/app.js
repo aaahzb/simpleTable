@@ -58,7 +58,7 @@ function statusMsg(msg, ms = 0) {
 }
 
 /**
- * 毫秒时长 → 用户可读文本（<1s 用 ms，否则秒保留 1 位小数）。
+ * 毫秒时长 → 用户可读文本（<1s 用 ms，否则秒保留 2 位小数）。
  *
  * @param {number} ms - 毫秒。
  * @returns {string} 展示文本。
@@ -66,7 +66,7 @@ function statusMsg(msg, ms = 0) {
 function fmtDuration(ms) {
   if (!Number.isFinite(ms) || ms < 0) return "-";
   if (ms < 1000) return `${Math.round(ms)} ms`;
-  return `${(ms / 1000).toFixed(1)} 秒`;
+  return `${(ms / 1000).toFixed(2)} 秒`;
 }
 
 /**
@@ -131,7 +131,7 @@ function updateStatusText() {
       : "";
     if (model.filterActive()) {
       statusText.textContent = `匹配 ${lastCounts[0]} / 共 ${meta?.rows ?? lastCounts[1]} 行` +
-        (lastFilterMs ? ` · 用时 ${(lastFilterMs / 1000).toFixed(1)} 秒` : "") +
+        (lastFilterMs ? ` · 用时 ${fmtDuration(lastFilterMs)}` : "") +
         sortSuffix;
       return;
     }
@@ -1212,14 +1212,15 @@ let bigFilterSeq = 0;
 /**
  * 收集大模式当前筛选条件（逐列 AND + 多重 OR）。
  *
- * @returns {{kws: Array<[number, string]>, mKw: string, mCols: number[]}}
- *   列号/关键字列表、多重关键字与勾选列。
+ * @returns {{kws: Array<[number, string, number]>, mKw: string, mCols: number[]}}
+ *   列号/关键字/严格模式（0 包含 / 1 等于·不分大小写 / 2 等于·区分大小写）、
+ *   多重关键字与勾选列。
  */
 function collectBigFilter() {
   const cc = model.columnCount();
   const kws = [];
   for (const [col, kw] of fgrid().filters) {
-    if (col < cc && kw) kws.push([col, kw]);
+    if (col < cc && kw) kws.push([col, kw, fgrid().filterModes.get(col) ?? 0]);
   }
   const mKw = fgrid().multi.on ? fgrid().multi.text : "";
   const mCols = mKw ? [...fgrid().multi.cols].filter((c) => c < cc) : [];
@@ -1287,7 +1288,7 @@ async function runBigFilter(opts = {}) {
     // 回顶后一次重绘落定，同任务内完成不出现中间帧。
     fgrid().resetScroll();
     lastFilterMs = performance.now() - t0;
-    statusMsg(`匹配 ${n} 行 · 用时 ${(lastFilterMs / 1000).toFixed(1)} 秒`, 4000);
+    statusMsg(`匹配 ${n} 行 · 用时 ${fmtDuration(lastFilterMs)}`, 4000);
     updateStatusText();
   } catch (err) {
     if (seq === bigFilterSeq) await errorDialog("筛选失败", String(err?.message ?? err));

@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { Grid } from "../frontend/js/grid.js";
+import { Grid, cellHit } from "../frontend/js/grid.js";
 
 /** 与 grid.js 的 Y_CLAMP 同步（未导出，仅测试用）。 */
 const Y_CLAMP = 4_000_000;
@@ -137,4 +137,24 @@ test("锚点恢复不动点：行数增长后恢复再捕获位置不变（CI �
     `重复恢复不得漂移：${pos1} → ${pos2}`);
   assert.ok(Math.abs(pos2 - pos0) <= 0.3,
     `两次事件后位置仍应≈50000，实际 ${pos2}`);
+});
+
+test("cellHit 三态真值表（0 包含 / 1 等于·不分大小写 / 2 等于·区分大小写）", () => {
+  // mode 0：包含（折叠子串，现状语义）
+  assert.equal(cellHit("xabc", "xABC", "xabc", 0), true);
+  assert.equal(cellHit("xyz", "abc", "abc", 0), false);
+  // mode 1：严格等于·不分大小写（折叠后整字段相等）
+  assert.equal(cellHit("AbC", "abc", "abc", 1), true);
+  assert.equal(cellHit("xabc", "abc", "abc", 1), false);
+  // mode 2：严格等于·区分大小写（原样比较 kwRaw）
+  assert.equal(cellHit("AbC", "AbC", "abc", 2), true);
+  assert.equal(cellHit("AbC", "abc", "abc", 2), false);
+  // CJK 无大小写：三态一致（等于只在整字段相同时命中）
+  assert.equal(cellHit("北京", "北京", "北京", 1), true);
+  assert.equal(cellHit("北京市", "北京", "北京", 1), false);
+  assert.equal(cellHit("北京", "北京", "北京", 2), true);
+  // 空串：空文本等于空关键字（三态同）
+  assert.equal(cellHit("", "", "", 0), true);
+  assert.equal(cellHit("", "", "", 1), true);
+  assert.equal(cellHit("", "", "", 2), true);
 });

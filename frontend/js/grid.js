@@ -24,6 +24,30 @@ const MIN_COL_W = 24;
 const MIN_ROW_H = 10;
 /** 行数超过此值时筛选输入防抖（每击键全表扫描代价高） */
 const FILTER_DEBOUNCE_ROWS = 50000;
+/** 严格三态开关符号：0 包含 / 1 严格等于·不分大小写 / 2 严格等于·区分大小写 */
+const STRICT_GLYPHS = ["~", "=", "≡"];
+/** 严格三态按钮悬停文案（与 STRICT_GLYPHS 同序） */
+const STRICT_TITLES = [
+  "包含匹配（默认）——点击切换为「严格等于·不分大小写」",
+  "严格等于·不分大小写——点击切换为「严格等于·区分大小写」",
+  "严格等于·区分大小写——点击切回「包含」",
+];
+
+/**
+ * 单元格三态匹配（与引擎 FieldScan::end_field 语义对齐）。
+ *
+ * @param {string} text - 单元格文本。
+ * @param {string} kwRaw - 关键字原样（mode 2 比较用）。
+ * @param {string} kwLower - 关键字小写（mode 0/1 比较用，调用方预计算）。
+ * @param {number} mode - 0 包含 / 1 严格等于·不分大小写 / 2 严格等于·区分大小写。
+ * @returns {boolean} 是否命中。
+ */
+export function cellHit(text, kwRaw, kwLower, mode) {
+  if (mode === 2) return text === kwRaw;
+  const t = text.toLowerCase();
+  if (mode === 1) return t === kwLower;
+  return t.includes(kwLower);
+}
 /**
  * 画布压缩上限（纵向虚拟缩放，见 _yScale）：4,000,000px。
  * 两条 WebView2 实测绘制墙决定不能更大：
@@ -119,6 +143,9 @@ export class Grid {
     this.colOrder = [];
     /** @type {Map<number, string>} 列号 → 筛选关键字 */
     this.filters = new Map();
+    /** @type {Map<number, number>} 列号 → 严格模式（1 等于·不分大小写 /
+     * 2 等于·区分大小写；0 不入图） */
+    this.filterModes = new Map();
     /** 多重筛选状态：on 闩锁（长期选中）；text 关键字；cols 参与"或"匹配的源列号集合 */
     this.multi = { on: false, text: "", cols: new Set() };
     /** @type {number[] | null} 可见源行号（筛选后）；null = 恒等快路径（无筛选） */
@@ -621,6 +648,22 @@ export class Grid {
       input.value = this.filters.get(srcCol) ?? "";
       input.dataset.col = String(srcCol);
       filter.appendChild(input);
+      // 严格三态开关（筛选框内右端常显）：~ 包含 → = 等于·不分大小写 → ≡ 等于·区分大小写
+      const stMode = this.filterModes.get(srcCol) ?? 0;
+      const st = document.createElement("button");
+      st.type = "button";
+      st.className = "col-strict";
+      st.dataset.col = String(srcCol);
+      st.dataset.mode = String(stMode);
+      st.textContent = STRICT_GLYPHS[stMode];
+      st.title = STRICT_TITLES[stMode];
+      st.disabled = indexing;
+      // 不触发列选择/拖拽；preventDefault 防止点击把焦点从筛选框抢走
+      st.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      });
+      filter.appendChild(st);
       const rz = document.createElement("div");
       rz.className = "col-resize";
       rz.dataset.col = String(srcCol);
@@ -798,6 +841,9 @@ export class Grid {
     for (const col of [...this.filters.keys()]) {
       if (col >= n) this.filters.delete(col);
     }
+    for (const col of [...this.filterModes.keys()]) {
+      if (col >= n) this.filterModes.delete(col);
+    }
   }
 
   /** 按当前条件重算可见行并刷新行渲染与状态 */
@@ -807,7 +853,10 @@ export class Grid {
     const cc = this.model.columnCount();
     const kws = [];
     for (const [col, kw] of this.filters) {
-      if (col < cc && kw) kws.push([col, kw.toLowerCase()]);
+      // kwLower 预计算：逐行匹配不再重复小写化关键字（680 万行规模）
+      if (col < cc && kw) {
+        kws.push([col, kw, kw.toLowerCase(), this.filterModes.get(col) ?? 0]);
+      }
     }
     // 多重筛选：关键字在勾选列中命中任意一列即通过（列间"或"），
     // 与各列自身筛选框（列间"并且"）叠加——先过多重，再过逐列。
@@ -847,8 +896,8 @@ export class Grid {
         this.model.rawData(r, c).toLowerCase().includes(mKw))) {
         ok = false;
       }
-      for (const [col, kw] of kws) {
-        if (!this.model.rawData(r, col).toLowerCase().includes(kw)) {
+      for (const [col, kwRaw, kwLower, mode] of kws) {
+        if (!cellHit(this.model.rawData(r, col), kwRaw, kwLower, mode)) {
           ok = false;
           break;
         }
@@ -1060,6 +1109,21 @@ export class Grid {
 
   // ============ 事件绑定 ============
 
+  /** 筛选条件变化统一尾段：大模式刷新状态并走引擎防抖链；小模式超阈值防抖。 */
+  _filterCondChanged() {
+    if (this.model.isBig) {
+      this._refilter(); // 刷新状态；条件清空时 _refilter 会自动清引擎筛选
+      this.hooks.bigFilterInput?.(); // 键入即筛（app 侧防抖 + 可中断扫描）
+      return;
+    }
+    clearTimeout(this._filterTimer);
+    if (this.model.rowCount() > FILTER_DEBOUNCE_ROWS) {
+      this._filterTimer = setTimeout(() => this._refilter(), 200);
+    } else {
+      this._refilter();
+    }
+  }
+
   _bindEvents() {
     const scroll = this.scrollEl;
 
@@ -1205,17 +1269,21 @@ export class Grid {
       const col = Number(input.dataset.col);
       const v = input.value;
       if (v) this.filters.set(col, v); else this.filters.delete(col);
-      if (this.model.isBig) {
-        this._refilter(); // 刷新状态；条件清空时 _refilter 会自动清引擎筛选
-        this.hooks.bigFilterInput?.(); // 键入即筛（app 侧防抖 + 可中断扫描）
-        return;
-      }
-      clearTimeout(this._filterTimer);
-      if (this.model.rowCount() > FILTER_DEBOUNCE_ROWS) {
-        this._filterTimer = setTimeout(() => this._refilter(), 200);
-      } else {
-        this._refilter();
-      }
+      this._filterCondChanged();
+    });
+
+    // ---- 严格三态开关点击：0 → 1 → 2 → 0 循环（列级独立设置） ----
+    this.headerEl.addEventListener("click", (e) => {
+      const st = e.target.closest(".col-strict");
+      if (!st) return;
+      const col = Number(st.dataset.col);
+      const mode = ((this.filterModes.get(col) ?? 0) + 1) % 3;
+      if (mode) this.filterModes.set(col, mode); else this.filterModes.delete(col);
+      st.dataset.mode = String(mode);
+      st.textContent = STRICT_GLYPHS[mode];
+      st.title = STRICT_TITLES[mode];
+      // 该列有条件文本时与输入等效触发重筛（大模式走 app 侧防抖链）
+      if (this.filters.get(col)) this._filterCondChanged();
     });
 
     // 大模式：筛选框内回车 = 跳过防抖立即执行一次
@@ -1828,10 +1896,16 @@ export class Grid {
   /** 清空全部筛选条件与输入框（含多重筛选关键字；多重筛选开关状态保留） */
   clearFilters() {
     this.filters.clear();
+    this.filterModes.clear();
     this.multi.text = "";
     this._suppressFilterInput = true;
     for (const input of this.headerEl.querySelectorAll(".col-filter input")) {
       input.value = "";
+    }
+    for (const btn of this.headerEl.querySelectorAll(".col-strict")) {
+      btn.dataset.mode = "0";
+      btn.textContent = STRICT_GLYPHS[0];
+      btn.title = STRICT_TITLES[0];
     }
     this._suppressFilterInput = false;
     this._refilter();

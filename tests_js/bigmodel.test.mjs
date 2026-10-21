@@ -404,6 +404,26 @@ test("筛选：runFilter 切结果视图，rowCount=命中数，clearFilter 还�
   assert.equal(model.rowCount(), 200);
 });
 
+test("筛选：runFilter 载荷携带三态 mode；mode2 关键字保持原样大小写", async () => {
+  const { model, calls } = makeFakeEngine({ rows: 10, cols: 3 });
+  await model.open("/x.csv");
+  await model.runFilter([[0, "AbC", 2], [1, "dEf", 1], [2, "gHi", 0]], [], "");
+  const call = calls.find(([c]) => c === "big_filter");
+  assert.deepEqual(call[1].spec.cols, [
+    [0, "AbC", 2], // mode 2：保持原样大小写（区分大小写比较）
+    [1, "def", 1], // mode 0/1：关键字小写化（引擎侧折叠匹配）
+    [2, "ghi", 0],
+  ]);
+});
+
+test("筛选：runFilter 兼容旧二元组调用（mode 缺省按 0 处理）", async () => {
+  const { model, calls } = makeFakeEngine({ rows: 10, cols: 1 });
+  await model.open("/x.csv");
+  await model.runFilter([[0, "Needle"]], [], "");
+  const call = calls.find(([c]) => c === "big_filter");
+  assert.deepEqual(call[1].spec.cols, [[0, "needle", 0]]);
+});
+
 test("save 后筛选态复位：引擎重开文件后视图回到全量", async () => {
   const { model, data } = makeFakeEngine({ rows: 200, cols: 1 });
   await model.open("/x.csv");

@@ -468,6 +468,48 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(model.rawData(grid.visAt(0), 0) === "丽江");
   });
 
+  // ========== 严格三态开关（~ 包含 → = 等于·不分大小写 → ≡ 等于·区分大小写） ==========
+
+  check("严格三态：按钮常显、点击循环 0→1→2→0、小模式三态命中数", async () => {
+    await window.__app.smokeLoadSmall(
+      ["品", "码"],
+      [["abc", "A1"], ["xabc", "a2"], ["ABC", "A1"]],
+    );
+    const btn = document.querySelector('.col-strict[data-col="0"]');
+    assert(btn, "筛选框内应有严格三态按钮");
+    assert(btn.dataset.mode === "0" && btn.textContent === "~", "默认应为包含（~）");
+    grid.filters.set(0, "abc");
+    grid._refilter();
+    assert(grid.visCount() === 3, `包含 abc 应中 3 行，实际 ${grid.visCount()}`);
+    btn.click(); // → 严格·不分大小写
+    assert(btn.dataset.mode === "1" && btn.textContent === "=", "第一次点击应为 =");
+    assert(grid.visCount() === 2, `严格CI abc 应中 abc/ABC 2 行，实际 ${grid.visCount()}`);
+    btn.click(); // → 严格·区分大小写
+    assert(btn.dataset.mode === "2" && btn.textContent === "≡", "第二次点击应为 ≡");
+    assert(grid.visCount() === 1, `严格CS abc 应只中 abc 1 行，实际 ${grid.visCount()}`);
+    btn.click(); // → 回包含
+    assert(btn.dataset.mode === "0", "第三次点击应回包含");
+    assert(grid.visCount() === 3, "回包含后应恢复 3 行");
+    await loadBasic(); // 还原基础小表
+  });
+
+  check("严格三态：表头重建后按钮态保持，清除筛选复位", async () => {
+    await loadBasic();
+    const btn = document.querySelector('.col-strict[data-col="1"]');
+    btn.click(); // 第 1 列 → mode 1
+    assert(grid.filterModes.get(1) === 1, "filterModes 应记录 mode 1");
+    grid.setMultiOn(true); // 触发表头重建（多重筛选复选框出现）
+    const btn2 = document.querySelector('.col-strict[data-col="1"]');
+    assert(btn2 && btn2.dataset.mode === "1" && btn2.textContent === "=",
+      "表头重建后按钮态应从 filterModes 回填");
+    grid.setMultiOn(false);
+    grid.clearFilters();
+    assert(grid.filterModes.size === 0, "清除筛选应清空严格模式");
+    const btn3 = document.querySelector('.col-strict[data-col="1"]');
+    assert(btn3 && btn3.dataset.mode === "0" && btn3.textContent === "~",
+      "清除筛选后按钮应复位为 ~");
+  });
+
   // ========== 多重筛选 ==========
 
   check("多重筛选：按钮在清除筛选右侧，开启出现输入框与默认勾选的列复选框", async () => {
@@ -2049,6 +2091,31 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const page = await invoke("big_filter_page", { from: 0, count: 5, session: bm.sessionId });
     assert(page.length === 5, `筛选页行数 ${page.length}`);
     assert(page[4][0] === "大理" && page[4][1] === "3", `筛选页内容 ${page[4]}`);
+    grid.clearFilters();
+    await sleep(150);
+    assert(bm.filterActive() === false, "清除筛选后应回全量");
+  });
+
+  check("大模式：严格三态（等于·不分大小写 / 等于·区分大小写）", async () => {
+    const bm = bigM();
+    // 夹具全为 "大理,3,古城" × 5000 行
+    grid.filters.set(0, "大理");
+    grid.filterModes.set(0, 1); // 严格·不分大小写
+    await window.__app.runBigFilter();
+    assert(await invoke("big_filter_count", { session: bm.sessionId }) === 5000,
+      "严格CI 整字段等于应中全部 5000 行");
+    grid.filters.set(0, "大"); // 子串 ≠ 整字段
+    await window.__app.runBigFilter();
+    assert(await invoke("big_filter_count", { session: bm.sessionId }) === 0,
+      "严格CI 下子串不应命中");
+    grid.filterModes.set(0, 2); // 严格·区分大小写
+    await window.__app.runBigFilter();
+    assert(await invoke("big_filter_count", { session: bm.sessionId }) === 0,
+      "严格CS 下子串同样不应命中");
+    grid.filterModes.delete(0); // 回包含
+    await window.__app.runBigFilter();
+    assert(await invoke("big_filter_count", { session: bm.sessionId }) === 5000,
+      "回包含后子串应恢复 5000 行");
     grid.clearFilters();
     await sleep(150);
     assert(bm.filterActive() === false, "清除筛选后应回全量");

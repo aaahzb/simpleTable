@@ -159,13 +159,25 @@ body.split #vsplit { display: block; }
 }
 .col-multi { flex: 0 0 auto; margin-right: 0.35em; cursor: pointer; }
 .col-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.col-filter { height: var(--filter-band); padding: 0 1px; }
+.col-filter { height: var(--filter-band); padding: 0 1px; position: relative; }
 .col-filter input {
   width: 100%; height: calc(100% - 2px); margin-top: 1px;
-  font: inherit; font-size: 0.92em; padding: 0 0.3em;
+  font: inherit; font-size: 0.92em; padding: 0 1.5em 0 0.3em; /* 右端让位严格开关 */
   border: 1px solid #d0d0d0; border-radius: 2px; background: #fff;
 }
 .col-filter input:focus { border-color: var(--accent); outline: none; }
+/* 严格三态开关（嵌入筛选框右端，常显）：~ 包含 → = 等于·不分大小写 → ≡ 等于·区分大小写 */
+.col-strict {
+  position: absolute; right: 3px; top: 50%; transform: translateY(-50%);
+  width: 1.35em; height: 1.35em; padding: 0; font-size: 0.85em; line-height: 1;
+  border: 1px solid transparent; border-radius: 2px; background: transparent;
+  color: #999; opacity: 0.55; cursor: pointer;
+}
+.col-strict:hover:not(:disabled) { opacity: 1; color: var(--accent); }
+.col-strict[data-mode="1"], .col-strict[data-mode="2"] {
+  opacity: 1; color: var(--accent); background: #dce6f0; border-color: var(--accent);
+}
+.col-strict:disabled { opacity: 0.3; cursor: default; }
 .col-resize {
   position: absolute; top: 0; right: -3px; width: 7px; height: 100%;
   cursor: col-resize; z-index: 8;

@@ -1048,7 +1048,9 @@ export class BigModel {
   /**
    * 执行一次筛选（引擎 rayon 全表扫描）。
    *
-   * @param {Array<[number, string]>} cols - (列号, 小写关键字) AND 组合。
+   * @param {Array<[number, string, number?]>} cols - (列号, 关键字, 模式) AND 组合；
+   *   模式 0 包含 / 1 严格等于·不分大小写 / 2 严格等于·区分大小写
+   *   （mode 2 关键字保持原样大小写，其余小写化）。
    * @param {number[]} multiCols - 多重筛选勾选列。
    * @param {string} multiText - 多重筛选关键字（小写）。
    * @returns {Promise<number | null>} 命中数；请求已过期/被引擎中断时返回 null。
@@ -1057,7 +1059,11 @@ export class BigModel {
     this._requireNotIndexing("文件仍在索引中，暂不支持筛选");
     const gen = ++this._filterGen;
     const spec = {
-      cols: cols.map(([c, kw]) => [c, kw.toLowerCase()]),
+      cols: cols.map(([c, kw, mode]) => [
+        c,
+        (mode ?? 0) === 2 ? kw : kw.toLowerCase(), // mode 2 区分大小写：保持原样
+        mode ?? 0,
+      ]),
       multi_cols: multiCols,
       multi_text: multiText.toLowerCase(),
     };
