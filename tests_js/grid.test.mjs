@@ -210,3 +210,114 @@ test("_rowHeadText：筛选态取原始行号（未缓存空串占位），非�
   g.model = { isBig: true, filterActive: () => false, rowNumber: () => null };
   assert.equal(g._rowHeadText(7), "8", "非筛选大模式=行索引+1");
 });
+
+/** 造一个仅含编辑协作者的原型级 Grid，避免 DOM 与真实引擎。 */
+function makeEditGrid(model) {
+  const g = Object.create(Grid.prototype);
+  const messages = [];
+  const selections = [];
+  g.model = model;
+  g.hooks = { statusMsg: (text) => messages.push(text) };
+  g.selectedCells = () => [[0, 0], [0, 1], [1, 0]];
+  g.select = (cell) => selections.push(["select", cell]);
+  g._extendTo = (cell) => selections.push(["extend", cell]);
+  return { g, messages, selections };
+}
+
+test("单值填充把含未加载格的完整选区交给一次 setCells", async () => {
+  const writes = [];
+  const model = {
+    setCells: async (cells) => { writes.push(cells); return true; },
+    rawData: () => { throw new Error("不得用缓存旧值过滤"); },
+    setData: async () => { throw new Error("不得逐格写入"); },
+    batch: async () => { throw new Error("不得走空事务"); },
+  };
+  const { g } = makeEditGrid(model);
+  await g._fillSelection("X");
+  assert.deepEqual(writes, [[
+    [0, 0, "X"], [0, 1, "X"], [1, 0, "X"],
+  ]]);
+});
+
+test("扩行粘贴只调 pasteRows，不预先插行或逐格写", async () => {
+  const writes = [];
+  const rows = [["A"], ["B"], ["C"]];
+  const model = {
+    rowCount: () => 1,
+    pasteRows: async (...args) => {
+      writes.push(args);
+      return { changed: true, insertedRows: 2 };
+    },
+    insertRows: async () => { throw new Error("不得另行插行"); },
+    setData: async () => { throw new Error("不得逐格写入"); },
+  };
+  const { g, selections } = makeEditGrid(model);
+  await g._pasteBig(0, 0, rows, 1);
+  assert.deepEqual(writes, [[0, 0, rows]]);
+  assert.deepEqual(selections, [["select", [0, 0]], ["extend", [2, 0]]]);
+});
+
+/** 造一个触发内存档自动扩列的最小 Grid。 */
+function makeAutoExpandGrid(approved) {
+  const calls = [];
+  const g = Object.create(Grid.prototype);
+  g.sel = { current: [0, 0] };
+  g.selectedSet = new Set([0]);
+  g.lastCopiedText = null;
+  g.hooks = {
+    statusMsg: () => {},
+    confirmColOps: async () => {
+      calls.push("confirm");
+      return approved;
+    },
+  };
+  g.model = {
+    columnCount: () => 2,
+    meta: () => ({ has_path: false, sorted: false }),
+    insertColumns: async (at, count) => { calls.push(`insert:${at}:${count}`); },
+    applyColOps: async () => { calls.push("apply"); },
+    pasteRows: async () => {
+      calls.push("paste");
+      return { changed: true, insertedRows: 0 };
+    },
+    setData: async () => { throw new Error("不得走单格纯文本分支"); },
+  };
+  g.select = () => {};
+  g._extendTo = () => {};
+  return { g, calls };
+}
+
+/** 临时替换剪贴板，并返回恢复函数。 */
+function stubNavigatorClipboard(text) {
+  const old = Object.getOwnPropertyDescriptor(globalThis.navigator, "clipboard");
+  Object.defineProperty(globalThis.navigator, "clipboard", {
+    value: { readText: async () => text }, configurable: true,
+  });
+  return () => {
+    if (old) Object.defineProperty(globalThis.navigator, "clipboard", old);
+    else delete globalThis.navigator.clipboard;
+  };
+}
+
+test("超宽粘贴取消列历史确认时零写入", async () => {
+  const { g, calls } = makeAutoExpandGrid(false);
+  const restore = stubNavigatorClipboard("A\tB\tC\r\n");
+  try {
+    await g.pasteClipboard();
+  } finally {
+    restore();
+  }
+  assert.deepEqual(calls, ["confirm"],
+    "取消后不得插列、执行列操作或粘贴任何内容");
+});
+
+test("超宽粘贴确认后先扩列再一次性粘贴", async () => {
+  const { g, calls } = makeAutoExpandGrid(true);
+  const restore = stubNavigatorClipboard("A\tB\tC\r\n");
+  try {
+    await g.pasteClipboard();
+  } finally {
+    restore();
+  }
+  assert.deepEqual(calls, ["confirm", "insert:2:1", "apply", "paste"]);
+});

@@ -98,6 +98,18 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await window.__app.smokeLoadSmall(headers, rows.map((r) => r.slice()));
   };
 
+  /** 当前已预热小表的完整同步快照。 */
+  const tableSnapshot = () => Array.from(
+    { length: model.rowCount() },
+    (_, r) => Array.from(
+      { length: model.columnCount() }, (_, c) => model.rawData(r, c),
+    ),
+  );
+
+  /** 当前小表是否与期望矩阵完全一致。 */
+  const tableEquals = (expected) =>
+    JSON.stringify(tableSnapshot()) === JSON.stringify(expected);
+
   /**
    * 断言某一侧的表头列与数据列逐列对齐（左缘与宽度），并校验左上角块
    * 与行号列同宽。
@@ -612,7 +624,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     pe.value = "line1\nline2XY";
     pe.dispatchEvent(new Event("input", { bubbles: true }));
     await waitFor(() => model.rawData(0, 2) === "line1\nline2XY", "二次写回模型失败");
-    // 引擎不合并同格连续击键：逐次撤销，撤到底回到夹具原值（对齐粘贴例的撤到底模式）
+    // 单格连续击键维持既有逐次撤销计步：逐次撤到底回到夹具原值
     let steps = 0;
     while (steps < 20) {
       try { if (!await model.undo()) break; } catch { break; }
@@ -791,23 +803,41 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(grid.lastCopiedText === '"a\tb\nc"\r\n', `引号包裹: ${JSON.stringify(grid.lastCopiedText)}`);
   });
 
-  check("粘贴区域展开：整块内容落定、撤销可复原（引擎逐格撤销）", async () => {
+  check("区域粘贴一次撤销整片复原、一次重做整片重放", async () => {
     await loadBasic();
+    const original = tableSnapshot();
+    const pasted = original.map((row) => row.slice());
+    pasted[0][0] = "A"; pasted[0][1] = "B";
+    pasted[1][0] = "C"; pasted[1][1] = "D";
     grid.select([0, 0]);
     stubClipboard("A\tB\r\nC\tD\r\n");
     await grid.pasteClipboard();
-    await waitFor(() => model.rawData(0, 0) === "A" && model.rawData(1, 1) === "D",
-      "区域粘贴内容落定");
-    let steps = 0;
-    while (steps < 20) { // 引擎逐格撤销：撤到底
-      try { if (!await model.undo()) break; } catch { break; }
-      steps += 1;
-    }
-    await waitFor(() => model.rawData(0, 0) === "大理" && model.rawData(1, 1) === "10",
-      "撤销后应整体复原");
+    await waitFor(() => tableEquals(pasted), "区域粘贴内容落定");
+    assert(await model.undo() === true, "区域粘贴应有一步可撤销");
+    await waitFor(() => tableEquals(original), "一次撤销应恢复整片及未变格");
+    assert(await model.redo() === true, "区域粘贴应有一步可重做");
+    await waitFor(() => tableEquals(pasted), "一次重做应重放整片");
   });
 
-  check("内存档粘贴超宽自动扩列（pending 插列 + 立即执行），另存为成功", async () => {
+  check("扩行粘贴与新增行同属一步撤销/重做", async () => {
+    await loadBasic();
+    const original = tableSnapshot();
+    const pasted = [
+      original[0].slice(), original[1].slice(),
+      ["X", "7", "N"], ["Y", "8", "M"],
+    ];
+    grid.select([2, 0]);
+    stubClipboard("X\t7\tN\r\nY\t8\tM\r\n");
+    await grid.pasteClipboard();
+    await waitFor(() => tableEquals(pasted), "既有行与新增行应一次落定");
+    assert(model.rowCount() === 4, "粘贴应自动增加一行");
+    assert(await model.undo() === true, "扩行粘贴应有一步可撤销");
+    await waitFor(() => tableEquals(original), "一次撤销应同时撤内容和新增行");
+    assert(await model.redo() === true, "扩行粘贴应有一步可重做");
+    await waitFor(() => tableEquals(pasted), "一次重做应同时恢复内容和新行");
+  });
+
+  check("内存档超宽粘贴：取消零写入，确认扩列后另存为", async () => {
     await window.__app.smokeLoadSmall([], []);
     tbBtn("新建").click();
     await waitFor(() => document.querySelector(".modal-mask"), "新建对话框");
@@ -818,16 +848,73 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await waitFor(() => window.__app.isBigMode() && model.rowCount() === 3,
       "新建 2×3 落定（内存档）");
     assert(window.__app.getPath() === null, "新建档应无磁盘路径");
+    const original = tableSnapshot();
+    const history = [model.canUndo(), model.canRedo()];
     grid.select([0, 0]);
     stubClipboard("A\tB\tC\tD\r\nE\tF\tG\tH\r\n"); // 4 列 > 现有 2 列
-    await grid.pasteClipboard();
+
+    const cancelled = grid.pasteClipboard();
+    await waitFor(() => document.querySelector(".modal-mask"), "自动扩列确认框");
+    const cancelText = document.querySelector(".modal-mask").textContent;
+    assert(cancelText.includes("撤销") && cancelText.includes("重做")
+      && cancelText.includes("清空"), `确认文案应说明历史丢失：${cancelText}`);
+    assert(clickModalButton("否"), "取消自动扩列");
+    await cancelled;
+    assert(model.columnCount() === 2 && tableEquals(original),
+      "取消自动扩列时列数和全部内容都应不变");
+    assert(model.colOpsPending() === false, "取消后不得留下 pending 列操作");
+    assert(model.canUndo() === history[0] && model.canRedo() === history[1],
+      "取消后撤销/重做能力不得变化");
+
+    const accepted = grid.pasteClipboard();
+    await waitFor(() => document.querySelector(".modal-mask"), "再次自动扩列确认框");
+    assert(clickModalButton("是"), "确认自动扩列");
+    await accepted;
     await waitFor(() => model.columnCount() === 4
       && model.rawData(0, 3) === "D" && model.rawData(1, 3) === "H",
-      "超宽粘贴应自动扩列并落定");
+      "确认后超宽粘贴应自动扩列并落定");
     const target = `${TMP}/paste-expand-saveas.csv`;
     assert(await window.__app.saveFileAs(target) === true, "扩列后另存为应成功");
     const txt = (await invoke("read_csv_file", { path: target })).text;
     assert(txt.includes("A,B,C,D") && txt.includes("E,F,G,H"), "落盘内容应含扩列数据");
+  });
+
+  check("内存档手动列执行：空历史也须确认，取消不重建", async () => {
+    await window.__app.smokeLoadSmall(["a"], [["x"], ["y"]]);
+    assert(model.canUndo() === false && model.canRedo() === false,
+      "夹具应从空撤销/重做历史开始");
+    await model.insertColumns(1, 1);
+    await waitFor(() => model.rawData(0, 0) === "x" && model.rawData(1, 0) === "y",
+      "pending 列预览落定");
+    const original = tableSnapshot();
+    const beforeDirty = window.__app.isDirty();
+
+    const cancelled = window.__app.applyColOps();
+    await waitFor(() => document.querySelector(".modal-mask"), "空历史手动列确认框");
+    const text = document.querySelector(".modal-mask").textContent;
+    assert(text.includes("撤销") && text.includes("重做") && text.includes("清空"),
+      `空历史也应显示历史丢失确认：${text}`);
+    assert(clickModalButton("否"), "取消手动列执行");
+    await cancelled;
+    assert(model.colOpsPending() === true && model.columnCount() === 2,
+      "取消后 pending 预览与列数应保持");
+    assert(tableEquals(original), "取消手动列执行不得改写任何单元格");
+    assert(model.canUndo() === false && model.canRedo() === false,
+      "取消后空历史应保持不变");
+    assert(window.__app.isDirty() === beforeDirty, "取消不得改变脏态");
+
+    const accepted = window.__app.applyColOps();
+    await waitFor(() => document.querySelector(".modal-mask"), "再次手动列确认框");
+    assert(clickModalButton("是"), "确认手动列执行");
+    await accepted;
+    assert(model.colOpsPending() === false && model.columnCount() === 2,
+      "确认后应完成内存列重建");
+    const physical = await invoke("big_rows", {
+      from: 0, count: 2, session: model.sessionId,
+    });
+    assert(physical.length === 2 && physical.every((row) => row.length === 2),
+      `确认后物理行宽应为 2：${JSON.stringify(physical)}`);
+    assert(physical[0][0] === "x" && physical[1][0] === "y", "既有内容应保持");
   });
 
   check("无 Tab 纯文本整段进当前格（不换行摊开）", async () => {
@@ -851,21 +938,22 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(model.rawData(2, 0) !== "填充值", "选区外的行不应被改");
   });
 
-  check("单格填充撤销后整体复原（引擎逐格撤销）", async () => {
+  check("单值填充一次撤销整片复原、一次重做整片重放", async () => {
     await loadBasic();
+    const original = tableSnapshot();
+    const filled = original.map((row) => row.slice());
+    for (let r = 0; r < 2; r += 1) {
+      for (let c = 0; c < 2; c += 1) filled[r][c] = "X";
+    }
     grid.select([0, 0]);
     grid._extendTo([1, 1]);
     stubClipboard("X");
     await grid.pasteClipboard();
-    await waitFor(() => model.rawData(0, 0) === "X" && model.rawData(1, 1) === "X",
-      "填充应落定");
-    let steps = 0;
-    while (steps < 20) { // 引擎逐格撤销：撤到底
-      try { if (!await model.undo()) break; } catch { break; }
-      steps += 1;
-    }
-    await waitFor(() => model.rawData(0, 0) === "大理" && model.rawData(1, 1) === "10",
-      "撤销后选区应整体复原");
+    await waitFor(() => tableEquals(filled), "填充应落定");
+    assert(await model.undo() === true, "填充应有一步可撤销");
+    await waitFor(() => tableEquals(original), "一次撤销应恢复完整选区");
+    assert(await model.redo() === true, "填充应有一步可重做");
+    await waitFor(() => tableEquals(filled), "一次重做应恢复完整选区");
   });
 
   check("多行文本不触发填充（保持整段进当前格语义）", async () => {
@@ -1501,13 +1589,46 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(flexAfter === "", "收屏后左组应清定宽恢复弹性");
   });
 
-  check("Del 立即清除选区内容（无确认）", async () => {
+  check("Delete 清除一次撤销整片复原、一次重做整片清除", async () => {
     await loadBasic();
+    const original = tableSnapshot();
+    const cleared = original.map((row) => row.slice());
+    cleared[0][0] = ""; cleared[0][1] = "";
     grid.select([0, 0]);
     grid._extendTo([0, 1]);
     grid.deleteSelection(false);
-    await waitFor(() => model.rawData(0, 0) === "" && model.rawData(0, 1) === "", "Del 应清除内容");
+    await waitFor(() => tableEquals(cleared), "Delete 应一次清除完整选区");
     assert(model.rowCount() === 3, "行结构应保留");
+    assert(await model.undo() === true, "Delete 应有一步可撤销");
+    await waitFor(() => tableEquals(original), "一次撤销应恢复 Delete 整片内容");
+    assert(await model.redo() === true, "Delete 应有一步可重做");
+    await waitFor(() => tableEquals(cleared), "一次重做应再次清除整片");
+  });
+
+  check("整行清除一次撤销恢复所有目标行、一次重放", async () => {
+    await loadBasic();
+    const original = tableSnapshot();
+    const cleared = original.map((row) => row.slice());
+    cleared[0] = ["", "", ""];
+    cleared[2] = ["", "", ""];
+    await model.clearRows([0, 2]);
+    await waitFor(() => tableEquals(cleared), "两个目标整行应一次清空");
+    assert(await model.undo() === true, "整行清除应有一步可撤销");
+    await waitFor(() => tableEquals(original), "一次撤销应恢复所有目标行");
+    assert(await model.redo() === true, "整行清除应有一步可重做");
+    await waitFor(() => tableEquals(cleared), "一次重做应再次清空目标行");
+  });
+
+  check("整列清除一次撤销恢复所有目标列、一次重放", async () => {
+    await loadBasic();
+    const original = tableSnapshot();
+    const cleared = original.map((row) => ["", row[1], ""]);
+    await model.clearColumns([0, 2]);
+    await waitFor(() => tableEquals(cleared), "两个目标整列应一次清空");
+    assert(await model.undo() === true, "整列清除应有一步可撤销");
+    await waitFor(() => tableEquals(original), "一次撤销应恢复所有目标列");
+    assert(await model.redo() === true, "整列清除应有一步可重做");
+    await waitFor(() => tableEquals(cleared), "一次重做应再次清空目标列");
   });
 
   // ========== 撤销/排序/结构 ==========
@@ -2147,22 +2268,28 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(rejected, "列操作 pending 期间编辑应被引擎拒绝");
   });
 
-  check("大模式：执行列操作（物理重写 + 进度事件 + 清空撤销）", async () => {
+  check("大模式：确认执行列操作（物理重写 + 进度 + 清空双栈）", async () => {
     const bm = bigM();
     let saw = null;
     const un = await bm.onProgress((done, total) => { saw = [done, total]; });
     try {
-      await window.__app.applyColOps();
+      const applying = window.__app.applyColOps();
+      await waitFor(() => document.querySelector(".modal-mask"), "大档列执行确认框");
+      const text = document.querySelector(".modal-mask").textContent;
+      assert(text.includes("撤销") && text.includes("重做") && text.includes("清空"),
+        `确认文案应说明历史丢失：${text}`);
+      assert(clickModalButton("是"), "确认大档列执行");
+      await applying;
     } finally {
       un();
     }
     assert(saw !== null, "应收到至少一次进度事件");
     assert(saw[1] > 0 && saw[0] === saw[1], `进度收尾应到满：${saw}`);
     assert(bm.colOpsPending() === false, "执行后不应再有 pending");
-    assert(bm.canUndo() === false, "物理重写后撤销栈应清空");
+    assert(bm.canUndo() === false && bm.canRedo() === false,
+      "物理重写后撤销/重做栈都应清空");
     assert(window.__app.isDirty() === false,
       "物理重写后文件与内存已一致，必须为干净（保存不得再全盘重写）");
-    // 物理生效验证：引擎直读行应有 4 列，表头含新列
     const rows = await invoke("big_rows", { from: 0, count: 1, session: bm.sessionId });
     assert(rows[0].length === 4, `物理行宽 ${rows[0].length}`);
     assert(bm.headers()[1] === "列4", `物理表头 ${bm.headers()}`);
@@ -2224,24 +2351,31 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await bm.setData(4, 0, "留脏");
   });
 
-  check("大模式：单格一对多填充逐格写引擎（选区外不动）", async () => {
+  check("大模式：单值填充一批写引擎，一步撤销/重做", async () => {
     const bm = bigM();
     grid.ensureVisible(0, 0);
     grid._renderRows();
     await waitFor(() => bm.rawData(0, 0) === "昆明", "首屏缓存回锚");
+    const region = () => [
+      [bm.rawData(0, 1), bm.rawData(0, 2)],
+      [bm.rawData(1, 1), bm.rawData(1, 2)],
+    ];
+    const original = region();
+    const filled = [["填big", "填big"], ["填big", "填big"]];
     grid.select([0, 1]);
     grid._extendTo([1, 2]); // 2×2 选区（避开 col0，防污染后续大理计数）
     stubClipboard("填big\r\n");
     await grid.pasteClipboard();
-    await waitFor(() => bm.rawData(1, 2) === "填big", "填充落定");
-    assert(bm.rawData(0, 1) === "填big" && bm.rawData(0, 2) === "填big"
-      && bm.rawData(1, 1) === "填big", "选区每个格都应填充");
+    await waitFor(() => JSON.stringify(region()) === JSON.stringify(filled),
+      "四格填充应一次落定");
     assert(bm.rawData(0, 0) === "昆明" && bm.rawData(1, 0) === "大理",
       "选区外的列不应被改");
-    for (let i = 0; i < 4; i += 1) await bm.undo(); // 大模式撤销逐条：一格一条
-    // undo 落定是异步的（缓存刷新经引擎回推），两个格都要等，不能只等一个
-    await waitFor(() => bm.rawData(0, 1) === "" && bm.rawData(1, 2) === "3",
-      "撤销后逐格复原");
+    assert(await bm.undo() === true, "大表填充应有一步可撤销");
+    await waitFor(() => JSON.stringify(region()) === JSON.stringify(original),
+      "一次撤销应恢复完整 2×2 选区");
+    assert(await bm.redo() === true, "大表填充应有一步可重做");
+    await waitFor(() => JSON.stringify(region()) === JSON.stringify(filled),
+      "一次重做应重放完整 2×2 选区");
   });
 
   // ========== 排序模式（阶段 4/5：载入内存 → 排列层 → 物理保存） ==========

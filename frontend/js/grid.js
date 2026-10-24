@@ -1645,8 +1645,9 @@ export class Grid {
       : (parsed.headers.length ? [parsed.headers] : []);
     if (!rows.length) return;
     const width = Math.max(...rows.map((row) => row.length));
-    // 粘贴超宽二态：无路径内存档自动 pending 插列 + 立即执行（内存内重建毫秒级，
-    // 本次粘贴的撤销栈随之清空）；有路径大档拒绝（物理重写代价大，请先手动加列）。
+    // 粘贴超宽二态：无路径内存档先确认历史丢失，再 pending 插列 + 立即执行。
+    // 取消则整次粘贴零写入；确认后内存重建会清空此前撤销/重做历史。
+    // 有路径大档拒绝（物理重写代价大，请先手动加列）。
     // 行方向始终自动扩（_pasteBig 内引擎插行）。
     if (c0 + width > this.model.columnCount()) {
       const meta = this.model.meta?.();
@@ -1654,8 +1655,13 @@ export class Grid {
         this.hooks.statusMsg("大文件模式：粘贴宽度超出现有列，已取消（可先用列操作加列）", 3000);
         return;
       }
-      const needCols = c0 + width - this.model.columnCount();
       try {
+        const confirmed = await this.hooks.confirmColOps?.();
+        if (!confirmed) {
+          this.hooks.statusMsg("已取消粘贴：未执行扩列", 2500);
+          return;
+        }
+        const needCols = c0 + width - this.model.columnCount();
         await this.model.insertColumns(this.model.columnCount(), needCols);
         await this.model.applyColOps();
       } catch (err) {
@@ -1667,8 +1673,8 @@ export class Grid {
   }
 
   /**
-   * 一对多填充：把单值写入选区每一格（Excel 行为，选区保持不动）。
-   * 引擎逐格异步写（撤销逐条，与 _pasteBig 一致），同值格跳过以免撤销日志刷屏。
+   * 一对多填充：把单值写入选区每一格，整个选区只占一步撤销。
+   * 同值过滤以引擎批前旧值为准，不能读取可能尚未加载的前端缓存作判断。
    *
    * @param {string} value - 填充值。
    * @returns {Promise<void>}
@@ -1677,13 +1683,7 @@ export class Grid {
     const cells = this.selectedCells();
     if (!cells.length) return;
     try {
-      await this.model.batch(async () => {
-        for (const [r, c] of cells) {
-          if (this.model.rawData(r, c) === value) continue;
-          // eslint-disable-next-line no-await-in-loop
-          await this.model.setData(r, c, value);
-        }
-      });
+      await this.model.setCells(cells.map(([r, c]) => [r, c, value]));
     } catch (err) {
       this.hooks.statusMsg(String(err?.message ?? err), 3000);
       return;
@@ -1692,7 +1692,7 @@ export class Grid {
   }
 
   /**
-   * 引擎粘贴：先扩行（引擎插入），再逐格写（BigModel 分块并发）。
+   * 引擎粘贴：既有格修改与自动扩行由一条 Paste 记录原子完成。
    *
    * @param {number} r0 - 起始行。
    * @param {number} c0 - 起始列。
@@ -1702,14 +1702,7 @@ export class Grid {
    */
   async _pasteBig(r0, c0, rows, width) {
     try {
-      const needRows = r0 + rows.length - this.model.rowCount();
-      if (needRows > 0) await this.model.insertRows(this.model.rowCount(), needRows);
-      for (let i = 0; i < rows.length; i += 1) {
-        for (let j = 0; j < rows[i].length; j += 1) {
-          // eslint-disable-next-line no-await-in-loop
-          await this.model.setData(r0 + i, c0 + j, rows[i][j]);
-        }
-      }
+      await this.model.pasteRows(r0, c0, rows);
       this.select([r0, c0], { silent: true });
       this._extendTo([r0 + rows.length - 1, c0 + width - 1]);
       this.hooks.statusMsg(`已粘贴 ${rows.length} 行`, 2000);

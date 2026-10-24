@@ -1224,6 +1224,467 @@ mod tests {
         fs::remove_file(&p).ok();
     }
 
+    /// 重做插行会换块号：其后的新行格编辑必须重绑定，不能写入死块。
+    #[test]
+    fn insert_rows_redo_rebinds_following_cell_edit() {
+        let p = tmp_csv("redo_rebind_ins", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.insert_rows(
+            0,
+            Some(vec![vec!["INS".into(), "".into(), "".into()]]),
+            0,
+        )
+        .unwrap();
+        bf.set_cell(0, 0, "EDITED".into()).unwrap();
+        assert!(bf.undo(), "撤销新行格编辑");
+        assert!(bf.undo(), "撤销插行");
+        assert!(bf.redo(), "重做插行");
+        assert!(bf.redo(), "重做新行格编辑");
+        assert_eq!(bf.rows(0, 1)[0][0], "EDITED");
+        fs::remove_file(&p).ok();
+    }
+
+    /// 插行逆操作的位置或内容不匹配时，不得假成功或移动历史栈。
+    #[test]
+    fn insert_rows_undo_validation_failure_keeps_history() {
+        let p = tmp_csv("undo_insert_validate", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.insert_rows(
+            0,
+            Some(vec![vec!["REAL".into(), "".into(), "".into()]]),
+            0,
+        )
+        .unwrap();
+        let revision = bf.revision;
+        let op = bf.undo_stack.last().cloned().unwrap();
+        let Op::InsertRows { vpos, block, .. } = op else {
+            panic!("应为插行记录");
+        };
+        *bf.undo_stack.last_mut().unwrap() = Op::InsertRows {
+            vpos,
+            block,
+            rows: vec![vec!["MISMATCH".into(), "".into(), "".into()]],
+        };
+        assert!(!bf.undo(), "内容不匹配必须拒绝逆操作");
+        assert_eq!(bf.meta().rows, 6);
+        assert_eq!(bf.rows(0, 1)[0][0], "REAL");
+        assert!(bf.meta().can_undo, "失败后原撤销记录仍在");
+        assert!(!bf.meta().can_redo, "失败后不得产生重做记录");
+        assert_eq!(bf.revision, revision);
+        fs::remove_file(&p).ok();
+    }
+
+    /// 多格批量修改跨源行/插入行且非连续：整批只占一步并反复往返。
+    #[test]
+    fn set_cells_one_step_mixed_identities_and_roundtrips() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.insert_rows(
+            2,
+            Some(vec![vec!["TMP".into(), "1".into(), "X".into()]]),
+            0,
+        )
+        .unwrap();
+        let original = bf.rows(0, 6);
+        assert!(bf
+            .set_cells(vec![
+                (0, 0, "A2".into()),
+                (2, 1, "99".into()),
+                (4, 2, "D City".into()),
+                (0, 2, "A City".into()),
+            ])
+            .unwrap());
+        let changed = bf.rows(0, 6);
+        assert_eq!(changed[0][0], "A2");
+        assert_eq!(changed[0][2], "A City");
+        assert_eq!(changed[2][1], "99");
+        assert_eq!(changed[4][2], "D City");
+        assert_eq!(bf.undo_stack.len(), 2, "插行一条 + 整批一条");
+        for _ in 0..2 {
+            assert!(bf.undo(), "一次撤销整批");
+            assert_eq!(bf.rows(0, 6), original);
+            assert!(bf.redo(), "一次重做整批");
+            assert_eq!(bf.rows(0, 6), changed);
+        }
+    }
+
+    /// 同一稳定格重复出现时后者胜；最终回到批前值的项不进入快照。
+    #[test]
+    fn set_cells_duplicate_last_wins_and_final_noop_filtered() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        assert!(bf
+            .set_cells(vec![
+                (0, 0, "TEMP".into()),
+                (1, 1, "26".into()),
+                (0, 0, "Alice2".into()),
+                (0, 0, "Alice".into()),
+                (2, 2, "Beijing".into()),
+            ])
+            .unwrap());
+        assert_eq!(bf.rows(0, 1)[0][0], "Alice");
+        assert_eq!(bf.rows(1, 1)[0][1], "26");
+        assert_eq!(bf.undo_stack.len(), 1);
+        let Op::SetCells { changes } = &bf.undo_stack[0] else {
+            panic!("应形成一条批量格快照");
+        };
+        assert_eq!(changes.len(), 1, "只有 bob 年龄实际变化");
+        assert_eq!(changes[0].old, "25");
+        assert_eq!(changes[0].new, "26");
+        assert!(bf.undo());
+        assert_eq!(bf.rows(1, 1)[0][1], "25");
+    }
+
+    /// 空批量和最终全同值都不增 revision、不压栈，也不清既有 redo。
+    #[test]
+    fn set_cells_empty_and_noop_preserve_redo_and_revision() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.set_cell(0, 0, "Z".into()).unwrap();
+        assert!(bf.undo());
+        let revision = bf.revision;
+        let redo = bf.redo_stack.clone();
+        assert!(!bf.set_cells(Vec::new()).unwrap());
+        assert!(!bf
+            .set_cells(vec![
+                (0, 0, "Alice".into()),
+                (0, 0, "TEMP".into()),
+                (0, 0, "Alice".into()),
+                (0, 1, "30".into()),
+            ])
+            .unwrap());
+        assert_eq!(bf.revision, revision);
+        assert_eq!(bf.redo_stack, redo);
+        assert!(bf.undo_stack.is_empty());
+        assert!(bf.redo(), "既有重做记录必须仍可使用");
+        assert_eq!(bf.rows(0, 1)[0][0], "Z");
+    }
+
+    /// 任一目标行/列非法时整批拒绝，已解析的前置目标也不得写入。
+    #[test]
+    fn set_cells_invalid_row_or_col_is_atomic() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.set_cell(0, 0, "Before".into()).unwrap();
+        let before = bf.rows(0, 5);
+        let undo = bf.undo_stack.clone();
+        let redo = bf.redo_stack.clone();
+        let revision = bf.revision;
+        let err = bf
+            .set_cells(vec![(0, 1, "31".into()), (99, 0, "X".into())])
+            .unwrap_err();
+        assert!(err.contains("行号"), "{err}");
+        let err = bf
+            .set_cells(vec![(0, 1, "31".into()), (1, 3, "X".into())])
+            .unwrap_err();
+        assert!(err.contains("列号"), "{err}");
+        assert_eq!(bf.rows(0, 5), before);
+        assert_eq!(bf.undo_stack, undo);
+        assert_eq!(bf.redo_stack, redo);
+        assert_eq!(bf.revision, revision);
+    }
+
+    /// 快照预算按 UTF-8 字节而非字符数计量，超限在首次写入前拒绝。
+    #[test]
+    fn set_cells_snapshot_budget_uses_utf8_bytes_and_rejects() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        let before = bf.rows(0, 5);
+        let too_big = "界".repeat(700_000); // 70 万字符 = 210 万 UTF-8 字节
+        let err = bf
+            .set_cells(vec![(0, 0, too_big), (1, 0, "NO".into())])
+            .unwrap_err();
+        assert!(err.contains("快照") && err.contains("字节"), "{err}");
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.undo_stack.is_empty() && bf.redo_stack.is_empty());
+        assert_eq!(bf.revision, 0);
+    }
+
+    /// 多格操作按一条记录计入 200 步上限，不按格子数量挤占历史。
+    #[test]
+    fn set_cells_uses_one_undo_slot() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        for i in 0..(UNDO_CAP + 5) {
+            assert!(bf
+                .set_cells(vec![
+                    (0, 0, i.to_string()),
+                    (1, 0, format!("b{i}")),
+                ])
+                .unwrap());
+        }
+        assert_eq!(bf.undo_stack.len(), UNDO_CAP);
+        for _ in 0..UNDO_CAP {
+            assert!(bf.undo());
+        }
+        assert!(!bf.undo(), "更早的 5 条已按记录数淘汰");
+    }
+
+    /// 不规则粘贴只写输入实际覆盖的格子，短行尾部保持原值。
+    #[test]
+    fn paste_rows_ragged_existing_region_one_step() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        let original = bf.rows(0, 5);
+        let out = bf
+            .paste_rows(
+                1,
+                1,
+                vec![
+                    vec!["26".into(), "SH".into()],
+                    vec!["36".into()],
+                    vec!["28".into(), "GZ".into()],
+                ],
+            )
+            .unwrap();
+        assert!(out.changed);
+        assert_eq!(out.inserted_rows, 0);
+        let pasted = bf.rows(0, 5);
+        assert_eq!(pasted[1], vec!["bob", "26", "SH"]);
+        assert_eq!(pasted[2], vec!["Carol", "36", "Beijing"]);
+        assert_eq!(pasted[3], vec!["dave", "28", "GZ"]);
+        assert_eq!(bf.undo_stack.len(), 1);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), original);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 5), pasted);
+    }
+
+    /// 跨末尾粘贴把既有格变化和新增行最终内容合并为一条记录。
+    #[test]
+    fn paste_rows_append_and_existing_changes_one_step() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        let original = bf.rows(0, 5);
+        let out = bf
+            .paste_rows(
+                4,
+                0,
+                vec![
+                    vec!["Eve2".into(), "23".into(), "SH".into()],
+                    vec!["N1".into(), "1".into(), "A".into()],
+                    vec!["N2".into(), "2".into()],
+                ],
+            )
+            .unwrap();
+        assert!(out.changed);
+        assert_eq!(out.inserted_rows, 2);
+        let pasted = bf.rows(0, 7);
+        assert_eq!(pasted[4], vec!["Eve2", "23", "SH"]);
+        assert_eq!(pasted[5], vec!["N1", "1", "A"]);
+        assert_eq!(pasted[6], vec!["N2", "2", ""], "新行短行补空");
+        assert_eq!(bf.undo_stack.len(), 1);
+        for _ in 0..2 {
+            assert!(bf.undo());
+            assert_eq!(bf.rows(0, 5), original);
+            assert!(!bf.meta().can_undo, "粘贴只占一步");
+            assert!(bf.redo());
+            assert_eq!(bf.rows(0, 7), pasted);
+        }
+    }
+
+    /// 粘贴到末尾的全空行仍是结构变化，也必须一步撤销/重做。
+    #[test]
+    fn paste_rows_empty_appended_rows_are_real_change() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        let out = bf
+            .paste_rows(5, 0, vec![Vec::new(), vec![String::new()]])
+            .unwrap();
+        assert!(out.changed);
+        assert_eq!(out.inserted_rows, 2);
+        assert_eq!(bf.rows(0, 7)[5], vec!["", "", ""]);
+        assert_eq!(bf.rows(0, 7)[6], vec!["", "", ""]);
+        assert!(bf.undo());
+        assert_eq!(bf.meta().rows, 5);
+        assert!(bf.redo());
+        assert_eq!(bf.meta().rows, 7);
+    }
+
+    /// 既有区域的全同值/空短行粘贴是空改动，不动 revision 和历史。
+    #[test]
+    fn paste_rows_noop_does_not_touch_history() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        let before = bf.rows(0, 5);
+        let out = bf
+            .paste_rows(0, 0, vec![vec!["Alice".into()], Vec::new()])
+            .unwrap();
+        assert!(!out.changed);
+        assert_eq!(out.inserted_rows, 0);
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.undo_stack.is_empty() && bf.redo_stack.is_empty());
+        assert_eq!(bf.revision, 0);
+    }
+
+    /// 排序态既有区域粘贴按显示行映射到稳定源记录。
+    #[test]
+    fn paste_rows_sorted_display_mapping() {
+        let p = tmp_csv("paste_sorted", &sort_fixture());
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+            .unwrap(); // e,d,c,b,a
+        let out = bf
+            .paste_rows(0, 1, vec![vec!["S0".into()], vec!["S1".into()]])
+            .unwrap();
+        assert!(out.changed && out.inserted_rows == 0);
+        assert_eq!(bf.rows(0, 2)[0], vec!["e", "S0", "foo"]);
+        assert_eq!(bf.rows(0, 2)[1], vec!["d", "S1", "Bar"]);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 2)[0][1], "x");
+        assert_eq!(bf.rows(0, 2)[1][1], "2");
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 2)[0][1], "S0");
+        assert_eq!(bf.rows(0, 2)[1][1], "S1");
+        fs::remove_file(&p).ok();
+    }
+
+    /// 排序态需要扩行时，在写入最后一个既有显示行之前整次拒绝。
+    #[test]
+    fn paste_rows_sorted_growth_rejected_atomically() {
+        let p = tmp_csv("paste_sorted_growth", &sort_fixture());
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+            .unwrap();
+        let before = bf.rows(0, 5);
+        let err = bf
+            .paste_rows(4, 0, vec![vec!["a2".into()], vec!["NEW".into()]])
+            .unwrap_err();
+        assert!(err.contains("排序"), "{err}");
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.undo_stack.is_empty() && bf.redo_stack.is_empty());
+        fs::remove_file(&p).ok();
+    }
+
+    /// 渐进索引期可写已发布行，但扩到未发布区域必须原子拒绝。
+    #[test]
+    fn paste_rows_indexing_growth_rejected_atomically() {
+        let mut text = String::from("a,b\r\n");
+        for i in 0..20 {
+            text.push_str(&format!("{i:04},x\r\n"));
+        }
+        let p = tmp_csv("paste_indexing", text.as_bytes());
+        let mut bf = BigFile::open_progressive_with(&p, 29, 1000, 8, false).unwrap();
+        assert!(bf.is_indexing());
+        let before = bf.rows(0, 3);
+        let err = bf
+            .paste_rows(2, 0, vec![vec!["EDIT".into()], vec!["NEW".into()]])
+            .unwrap_err();
+        assert!(err.contains("索引"), "{err}");
+        assert_eq!(bf.rows(0, 3), before);
+        assert!(bf.undo_stack.is_empty() && bf.redo_stack.is_empty());
+        assert_eq!(bf.revision, 0);
+        let out = bf.paste_rows(1, 0, vec![vec!["OK".into()]]).unwrap();
+        assert!(out.changed && out.inserted_rows == 0);
+        assert_eq!(bf.rows(1, 1)[0][0], "OK");
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 3), before);
+        fs::remove_file(&p).ok();
+    }
+
+    /// 粘贴位置、列范围和整数加法越界都在任何写入前拒绝。
+    #[test]
+    fn paste_rows_invalid_position_or_column_rejected_atomically() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        let before = bf.rows(0, 5);
+        assert!(bf.paste_rows(6, 0, vec![vec!["X".into()]]).is_err());
+        assert!(bf.paste_rows(0, 3, vec![vec!["X".into()]]).is_err());
+        assert!(bf
+            .paste_rows(0, u32::MAX, vec![vec!["X".into(), "Y".into()]])
+            .is_err());
+        assert!(bf
+            .paste_rows(u64::MAX, 0, vec![vec!["X".into()], vec!["Y".into()]])
+            .is_err());
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.undo_stack.is_empty() && bf.redo_stack.is_empty());
+        assert_eq!(bf.revision, 0);
+    }
+
+    /// 粘贴快照含新行内容，超预算时既有格和行数都保持原样。
+    #[test]
+    fn paste_rows_snapshot_budget_rejected_atomically() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        let before = bf.rows(0, 5);
+        let err = bf
+            .paste_rows(
+                4,
+                0,
+                vec![vec!["Eve2".into()], vec!["界".repeat(700_000)]],
+            )
+            .unwrap_err();
+        assert!(err.contains("快照") && err.contains("字节"), "{err}");
+        assert_eq!(bf.meta().rows, 5);
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.undo_stack.is_empty() && bf.redo_stack.is_empty());
+        assert_eq!(bf.revision, 0);
+    }
+
+    /// 扩行粘贴重做换块后，后续新行单格编辑仍落到活块。
+    #[test]
+    fn paste_rows_redo_rebinds_new_row_cell_edit() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        let out = bf
+            .paste_rows(5, 0, vec![vec!["N0".into(), "0".into()]])
+            .unwrap();
+        assert_eq!(out.inserted_rows, 1);
+        bf.set_cell(5, 0, "EDITED".into()).unwrap();
+        assert!(bf.undo());
+        assert!(bf.undo());
+        assert!(bf.redo());
+        assert!(bf.redo());
+        assert_eq!(bf.rows(5, 1)[0][0], "EDITED");
+    }
+
+    /// 普通插行重做换块后，后续 SetCells 的 Ins 地址重绑、Src 地址不变。
+    #[test]
+    fn insert_rows_redo_rebinds_following_set_cells() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.insert_rows(
+            0,
+            Some(vec![vec!["INS".into(), "".into(), "".into()]]),
+            0,
+        )
+        .unwrap();
+        bf.set_cells(vec![(0, 0, "BATCH".into()), (1, 0, "ALICE".into())])
+            .unwrap();
+        assert!(bf.undo());
+        assert!(bf.undo());
+        assert!(bf.redo());
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 1)[0][0], "BATCH");
+        assert_eq!(bf.rows(1, 1)[0][0], "ALICE");
+    }
+
+    /// 普通插行重做换块后，后续 Paste.changes 也不得引用旧块。
+    #[test]
+    fn insert_rows_redo_rebinds_following_paste_changes() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.insert_rows(
+            0,
+            Some(vec![vec!["INS".into(), "".into(), "".into()]]),
+            0,
+        )
+        .unwrap();
+        bf.paste_rows(0, 0, vec![vec!["PASTED".into()]]).unwrap();
+        assert!(bf.undo());
+        assert!(bf.undo());
+        assert!(bf.redo());
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 1)[0][0], "PASTED");
+    }
+
+    /// Paste 逆操作先校验完整新行块；失败时连既有格也不得恢复一半。
+    #[test]
+    fn paste_rows_undo_validation_failure_avoids_partial_restore() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.paste_rows(4, 0, vec![vec!["Eve2".into()], vec!["NEW".into()]])
+            .unwrap();
+        let revision = bf.revision;
+        let undo_len = bf.undo_stack.len();
+        let block = match bf.undo_stack.last().unwrap() {
+            Op::Paste { inserted: Some(ins), .. } => ins.block,
+            other => panic!("应为含插入块的 Paste：{other:?}"),
+        };
+        bf.seg.blocks[block as usize].as_mut().unwrap()[0][0] = "TAMPER".into();
+        assert!(!bf.undo());
+        assert_eq!(bf.meta().rows, 6);
+        assert_eq!(bf.rows(4, 1)[0][0], "Eve2", "不得只恢复既有格");
+        assert_eq!(bf.rows(5, 1)[0][0], "TAMPER");
+        assert_eq!(bf.undo_stack.len(), undo_len);
+        assert!(bf.redo_stack.is_empty());
+        assert_eq!(bf.revision, revision);
+    }
+
     #[test]
     fn big_insert_remove_undo_restores_order() {
         let p = tmp_csv("insdel", &people_csv());
@@ -3528,6 +3989,22 @@ enum CellId {
     Ins { block: u32, row: u32, col: u32 },
 }
 
+/// 一个实际变化格子的批前/批后稀疏快照。
+#[derive(Clone, PartialEq, Debug)]
+struct CellChange {
+    cell: CellId,
+    old: String,
+    new: String,
+}
+
+/// 粘贴末尾新增行的最终内容及其实际插入块。
+#[derive(Clone, PartialEq, Debug)]
+struct PasteInsert {
+    vpos: u64,
+    block: u32,
+    rows: Vec<Vec<String>>,
+}
+
 /// 前向操作（重做执行它，撤销执行其逆）。
 ///
 /// 所有寻址用稳定身份（记录号/块号），撤销/重做后压回栈的是
@@ -3535,6 +4012,8 @@ enum CellId {
 #[derive(Clone, PartialEq, Debug)]
 enum Op {
     SetCell { cell: CellId, old: String, new: String },
+    SetCells { changes: Vec<CellChange> },
+    Paste { changes: Vec<CellChange>, inserted: Option<PasteInsert> },
     InsertRows { vpos: u64, block: u32, rows: Vec<Vec<String>> },
     /// items 按 vpos 升序（重做按身份重新定位）。
     RemoveRows { items: Vec<DeletedRow> },
@@ -3542,8 +4021,19 @@ enum Op {
 
 /// 撤销日志上限。
 const UNDO_CAP: usize = 200;
-/// 单条删除操作可快照的单元格字符上限（超出则该步不可撤销）。
+/// 单条操作可快照的单元格内容 UTF-8 字节上限。
+/// 既有删除行超限仍清历史；新批量/粘贴超限则在写入前拒绝。
 const UNDO_CELL_CHAR_CAP: usize = 2_000_000;
+
+/// 粘贴命令结果。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasteOutcome {
+    /// 是否存在实际内容或结构变化。
+    pub changed: bool,
+    /// 本次在末尾新增的行数。
+    pub inserted_rows: u32,
+}
 
 // ============================================================
 // BigFile：大文件会话（mmap + 索引 + 编辑层）
@@ -5668,6 +6158,237 @@ impl BigFile {
         }
     }
 
+    /// 将显示行与物理列解析为稳定格地址，供批量写入预检使用。
+    ///
+    /// # Parameters
+    /// - `vrow`: 当前显示行号。
+    /// - `col`: 物理列号。
+    ///
+    /// # Returns
+    /// 稳定的源记录或插入块单元格地址。
+    ///
+    /// # Errors
+    /// 行号、列号越界时返回中文错误；不会修改数据。
+    fn resolve_batch_cell(&self, vrow: u64, col: u32) -> Result<CellId, String> {
+        if (col as usize) >= self.base_ncols {
+            return Err("列号越界".into());
+        }
+        let vrow = self.orig_vrow(vrow);
+        let resolved = if self.partial.is_some() {
+            if vrow >= self.indexed_data_rows() {
+                return Err("行号越界".into());
+            }
+            let rec = u32::try_from(vrow)
+                .ok()
+                .and_then(|v| v.checked_add(self.record_offset()))
+                .ok_or("行号越界")?;
+            ResolvedRow::Src(rec)
+        } else {
+            self.seg.resolve(vrow).ok_or("行号越界")?
+        };
+        Ok(match resolved {
+            ResolvedRow::Src(rec) => CellId::Src { rec, col },
+            ResolvedRow::Ins { block, row } => CellId::Ins { block, row, col },
+        })
+    }
+
+    /// 完整预检并生成稀疏格快照：重复目标后者胜，最终同值项剔除。
+    ///
+    /// # Parameters
+    /// - `cells`: `(显示行, 列, 新值)` 输入序列。
+    ///
+    /// # Returns
+    /// 仅含实际变化项的快照；顺序稳定，旧值只读取批前状态一次。
+    ///
+    /// # Errors
+    /// 任一目标非法时返回错误，且不写任何单元格。
+    fn prepare_cell_changes(
+        &self,
+        cells: Vec<(u64, u32, String)>,
+    ) -> Result<Vec<CellChange>, String> {
+        // 先解析全部地址，保证后置非法项不会留下前置半次写入。
+        let mut resolved = Vec::with_capacity(cells.len());
+        for (vrow, col, value) in cells {
+            resolved.push((self.resolve_batch_cell(vrow, col)?, value));
+        }
+        let mut latest: HashMap<CellId, usize> = HashMap::with_capacity(resolved.len());
+        let mut deduped: Vec<(CellId, String)> = Vec::with_capacity(resolved.len());
+        for (cell, value) in resolved {
+            if let Some(index) = latest.get(&cell).copied() {
+                deduped[index].1 = value; // 同一稳定格后者胜，旧值仍取批前一次
+            } else {
+                latest.insert(cell, deduped.len());
+                deduped.push((cell, value));
+            }
+        }
+        let mut changes = Vec::with_capacity(deduped.len());
+        for (cell, new) in deduped {
+            let old = self.cell_value(cell);
+            if old != new {
+                changes.push(CellChange { cell, old, new });
+            }
+        }
+        Ok(changes)
+    }
+
+    /// 校验一次用户操作的撤销快照预算，按 UTF-8 字节并检查加法溢出。
+    ///
+    /// # Parameters
+    /// - `changes`: 既有格的旧值/新值快照。
+    /// - `inserted`: 新增行的最终内容快照。
+    ///
+    /// # Returns
+    /// 未超预算时返回 `Ok(())`。
+    ///
+    /// # Errors
+    /// 字节数溢出或超过固定预算时返回错误；调用方须在首次写入前调用。
+    fn ensure_snapshot_budget(
+        changes: &[CellChange],
+        inserted: &[Vec<String>],
+    ) -> Result<(), String> {
+        let mut bytes = 0usize;
+        let mut add = |n: usize| -> Result<(), String> {
+            bytes = bytes
+                .checked_add(n)
+                .ok_or("撤销快照字节数溢出，操作已取消")?;
+            if bytes > UNDO_CELL_CHAR_CAP {
+                return Err(format!(
+                    "撤销快照超过 {UNDO_CELL_CHAR_CAP} UTF-8 字节预算，操作已取消"
+                ));
+            }
+            Ok(())
+        };
+        for change in changes {
+            add(change.old.len())?;
+            add(change.new.len())?;
+        }
+        for row in inserted {
+            for value in row {
+                add(value.len())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 将一组单元格修改作为一个用户操作写入并记录稀疏撤销快照。
+    ///
+    /// # Parameters
+    /// - `cells`: `(显示行, 列, 新值)`；允许非连续及重复目标。
+    ///
+    /// # Returns
+    /// 有实际变化时返回 true；空输入或全同值返回 false。
+    ///
+    /// # Errors
+    /// 编辑闸门、任一目標地址或快照预算校验失败时返回错误，数据与历史不变。
+    pub fn set_cells(&mut self, cells: Vec<(u64, u32, String)>) -> Result<bool, String> {
+        self.require_editable()?;
+        self.refresh_indexed();
+        let changes = self.prepare_cell_changes(cells)?;
+        if changes.is_empty() {
+            return Ok(false);
+        }
+        Self::ensure_snapshot_budget(&changes, &[])?;
+        for change in &changes {
+            self.write_cell(change.cell, &change.new);
+        }
+        self.last_spec = None;
+        self.push_undo(Op::SetCells { changes });
+        Ok(true)
+    }
+
+    /// 粘贴不规则行块；既有格快照与末尾新增行合并为一个用户操作。
+    ///
+    /// # Parameters
+    /// - `vrow`: 粘贴起点的当前显示行号。
+    /// - `col`: 粘贴起点的物理列号。
+    /// - `rows`: 输入行块；短行保持稀疏语义，只有新行补齐物理列宽。
+    ///
+    /// # Returns
+    /// 实际变化标志与新增行数。
+    ///
+    /// # Errors
+    /// 位置、列宽、排序/索引结构限制或快照预算校验失败时返回错误，
+    /// 既有格、行数与撤销历史均不变。
+    pub fn paste_rows(
+        &mut self,
+        vrow: u64,
+        col: u32,
+        mut rows: Vec<Vec<String>>,
+    ) -> Result<PasteOutcome, String> {
+        self.require_editable()?;
+        self.refresh_indexed();
+        if rows.is_empty() {
+            return Ok(PasteOutcome { changed: false, inserted_rows: 0 });
+        }
+        let max_width = rows.iter().map(Vec::len).max().unwrap_or(0);
+        if max_width > 0 {
+            let col_end = (col as usize).checked_add(max_width).ok_or("列号越界")?;
+            if col_end > self.base_ncols {
+                return Err("粘贴列号越界".into());
+            }
+        }
+        let input_count = u64::try_from(rows.len()).map_err(|_| "粘贴行数过多")?;
+        let total = if self.partial.is_some() {
+            self.indexed_data_rows()
+        } else {
+            self.seg.vrow_count()
+        };
+        if vrow > total {
+            return Err("粘贴位置越界".into());
+        }
+        let end = vrow.checked_add(input_count).ok_or("粘贴位置越界")?;
+        let growth = end.saturating_sub(total);
+        let inserted_rows = u32::try_from(growth).map_err(|_| "粘贴新增行数过多")?;
+        if growth > 0 {
+            if self.order.is_some() {
+                return Err("排序模式下暂不支持扩行粘贴，请先退出排序".into());
+            }
+            if self.is_indexing() {
+                return Err("文件仍在索引中，暂不支持扩行粘贴".into());
+            }
+        }
+
+        // 仅既有行进稀疏快照；超出末尾的行直接保存最终内容。
+        let existing_count = input_count.min(total - vrow) as usize;
+        let mut cells = Vec::new();
+        for (i, row) in rows[..existing_count].iter().enumerate() {
+            for (j, value) in row.iter().enumerate() {
+                cells.push((vrow + i as u64, col + j as u32, value.clone()));
+            }
+        }
+        let mut inserted = if growth > 0 {
+            rows.split_off(existing_count)
+        } else {
+            Vec::new()
+        };
+        for row in &mut inserted {
+            if row.len() < self.base_ncols {
+                row.resize(self.base_ncols, String::new());
+            } else if row.len() > self.base_ncols {
+                row.truncate(self.base_ncols);
+            }
+        }
+        let changes = self.prepare_cell_changes(cells)?;
+        if changes.is_empty() && inserted.is_empty() {
+            return Ok(PasteOutcome { changed: false, inserted_rows: 0 });
+        }
+        Self::ensure_snapshot_budget(&changes, &inserted)?;
+
+        let inserted = if inserted.is_empty() {
+            None
+        } else {
+            // 扩行只可能发生在末尾，insert_block 不会切分既有插入块。
+            let block = self.seg.insert_block(total, inserted.clone());
+            Some(PasteInsert { vpos: total, block, rows: inserted })
+        };
+        for change in &changes {
+            self.write_cell(change.cell, &change.new);
+        }
+        self.last_spec = None;
+        self.push_undo(Op::Paste { changes, inserted });
+        Ok(PasteOutcome { changed: true, inserted_rows })
+    }
+
     /// 写单元格（覆盖层/直改块 + 撤销日志）。
     pub fn set_cell(&mut self, vrow: u64, col: u32, value: String) -> Result<(), String> {
         self.require_editable()?;
@@ -5822,6 +6543,22 @@ impl BigFile {
                 self.write_cell(cell, &new);
                 op.clone()
             }
+            Op::SetCells { changes } => {
+                for change in &changes {
+                    self.write_cell(change.cell, &change.new);
+                }
+                Op::SetCells { changes }
+            }
+            Op::Paste { changes, inserted } => {
+                let inserted = inserted.map(|ins| {
+                    let block = self.seg.insert_block(ins.vpos, ins.rows.clone());
+                    PasteInsert { vpos: ins.vpos, block, rows: ins.rows }
+                });
+                for change in &changes {
+                    self.write_cell(change.cell, &change.new);
+                }
+                Op::Paste { changes, inserted }
+            }
             Op::InsertRows { vpos, block: _, rows } => {
                 let block = self.seg.insert_block(vpos, rows.clone());
                 Op::InsertRows { vpos, block, rows }
@@ -5873,12 +6610,15 @@ impl BigFile {
 
     /// 源记录当前 vrow（重做删除时重新定位；不存在 = 已删）。
 
-    /// 撤销。
+    /// 撤销；逆操作校验失败时保持数据与双栈不变。
     pub fn undo(&mut self) -> bool {
         let Some(op) = self.undo_stack.pop() else { return false };
+        let Some(restored) = self.apply_inverse(&op) else {
+            self.undo_stack.push(op);
+            return false;
+        };
         // 覆盖层/行结构都可能回退：收窄基准作废
         self.last_spec = None;
-        let restored = self.apply_inverse(&op);
         self.redo_stack.push(restored);
         self.revision = self.revision.saturating_add(1);
         true
@@ -5888,38 +6628,104 @@ impl BigFile {
     pub fn redo(&mut self) -> bool {
         let Some(op) = self.redo_stack.pop() else { return false };
         self.last_spec = None;
+        let old_block = match &op {
+            Op::InsertRows { block, .. } => Some(*block),
+            Op::Paste { inserted: Some(ins), .. } => Some(ins.block),
+            _ => None,
+        };
         let normalized = self.apply(&op);
+        let new_block = match &normalized {
+            Op::InsertRows { block, .. } => Some(*block),
+            Op::Paste { inserted: Some(ins), .. } => Some(ins.block),
+            _ => None,
+        };
+        if let (Some(old), Some(new)) = (old_block, new_block) {
+            if old != new {
+                self.rebind_redo_cells(old, new);
+            }
+        }
         self.undo_stack.push(normalized);
         self.revision = self.revision.saturating_add(1);
         true
     }
 
-    fn apply_inverse(&mut self, op: &Op) -> Op {
+    /// 插行/扩行粘贴重做换块后，重写后续重做记录里的稳定格地址。
+    fn rebind_redo_cells(&mut self, old_block: u32, new_block: u32) {
+        fn rebind(cell: &mut CellId, old_block: u32, new_block: u32) {
+            if let CellId::Ins { block, .. } = cell {
+                if *block == old_block {
+                    *block = new_block;
+                }
+            }
+        }
+        for op in &mut self.redo_stack {
+            match op {
+                Op::SetCell { cell, .. } => rebind(cell, old_block, new_block),
+                Op::SetCells { changes } | Op::Paste { changes, .. } => {
+                    for change in changes {
+                        rebind(&mut change.cell, old_block, new_block);
+                    }
+                }
+                // 其他操作自己拥有的插入块编号不属于“后续格引用”，不改。
+                Op::InsertRows { .. } | Op::RemoveRows { .. } => {}
+            }
+        }
+    }
+
+    /// 校验并摘除撤销所需的完整插入块；失败时不修改段表。
+    fn remove_inserted_block_for_undo(&mut self, vpos: u64, rows: &[Vec<String>]) -> bool {
+        let Some((i, off)) = self.seg.locate(vpos) else {
+            return false;
+        };
+        let SegKind::Ins { block } = self.seg.segs[i].kind else {
+            return false;
+        };
+        let same = off == 0
+            && self.seg.segs[i].len == rows.len() as u32
+            && self
+                .seg
+                .blocks
+                .get(block as usize)
+                .and_then(|b| b.as_ref())
+                .is_some_and(|r| *r == rows);
+        if !same {
+            return false;
+        }
+        self.seg.segs.remove(i);
+        self.seg.blocks[block as usize] = None;
+        true
+    }
+
+    /// 应用逆操作；无法完整校验时返回 None，且不修改数据。
+    fn apply_inverse(&mut self, op: &Op) -> Option<Op> {
         match op.clone() {
             Op::SetCell { cell, old, .. } => {
                 self.write_cell(cell, &old);
-                op.clone() // 重做时 apply 会写回 new
+                Some(op.clone()) // 重做时 apply 会写回 new
             }
-            Op::InsertRows { vpos, rows, block: _ } => {
-                // 逆 = 摘除位于 vpos 的那行块。删除+恢复会把块换成新 id，
-                // 故按 位置+内容 定位，不依赖 block id（重做时 apply 重新插块）
-                if let Some((i, off)) = self.seg.locate(vpos) {
-                    if let SegKind::Ins { block } = self.seg.segs[i].kind {
-                        let same = off == 0
-                            && self.seg.segs[i].len == rows.len() as u32
-                            && self
-                                .seg
-                                .blocks
-                                .get(block as usize)
-                                .and_then(|b| b.as_ref())
-                                .is_some_and(|r| *r == rows);
-                        if same {
-                            self.seg.segs.remove(i);
-                            self.seg.blocks[block as usize] = None;
-                        }
+            Op::SetCells { changes } => {
+                for change in &changes {
+                    self.write_cell(change.cell, &change.old);
+                }
+                Some(Op::SetCells { changes })
+            }
+            Op::Paste { changes, inserted } => {
+                // 先验证并摘除整个新行块，再恢复既有格，避免半次逆操作。
+                if let Some(ins) = &inserted {
+                    if !self.remove_inserted_block_for_undo(ins.vpos, &ins.rows) {
+                        return None;
                     }
                 }
-                op.clone()
+                for change in &changes {
+                    self.write_cell(change.cell, &change.old);
+                }
+                Some(Op::Paste { changes, inserted })
+            }
+            Op::InsertRows { vpos, rows, block: _ } => {
+                if !self.remove_inserted_block_for_undo(vpos, &rows) {
+                    return None;
+                }
+                Some(op.clone())
             }
             Op::RemoveRows { items } => {
                 // 逆 = 按 vpos 升序逐行放回（低 vrow 先复位，高 vrow 的
@@ -5949,7 +6755,7 @@ impl BigFile {
                     }
                 }
                 self.seg.compact();
-                Op::RemoveRows { items: restored }
+                Some(Op::RemoveRows { items: restored })
             }
         }
     }

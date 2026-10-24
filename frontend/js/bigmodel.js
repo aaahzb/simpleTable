@@ -892,29 +892,79 @@ export class BigModel {
   }
 
   /**
-   * 清空一批单元格。
+   * 将一组单元格修改作为一次用户操作写入引擎。
+   *
+   * @param {Array<[number, number, string]>} cells - [视图行, 列, 新值] 列表。
+   * @returns {Promise<boolean>} 是否存在实际变化。
+   * @throws {Error} 筛选态、目标非法、快照超限或会话失败。
+   */
+  async setCells(cells) {
+    if (this._filterOn) {
+      throw new Error("筛选结果中不可编辑：请先清除筛选");
+    }
+    let changed;
+    try {
+      changed = await this._invoke("big_set_cells", { cells });
+    } catch (err) {
+      // 新批量路径不做乐观写：引擎拒绝时既有缓存原样保留。
+      throw new Error(`${BIG_EDIT_ERR}：${err}`);
+    }
+    if (!changed) return false;
+    this._invalidate();
+    await this._refreshMeta();
+    this._emitData(false);
+    return true;
+  }
+
+  /**
+   * 粘贴不规则行块；既有格与末尾自动扩行只产生一条撤销记录。
+   *
+   * @param {number} row - 起始视图行。
+   * @param {number} col - 起始列。
+   * @param {string[][]} rows - 粘贴行块，短行保持稀疏语义。
+   * @returns {Promise<{changed: boolean, insertedRows: number}>} 变化与扩行数。
+   * @throws {Error} 筛选态、位置/列非法、快照超限或会话失败。
+   */
+  async pasteRows(row, col, rows) {
+    if (this._filterOn) {
+      throw new Error("筛选结果中不可编辑：请先清除筛选");
+    }
+    let outcome;
+    try {
+      outcome = await this._invoke("big_paste", { vrow: row, col, rows });
+    } catch (err) {
+      throw new Error(`${BIG_EDIT_ERR}：${err}`);
+    }
+    const changed = outcome?.changed === true;
+    const insertedRows = Number(outcome?.insertedRows ?? 0);
+    if (!changed) return { changed: false, insertedRows: 0 };
+    this._invalidate();
+    await this._refreshMeta();
+    this._emitData(insertedRows > 0);
+    return { changed: true, insertedRows };
+  }
+
+  /**
+   * 清空一批单元格，整批只占一步撤销。
    *
    * @param {Array<[number, number]>} cells - [行, 列] 列表。
    * @returns {Promise<void>}
+   * @throws {Error} 引擎拒绝批量写入时。
    */
   async clearCells(cells) {
     if (this._filterOn) {
       throw new Error("筛选结果中不可编辑：请先清除筛选");
     }
-    // 按 (row,col) 去重，避免重复写
+    // 按 (row,col) 去重；同值过滤与快照由引擎按批前状态统一完成。
     const seen = new Set();
     const jobs = [];
     for (const [r, c] of cells) {
       const k = r * 1048576 + c;
       if (seen.has(k)) continue;
       seen.add(k);
-      jobs.push([r, c]);
+      jobs.push([r, c, ""]);
     }
-    await this._editChunked(jobs, (r, c) =>
-      this._invoke("big_set_cell", { vrow: r, col: c, value: "" })
-    );
-    this._invalidate();
-    this._emitData(true);
+    await this.setCells(jobs);
   }
 
   /**
@@ -922,6 +972,7 @@ export class BigModel {
    *
    * @param {number[]} rows - 视图行号列表。
    * @returns {Promise<void>}
+   * @throws {Error} 引擎拒绝批量写入时。
    */
   async clearRows(rows) {
     const ncols = this.columnCount();
@@ -933,42 +984,22 @@ export class BigModel {
   }
 
   /**
-   * 清空若干整列。
+   * 清空若干整列，列号先去重，再一次提交所有目标格。
    *
    * @param {number[]} cols - 视图列号列表。
    * @returns {Promise<void>}
+   * @throws {Error} 引擎拒绝批量写入时。
    */
   async clearColumns(cols) {
     if (this._filterOn) {
       throw new Error("筛选结果中不可编辑：请先清除筛选");
     }
+    const uniqueCols = [...new Set(cols)];
     const jobs = [];
     for (let r = 0; r < this._meta.rows; r += 1) {
-      for (const c of cols) jobs.push([r, c]);
+      for (const c of uniqueCols) jobs.push([r, c, ""]);
     }
-    await this._editChunked(jobs, (r, c) =>
-      this._invoke("big_set_cell", { vrow: r, col: c, value: "" })
-    );
-    this._invalidate();
-    this._emitData(true);
-  }
-
-  /**
-   * 分块并发执行编辑调用（块内并发、块间串行，避免上万请求同时压出）。
-   *
-   * @param {Array<[number, number]>} jobs - (行, 列) 列表。
-   * @param {(r: number, c: number) => Promise<void>} fn - 单次编辑。
-   * @returns {Promise<void>}
-   */
-  async _editChunked(jobs, fn) {
-    const CHUNK = 256;
-    for (let i = 0; i < jobs.length; i += CHUNK) {
-      const part = jobs.slice(i, i + CHUNK);
-      const results = await Promise.allSettled(part.map(([r, c]) => fn(r, c)));
-      const failed = results.find((x) => x.status === "rejected");
-      if (failed) throw new Error(`${BIG_EDIT_ERR}：${failed.reason}`);
-    }
-    await this._refreshMeta();
+    await this.setCells(jobs);
   }
 
   /**
@@ -1063,10 +1094,11 @@ export class BigModel {
    */
   async undo() {
     const ok = await this._invoke("big_undo");
+    if (!ok) return false;
     this._invalidate();
     await this._refreshMeta();
     this._emitData(true);
-    return ok;
+    return true;
   }
 
   /**
@@ -1076,10 +1108,11 @@ export class BigModel {
    */
   async redo() {
     const ok = await this._invoke("big_redo");
+    if (!ok) return false;
     this._invalidate();
     await this._refreshMeta();
     this._emitData(true);
-    return ok;
+    return true;
   }
 
   // ---- 筛选（按钮触发，结果存 Rust 侧） ----
@@ -1328,17 +1361,6 @@ export class BigModel {
    */
   async copyRows(r0, r1, c0, c1) {
     return this._invoke("big_copy", { r0, r1, c0, c1 });
-  }
-
-  /**
-   * 每次 invoke 自身落引擎撤销日志（引擎不做事务），batch 仅保证顺序
-   * 执行（接口保留以兼容既有调用方）。
-   *
-   * @param {Function} fn - 同步函数（内部可多次调 model 方法）。
-   * @returns {Promise<void>} fn 返回的 Promise（如有）。
-   */
-  async batch(fn) {
-    return fn();
   }
 
   // ---- 明确不支持（大模式 v1 边界，app 层已禁用入口） ----

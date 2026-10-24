@@ -847,6 +847,7 @@ function makeHooks(side) {
   const focused = () => focusedSide === side;
   return {
     statusMsg,
+    confirmColOps: () => confirmColOpsHistoryLoss(),
     countsChanged: (v, t) => { if (focused()) onCountsChanged(v, t); },
     zoomed: (f) => { if (focused()) statusMsg(`表格缩放 ${Math.round(f * 100)}%`, 1500); },
     undoRequested: () => { if (focused()) undo(); },
@@ -1289,13 +1290,24 @@ async function runBigFilter(opts = {}) {
   }
 }
 
-/** 执行 pending 列操作（物理重写 + 进度条） */
+/**
+ * 确认执行将清空撤销/重做历史的列操作。
+ *
+ * @returns {Promise<boolean>} 用户是否确认继续。
+ */
+function confirmColOpsHistoryLoss() {
+  return confirmDialog("执行列操作将清空此前所有撤销/重做历史，且无法恢复。是否继续？");
+}
+
+/** 执行 pending 列操作（确认历史丢失后物理重写 + 进度条） */
 async function applyColOps() {
   if (!model.colOpsPending()) return;
   if (model.indexing?.()) {
     statusMsg("文件仍在索引中，暂不支持列操作", 2500);
     return;
   }
+  const confirmed = await confirmColOpsHistoryLoss();
+  if (!confirmed) return;
   const dlg = progressDialog("执行列操作…");
   const un = await model.onProgress((done, total, phase, rows) => dlg.set(done, total, phase, rows));
   let ok = false;

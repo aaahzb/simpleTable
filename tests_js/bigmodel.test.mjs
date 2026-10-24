@@ -89,6 +89,44 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
           const from = Number(args.from);
           return data.slice(from, from + Number(args.count));
         }
+        case "big_set_cells": {
+          const cells = args.cells.map(([r, c, value]) => [Number(r), Number(c), value]);
+          for (const [r, c] of cells) {
+            if (!data[r] || c >= ncols) throw new Error("目标单元格越界");
+          }
+          let changed = false;
+          for (const [r, c, value] of cells) {
+            if ((data[r][c] ?? "") !== value) {
+              data[r][c] = value;
+              changed = true;
+            }
+          }
+          return changed;
+        }
+        case "big_paste": {
+          const start = Number(args.vrow);
+          const col = Number(args.col);
+          const input = args.rows.map((row) => row.slice());
+          const width = Math.max(0, ...input.map((row) => row.length));
+          if (start > data.length || col + width > ncols) throw new Error("粘贴位置越界");
+          const existing = Math.min(input.length, data.length - start);
+          let changed = false;
+          for (let i = 0; i < existing; i += 1) {
+            for (let c = 0; c < input[i].length; c += 1) {
+              if ((data[start + i][col + c] ?? "") !== input[i][c]) {
+                data[start + i][col + c] = input[i][c];
+                changed = true;
+              }
+            }
+          }
+          const appended = input.slice(existing).map((row) =>
+            Array.from({ length: ncols }, (_, c) => row[c] ?? ""));
+          if (appended.length) {
+            data.push(...appended);
+            changed = true;
+          }
+          return { changed, insertedRows: appended.length };
+        }
         case "big_set_cell": {
           const r = Number(args.vrow);
           if (r >= data.length) throw new Error("行号越界");
@@ -553,6 +591,8 @@ test("筛选结果中禁止编辑/删除", async () => {
   await model.open("/x.csv");
   await model.runFilter([[0, "r1"]], [], "");
   await assert.rejects(() => model.setData(0, 0, "x"), /清除筛选/);
+  await assert.rejects(() => model.setCells([[0, 0, "x"]]), /清除筛选/);
+  await assert.rejects(() => model.pasteRows(0, 0, [["x"]]), /清除筛选/);
   await assert.rejects(() => model.removeRows([0]), /清除筛选/);
 });
 
@@ -575,7 +615,7 @@ test("列操作 pending 后元数据刷新由引擎视图映射（mock 不映射
   assert.ok(calls.some(([c]) => c === "big_col_apply"));
 });
 
-test("clearCells 去重后逐格写空", async () => {
+test("clearCells 去重后只发一次批量命令", async () => {
   const { model, data, calls } = makeFakeEngine({ rows: 10, cols: 3 });
   await model.open("/x.csv");
   data[2] = ["a", "b", "c"];
@@ -586,8 +626,135 @@ test("clearCells 去重后逐格写空", async () => {
     [2, 2],
   ]);
   assert.deepEqual(data[2], ["", "", ""]);
-  const sets = calls.filter(([c]) => c === "big_set_cell");
-  assert.equal(sets.length, 3); // 去重后 3 次
+  const batches = calls.filter(([c]) => c === "big_set_cells");
+  assert.equal(batches.length, 1);
+  assert.deepEqual(batches[0][1].cells,
+    [[2, 0, ""], [2, 1, ""], [2, 2, ""]]);
+  assert.equal(calls.filter(([c]) => c === "big_set_cell").length, 0);
+});
+
+test("setCells 一次写入并只发一次非结构编辑通知", async () => {
+  const { model, data, calls } = makeFakeEngine({ rows: 3, cols: 2 });
+  await model.open("/x.csv");
+  await model.warmup();
+  const events = [];
+  let undoEvents = 0;
+  model.onData((structural, origin) => events.push([structural, origin]));
+  model.onUndoStack(() => { undoEvents += 1; });
+  calls.length = 0;
+  const changed = await model.setCells([[0, 0, "A"], [2, 1, "B"]]);
+  assert.equal(changed, true);
+  assert.equal(data[0][0], "A");
+  assert.equal(data[2][1], "B");
+  assert.deepEqual(calls.map(([cmd]) => cmd), ["big_set_cells", "big_meta"]);
+  assert.deepEqual(calls[0][1].cells, [[0, 0, "A"], [2, 1, "B"]]);
+  assert.deepEqual(events, [[false, "edit"]]);
+  assert.equal(undoEvents, 1);
+});
+
+test("setCells/pasteRows 空改动不刷新缓存、meta 或事件", async () => {
+  const { model, data, calls } = makeFakeEngine({
+    data: [["a", "b"], ["c", "d"]], cols: 2,
+  });
+  await model.open("/x.csv");
+  await model.warmup();
+  const events = [];
+  let undoEvents = 0;
+  model.onData((...args) => events.push(args));
+  model.onUndoStack(() => { undoEvents += 1; });
+  const gen = model._gen;
+  calls.length = 0;
+  assert.equal(await model.setCells([[0, 0, data[0][0]]]), false);
+  assert.deepEqual(await model.pasteRows(0, 0, [["a"]]),
+    { changed: false, insertedRows: 0 });
+  assert.deepEqual(calls.map(([cmd]) => cmd), ["big_set_cells", "big_paste"]);
+  assert.equal(model._gen, gen, "空改动不得失效缓存");
+  assert.equal(model.peekData(0, 0), "a");
+  assert.deepEqual(events, []);
+  assert.equal(undoEvents, 0);
+});
+
+test("pasteRows 一次完成既有格与扩行并发结构通知", async () => {
+  const { model, data, calls } = makeFakeEngine({
+    data: [["a", "b"], ["c", "d"]], cols: 2,
+  });
+  await model.open("/x.csv");
+  await model.warmup();
+  const events = [];
+  let undoEvents = 0;
+  model.onData((...args) => events.push(args));
+  model.onUndoStack(() => { undoEvents += 1; });
+  calls.length = 0;
+  const out = await model.pasteRows(1, 0, [["C2"], ["N", "2"]]);
+  assert.deepEqual(out, { changed: true, insertedRows: 1 });
+  assert.deepEqual(data, [["a", "b"], ["C2", "d"], ["N", "2"]]);
+  assert.deepEqual(calls.map(([cmd]) => cmd), ["big_paste", "big_meta"]);
+  assert.deepEqual(calls[0][1].rows, [["C2"], ["N", "2"]]);
+  assert.deepEqual(events, [[true, "edit"]]);
+  assert.equal(undoEvents, 1);
+  assert.equal(model.rowCount(), 3);
+});
+
+test("setCells 失败不乐观改缓存并抛统一编辑错误", async () => {
+  const { model } = makeFakeEngine({ rows: 2, cols: 1 });
+  await model.open("/x.csv");
+  await model.warmup();
+  const orig = model._invoke.bind(model);
+  model._invoke = async (cmd, args) => {
+    if (cmd === "big_set_cells") throw new Error("快照超过预算");
+    return orig(cmd, args);
+  };
+  const gen = model._gen;
+  await assert.rejects(() => model.setCells([[0, 0, "X"]]), /大文件编辑失败.*快照/);
+  assert.equal(model.peekData(0, 0), "r0c0");
+  assert.equal(model._gen, gen);
+});
+
+test("clearRows 重复行也只形成一批快照输入", async () => {
+  const { model, calls } = makeFakeEngine({ rows: 3, cols: 3 });
+  await model.open("/x.csv");
+  await model.clearRows([1, 1]);
+  const batches = calls.filter(([cmd]) => cmd === "big_set_cells");
+  assert.equal(batches.length, 1);
+  assert.deepEqual(batches[0][1].cells, [
+    [1, 0, ""], [1, 1, ""], [1, 2, ""],
+  ]);
+});
+
+test("clearColumns 列号去重并一次清空所有目标格", async () => {
+  const { model, data, calls } = makeFakeEngine({ rows: 3, cols: 3 });
+  await model.open("/x.csv");
+  await model.clearColumns([2, 0, 2]);
+  const batches = calls.filter(([cmd]) => cmd === "big_set_cells");
+  assert.equal(batches.length, 1);
+  const expected = [];
+  for (let r = 0; r < 3; r += 1) {
+    for (const c of [2, 0]) expected.push([r, c, ""]);
+  }
+  assert.deepEqual(batches[0][1].cells, expected);
+  for (const row of data) assert.deepEqual(row, ["", row[1], ""]);
+});
+
+test("空 undo/redo 返回 false 且不失效、不刷新、不通知", async () => {
+  const { model, calls } = makeFakeEngine({ rows: 2, cols: 1 });
+  await model.open("/x.csv");
+  await model.warmup();
+  const orig = model._invoke.bind(model);
+  model._invoke = async (cmd, args) => {
+    if (cmd === "big_undo" || cmd === "big_redo") return false;
+    return orig(cmd, args);
+  };
+  const events = [];
+  let undoEvents = 0;
+  model.onData((...args) => events.push(args));
+  model.onUndoStack(() => { undoEvents += 1; });
+  const gen = model._gen;
+  assert.equal(await model.undo(), false);
+  assert.equal(await model.redo(), false);
+  assert.equal(model._gen, gen);
+  assert.equal(calls.filter(([cmd]) => cmd === "big_meta").length, 0);
+  assert.deepEqual(events, []);
+  assert.equal(undoEvents, 0);
 });
 
 test("不支持的能力抛中文错误（app 层禁用入口的保险）", async () => {

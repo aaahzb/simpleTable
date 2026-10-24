@@ -17,7 +17,9 @@ use serde::Serialize;
 use tauri::{Emitter, Manager};
 
 mod engine;
-use engine::{BigFile, BigMeta, ColOp, FilterPage, FilterSpec, SortEstimate, SortLevel};
+use engine::{
+    BigFile, BigMeta, ColOp, FilterPage, FilterSpec, PasteOutcome, SortEstimate, SortLevel,
+};
 
 /// 读文件结果：解码后的纯文本 + 实际使用的编码名（供状态栏展示）。
 #[derive(Serialize)]
@@ -565,6 +567,28 @@ fn big_set_cell(
     with_big(&state, session, |bf| bf.set_cell(vrow, col, value))
 }
 
+/// 将一组单元格修改作为一次用户操作写入。
+#[tauri::command]
+fn big_set_cells(
+    state: tauri::State<BigShared>,
+    session: u64,
+    cells: Vec<(u64, u32, String)>,
+) -> Result<bool, String> {
+    with_big(&state, session, |bf| bf.set_cells(cells))
+}
+
+/// 粘贴不规则行块；既有格与自动扩行合并为一次用户操作。
+#[tauri::command]
+fn big_paste(
+    state: tauri::State<BigShared>,
+    session: u64,
+    vrow: u64,
+    col: u32,
+    rows: Vec<Vec<String>>,
+) -> Result<PasteOutcome, String> {
+    with_big(&state, session, |bf| bf.paste_rows(vrow, col, rows))
+}
+
 /// 在 vpos 处插入行（rows 为 null 时插 count 行空行）。
 #[tauri::command]
 fn big_insert_rows(
@@ -900,6 +924,8 @@ pub fn run() {
             big_rows,
             big_find_edge,
             big_set_cell,
+            big_set_cells,
+            big_paste,
             big_insert_rows,
             big_remove_rows,
             big_undo,
