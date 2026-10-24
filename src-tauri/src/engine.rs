@@ -1890,6 +1890,59 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "P8 baseline transform"]
+    fn p8_save_insert_then_undo_removes_materialized_row() {
+        let p = tmp_csv("p8_save_insert", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 5);
+        let inserted = vec![vec!["X".to_string(), "Y".to_string(), "Z".to_string()]];
+        bf.insert_rows(1, Some(inserted.clone()), 1).unwrap();
+        bf.save(|_, _, _, _| {}).unwrap();
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(1, 1), inserted);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    #[ignore = "P8 deleted row recovery"]
+    fn p8_save_delete_last_then_undo_restores_row() {
+        let p = tmp_csv("p8_save_delete", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 5);
+        assert_eq!(bf.remove_rows(vec![4]).unwrap(), 1);
+        bf.save(|_, _, _, _| {}).unwrap();
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 5), before[..4]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    #[ignore = "P8 source cell rebind"]
+    fn p8_save_undo_source_edit_after_insert_targets_original_row() {
+        let p = tmp_csv("p8_save_source_edit", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 5);
+        bf.insert_rows(
+            1,
+            Some(vec![vec!["X".to_string(), "Y".to_string(), "Z".to_string()]]),
+            1,
+        )
+        .unwrap();
+        bf.set_cell(2, 0, "changed".to_string()).unwrap();
+        bf.save(|_, _, _, _| {}).unwrap();
+        assert!(bf.undo());
+        assert_eq!(bf.rows(1, 1)[0][0], "X");
+        assert_eq!(bf.rows(2, 1)[0][0], before[1][0]);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(2, 1)[0][0], "changed");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
     fn big_save_roundtrip_and_keeps_undo() {
         let p = tmp_csv("save", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
