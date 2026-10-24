@@ -116,6 +116,8 @@ pub struct Prepared<T> {
 }
 impl<T> Prepared<T> {
     pub fn entry(&self) -> &HistoryEntry<T> { &self.entry }
+    /// 执行期只归一化块号等寻址字段；调用方不得改变已预检的字节成本。
+    pub fn entry_mut(&mut self) -> &mut HistoryEntry<T> { &mut self.entry }
     pub fn entry_bytes(&self) -> u64 { self.entry_bytes }
     pub fn requires_fixed_point(&self) -> bool { self.entry_bytes > self.budget_bytes }
     pub fn into_entry(self) -> HistoryEntry<T> { self.entry }
@@ -174,6 +176,10 @@ impl<T> HistoryLedger<T> {
 
     pub fn undo_op(&self) -> Option<&T> { self.undo.back().map(|e| &e.op) }
     pub fn redo_op(&self) -> Option<&T> { self.redo.back().map(|e| &e.op) }
+    /// 重做换块后只重绑稳定格地址，不移动条目也不改变账本。
+    pub fn redo_ops_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.redo.iter_mut().map(|entry| &mut entry.op)
+    }
     pub fn stats(&self) -> HistoryStats {
         HistoryStats { undo_count: self.undo.len(), redo_count: self.redo.len(),
             bytes: self.total_bytes, budget_bytes: self.budget_bytes }

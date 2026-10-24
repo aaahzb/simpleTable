@@ -6,6 +6,10 @@ import { test } from "node:test";
 import { BigModel, BIG_PAGE, BIG_THRESHOLD } from "../frontend/js/bigmodel.js";
 import { findVerticalEdge } from "../frontend/js/nav.js";
 
+function editOutcome({ changed = false, insertedRows = 0, removedRows = 0 } = {}) {
+  return { changed, insertedRows, removedRows, fixedPoint: null, cancelled: false };
+}
+
 /** 造一个内存版"引擎"：N 行 M 列的顺序数据 + 记录 invoke 调用。 */
 function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
   let data = initial
@@ -87,7 +91,7 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
           return meta();
         case "big_rows": {
           const from = Number(args.from);
-          return data.slice(from, from + Number(args.count));
+          return data.slice(from, from + Number(args.count)).map((row) => [...row]);
         }
         case "big_set_cells": {
           const cells = args.cells.map(([r, c, value]) => [Number(r), Number(c), value]);
@@ -101,7 +105,7 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
               changed = true;
             }
           }
-          return changed;
+          return editOutcome({ changed });
         }
         case "big_paste": {
           const start = Number(args.vrow);
@@ -125,24 +129,26 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
             data.push(...appended);
             changed = true;
           }
-          return { changed, insertedRows: appended.length };
+          return editOutcome({ changed, insertedRows: appended.length });
         }
         case "big_set_cell": {
           const r = Number(args.vrow);
+          const c = Number(args.col);
           if (r >= data.length) throw new Error("行号越界");
-          data[r][Number(args.col)] = args.value;
-          return null;
+          const changed = (data[r][c] ?? "") !== args.value;
+          data[r][c] = args.value;
+          return editOutcome({ changed });
         }
         case "big_insert_rows": {
           const at = Math.min(Number(args.vpos), data.length);
           const n = args.rows ? args.rows.length : Number(args.count);
           const blank = Array.from({ length: ncols }, () => "");
           for (let i = 0; i < n; i += 1) data.splice(at + i, 0, args.rows ? [...args.rows[i]] : [...blank]);
-          return null;
+          return editOutcome({ changed: n > 0, insertedRows: n });
         }
         case "big_remove_rows": {
           for (const v of [...args.vrows].sort((a, b) => b - a)) data.splice(Number(v), 1);
-          return args.vrows.length;
+          return editOutcome({ changed: args.vrows.length > 0, removedRows: args.vrows.length });
         }
         case "big_undo":
         case "big_redo":
@@ -298,13 +304,13 @@ function makeIndexingEngine({ rows = 100, cols = 2, openRows = 20, steps = [], p
           return { ...meta };
         case "big_rows": {
           const from = Number(args.from);
-          return data.slice(from, Math.min(from + Number(args.count), meta.rows));
+          return data.slice(from, Math.min(from + Number(args.count), meta.rows)).map((row) => [...row]);
         }
         case "big_set_cell": {
           const r = Number(args.vrow);
           if (r >= meta.rows) throw new Error("行号越界");
           data[r][Number(args.col)] = args.value;
-          return null;
+          return editOutcome({ changed: true });
         }
         case "big_filter":
           return 0;
@@ -642,8 +648,8 @@ test("setCells 一次写入并只发一次非结构编辑通知", async () => {
   model.onData((structural, origin) => events.push([structural, origin]));
   model.onUndoStack(() => { undoEvents += 1; });
   calls.length = 0;
-  const changed = await model.setCells([[0, 0, "A"], [2, 1, "B"]]);
-  assert.equal(changed, true);
+  const outcome = await model.setCells([[0, 0, "A"], [2, 1, "B"]]);
+  assert.equal(outcome.changed, true);
   assert.equal(data[0][0], "A");
   assert.equal(data[2][1], "B");
   assert.deepEqual(calls.map(([cmd]) => cmd), ["big_set_cells", "big_meta"]);
@@ -664,9 +670,9 @@ test("setCells/pasteRows 空改动不刷新缓存、meta 或事件", async () =>
   model.onUndoStack(() => { undoEvents += 1; });
   const gen = model._gen;
   calls.length = 0;
-  assert.equal(await model.setCells([[0, 0, data[0][0]]]), false);
-  assert.deepEqual(await model.pasteRows(0, 0, [["a"]]),
-    { changed: false, insertedRows: 0 });
+  const noEdit = await model.setCells([[0, 0, data[0][0]]]);
+  assert.equal(noEdit.changed, false);
+  assert.deepEqual(await model.pasteRows(0, 0, [["a"]]), editOutcome());
   assert.deepEqual(calls.map(([cmd]) => cmd), ["big_set_cells", "big_paste"]);
   assert.equal(model._gen, gen, "空改动不得失效缓存");
   assert.equal(model.peekData(0, 0), "a");
@@ -686,7 +692,7 @@ test("pasteRows 一次完成既有格与扩行并发结构通知", async () => {
   model.onUndoStack(() => { undoEvents += 1; });
   calls.length = 0;
   const out = await model.pasteRows(1, 0, [["C2"], ["N", "2"]]);
-  assert.deepEqual(out, { changed: true, insertedRows: 1 });
+  assert.deepEqual(out, editOutcome({ changed: true, insertedRows: 1 }));
   assert.deepEqual(data, [["a", "b"], ["C2", "d"], ["N", "2"]]);
   assert.deepEqual(calls.map(([cmd]) => cmd), ["big_paste", "big_meta"]);
   assert.deepEqual(calls[0][1].rows, [["C2"], ["N", "2"]]);
@@ -1327,4 +1333,60 @@ test("空构造无会话：meta/indexing/filterActive/peekData 全部安全假�
   assert.ok(!m.indexing());
   assert.ok(!m.filterActive());
   assert.equal(m.peekData(0, 0), undefined);
+});
+
+function makeFixedPointModel(confirm, retry) {
+  const calls = [];
+  let refreshes = 0;
+  let dataEvents = 0;
+  const fixedPoint = {
+    kind: "stepOverBudget", operation: "setCells", requiredBytes: 10000,
+    budgetBytes: 4096, preflightId: 7,
+  };
+  const model = new BigModel({
+    invoke: async (cmd, args = {}) => {
+      calls.push([cmd, args]);
+      if (cmd !== "big_set_cells") throw new Error("unexpected " + cmd);
+      if (calls.length === 1) {
+        return { changed: false, insertedRows: 0, removedRows: 0,
+          fixedPoint, cancelled: false };
+      }
+      return retry;
+    },
+    listen: async () => () => {},
+    confirmFixedPoint: confirm,
+  });
+  model._refreshMeta = async () => { refreshes += 1; };
+  model._emitData = () => { dataEvents += 1; };
+  model._emitUndo = () => {};
+  return { model, calls, counts: () => ({ refreshes, dataEvents }) };
+}
+
+test("固定点取消不重试、不刷新、不发数据通知", async () => {
+  const { model, calls, counts } = makeFixedPointModel(async () => false, null);
+  const outcome = await model.setCells([[0, 0, "x"]]);
+  assert.equal(outcome.cancelled, true);
+  assert.equal(outcome.changed, false);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(counts(), { refreshes: 0, dataEvents: 0 });
+});
+
+test("固定点确认只带原 preflightId 重试一次", async () => {
+  const retry = { changed: true, insertedRows: 0, removedRows: 0,
+    fixedPoint: null, cancelled: false };
+  const { model, calls, counts } = makeFixedPointModel(async () => true, retry);
+  const outcome = await model.setCells([[0, 0, "x"]]);
+  assert.equal(outcome.changed, true);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1][1].approval, { allowFixedPoint: true, preflightId: 7 });
+  assert.deepEqual(counts(), { refreshes: 1, dataEvents: 1 });
+});
+
+test("固定点过期重试抛错且不刷新", async () => {
+  const retry = { changed: false, insertedRows: 0, removedRows: 0,
+    fixedPoint: { preflightId: 8 }, cancelled: false };
+  const { model, calls, counts } = makeFixedPointModel(async () => true, retry);
+  await assert.rejects(model.setCells([[0, 0, "x"]]), /预检已过期/);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(counts(), { refreshes: 0, dataEvents: 0 });
 });

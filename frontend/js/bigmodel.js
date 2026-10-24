@@ -34,7 +34,8 @@ let nextSessionId = 1;
  */
 export class BigModel {
   /**
-   * @param {{invoke: Function, listen: Function}} [io] - Tauri 桥（可注入 mock）。
+   * @param {{invoke: Function, listen: Function, confirmFixedPoint?: Function}} [io]
+   *   Tauri 桥与固定点确认（可注入 mock）。
    */
   constructor(io) {
     /** 大文件模式标记：grid/app 据此刻画双模式行为 */
@@ -50,6 +51,8 @@ export class BigModel {
     nextSessionId += 1;
     /** @type {Function} */
     this._listen = tauri.listen;
+    /** @type {Function} 超大操作确认；未注入时安全取消。 */
+    this._confirmFixedPoint = tauri.confirmFixedPoint ?? (async () => false);
     /** @type {number} 索引进度轮询周期 ms（测试可注入更短值） */
     this._pollMs = tauri.pollMs ?? 200;
     /** @type {object | null} 最近一次的 big_meta 缓存 */
@@ -115,6 +118,52 @@ export class BigModel {
    */
   _invoke(cmd, args = {}) {
     return this._rawInvoke(cmd, { session: this._sid, ...args });
+  }
+
+  /**
+   * 调编辑命令；单步超预算时确认，并只携带原预检代际重试一次。
+   *
+   * @param {string} cmd - 编辑命令名。
+   * @param {object} [args] - 不含 approval 的命令参数。
+   * @returns {Promise<object>} EditOutcome；用户取消时 cancelled=true。
+   * @throws {Error} 引擎失败，或确认后预检已经过期。
+   */
+  async _invokeEdit(cmd, args = {}) {
+    const first = await this._invoke(cmd, {
+      ...args,
+      approval: { allowFixedPoint: false, preflightId: null },
+    });
+    if (!first.fixedPoint) return first;
+    const confirmed = await this._confirmFixedPoint(first.fixedPoint);
+    if (!confirmed) {
+      return { changed: false, insertedRows: 0, removedRows: 0,
+        fixedPoint: null, cancelled: true };
+    }
+    const retry = await this._invoke(cmd, {
+      ...args,
+      approval: {
+        allowFixedPoint: true,
+        preflightId: first.fixedPoint.preflightId,
+      },
+    });
+    if (retry.fixedPoint) throw new Error("固定点预检已过期，请重试");
+    return retry;
+  }
+
+  /**
+   * 实际修改后的统一收尾；取消和空改动不刷新、不失效、不通知。
+   *
+   * @param {object} outcome - 引擎 EditOutcome。
+   * @param {string} [origin] - 数据通知来源。
+   * @returns {Promise<object>} 原 EditOutcome。
+   */
+  async _afterEdit(outcome, origin = "edit") {
+    if (!outcome?.changed) return outcome;
+    this._invalidate();
+    // _refreshMeta 已发 onUndoStack，这里不能重复通知。
+    await this._refreshMeta();
+    this._emitData(outcome.insertedRows > 0 || outcome.removedRows > 0, origin);
+    return outcome;
   }
 
   // ---- 生命周期 ----
@@ -849,7 +898,7 @@ export class BigModel {
    * @param {number} row - 视图行号。
    * @param {number} col - 视图列号。
    * @param {string} value - 新值。
-   * @returns {Promise<void>}
+   * @returns {Promise<object>} 引擎 EditOutcome。
    * @throws {Error} 引擎拒绝（如列操作 pending）或网络失败。
    */
   async setData(row, col, value) {
@@ -872,22 +921,35 @@ export class BigModel {
       throw new Error("目标单元格超出表格范围");
     }
     const oldValue = this._cell(row, col);
-    // 乐观写：有缓存页则原地更新，重绘立即反映
+    // 乐观写：有缓存页则原地更新，重绘立即反映。
     const page = Math.floor(row / BIG_PAGE);
     const cached = this._cache.get(this._key(page));
+    const restore = () => {
+      if (cached && cached.rows[row % BIG_PAGE] && col < cached.rows[row % BIG_PAGE].length) {
+        cached.rows[row % BIG_PAGE][col] = oldValue;
+      }
+    };
     if (cached && cached.rows[row % BIG_PAGE]) {
       const cells = cached.rows[row % BIG_PAGE];
       if (col < cells.length) cells[col] = value;
     }
     try {
-      await this._invoke("big_set_cell", { vrow: row, col, value });
-      await this._refreshMeta();
-      this._emitData(false);
-    } catch (err) {
-      if (cached && cached.rows[row % BIG_PAGE] && col < cached.rows[row % BIG_PAGE].length) {
-        cached.rows[row % BIG_PAGE][col] = oldValue;
+      const outcome = await this._invokeEdit("big_set_cell", { vrow: row, col, value });
+      if (outcome?.changed) {
+        // 编辑开始时未命中缓存会触发取页；旧页可能在 await 期间落定，
+        // 因而成功时必须写回当前缓存，而不是只保留开始时捕获的页。
+        const current = this._cache.get(this._key(page));
+        const cells = current?.rows[row % BIG_PAGE];
+        if (cells && col < cells.length) cells[col] = value;
+        await this._refreshMeta();
+        this._emitData(false);
+      } else {
+        restore();
       }
-      throw new Error(`${BIG_EDIT_ERR}：${err}`);
+      return outcome;
+    } catch (err) {
+      restore();
+      throw new Error(BIG_EDIT_ERR + "：" + err);
     }
   }
 
@@ -895,25 +957,21 @@ export class BigModel {
    * 将一组单元格修改作为一次用户操作写入引擎。
    *
    * @param {Array<[number, number, string]>} cells - [视图行, 列, 新值] 列表。
-   * @returns {Promise<boolean>} 是否存在实际变化。
+   * @returns {Promise<object>} 引擎 EditOutcome（含 changed/cancelled）。
    * @throws {Error} 筛选态、目标非法、快照超限或会话失败。
    */
   async setCells(cells) {
     if (this._filterOn) {
       throw new Error("筛选结果中不可编辑：请先清除筛选");
     }
-    let changed;
+    let outcome;
     try {
-      changed = await this._invoke("big_set_cells", { cells });
+      outcome = await this._invokeEdit("big_set_cells", { cells });
     } catch (err) {
       // 新批量路径不做乐观写：引擎拒绝时既有缓存原样保留。
-      throw new Error(`${BIG_EDIT_ERR}：${err}`);
+      throw new Error(BIG_EDIT_ERR + "：" + err);
     }
-    if (!changed) return false;
-    this._invalidate();
-    await this._refreshMeta();
-    this._emitData(false);
-    return true;
+    return this._afterEdit(outcome);
   }
 
   /**
@@ -922,7 +980,7 @@ export class BigModel {
    * @param {number} row - 起始视图行。
    * @param {number} col - 起始列。
    * @param {string[][]} rows - 粘贴行块，短行保持稀疏语义。
-   * @returns {Promise<{changed: boolean, insertedRows: number}>} 变化与扩行数。
+   * @returns {Promise<object>} 引擎 EditOutcome（含 changed/insertedRows/cancelled）。
    * @throws {Error} 筛选态、位置/列非法、快照超限或会话失败。
    */
   async pasteRows(row, col, rows) {
@@ -931,17 +989,11 @@ export class BigModel {
     }
     let outcome;
     try {
-      outcome = await this._invoke("big_paste", { vrow: row, col, rows });
+      outcome = await this._invokeEdit("big_paste", { vrow: row, col, rows });
     } catch (err) {
-      throw new Error(`${BIG_EDIT_ERR}：${err}`);
+      throw new Error(BIG_EDIT_ERR + "：" + err);
     }
-    const changed = outcome?.changed === true;
-    const insertedRows = Number(outcome?.insertedRows ?? 0);
-    if (!changed) return { changed: false, insertedRows: 0 };
-    this._invalidate();
-    await this._refreshMeta();
-    this._emitData(insertedRows > 0);
-    return { changed: true, insertedRows };
+    return this._afterEdit(outcome);
   }
 
   /**
@@ -1011,8 +1063,8 @@ export class BigModel {
    */
   async insertRows(row, count = 1) {
     this._requireNotIndexing("文件仍在索引中，暂不支持插入/删除行");
-    await this._invoke("big_insert_rows", { vpos: row, rows: null, count });
-    await this._afterStructural();
+    const outcome = await this._invokeEdit("big_insert_rows", { vpos: row, rows: null, count });
+    return this._afterEdit(outcome);
   }
 
   /**
@@ -1034,8 +1086,8 @@ export class BigModel {
    */
   async insertRowsWithValues(vpos, rows) {
     this._requireNotIndexing("文件仍在索引中，暂不支持插入/删除行");
-    await this._invoke("big_insert_rows", { vpos, rows, count: 0 });
-    await this._afterStructural();
+    const outcome = await this._invokeEdit("big_insert_rows", { vpos, rows, count: 0 });
+    return this._afterEdit(outcome);
   }
 
   /**
@@ -1050,19 +1102,8 @@ export class BigModel {
     }
     this._requireNotIndexing("文件仍在索引中，暂不支持插入/删除行");
     const sorted = [...new Set(rows)].sort((a, b) => a - b);
-    await this._invoke("big_remove_rows", { vrows: sorted });
-    await this._afterStructural();
-  }
-
-  /**
-   * 结构变化后的统一收尾：失效缓存、刷元数据、发结构通知。
-   *
-   * @returns {Promise<void>}
-   */
-  async _afterStructural() {
-    this._invalidate();
-    await this._refreshMeta();
-    this._emitData(true);
+    const outcome = await this._invokeEdit("big_remove_rows", { vrows: sorted });
+    return this._afterEdit(outcome);
   }
 
   /**
@@ -1097,7 +1138,7 @@ export class BigModel {
     if (!ok) return false;
     this._invalidate();
     await this._refreshMeta();
-    this._emitData(true);
+    this._emitData(true, "history");
     return true;
   }
 
@@ -1111,7 +1152,7 @@ export class BigModel {
     if (!ok) return false;
     this._invalidate();
     await this._refreshMeta();
-    this._emitData(true);
+    this._emitData(true, "history");
     return true;
   }
 
