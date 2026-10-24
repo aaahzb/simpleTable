@@ -17,6 +17,9 @@ use serde::Serialize;
 use tauri::{Emitter, Manager};
 
 mod engine;
+// Task 2 先建立独立账本；接口在 Task 3–14 接入，Task 15 移除本豁免。
+#[allow(dead_code)]
+mod history;
 use engine::{
     BigFile, BigMeta, ColOp, FilterPage, FilterSpec, PasteOutcome, SortEstimate, SortLevel,
 };
