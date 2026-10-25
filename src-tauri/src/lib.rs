@@ -21,6 +21,9 @@ mod engine;
 #[allow(dead_code)]
 mod history;
 mod schema;
+// Task 7 先以缺失类型测试驱动实现；Task 15 复查临时豁免。
+#[allow(dead_code)]
+mod spool;
 use engine::{BigFile, BigMeta, ClearTarget, ColOp, FilterPage, FilterSpec, SortEstimate, SortLevel};
 use history::{Approval, EditOutcome};
 
@@ -396,13 +399,15 @@ async fn big_new(
 /// 关闭大文件会话。
 #[tauri::command]
 fn big_close(state: tauri::State<BigShared>, session: u64) {
-    if let Ok(mut guard) = state.lock() {
-        if let Some(entry) = guard.remove(&session) {
-            // 正在跑的筛选扫描持有文件锁：先让它在下一个检查点退出；
-            // 正在载入排序内存时也通知其停止，避免关签后继续拷完整个文件。
-            entry.bump_gate();
-            entry.load_cancel.store(true, Ordering::Relaxed);
-        }
+    let entry = match state.lock() {
+        Ok(mut guard) => guard.remove(&session),
+        Err(_) => return,
+    };
+    if let Some(entry) = entry {
+        // 先移出会话表并通知后台任务取消，再在表锁外等待文件锁释放。
+        entry.bump_gate();
+        entry.load_cancel.store(true, Ordering::Relaxed);
+        drop(entry.file.lock());
     }
 }
 

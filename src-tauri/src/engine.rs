@@ -26,6 +26,7 @@ use crate::history::{
     DEFAULT_HISTORY_BUDGET_BYTES,
 };
 use crate::schema::{ColumnId, ColumnStorage, Schema};
+use crate::spool::{RowSnapshot, SessionSpool};
 use memchr::{memchr, memchr_iter};
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
@@ -1782,6 +1783,39 @@ a,b
         assert_eq!(bf.revision, revision);
     }
 
+    /// 删除撤销若在后续插入行校验失败，前面的源行也不得已恢复。
+    #[test]
+    fn remove_rows_undo_validation_failure_avoids_partial_restore() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.insert_rows(
+            1,
+            Some(vec![vec!["TMP".into(), "1".into(), "X".into()]]),
+            0,
+            Approval::deny(),
+        )
+        .unwrap();
+        bf.remove_rows(vec![0, 1], Approval::deny()).unwrap();
+        let before_rows = bf.rows(0, 6);
+        let before_stats = bf.history_stats();
+        let before_revision = bf.revision;
+        let before_generation = bf.history_generation;
+        let block = match bf.history.undo_op().unwrap() {
+            Op::RemoveRows { items } => items.iter().find_map(|item| match item {
+                DeletedRow::Ins { block, .. } => Some(*block),
+                DeletedRow::Src { .. } => None,
+            }).unwrap(),
+            other => panic!("应为删除行记录：{other:?}"),
+        };
+
+        // 空块占用但无对应段不会改变可见行，却会让后续插入行恢复失败。
+        bf.seg.blocks[block as usize] = Some(Vec::new());
+        assert!(!bf.undo());
+        assert_eq!(bf.rows(0, 6), before_rows, "不得只恢复前面的源行");
+        assert_eq!(bf.history_stats(), before_stats);
+        assert_eq!(bf.revision, before_revision);
+        assert_eq!(bf.history_generation, before_generation);
+    }
+
     #[test]
     fn big_insert_remove_undo_restores_order() {
         let p = tmp_csv("insdel", &people_csv());
@@ -1888,6 +1922,64 @@ a,b
         assert_eq!(bf.revision, before_revision);
         assert_eq!(bf.history_generation, before_generation);
         assert_eq!(bf.modified(), before_modified);
+    }
+
+    /// 删除源行必须在任何保存发生前保留完整内容供撤销恢复。
+    #[test]
+    fn deleted_source_row_has_content_before_any_save() {
+        let p = tmp_csv("p3_snapshot", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 5);
+        bf.remove_rows(vec![4], Approval::deny()).unwrap();
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 5), before[..4]);
+        fs::remove_file(&p).ok();
+    }
+
+    /// 后备代际变化后，撤销删除必须从自包含快照恢复原内容。
+    #[test]
+    fn deleted_source_row_undo_uses_snapshot_after_backing_change() {
+        let p = tmp_csv("p3_snapshot_backing", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 5);
+        let rec = match bf.seg.resolve(4) {
+            Some(ResolvedRow::Src(rec)) => rec,
+            other => panic!("末行应解析为源记录：{other:?}"),
+        };
+        bf.remove_rows(vec![4], Approval::deny()).unwrap();
+        let (start, end) = bf.src_span(rec).unwrap();
+        let mut replacement = bf.bytes().to_vec();
+        for byte in &mut replacement[start..end] {
+            if byte.is_ascii_alphanumeric() {
+                *byte = b'X';
+            }
+        }
+        bf.backing = Backing::Ram(replacement);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), before);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn bigfile_spool_and_backing_path_are_session_owned() {
+        let p = tmp_csv("p3_owned_spool", &people_csv());
+        let disk = BigFile::open(&p).unwrap();
+        assert_eq!(disk.backing_path, p);
+        let memory = BigFile::from_bytes(people_csv(), false).unwrap();
+        assert_eq!(memory.backing_path, PathBuf::new());
+        let disk_root = disk.spool.root().to_path_buf();
+        let memory_root = memory.spool.root().to_path_buf();
+        assert_ne!(disk_root, memory_root);
+        assert!(disk_root.exists());
+        assert!(memory_root.exists());
+        drop(disk);
+        assert!(!disk_root.exists());
+        assert!(memory_root.exists());
+        drop(memory);
+        assert!(!memory_root.exists());
+        fs::remove_file(&p).ok();
     }
 
     #[test]
@@ -4424,7 +4516,7 @@ impl Segments {
     }
 
     /// 删除单个 vrow（源记录进位图并分裂段；插入块行直接摘除）。
-    fn delete_one(&mut self, vrow: u64) -> Option<DeletedRow> {
+    fn delete_one(&mut self, vrow: u64) -> Option<Vec<String>> {
         let (i, off) = self.locate(vrow)?;
         let s = self.segs[i];
         match s.kind {
@@ -4445,7 +4537,7 @@ impl Segments {
                         len: right_len,
                     },
                 );
-                Some(DeletedRow::Src { vpos: vrow, rec })
+                Some(Vec::new())
             }
             SegKind::Ins { block } => {
                 let rows = self.blocks.get_mut(block as usize)?.as_mut()?;
@@ -4459,21 +4551,17 @@ impl Segments {
                 } else {
                     self.segs[i].len -= 1;
                 }
-                Some(DeletedRow::Ins { vpos: vrow, block, row: off, cells })
+                Some(cells)
             }
         }
     }
 
     /// 删除中途发现内部不一致时，按相反顺序恢复已完成的删除。
-    fn rollback_deleted(
-        &mut self,
-        mut items: Vec<DeletedRow>,
-        mut rollbacks: Vec<DeleteRollback>,
-    ) {
-        while let Some(item) = items.pop() {
-            let rollback = rollbacks.pop().expect("成功删除必须有对应回滚项");
-            match item {
-                DeletedRow::Src { rec, .. } => {
+    fn rollback_deleted(&mut self, mut rollbacks: Vec<DeleteRollback>) {
+        while let Some(rollback) = rollbacks.pop() {
+            match rollback.seg.kind {
+                SegKind::Src { start, .. } => {
+                    let rec = start.checked_add(rollback.off).expect("删除回滚记录号有效");
                     if rollback.tombstone_was_present {
                         self.tombstones.insert(rec);
                     } else {
@@ -4482,10 +4570,10 @@ impl Segments {
                     self.segs.remove(rollback.index + 1);
                     self.segs[rollback.index] = rollback.seg;
                 }
-                DeletedRow::Ins { block, row, cells, .. } => {
+                SegKind::Ins { block } => {
                     let slot = self.blocks.get_mut(block as usize).expect("删除块必须存在");
                     let rows = slot.get_or_insert_with(Vec::new);
-                    rows.insert(row as usize, cells);
+                    rows.insert(rollback.off as usize, rollback.cells);
                     if rollback.removed_seg {
                         self.segs.insert(rollback.index, rollback.seg);
                     } else {
@@ -4494,7 +4582,45 @@ impl Segments {
                 }
             }
         }
-        debug_assert!(rollbacks.is_empty());
+    }
+
+    /// 写入前按恢复顺序模拟插入块状态，保证后续失败不会留下半次撤销。
+    fn validate_restore_inserted(&self, items: &[DeletedRow]) -> bool {
+        let mut simulated = HashMap::<u32, (bool, usize, Option<u32>)>::new();
+        for item in items {
+            let DeletedRow::Ins { block, row, .. } = item else { continue };
+            if !simulated.contains_key(block) {
+                let Some(slot) = self.blocks.get(*block as usize) else { return false };
+                let occupied = slot.is_some();
+                let rows_len = slot.as_ref().map_or(0, Vec::len);
+                let seg_len = self.segs.iter().find(|seg| {
+                    matches!(seg.kind, SegKind::Ins { block: id } if id == *block)
+                }).map(|seg| seg.len);
+                simulated.insert(*block, (occupied, rows_len, seg_len));
+            }
+            let (occupied, rows_len, seg_len) = simulated.get_mut(block).unwrap();
+            match (*occupied, *seg_len) {
+                (true, Some(current_seg_len)) => {
+                    let Some(next_len) = current_seg_len.checked_add(1) else { return false };
+                    if *row as usize > *rows_len || current_seg_len as usize != *rows_len {
+                        return false;
+                    }
+                    *rows_len += 1;
+                    *seg_len = Some(next_len);
+                }
+                (false, None) => {
+                    // 整块删除后的首条恢复必须为原第 0 行。
+                    if *row != 0 {
+                        return false;
+                    }
+                    *occupied = true;
+                    *rows_len = 1;
+                    *seg_len = Some(1);
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// 按原块号和块内行号恢复删除的插入行，保留旧历史的 CellId。
@@ -4576,16 +4702,18 @@ impl Segments {
 /// 删除掉的行（撤销恢复用）。
 #[derive(Clone, PartialEq, Debug)]
 enum DeletedRow {
-    Src { vpos: u64, rec: u32 },
-    Ins { vpos: u64, block: u32, row: u32, cells: Vec<String> },
+    Src { vpos: u64, rec: u32, snapshot: RowSnapshot, snapshot_row: u32 },
+    Ins { vpos: u64, block: u32, row: u32, snapshot: RowSnapshot, snapshot_row: u32 },
 }
 
 /// 单次删除的执行前段状态，仅在批量删除中途失败时用于回滚。
 struct DeleteRollback {
     index: usize,
+    off: u32,
     seg: Seg,
     removed_seg: bool,
     tombstone_was_present: bool,
+    cells: Vec<String>,
 }
 
 // ============================================================
@@ -4773,14 +4901,6 @@ impl Op {
             Op::InsertRows { rows, .. } => Self::rows_cost(&mut cost, rows)?,
             Op::RemoveRows { items } => {
                 cost.add_vec(items)?;
-                for item in items {
-                    if let DeletedRow::Ins { cells, .. } = item {
-                        cost.add_vec(cells)?;
-                        for value in cells {
-                            cost.add_string(value)?;
-                        }
-                    }
-                }
             }
         }
         Ok(cost.bytes())
@@ -4788,7 +4908,15 @@ impl Op {
 
     fn history_entry(self) -> Result<HistoryEntry<Op>, HistoryError> {
         let own_bytes = self.history_cost()?;
-        Ok(HistoryEntry::new(self, own_bytes, Vec::new(), 1))
+        let shared = match &self {
+            Op::RemoveRows { items } => items.iter().map(|item| match item {
+                DeletedRow::Src { snapshot, .. } | DeletedRow::Ins { snapshot, .. } => {
+                    snapshot.shared_charge()
+                }
+            }).collect(),
+            _ => Vec::new(),
+        };
+        Ok(HistoryEntry::new(self, own_bytes, shared, 1))
     }
 }
 
@@ -5824,9 +5952,20 @@ mod platform_mem {
     }
 }
 
+static NEXT_SESSION_SPOOL: AtomicU64 = AtomicU64::new(0);
+
+fn new_session_spool() -> Result<SessionSpool, String> {
+    let id = NEXT_SESSION_SPOOL.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simpletable-{}-{id}", std::process::id()));
+    SessionSpool::create(&root)
+}
+
 /// 大文件编辑会话。
 pub struct BigFile {
     path: PathBuf,
+    /// Task 8/14 重绑定和固定点 generation 使用；与用户保存身份 path 分离。
+    #[allow(dead_code)]
+    backing_path: PathBuf,
     /// 字节后备：常规为文件映射，排序模式载入后为私有内存缓冲。
     backing: Backing,
     enc: Encoding,
@@ -5861,6 +6000,8 @@ pub struct BigFile {
     last_spec: Option<FilterSpec>,
     filter_stats: FilterStats,
     history: HistoryLedger<Op>,
+    /// 删除快照和后续固定点 generation 的会话独占临时目录。
+    spool: SessionSpool,
     history_generation: u64,
     fixed_point: bool,
     savepoint_detached: bool,
@@ -5985,7 +6126,9 @@ impl BigFile {
         let base_ncols = headers.len();
         let schema = Arc::new(Schema::from_headers(headers.clone())?);
         let open_ms = t0.elapsed().as_millis() as u64;
+        let spool = new_session_spool()?;
         Ok(Self {
+            backing_path: path.clone(),
             path,
             backing,
             enc,
@@ -6008,6 +6151,7 @@ impl BigFile {
             last_spec: None,
             filter_stats: FilterStats::default(),
             history: HistoryLedger::new(DEFAULT_HISTORY_BUDGET_BYTES),
+            spool,
             history_generation: 0,
             fixed_point: false,
             savepoint_detached: false,
@@ -6078,6 +6222,7 @@ impl BigFile {
         headerless: bool,
     ) -> Result<Self, String> {
         let t0 = Instant::now();
+        let spool = new_session_spool()?;
         let file = fs::File::open(path)
             .map_err(|e| format!("打开失败：{}（{}）", path.display(), e))?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
@@ -6173,6 +6318,7 @@ impl BigFile {
 
         Ok(Self {
             path: path.to_path_buf(),
+            backing_path: path.to_path_buf(),
             backing: Backing::Mmap(mmap),
             enc,
             idx,
@@ -6194,6 +6340,7 @@ impl BigFile {
             last_spec: None,
             filter_stats: FilterStats::default(),
             history: HistoryLedger::new(DEFAULT_HISTORY_BUDGET_BYTES),
+            spool,
             history_generation: 0,
             fixed_point: false,
             savepoint_detached: false,
@@ -7605,33 +7752,36 @@ impl BigFile {
     }
 
     /// 借用当前插入行计算完整删除成本，避免为预检克隆行内容。
+    /// 删除前一次性保存全部行内容；条目只引用共享快照及行号。
     fn remove_rows_history_entry(&self, vrows: &[u64]) -> Result<HistoryEntry<Op>, String> {
-        let op = Op::RemoveRows { items: Vec::with_capacity(vrows.len()) };
-        let mut cost = Cost::new();
-        cost.add_value::<Op>().map_err(history_cost_error)?;
-        if let Op::RemoveRows { items } = &op {
-            cost.add_vec(items).map_err(history_cost_error)?;
-        }
+        let mut resolved = Vec::with_capacity(vrows.len());
+        let mut rows = Vec::with_capacity(vrows.len());
         for &vpos in vrows {
-            let cells = match self.seg.resolve(vpos).ok_or("行号越界")? {
-                ResolvedRow::Src(_) => None,
-                ResolvedRow::Ins { block, row } => Some(
-                    self.seg
-                        .blocks
-                        .get(block as usize)
-                        .and_then(Option::as_ref)
-                        .and_then(|rows| rows.get(row as usize))
-                        .ok_or("行号越界")?,
-                ),
+            let identity = self.seg.resolve(vpos).ok_or("行号越界")?;
+            let cells = match identity {
+                ResolvedRow::Src(rec) => self.src_fields(rec),
+                ResolvedRow::Ins { block, row } => self.seg.blocks
+                    .get(block as usize)
+                    .and_then(Option::as_ref)
+                    .and_then(|rows| rows.get(row as usize))
+                    .cloned()
+                    .ok_or("行号越界")?,
             };
-            if let Some(cells) = cells {
-                cost.add_vec(cells).map_err(history_cost_error)?;
-                for value in cells {
-                    cost.add_string(value).map_err(history_cost_error)?;
-                }
-            }
+            resolved.push((vpos, identity));
+            rows.push(cells);
         }
-        Ok(HistoryEntry::new(op, cost.bytes(), Vec::new(), 1))
+        let snapshot = RowSnapshot::write(&self.spool, rows.into_iter())?;
+        let items = resolved.into_iter().enumerate().map(|(index, (vpos, identity))| {
+            let snapshot_row = u32::try_from(index).map_err(|_| "删除快照行数超过 u32")?;
+            let snapshot = snapshot.clone();
+            Ok(match identity {
+                ResolvedRow::Src(rec) => DeletedRow::Src { vpos, rec, snapshot, snapshot_row },
+                ResolvedRow::Ins { block, row } => {
+                    DeletedRow::Ins { vpos, block, row, snapshot, snapshot_row }
+                }
+            })
+        }).collect::<Result<Vec<_>, String>>()?;
+        Op::RemoveRows { items }.history_entry().map_err(history_cost_error)
     }
 
     /// 删除一组 vrow；确认后才执行并收集真实删除快照。
@@ -7661,7 +7811,7 @@ impl BigFile {
             return Ok(EditOutcome::unchanged());
         }
         let entry = self.remove_rows_history_entry(&vrows)?;
-        let (mut prepared, fixed_point) = match self.preflight_history_entry(
+        let (prepared, fixed_point) = match self.preflight_history_entry(
             entry,
             "删除行",
             approval,
@@ -7671,9 +7821,6 @@ impl BigFile {
             HistoryDecision::Confirm(outcome) => return Ok(outcome),
         };
         let (removed_rows, complete, rollbacks) = {
-            let Op::RemoveRows { items } = &mut prepared.entry_mut().op else {
-                unreachable!();
-            };
             let mut rollbacks = Vec::with_capacity(vrows.len());
             let mut complete = true;
             for &vpos in vrows.iter().rev() {
@@ -7683,9 +7830,7 @@ impl BigFile {
                 };
                 let original_seg = self.seg.segs[index];
                 let removed_seg = match original_seg.kind {
-                    SegKind::Ins { block } => self
-                        .seg
-                        .blocks
+                    SegKind::Ins { block } => self.seg.blocks
                         .get(block as usize)
                         .and_then(Option::as_ref)
                         .is_some_and(|rows| rows.len() == 1),
@@ -7697,29 +7842,23 @@ impl BigFile {
                         .is_some_and(|rec| self.seg.tombstones.contains(&rec)),
                     SegKind::Ins { .. } => false,
                 };
-                let Some(deleted) = self.seg.delete_one(vpos) else {
+                let Some(cells) = self.seg.delete_one(vpos) else {
                     complete = false;
                     break;
                 };
                 rollbacks.push(DeleteRollback {
                     index,
+                    off,
                     seg: original_seg,
                     removed_seg,
                     tombstone_was_present,
+                    cells,
                 });
-                items.push(deleted);
             }
-            if complete {
-                items.reverse();
-            }
-            (items.len() as u64, complete, rollbacks)
+            (vrows.len() as u64, complete, rollbacks)
         };
         if !complete {
-            let Op::RemoveRows { items } = &mut prepared.entry_mut().op else {
-                unreachable!();
-            };
-            let items = std::mem::take(items);
-            self.seg.rollback_deleted(items, rollbacks);
+            self.seg.rollback_deleted(rollbacks);
             return Err("内部行索引不一致，删除已取消".into());
         }
         drop(rollbacks);
@@ -7916,9 +8055,30 @@ impl BigFile {
                 self.remove_inserted_block_for_undo(*vpos, rows)
             }
             Op::RemoveRows { items } => {
-                for item in items {
+                // 任何写入前验证全部插入块，后续失败不得留下前序源行恢复。
+                if !self.seg.validate_restore_inserted(items) {
+                    return false;
+                }
+
+                let visible = self.schema.visible().to_vec();
+                let restored = items.iter().map(|item| match item {
+                    DeletedRow::Src { snapshot, snapshot_row, .. }
+                    | DeletedRow::Ins { snapshot, snapshot_row, .. } => {
+                        snapshot.read_row(*snapshot_row as usize)
+                    }
+                }).collect::<Result<Vec<_>, _>>();
+                let Ok(restored) = restored else { return false };
+                if items.iter().zip(&restored).any(|(item, cells)| {
+                    matches!(item, DeletedRow::Src { .. }) && cells.len() != visible.len()
+                }) {
+                    return false;
+                }
+                for (item, cells) in items.iter().zip(restored) {
                     match item {
-                        DeletedRow::Src { vpos, rec } => {
+                        DeletedRow::Src { vpos, rec, .. } => {
+                            for (id, value) in visible.iter().zip(cells) {
+                                self.overlay.insert((*rec, *id), value);
+                            }
                             self.seg.tombstones.remove(rec);
                             let at = self.seg.split_at(*vpos);
                             self.seg.segs.insert(
@@ -7926,8 +8086,8 @@ impl BigFile {
                                 Seg { kind: SegKind::Src { start: *rec, len: 1 }, len: 1 },
                             );
                         }
-                        DeletedRow::Ins { vpos, block, row, cells } => {
-                            if !self.seg.restore_inserted(*vpos, *block, *row, cells.clone()) {
+                        DeletedRow::Ins { vpos, block, row, .. } => {
+                            if !self.seg.restore_inserted(*vpos, *block, *row, cells) {
                                 return false;
                             }
                         }
