@@ -65,6 +65,11 @@ impl Schema {
         self.resolve(id).map(|column| column.storage)
     }
 
+    /// 遍历所有仍保留的列身份，包括当前隐藏但历史仍引用的列。
+    pub fn columns(&self) -> impl Iterator<Item = (ColumnId, &Column)> {
+        self.columns.iter().map(|(id, column)| (*id, column))
+    }
+
     /// 将当前视图列号解析为稳定身份。
     pub fn view_id(&self, view_col: u32) -> Option<ColumnId> {
         self.visible.get(view_col as usize).copied()
@@ -150,9 +155,42 @@ impl Schema {
         Ok(())
     }
 
+    /// 把历史 Schema 重绑定到保存后的连续 Source 基线。
+    /// 任一历史列已不在可见保存映射中时，调用方必须请求固定点。
+    pub fn rebind_saved(
+        &self,
+        columns: &BTreeMap<ColumnId, u32>,
+    ) -> Result<Self, String> {
+        let next_id = u32::try_from(columns.len()).map_err(|_| "保存列数超过 u32")?;
+        let mut visible = Vec::with_capacity(self.visible.len());
+        for id in &self.visible {
+            let slot = columns.get(id).copied().ok_or("历史列已不在保存结构中")?;
+            visible.push(ColumnId(slot));
+        }
+        let mut rebound = BTreeMap::new();
+        for (id, column) in &self.columns {
+            let slot = columns.get(id).copied().ok_or("历史列已不在保存结构中")?;
+            let mapped = ColumnId(slot);
+            let column = Column {
+                storage: ColumnStorage::Source(slot),
+                header: column.header.clone(),
+            };
+            if rebound.insert(mapped, column).is_some() {
+                return Err("保存列身份映射冲突".into());
+            }
+        }
+        let mut schema = Self {
+            visible,
+            columns: rebound,
+            next_id,
+            next_inserted_storage: 0,
+            history_bytes: 0,
+        };
+        schema.history_bytes = schema.compute_history_bytes()?;
+        Ok(schema)
+    }
+
     /// 预先核算的共享 Schema 历史字节数。
-    /// Task 9 接入 Op::Columns 共享计费后移除临时豁免。
-    #[allow(dead_code)]
     pub fn history_bytes(&self) -> u64 { self.history_bytes }
 }
 

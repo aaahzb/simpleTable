@@ -1684,30 +1684,7 @@ export class Grid {
       : (parsed.headers.length ? [parsed.headers] : []);
     if (!rows.length) return;
     const width = Math.max(...rows.map((row) => row.length));
-    // 粘贴超宽二态：无路径内存档先确认历史丢失，再 pending 插列 + 立即执行。
-    // 取消则整次粘贴零写入；确认后内存重建会清空此前撤销/重做历史。
-    // 有路径大档拒绝（物理重写代价大，请先手动加列）。
-    // 行方向始终自动扩（_pasteBig 内引擎插行）。
-    if (c0 + width > this.model.columnCount()) {
-      const meta = this.model.meta?.();
-      if (!meta || meta.has_path !== false || meta.sorted === true) {
-        this.hooks.statusMsg("大文件模式：粘贴宽度超出现有列，已取消（可先用列操作加列）", 3000);
-        return;
-      }
-      try {
-        const confirmed = await this.hooks.confirmColOps?.();
-        if (!confirmed) {
-          this.hooks.statusMsg("已取消粘贴：未执行扩列", 2500);
-          return;
-        }
-        const needCols = c0 + width - this.model.columnCount();
-        await this.model.insertColumns(this.model.columnCount(), needCols);
-        await this.model.applyColOps();
-      } catch (err) {
-        this.hooks.statusMsg(String(err?.message ?? err), 3000);
-        return;
-      }
-    }
+    // 超宽、扩行与既有格修改统一由引擎合并为一次可撤销粘贴。
     await this._pasteBig(r0, c0, rows, width);
   }
 
@@ -1741,7 +1718,11 @@ export class Grid {
    */
   async _pasteBig(r0, c0, rows, width) {
     try {
-      await this.model.pasteRows(r0, c0, rows);
+      const outcome = await this.model.pasteRows(r0, c0, rows);
+      if (outcome?.cancelled) {
+        this.hooks.statusMsg("已取消粘贴", 2500);
+        return;
+      }
       this.select([r0, c0], { silent: true });
       this._extendTo([r0 + rows.length - 1, c0 + width - 1]);
       this.hooks.statusMsg(`已粘贴 ${rows.length} 行`, 2000);

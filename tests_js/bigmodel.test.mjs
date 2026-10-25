@@ -221,7 +221,7 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
         case "big_col_clear":
           return null;
         case "big_col_apply":
-          return null;
+          return editOutcome({ changed: true });
         case "big_save":
         case "big_save_as":
           // 真实引擎保存/另存为后重开文件：筛选结果被丢弃、排序视图已物理落盘
@@ -739,8 +739,63 @@ test("列操作 pending 后元数据刷新由引擎视图映射（mock 不映射
   assert.deepEqual(calls.filter(([c]) => c === "big_col_push").at(-1)[1].op, {
     Rename: { col: 0, name: "改名" },
   });
-  await model.applyColOps();
-  assert.ok(calls.some(([c]) => c === "big_col_apply"));
+  const outcome = await model.applyColOps();
+  assert.equal(outcome?.changed, true);
+  const apply = calls.find(([c]) => c === "big_col_apply");
+  assert.deepEqual(apply[1].approval, { allowFixedPoint: false, preflightId: null });
+});
+
+function makeFixedPointColumnModel(confirm, first, retry) {
+  const calls = [];
+  let refreshes = 0;
+  let dataEvents = 0;
+  const model = new BigModel({
+    invoke: async (cmd, args = {}) => {
+      calls.push([cmd, args]);
+      if (cmd !== "big_col_apply") throw new Error("unexpected " + cmd);
+      return calls.length === 1 ? first : retry;
+    },
+    listen: async () => () => {},
+    confirmFixedPoint: confirm,
+  });
+  model._refreshMeta = async () => { refreshes += 1; };
+  model._emitData = () => { dataEvents += 1; };
+  return { model, calls, counts: () => ({ refreshes, dataEvents }) };
+}
+
+test("列操作 fixedPoint 确认携带原 preflightId，changed 后才刷新", async () => {
+  const fixedPoint = {
+    kind: "stepOverBudget", operation: "列操作", requiredBytes: 100,
+    budgetBytes: 10, preflightId: 77,
+  };
+  const { model, calls, counts } = makeFixedPointColumnModel(
+    async () => true,
+    { changed: false, insertedRows: 0, removedRows: 0, fixedPoint, cancelled: false },
+    editOutcome({ changed: true }),
+  );
+  const outcome = await model.applyColOps();
+  assert.equal(outcome?.changed, true);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0][1].approval, { allowFixedPoint: false, preflightId: null });
+  assert.deepEqual(calls[1][1].approval, { allowFixedPoint: true, preflightId: 77 });
+  assert.deepEqual(counts(), { refreshes: 1, dataEvents: 1 });
+});
+
+test("列操作 fixedPoint 取消不重试、不刷新并返回 cancelled", async () => {
+  const fixedPoint = {
+    kind: "stepOverBudget", operation: "列操作", requiredBytes: 100,
+    budgetBytes: 10, preflightId: 78,
+  };
+  const { model, calls, counts } = makeFixedPointColumnModel(
+    async () => false,
+    { changed: false, insertedRows: 0, removedRows: 0, fixedPoint, cancelled: false },
+    null,
+  );
+  const outcome = await model.applyColOps();
+  assert.equal(outcome?.cancelled, true);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0][1].approval, { allowFixedPoint: false, preflightId: null });
+  assert.deepEqual(counts(), { refreshes: 0, dataEvents: 0 });
 });
 
 function makeModelWithMeta({ rows, cols }) {

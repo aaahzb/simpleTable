@@ -837,7 +837,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await waitFor(() => tableEquals(pasted), "一次重做应同时恢复内容和新行");
   });
 
-  check("内存档超宽粘贴：取消零写入，确认扩列后另存为", async () => {
+  check("内存档超宽粘贴：一次扩列并一步撤销/重做后另存为", async () => {
     await window.__app.smokeLoadSmall([], []);
     tbBtn("新建").click();
     await waitFor(() => document.querySelector(".modal-mask"), "新建对话框");
@@ -849,72 +849,98 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       "新建 2×3 落定（内存档）");
     assert(window.__app.getPath() === null, "新建档应无磁盘路径");
     const original = tableSnapshot();
-    const history = [model.canUndo(), model.canRedo()];
+    const pasted = [
+      ["A", "B", "C", "D"],
+      ["E", "F", "G", "H"],
+      ["", "", "", ""],
+    ];
     grid.select([0, 0]);
-    stubClipboard("A\tB\tC\tD\r\nE\tF\tG\tH\r\n"); // 4 列 > 现有 2 列
-
-    const cancelled = grid.pasteClipboard();
-    await waitFor(() => document.querySelector(".modal-mask"), "自动扩列确认框");
-    const cancelText = document.querySelector(".modal-mask").textContent;
-    assert(cancelText.includes("撤销") && cancelText.includes("重做")
-      && cancelText.includes("清空"), `确认文案应说明历史丢失：${cancelText}`);
-    assert(clickModalButton("否"), "取消自动扩列");
-    await cancelled;
-    assert(model.columnCount() === 2 && tableEquals(original),
-      "取消自动扩列时列数和全部内容都应不变");
-    assert(model.colOpsPending() === false, "取消后不得留下 pending 列操作");
-    assert(model.canUndo() === history[0] && model.canRedo() === history[1],
-      "取消后撤销/重做能力不得变化");
-
-    const accepted = grid.pasteClipboard();
-    await waitFor(() => document.querySelector(".modal-mask"), "再次自动扩列确认框");
-    assert(clickModalButton("是"), "确认自动扩列");
-    await accepted;
-    await waitFor(() => model.columnCount() === 4
-      && model.rawData(0, 3) === "D" && model.rawData(1, 3) === "H",
-      "确认后超宽粘贴应自动扩列并落定");
-    const target = `${TMP}/paste-expand-saveas.csv`;
+    stubClipboard("A\tB\tC\tD\r\nE\tF\tG\tH\r\n");
+    await grid.pasteClipboard();
+    await waitFor(() => model.columnCount() === 4 && tableEquals(pasted),
+      "超宽粘贴应一次扩列并落定，不再先弹列历史确认");
+    assert(await model.undo() === true, "扩列粘贴应只有一步撤销");
+    await waitFor(() => model.columnCount() === 2 && tableEquals(original),
+      "一次撤销应同时恢复列数、内容和行数");
+    assert(await model.redo() === true, "扩列粘贴应只有一步重做");
+    await waitFor(() => model.columnCount() === 4 && tableEquals(pasted),
+      "一次重做应同时恢复扩列和全部内容");
+    const target = TMP + "/paste-expand-saveas.csv";
     assert(await window.__app.saveFileAs(target) === true, "扩列后另存为应成功");
     const txt = (await invoke("read_csv_file", { path: target })).text;
     assert(txt.includes("A,B,C,D") && txt.includes("E,F,G,H"), "落盘内容应含扩列数据");
   });
 
-  check("内存档手动列执行：空历史也须确认，取消不重建", async () => {
+  check("列执行：可撤销重做且不提前写盘", async () => {
     await window.__app.smokeLoadSmall(["a"], [["x"], ["y"]]);
+    const path = TMP + "/column-apply-undo.csv";
+    assert(await window.__app.saveFileAs(path) === true, "列执行夹具应先建立磁盘基线");
+    const diskBefore = (await invoke("read_csv_file", { path })).text;
     assert(model.canUndo() === false && model.canRedo() === false,
       "夹具应从空撤销/重做历史开始");
     await model.insertColumns(1, 1);
     await waitFor(() => model.rawData(0, 0) === "x" && model.rawData(1, 0) === "y",
       "pending 列预览落定");
-    const original = tableSnapshot();
-    const beforeDirty = window.__app.isDirty();
-
-    const cancelled = window.__app.applyColOps();
-    await waitFor(() => document.querySelector(".modal-mask"), "空历史手动列确认框");
-    const text = document.querySelector(".modal-mask").textContent;
-    assert(text.includes("撤销") && text.includes("重做") && text.includes("清空"),
-      `空历史也应显示历史丢失确认：${text}`);
-    assert(clickModalButton("否"), "取消手动列执行");
-    await cancelled;
-    assert(model.colOpsPending() === true && model.columnCount() === 2,
-      "取消后 pending 预览与列数应保持");
-    assert(tableEquals(original), "取消手动列执行不得改写任何单元格");
-    assert(model.canUndo() === false && model.canRedo() === false,
-      "取消后空历史应保持不变");
-    assert(window.__app.isDirty() === beforeDirty, "取消不得改变脏态");
-
-    const accepted = window.__app.applyColOps();
-    await waitFor(() => document.querySelector(".modal-mask"), "再次手动列确认框");
-    assert(clickModalButton("是"), "确认手动列执行");
-    await accepted;
+    const pending = tableSnapshot();
+    await window.__app.applyColOps();
     assert(model.colOpsPending() === false && model.columnCount() === 2,
-      "确认后应完成内存列重建");
-    const physical = await invoke("big_rows", {
-      from: 0, count: 2, session: model.sessionId,
-    });
-    assert(physical.length === 2 && physical.every((row) => row.length === 2),
-      `确认后物理行宽应为 2：${JSON.stringify(physical)}`);
-    assert(physical[0][0] === "x" && physical[1][0] === "y", "既有内容应保持");
+      "执行后应提交 Schema 并清除 pending");
+    await waitFor(() => tableEquals(pending), "执行只提交结构，重新取页后内容不变");
+    assert(window.__app.isDirty() === true, "可撤销列执行后必须保持脏态");
+    assert((await invoke("read_csv_file", { path })).text === diskBefore,
+      "列执行不得提前改写源文件");
+    assert(await model.undo() === true, "列执行应产生一步撤销");
+    await waitFor(() => model.columnCount() === 1 && tableEquals([["x"], ["y"]]),
+      "撤销列执行应恢复原结构和内容");
+    assert(await model.redo() === true, "列执行应可重做");
+    await waitFor(() => model.columnCount() === 2 && tableEquals(pending),
+      "重做列执行应恢复预览结构");
+    assert((await invoke("read_csv_file", { path })).text === diskBefore,
+      "撤销和重做列结构均不得改写源文件");
+  });
+
+  check("删除 Source 列保存：取消保留历史，确认固定点后落盘", async () => {
+    await window.__app.smokeLoadSmall(["a", "b"], [["1", "2"], ["3", "4"]]);
+    const path = TMP + "/delete-source-column-save.csv";
+    assert(await window.__app.saveFileAs(path) === true, "删除列夹具应先建立 Source 基线");
+    const diskBefore = (await invoke("read_csv_file", { path })).text;
+    await model.removeColumns([0]);
+    await window.__app.applyColOps();
+    assert(model.columnCount() === 1 && model.headers()[0] === "b",
+      "删除 Source 列后应只剩可见列 b");
+    assert(model.canUndo() === true, "删除 Source 列必须保留撤销历史");
+    await waitFor(() => tableEquals([["2"], ["4"]]), "删除 Source 列后重新取页");
+    const visible = tableSnapshot();
+    const fixedPointMask = () => [...document.querySelectorAll(".modal-mask")]
+      .find((item) => item.querySelector(".modal-title")?.textContent === "确认固定点");
+    const clickFixedPoint = (label) => {
+      const button = [...(fixedPointMask()?.querySelectorAll("button") ?? [])]
+        .find((item) => item.textContent === label);
+      button?.click();
+      return !!button;
+    };
+    const cancelled = window.__app.saveFile();
+    await waitFor(() => fixedPointMask()?.textContent.includes("历史列"),
+      "删除 Source 列保存应请求固定点");
+    assert(clickFixedPoint("取消"), "取消删除 Source 列保存固定点");
+    assert(await cancelled === false, "取消固定点保存应返回 false");
+    assert((await invoke("read_csv_file", { path })).text === diskBefore,
+      "取消固定点保存不得改写源文件");
+    assert(tableEquals(visible) && model.canUndo() === true && window.__app.isDirty(),
+      "取消后应保留数据、撤销历史和脏态");
+    const accepted = window.__app.saveFile();
+    await waitFor(() => fixedPointMask()?.textContent.includes("此前历史与本次操作不可撤销"),
+      "确认删除 Source 列保存固定点");
+    assert(clickFixedPoint("继续"), "确认删除 Source 列保存固定点");
+    assert(await accepted === true, "确认固定点后保存应成功");
+    assert(model.canUndo() === false && model.canRedo() === false,
+      "固定点保存后不得保留跨越保存的历史");
+    assert(window.__app.isDirty() === false, "固定点保存成功后应恢复干净保存点");
+    const saved = parseCsv((await invoke("read_csv_file", { path })).text);
+    assert(JSON.stringify(saved.headers) === JSON.stringify(["b"]),
+      "固定点保存后的表头应只含 b");
+    assert(JSON.stringify(saved.rows) === JSON.stringify([["2"], ["4"]]),
+      "固定点保存后的内容应只含原 b 列");
   });
 
   check("无 Tab 纯文本整段进当前格（不换行摊开）", async () => {
@@ -2270,31 +2296,40 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(rejected, "列操作 pending 期间编辑应被引擎拒绝");
   });
 
-  check("大模式：确认执行列操作（物理重写 + 进度 + 清空双栈）", async () => {
+  check("大模式：执行列操作可撤销/重做且不提前写盘", async () => {
     const bm = bigM();
-    let saw = null;
-    const un = await bm.onProgress((done, total) => { saw = [done, total]; });
-    try {
-      const applying = window.__app.applyColOps();
-      await waitFor(() => document.querySelector(".modal-mask"), "大档列执行确认框");
-      const text = document.querySelector(".modal-mask").textContent;
-      assert(text.includes("撤销") && text.includes("重做") && text.includes("清空"),
-        `确认文案应说明历史丢失：${text}`);
-      assert(clickModalButton("是"), "确认大档列执行");
-      await applying;
-    } finally {
-      un();
-    }
-    assert(saw !== null, "应收到至少一次进度事件");
-    assert(saw[1] > 0 && saw[0] === saw[1], `进度收尾应到满：${saw}`);
+    const path = window.__app.getPath();
+    const diskBefore = (await invoke("read_csv_file", { path })).text;
+    const pendingRows = await invoke("big_rows", {
+      from: 0, count: 2, session: bm.sessionId,
+    });
+    await window.__app.applyColOps();
     assert(bm.colOpsPending() === false, "执行后不应再有 pending");
-    assert(bm.canUndo() === false && bm.canRedo() === false,
-      "物理重写后撤销/重做栈都应清空");
-    assert(window.__app.isDirty() === false,
-      "物理重写后文件与内存已一致，必须为干净（保存不得再全盘重写）");
-    const rows = await invoke("big_rows", { from: 0, count: 1, session: bm.sessionId });
-    assert(rows[0].length === 4, `物理行宽 ${rows[0].length}`);
-    assert(bm.headers()[1] === "列4", `物理表头 ${bm.headers()}`);
+    assert(bm.canUndo() === true, "列执行后必须保留撤销历史");
+    assert(window.__app.isDirty() === true, "列执行只改会话，必须保持脏态");
+    assert((await invoke("read_csv_file", { path })).text === diskBefore,
+      "大档列执行不得提前物理重写");
+    const appliedRows = await invoke("big_rows", {
+      from: 0, count: 2, session: bm.sessionId,
+    });
+    assert(JSON.stringify(appliedRows) === JSON.stringify(pendingRows),
+      "执行后视图行应与 pending 预览一致");
+    assert(bm.headers()[1] === "列4", "执行后应保留新列名");
+    assert(await bm.undo() === true, "大档列执行应可撤销");
+    await waitFor(() => bm.columnCount() === 3, "撤销大档列执行应恢复三列");
+    assert(JSON.stringify(bm.headers()) === JSON.stringify(["目的地", "评分", "备注"]),
+      "撤销后应恢复原始表头");
+    assert((await invoke("read_csv_file", { path })).text === diskBefore,
+      "撤销列结构不得改写源文件");
+    assert(await bm.redo() === true, "大档列执行应可重做");
+    await waitFor(() => bm.columnCount() === 4, "重做应恢复四列");
+    const redoneRows = await invoke("big_rows", {
+      from: 0, count: 2, session: bm.sessionId,
+    });
+    assert(JSON.stringify(redoneRows) === JSON.stringify(pendingRows),
+      "重做后应恢复 pending 的列和内容");
+    assert((await invoke("read_csv_file", { path })).text === diskBefore,
+      "重做列结构不得改写源文件");
   });
 
   check("大模式：放弃列操作预览恢复原结构", async () => {
@@ -3542,7 +3577,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       lines.push(`✓ ${name}`);
     } catch (err) {
       failed += 1;
-      lines.push(`✗ ${name} —— ${err.message}`);
+      lines.push(`✗ ${name} —— ${String(err?.message ?? err)}`);
     }
   }
   window.__smokeCurrent = "";

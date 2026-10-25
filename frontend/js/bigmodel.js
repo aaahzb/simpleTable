@@ -5,7 +5,7 @@
  * - 取数走 200 行/页的同步窗口缓存，±2 屏预取，落定经 onData 触发重绘；
  * - 编辑/插删/撤销立即异步落引擎，乐观写缓存，失败回滚并抛错；
  * - 筛选为按钮触发的整表扫描（引擎 rayon 并行），结果集存 Rust 侧；
- * - 列操作先进 pending 列表（视图立即映射），"执行列操作"才物理重写。
+ * - 列操作先进 pending 列表，执行时提交可撤销的共享 Schema。
  *
  * 依赖注入：构造可传 {invoke, listen}，便于 node:test 脱离 Tauri 环境测试。
  */
@@ -175,10 +175,15 @@ export class BigModel {
    */
   async _afterEdit(outcome, origin = "edit") {
     if (!outcome?.changed) return outcome;
+    const previousCols = this._meta?.cols;
     this._invalidate();
     // _refreshMeta 已发 onUndoStack，这里不能重复通知。
     await this._refreshMeta();
-    this._emitData(outcome.insertedRows > 0 || outcome.removedRows > 0, origin);
+    const columnsChanged = previousCols !== undefined && this._meta?.cols !== previousCols;
+    this._emitData(
+      outcome.insertedRows > 0 || outcome.removedRows > 0 || columnsChanged,
+      origin,
+    );
     return outcome;
   }
 
@@ -1403,16 +1408,14 @@ export class BigModel {
   }
 
   /**
-   * 执行全部 pending 列操作（物理重写整个文件，带进度事件）。
+   * 执行全部 pending 列操作，成功后产生一条可撤销 SchemaChange。
    *
-   * @returns {Promise<void>}
+   * @returns {Promise<object>} 引擎 EditOutcome。
    */
   async applyColOps() {
     this._requireNotIndexing("文件仍在索引中，暂不支持列操作");
-    await this._invoke("big_col_apply");
-    this._invalidate();
-    await this._refreshMeta();
-    this._emitData(true);
+    const outcome = await this._invokeEdit("big_col_apply");
+    return this._afterEdit(outcome, "structure");
   }
 
   /**

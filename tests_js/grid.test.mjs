@@ -346,12 +346,14 @@ test("扩行粘贴只调 pasteRows，不预先插行或逐格写", async () => {
 /** 造一个触发内存档自动扩列的最小 Grid。 */
 function makeAutoExpandGrid(approved) {
   const calls = [];
+  const selections = [];
+  const messages = [];
   const g = Object.create(Grid.prototype);
   g.sel = { current: [0, 0] };
   g.selectedSet = new Set([0]);
   g.lastCopiedText = null;
   g.hooks = {
-    statusMsg: () => {},
+    statusMsg: (text) => { messages.push(text); },
     confirmColOps: async () => {
       calls.push("confirm");
       return approved;
@@ -364,13 +366,13 @@ function makeAutoExpandGrid(approved) {
     applyColOps: async () => { calls.push("apply"); },
     pasteRows: async () => {
       calls.push("paste");
-      return { changed: true, insertedRows: 0 };
+      return { changed: approved, insertedRows: 0, cancelled: !approved };
     },
     setData: async () => { throw new Error("不得走单格纯文本分支"); },
   };
-  g.select = () => {};
-  g._extendTo = () => {};
-  return { g, calls };
+  g.select = (point) => { selections.push(["select", point]); };
+  g._extendTo = (point) => { selections.push(["extend", point]); };
+  return { g, calls, selections, messages };
 }
 
 /** 临时替换剪贴板，并返回恢复函数。 */
@@ -385,25 +387,27 @@ function stubNavigatorClipboard(text) {
   };
 }
 
-test("超宽粘贴取消列历史确认时零写入", async () => {
-  const { g, calls } = makeAutoExpandGrid(false);
+test("超宽粘贴直接一次 pasteRows，不先确认或执行列操作", async () => {
+  const { g, calls, selections } = makeAutoExpandGrid(true);
   const restore = stubNavigatorClipboard("A\tB\tC\r\n");
   try {
     await g.pasteClipboard();
   } finally {
     restore();
   }
-  assert.deepEqual(calls, ["confirm"],
-    "取消后不得插列、执行列操作或粘贴任何内容");
+  assert.deepEqual(calls, ["paste"]);
+  assert.deepEqual(selections, [["select", [0, 0]], ["extend", [0, 2]]]);
 });
 
-test("超宽粘贴确认后先扩列再一次性粘贴", async () => {
-  const { g, calls } = makeAutoExpandGrid(true);
+test("扩列 fixedPoint 取消时不扩展选区并提示取消", async () => {
+  const { g, calls, selections, messages } = makeAutoExpandGrid(false);
   const restore = stubNavigatorClipboard("A\tB\tC\r\n");
   try {
     await g.pasteClipboard();
   } finally {
     restore();
   }
-  assert.deepEqual(calls, ["confirm", "insert:2:1", "apply", "paste"]);
+  assert.deepEqual(calls, ["paste"]);
+  assert.deepEqual(selections, []);
+  assert.equal(messages.at(-1), "已取消粘贴");
 });

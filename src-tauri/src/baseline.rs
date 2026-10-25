@@ -24,7 +24,11 @@ pub struct BaselineTransform {
     pub deleted_sources: BTreeSet<u32>,
     /// 已删除 Source rec 到预留 Inserted block（row=0）的稳定映射。
     pub suspended_rows: BTreeMap<u32, u32>,
+    /// 当前可见旧 ColumnId 到保存后连续 Source 槽/新 ColumnId 的映射。
     pub columns: BTreeMap<ColumnId, u32>,
+    /// 保存前所有仍保留的物理槽到稳定列身份，含当前隐藏列。
+    pub source_columns: BTreeMap<u32, ColumnId>,
+    pub inserted_columns: BTreeMap<u32, ColumnId>,
 }
 
 impl BaselineTransform {

@@ -1702,7 +1702,13 @@ a,b
         let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
         let before = bf.rows(0, 5);
         assert!(bf.paste_rows(6, 0, vec![vec!["X".into()]], Approval::deny()).is_err());
-        assert!(bf.paste_rows(0, 3, vec![vec!["X".into()]], Approval::deny()).is_err());
+        assert!(bf.paste_rows(0, 3, vec![vec!["X".into()]], Approval::deny()).unwrap().changed);
+        assert_eq!(bf.rows(0, 1)[0], vec!["Alice", "30", "Beijing", "X"]);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), before);
+        let history = bf.history_stats();
+        let revision = bf.revision;
+        assert!(bf.paste_rows(0, 4, vec![vec!["X".into()]], Approval::deny()).is_err());
         assert!(bf
             .paste_rows(0, u32::MAX, vec![vec!["X".into(), "Y".into()]], Approval::deny())
             .is_err());
@@ -1710,8 +1716,8 @@ a,b
             .paste_rows(u64::MAX, 0, vec![vec!["X".into()], vec!["Y".into()]], Approval::deny())
             .is_err());
         assert_eq!(bf.rows(0, 5), before);
-        assert!(bf.history_stats().undo_count == 0 && bf.history_stats().redo_count == 0);
-        assert_eq!(bf.revision, 0);
+        assert_eq!(bf.history_stats(), history);
+        assert_eq!(bf.revision, revision);
     }
 
     /// 扩行粘贴的插入行也计入完整成本；未确认时不写行或既有格。
@@ -2733,6 +2739,156 @@ keep,old,target
     }
 
     #[test]
+    fn p2_column_execute_is_undoable_without_rewriting_source() {
+        let p = tmp_csv("p2_columns", &people_csv());
+        let original = fs::read(&p).unwrap();
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.push_col_op(ColOp::Insert { pos: 1, name: "X".into() }).unwrap();
+        bf.push_col_op(ColOp::Rename { col: 0, name: "AA".into() }).unwrap();
+        let outcome = bf.apply_col_ops(Approval::deny()).unwrap();
+        assert!(outcome.changed);
+        assert_eq!(fs::read(&p).unwrap(), original, "执行列结构不得提前改写源文件");
+        assert!(bf.modified());
+        assert_eq!(bf.meta().headers, vec!["AA", "X", "age", "city"]);
+        assert!(bf.undo());
+        assert_eq!(bf.meta().headers, vec!["name", "age", "city"]);
+        assert!(bf.redo());
+        assert_eq!(bf.meta().headers, vec!["AA", "X", "age", "city"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p2_save_interleaved_columns_rows_cells_roundtrip() {
+        let p = tmp_csv("p2_save_all_ops", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, bf.meta().rows as u32);
+        let before_headers = bf.meta().headers;
+        bf.set_cell(4, 0, "last-before-structure".into(), Approval::deny()).unwrap();
+        bf.insert_rows(
+            1,
+            Some(vec![vec!["X".into(), "Y".into(), "Z".into()]]),
+            1,
+            Approval::deny(),
+        ).unwrap();
+        bf.push_col_op(ColOp::Insert { pos: 1, name: "extra".into() }).unwrap();
+        bf.apply_col_ops(Approval::deny()).unwrap();
+        let after = bf.rows(0, bf.meta().rows as u32);
+        let after_headers = bf.meta().headers;
+        let saved = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(saved.saved, "插入列仍在可见 schema 中，不应要求固定点");
+        assert_eq!(bf.rows(0, bf.meta().rows as u32), after);
+        assert!(bf.undo());
+        assert!(bf.undo());
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, bf.meta().rows as u32), before);
+        assert_eq!(bf.meta().headers, before_headers);
+        assert!(bf.redo());
+        assert!(bf.redo());
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, bf.meta().rows as u32), after);
+        assert_eq!(bf.meta().headers, after_headers);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p2_paste_expand_undo_redo_is_atomic() {
+        let p = tmp_csv("p2_paste_expand", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, bf.meta().rows as u32);
+        let headers = bf.meta().headers;
+        let history = bf.history_stats();
+        let rows = vec![vec!["X".to_string(); 4]; 6];
+        assert!(bf.paste_rows(u64::MAX, 0, rows.clone(), Approval::deny()).is_err());
+        assert_eq!(bf.rows(0, bf.meta().rows as u32), before);
+        assert_eq!(bf.history_stats(), history);
+        assert!(bf.paste_rows(3, 1, rows, Approval::deny()).unwrap().changed);
+        assert_eq!(bf.meta().rows, 9);
+        assert_eq!(bf.meta().cols, 5);
+        let after = bf.rows(0, bf.meta().rows as u32);
+        let after_headers = bf.meta().headers;
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, bf.meta().rows as u32), before);
+        assert_eq!(bf.meta().headers, headers);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, bf.meta().rows as u32), after);
+        assert_eq!(bf.meta().headers, after_headers);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p2_over_budget_paste_cancel_then_fixed_point() {
+        let p = tmp_csv("p2_paste_fixed", &people_csv());
+        let original = fs::read(&p).unwrap();
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_history_budget(4_096).unwrap();
+        let before = bf.rows(0, bf.meta().rows as u32);
+        let rows = vec![vec!["x".repeat(128 * 1024)]];
+        let first = bf.paste_rows(0, 3, rows.clone(), Approval::deny()).unwrap();
+        assert!(!first.changed);
+        let request = first.fixed_point.expect("超预算扩列粘贴必须先请求固定点");
+        assert_eq!(bf.rows(0, bf.meta().rows as u32), before);
+        assert_eq!(bf.meta().cols, 3);
+        let done = bf.paste_rows(0, 3, rows, Approval::allow(request.preflight_id)).unwrap();
+        assert!(done.changed);
+        assert_eq!(bf.meta().cols, 4);
+        assert_eq!(bf.rows(0, 1)[0][3].len(), 128 * 1024);
+        assert_eq!(bf.history_stats().undo_count, 0);
+        assert!(!bf.undo());
+        assert_eq!(fs::read(&p).unwrap(), original);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p2_delete_source_column_save_requires_fixed_point() {
+        let p = tmp_csv("p2_delete_source_save", &people_csv());
+        let original = fs::read(&p).unwrap();
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.push_col_op(ColOp::Delete { col: 1 }).unwrap();
+        bf.apply_col_ops(Approval::deny()).unwrap();
+        let visible_headers = bf.meta().headers;
+        let visible_rows = bf.rows(0, bf.meta().rows as u32);
+        assert!(bf.meta().can_undo, "必须保留能恢复被删 Source 列的历史");
+        let first = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(!first.saved);
+        let request = first.fixed_point.expect("删除 Source 列的保存必须请求固定点");
+        assert_eq!(request.kind, FixedPointKind::SaveTransform);
+        assert_eq!(fs::read(&p).unwrap(), original);
+        let done = bf.save(Approval::allow(request.preflight_id), |_, _, _, _| {}).unwrap();
+        assert!(done.saved);
+        assert_eq!(bf.history_stats().undo_count, 0);
+        assert_eq!(bf.history_stats().redo_count, 0);
+        let reopened = BigFile::open(&p).unwrap();
+        assert_eq!(reopened.meta().headers, visible_headers);
+        assert_eq!(reopened.rows(0, reopened.meta().rows as u32), visible_rows);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p2_deleted_column_history_evicted_allows_save() {
+        let p = tmp_csv("p2_deleted_column_evicted", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.push_col_op(ColOp::Delete { col: 1 }).unwrap();
+        bf.apply_col_ops(Approval::deny()).unwrap();
+        let delete_bytes = bf.history_stats().bytes;
+        bf.set_history_budget(delete_bytes).unwrap();
+        assert_eq!(bf.history_stats().undo_count, 1);
+        assert!(bf.set_cell(0, 0, "updated".into(), Approval::deny()).unwrap().changed);
+        assert_eq!(
+            bf.history_stats().undo_count,
+            1,
+            "后续小编辑应淘汰最旧列历史而保留自身"
+        );
+        let headers = bf.meta().headers;
+        let rows = bf.rows(0, bf.meta().rows as u32);
+        let saved = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(saved.saved, "删除列历史已淘汰后不应再要求固定点");
+        let reopened = BigFile::open(&p).unwrap();
+        assert_eq!(reopened.meta().headers, headers);
+        assert_eq!(reopened.rows(0, reopened.meta().rows as u32), rows);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
     fn p8_save_delete_last_then_undo_restores_row() {
         let p = tmp_csv("p8_save_delete", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
@@ -2900,32 +3056,42 @@ keep,old,target
     #[test]
     fn big_col_ops_pending_blocks_edits_then_apply() {
         let p = tmp_csv("colops", &people_csv());
+        let original = fs::read(&p).unwrap();
         let mut bf = BigFile::open(&p).unwrap();
-        // pending：视图立即多出列
+        let before = bf.rows(0, 2);
         bf.push_col_op(ColOp::Insert { pos: 1, name: "memo".into() }).unwrap();
         assert!(bf.meta().pending_cols);
         assert_eq!(bf.meta().cols, 4);
         assert_eq!(bf.meta().headers, vec!["name", "memo", "age", "city"]);
-        // pending 期间编辑/筛选被拒
         assert!(bf.set_cell(0, 0, "x".into(), Approval::deny()).is_err());
         assert!(bf.run_filter(&FilterSpec {
             cols: vec![(0, "a".into(), 0)],
             multi_cols: vec![],
             multi_text: String::new(),
         }).is_err());
-        // 撤销 pending（pop）后恢复
         bf.pop_col_op();
         assert!(!bf.meta().pending_cols);
         assert_eq!(bf.meta().cols, 3);
-        // 重新 push 并真正执行
         bf.push_col_op(ColOp::Insert { pos: 1, name: "memo".into() }).unwrap();
         bf.push_col_op(ColOp::Rename { col: 0, name: "姓名".into() }).unwrap();
-        bf.push_col_op(ColOp::Delete { col: 2 }).unwrap(); // 删原 age
-        bf.apply_col_ops(|_, _, _, _| {}).unwrap();
+        bf.push_col_op(ColOp::Delete { col: 2 }).unwrap();
+        let outcome = bf.apply_col_ops(Approval::deny()).unwrap();
+        assert!(outcome.changed);
         assert!(!bf.meta().pending_cols);
         assert_eq!(bf.meta().headers, vec!["姓名", "memo", "city"]);
-        assert!(!bf.meta().can_undo, "列操作物理重写后清空撤销栈");
-        // 物理落盘验证
+        assert!(bf.meta().can_undo, "列操作必须保留撤销历史");
+        assert_eq!(fs::read(&p).unwrap(), original, "执行不得提前物理重写");
+        assert!(bf.undo());
+        assert_eq!(bf.meta().headers, vec!["name", "age", "city"]);
+        assert_eq!(bf.rows(0, 2), before);
+        assert!(bf.redo());
+        assert_eq!(bf.meta().headers, vec!["姓名", "memo", "city"]);
+        let first = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(!first.saved);
+        let request = first.fixed_point.expect("删除 Source 列保存必须请求固定点");
+        assert_eq!(request.kind, FixedPointKind::SaveTransform);
+        let saved = bf.save(Approval::allow(request.preflight_id), |_, _, _, _| {}).unwrap();
+        assert!(saved.saved);
         let bf2 = BigFile::open(&p).unwrap();
         assert_eq!(bf2.meta().headers, vec!["姓名", "memo", "city"]);
         assert_eq!(bf2.rows(0, 1)[0], vec!["Alice", "", "Beijing"]);
@@ -2933,30 +3099,23 @@ keep,old,target
     }
 
     #[test]
-    fn big_col_ops_progress_phased_monotonic() {
-        // 进度契约（进度条配平，治"中途定住像卡死"）：
-        // 阶段 0 流式重写按行推进（加权到 70%），阶段 1 落盘换名（70→78%），
-        // 阶段 2 重建索引完成后收尾必到满 (total,total)；序列单调不减。
+    fn big_col_ops_delete_undo_redo_without_source_rewrite() {
         let p = tmp_csv("colprog", &people_csv());
+        let original = fs::read(&p).unwrap();
         let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 2);
         bf.push_col_op(ColOp::Delete { col: 2 }).unwrap();
-        let mut events: Vec<(u64, u64, u8, u64)> = Vec::new();
-        bf.apply_col_ops(|d, t, ph, rows| events.push((d, t, ph, rows)))
-            .unwrap();
-        assert!(!events.is_empty(), "至少应收到收尾进度事件");
-        for w in events.windows(2) {
-            assert!(w[1].0 >= w[0].0, "进度应单调不减：{:?} -> {:?}", w[0], w[1]);
-        }
-        assert_eq!(events[0].2, PHASE_STREAM, "首事件应为流式阶段：{:?}", events);
-        assert!(
-            events.iter().any(|e| e.2 == PHASE_FLUSH),
-            "应有落盘阶段事件：{:?}",
-            events
-        );
-        let last = events.last().unwrap();
-        assert_eq!(last.0, last.1, "收尾应到满：{:?}", last);
-        assert_eq!(last.2, PHASE_REINDEX, "收尾应标记索引阶段：{:?}", last);
-        assert!(last.3 > 0, "行计数应非零：{:?}", last);
+        let outcome = bf.apply_col_ops(Approval::deny()).unwrap();
+        assert!(outcome.changed);
+        let after = bf.rows(0, 2);
+        assert_eq!(bf.meta().headers, vec!["name", "age"]);
+        assert_eq!(fs::read(&p).unwrap(), original, "删除列不得提前改写源文件");
+        assert!(bf.undo());
+        assert_eq!(bf.meta().headers, vec!["name", "age", "city"]);
+        assert_eq!(bf.rows(0, 2), before);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 2), after);
+        assert_eq!(fs::read(&p).unwrap(), original, "往返撤销仍不得改写源文件");
         fs::remove_file(&p).ok();
     }
 
@@ -3831,13 +3990,15 @@ keep,old,target
         let err = bf.set_headerless(false).unwrap_err();
         assert!(err.contains("列操作"), "{err}");
         assert!(bf.meta().headerless);
-        bf.apply_col_ops(|_, _, _, _| {}).unwrap();
+        bf.apply_col_ops(Approval::deny()).unwrap();
         let m = bf.meta();
         assert!(m.headerless);
         assert_eq!(m.cols, 3);
         assert_eq!(m.rows, 2);
         assert_eq!(bf.rows(0, 1)[0], vec!["a", "1", ""]);
-        // 文件不得写独立表头：重开无列名，两行都是数据
+        assert_eq!(fs::read(&p).unwrap(), b"a,1\r\nb,2\r\n", "执行不得提前写文件");
+        assert!(bf.save(Approval::deny(), |_, _, _, _| {}).unwrap().saved);
+        // 保存后仍无独立表头：重开无列名，两行都是数据。
         let bf2 = BigFile::open_with(&p, true).unwrap();
         assert_eq!(bf2.meta().rows, 2);
         assert_eq!(
@@ -3852,7 +4013,7 @@ keep,old,target
         let p = tmp_csv("hlzerocol", b"a\r\nb\r\n");
         let mut bf = BigFile::open_with(&p, true).unwrap();
         bf.push_col_op(ColOp::Delete { col: 0 }).unwrap();
-        let err = bf.apply_col_ops(|_, _, _, _| {}).unwrap_err();
+        let err = bf.apply_col_ops(Approval::deny()).unwrap_err();
         assert!(err.contains("至少保留一列"), "{err}");
         assert!(bf.meta().pending_cols, "失败时保留待执行操作");
         assert_eq!(fs::read(&p).unwrap(), b"a\r\nb\r\n", "文件未被改写");
@@ -3872,7 +4033,7 @@ keep,old,target
         assert!(err.contains("至少保留一行"), "{err}");
         bf.push_col_op(ColOp::Insert { pos: 0, name: "x".into() })
             .unwrap();
-        let err = bf.apply_col_ops(|_, _, _, _| {}).unwrap_err();
+        let err = bf.apply_col_ops(Approval::deny()).unwrap_err();
         assert!(err.contains("至少保留一行"), "{err}");
         fs::remove_file(&p).ok();
     }
@@ -4642,18 +4803,24 @@ keep,old,target
     /// 内存档列操作：apply 在内存内重建（不写临时文件），表头/数据正确、
     /// 仍无路径保持 Ram，且重建后可另存为。
     #[test]
-    fn memory_doc_apply_col_ops_rebuilds_in_memory() {
+    fn memory_doc_apply_col_ops_is_undoable_and_saveable() {
         let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        let before = bf.rows(0, 2);
         bf.push_col_op(ColOp::Insert { pos: 1, name: "gender".into() })
             .unwrap();
-        bf.apply_col_ops(|_, _, _, _| {}).unwrap();
+        assert!(bf.apply_col_ops(Approval::deny()).unwrap().changed);
         let m = bf.meta();
         assert_eq!(m.cols, 4);
         assert_eq!(m.headers, vec!["name", "gender", "age", "city"]);
-        assert!(m.ram_backed && !m.has_path);
-        assert_eq!(bf.rows(0, 1)[0], vec!["Alice", "", "30", "Beijing"]);
+        assert!(m.ram_backed && !m.has_path && m.can_undo);
+        let after = bf.rows(0, 2);
+        assert_eq!(after[0], vec!["Alice", "", "30", "Beijing"]);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 2), before);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 2), after);
         let p = tmp_csv("mem_colops", b"x\n");
-        bf.save_as(&p, Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(bf.save_as(&p, Approval::deny(), |_, _, _, _| {}).unwrap().saved);
         let bf2 = BigFile::open(&p).unwrap();
         assert_eq!(bf2.rows(0, 1)[0], vec!["Alice", "", "30", "Beijing"]);
         fs::remove_file(&p).ok();
@@ -5025,6 +5192,7 @@ enum DeletedRow {
 struct PreparedSaveHistory {
     history: PreparedHistory<Op>,
     blocks: Vec<Option<Vec<Vec<String>>>>,
+    schema: Arc<Schema>,
 }
 
 /// 临时文件阶段已验证的 backing/index；目标换名后只做无失败提交。
@@ -5226,12 +5394,31 @@ struct PasteInsert {
     rows: Vec<Vec<String>>,
 }
 
+/// 一次可撤销列结构变化；前后 Schema 通过 Arc 共享列级存储。
+#[derive(Clone, PartialEq, Debug)]
+pub struct SchemaChange {
+    pub before: Arc<Schema>,
+    pub after: Arc<Schema>,
+}
+
+impl SchemaChange {
+    fn add_shared_charge(&self, charges: &mut Vec<SharedCharge>) {
+        charges.push(SharedCharge::of(&self.before, self.before.history_bytes()));
+        charges.push(SharedCharge::of(&self.after, self.after.history_bytes()));
+    }
+}
+
 /// 前向操作（重做执行它，撤销执行其逆）。
 #[derive(Clone, PartialEq, Debug)]
 enum Op {
     SetCell { cell: CellId, old: ValueRef, new: ValueRef },
     SetCells { changes: Vec<CellChange> },
-    Paste { changes: Vec<CellChange>, inserted: Option<PasteInsert> },
+    Columns { change: SchemaChange },
+    Paste {
+        changes: Vec<CellChange>,
+        inserted: Option<PasteInsert>,
+        schema_change: Option<SchemaChange>,
+    },
     InsertRows { vpos: u64, block: u32, rows: Vec<Vec<String>> },
     /// items 按 vpos 升序（重做按身份重新定位）。
     RemoveRows { items: Vec<DeletedRow> },
@@ -5269,7 +5456,8 @@ impl Op {
                     change.new.add_own_cost(&mut cost)?;
                 }
             }
-            Op::Paste { changes, inserted } => {
+            Op::Columns { .. } => {}
+            Op::Paste { changes, inserted, .. } => {
                 cost.add_vec(changes)?;
                 for change in changes {
                     change.old.add_own_cost(&mut cost)?;
@@ -5295,10 +5483,20 @@ impl Op {
                 old.add_shared_charge(&mut shared)?;
                 new.add_shared_charge(&mut shared)?;
             }
-            Op::SetCells { changes } | Op::Paste { changes, .. } => {
+            Op::SetCells { changes } => {
                 for change in changes {
                     change.old.add_shared_charge(&mut shared)?;
                     change.new.add_shared_charge(&mut shared)?;
+                }
+            }
+            Op::Columns { change } => change.add_shared_charge(&mut shared),
+            Op::Paste { changes, schema_change, .. } => {
+                for change in changes {
+                    change.old.add_shared_charge(&mut shared)?;
+                    change.new.add_shared_charge(&mut shared)?;
+                }
+                if let Some(change) = schema_change {
+                    change.add_shared_charge(&mut shared);
                 }
             }
             Op::RemoveRows { items } => {
@@ -7278,13 +7476,6 @@ impl BigFile {
         Some((id, storage))
     }
 
-    /// 写路径只接受 committed 视图列；pending 期间由编辑闸门先行拒绝。
-    fn committed_column(&self, view_col: u32) -> Result<(ColumnId, ColumnStorage), String> {
-        let id = self.schema.view_id(view_col).ok_or("列号越界")?;
-        let storage = self.schema.storage(id).ok_or("列身份不存在")?;
-        Ok((id, storage))
-    }
-
     /// 插入行的物理槽：原始列沿用源槽，新增列使用源区之后的稀疏扩展槽。
     fn inserted_slot(&self, storage: ColumnStorage) -> Option<usize> {
         match storage {
@@ -7295,11 +7486,20 @@ impl BigFile {
 
     /// 把 committed 逻辑行转换为插入块物理行；尾部空值不 materialize 存储槽。
     fn logical_rows_to_storage(&self, rows: Vec<Vec<String>>) -> Result<Vec<Vec<String>>, String> {
+        self.logical_rows_to_storage_in_schema(&self.schema, rows)
+    }
+
+    /// 按候选 Schema 转换新行，扩列粘贴不依赖尚未提交的活动结构。
+    fn logical_rows_to_storage_in_schema(
+        &self,
+        schema: &Schema,
+        rows: Vec<Vec<String>>,
+    ) -> Result<Vec<Vec<String>>, String> {
         rows.into_iter()
             .map(|row| {
                 let mut stored = Vec::new();
-                for (id, value) in self.schema.visible().iter().zip(row) {
-                    let storage = self.schema.storage(*id).ok_or("列身份不存在")?;
+                for (id, value) in schema.visible().iter().zip(row) {
+                    let storage = schema.storage(*id).ok_or("列身份不存在")?;
                     let slot = self.inserted_slot(storage).ok_or("插入列存储槽越界")?;
                     if slot >= stored.len() {
                         if value.is_empty() {
@@ -7700,7 +7900,17 @@ impl BigFile {
     /// # Errors
     /// 行号、列号越界时返回中文错误；不会修改数据。
     fn resolve_batch_cell(&self, vrow: u64, col: u32) -> Result<CellId, String> {
-        let (col, _) = self.committed_column(col)?;
+        self.resolve_batch_cell_in_schema(vrow, col, &self.schema)
+    }
+
+    /// 使用指定候选 Schema 解析稳定格地址，供扩列粘贴一次性预检。
+    fn resolve_batch_cell_in_schema(
+        &self,
+        vrow: u64,
+        col: u32,
+        schema: &Schema,
+    ) -> Result<CellId, String> {
+        let col = schema.view_id(col).ok_or("列号越界")?;
         let vrow = self.orig_vrow(vrow);
         let resolved = if self.partial.is_some() {
             if vrow >= self.indexed_data_rows() {
@@ -7734,10 +7944,19 @@ impl BigFile {
         &self,
         cells: Vec<(u64, u32, String)>,
     ) -> Result<Vec<CellChange>, String> {
+        self.prepare_cell_changes_in_schema(cells, &self.schema)
+    }
+
+    /// 在候选 Schema 下完整预检单元格，扩列格与既有格共用同一快照路径。
+    fn prepare_cell_changes_in_schema(
+        &self,
+        cells: Vec<(u64, u32, String)>,
+        schema: &Schema,
+    ) -> Result<Vec<CellChange>, String> {
         // 先解析全部地址，保证后置非法项不会留下前置半次写入。
         let mut resolved = Vec::with_capacity(cells.len());
         for (vrow, col, value) in cells {
-            resolved.push((self.resolve_batch_cell(vrow, col)?, value));
+            resolved.push((self.resolve_batch_cell_in_schema(vrow, col, schema)?, value));
         }
         let mut latest: HashMap<CellId, usize> = HashMap::with_capacity(resolved.len());
         let mut deduped: Vec<(CellId, String)> = Vec::with_capacity(resolved.len());
@@ -8012,7 +8231,7 @@ impl BigFile {
         self.finish_history(prepared, fixed_point, 0, 0)
     }
 
-    /// 粘贴不规则行块；既有格与末尾扩行只占一步历史。
+    /// 粘贴不规则行块；扩列、既有格与末尾扩行只占一步历史。
     pub fn paste_rows(
         &mut self,
         vrow: u64,
@@ -8026,21 +8245,43 @@ impl BigFile {
             return Ok(EditOutcome::unchanged());
         }
         let max_width = rows.iter().map(Vec::len).max().unwrap_or(0);
-        let ncols = self.schema.visible().len();
-        let mut paste_start = 0;
+        let original_ncols = self.schema.visible().len();
+        let mut paste_start = 0usize;
+        let mut target_ncols = original_ncols;
         if max_width > 0 {
-            let start_id = self.schema.view_id(col).ok_or("粘贴列号越界")?;
-            paste_start = self
-                .schema
-                .visible()
-                .iter()
-                .position(|id| *id == start_id)
-                .ok_or("粘贴列号越界")?;
-            let col_end = paste_start.checked_add(max_width).ok_or("列号越界")?;
-            if col_end > ncols {
+            paste_start = usize::try_from(col).map_err(|_| "粘贴列号越界")?;
+            if paste_start > original_ncols {
                 return Err("粘贴列号越界".into());
             }
+            let col_end = paste_start.checked_add(max_width).ok_or("列号越界")?;
+            target_ncols = target_ncols.max(col_end);
         }
+        let after = if target_ncols > original_ncols {
+            let mut candidate = (*self.schema).clone();
+            for pos in original_ncols..target_ncols {
+                let mut name_number = pos + 1;
+                let name = loop {
+                    let candidate_name = format!("列{name_number}");
+                    let exists = candidate.visible().iter().any(|id| {
+                        candidate.resolve(*id).is_some_and(|column| column.header == candidate_name)
+                    });
+                    if !exists {
+                        break candidate_name;
+                    }
+                    name_number += 1;
+                };
+                let pos = u32::try_from(pos).map_err(|_| "粘贴列号越界")?;
+                candidate.insert(pos, name)?;
+            }
+            Arc::new(candidate)
+        } else {
+            Arc::clone(&self.schema)
+        };
+        let schema_change = if target_ncols > original_ncols {
+            Some(SchemaChange { before: Arc::clone(&self.schema), after: Arc::clone(&after) })
+        } else {
+            None
+        };
         let input_count = u64::try_from(rows.len()).map_err(|_| "粘贴行数过多")?;
         let total = if self.partial.is_some() {
             self.indexed_data_rows()
@@ -8064,7 +8305,9 @@ impl BigFile {
         let mut cells = Vec::new();
         for (i, row) in rows[..existing_count].iter().enumerate() {
             for (j, value) in row.iter().enumerate() {
-                cells.push((vrow + i as u64, col + j as u32, value.clone()));
+                let target_col = paste_start.checked_add(j).ok_or("列号越界")?;
+                let target_col = u32::try_from(target_col).map_err(|_| "列号越界")?;
+                cells.push((vrow + i as u64, target_col, value.clone()));
             }
         }
         let inserted = if inserted_rows > 0 {
@@ -8075,16 +8318,16 @@ impl BigFile {
         let inserted = inserted
             .into_iter()
             .map(|row| {
-                let mut logical = vec![String::new(); ncols];
+                let mut logical = vec![String::new(); target_ncols];
                 for (j, value) in row.into_iter().enumerate() {
                     logical[paste_start + j] = value;
                 }
                 logical
             })
             .collect();
-        let inserted = self.logical_rows_to_storage(inserted)?;
-        let changes = self.prepare_cell_changes(cells)?;
-        if changes.is_empty() && inserted.is_empty() {
+        let inserted = self.logical_rows_to_storage_in_schema(&after, inserted)?;
+        let changes = self.prepare_cell_changes_in_schema(cells, &after)?;
+        if changes.is_empty() && inserted.is_empty() && schema_change.is_none() {
             return Ok(EditOutcome::unchanged());
         }
         let inserted = if inserted.is_empty() {
@@ -8093,7 +8336,7 @@ impl BigFile {
             Some(PasteInsert { vpos: total, block: 0, rows: inserted })
         };
         let (mut prepared, fixed_point) = match self.preflight_history(
-            Op::Paste { changes, inserted },
+            Op::Paste { changes, inserted, schema_change },
             "粘贴区域",
             approval,
         )? {
@@ -8328,7 +8571,13 @@ impl BigFile {
                     self.write_value(change.cell, &change.new);
                 }
             }
-            Op::Paste { changes, inserted } => {
+            Op::Columns { change } => {
+                self.schema = Arc::clone(&change.after);
+            }
+            Op::Paste { changes, inserted, schema_change } => {
+                if let Some(change) = schema_change {
+                    self.schema = Arc::clone(&change.after);
+                }
                 if let Some(inserted) = inserted {
                     inserted.block = self.seg.insert_block(inserted.vpos, inserted.rows.clone());
                 }
@@ -8469,7 +8718,7 @@ impl BigFile {
                         rebind(&mut change.cell, old_block, new_block);
                     }
                 }
-                Op::InsertRows { .. } => {}
+                Op::Columns { .. } | Op::InsertRows { .. } => {}
                 Op::RemoveRows { items } => {
                     for item in items {
                         if let DeletedRow::Ins { block, .. } = item {
@@ -8523,7 +8772,7 @@ impl BigFile {
                         }
                     }
                 }
-                Op::InsertRows { .. } => {}
+                Op::Columns { .. } | Op::InsertRows { .. } => {}
             }
         }
     }
@@ -8565,20 +8814,37 @@ impl BigFile {
                     if rec.checked_add(1).is_none() {
                         return false;
                     }
-                    self.src_fields(rec)
+                    // 保存后的历史行是物理槽布局；先取原始槽，再应用当前覆盖层。
+                    let mut fields = self.raw_src_fields(rec);
+                    for (id, column) in self.schema.columns() {
+                        let ColumnStorage::Source(slot) = column.storage else { continue };
+                        let Some(value) = self.overlay.get(&(rec, id)) else { continue };
+                        let slot = slot as usize;
+                        if slot >= fields.len() {
+                            fields.resize(slot + 1, String::new());
+                        }
+                        fields[slot].clone_from(value);
+                    }
+                    fields
                 }
                 ResolvedRow::Ins { block, row } => {
-                    let exists = self.seg.blocks.get(block as usize)
+                    let Some(fields) = self.seg.blocks.get(block as usize)
                         .and_then(Option::as_ref)
                         .and_then(|block_rows| block_rows.get(row as usize))
-                        .is_some();
-                    if !exists {
+                        .cloned()
+                    else {
                         return false;
-                    }
-                    self.ins_fields(block, row)
+                    };
+                    fields
                 }
             };
-            if actual.as_slice() != expected.as_slice() {
+            // 物理槽允许稀疏省略尾部空值，但不能用当前可见逻辑列顺序比较。
+            let width = actual.len().max(expected.len());
+            let same = (0..width).all(|slot| {
+                actual.get(slot).map(String::as_str).unwrap_or("")
+                    == expected.get(slot).map(String::as_str).unwrap_or("")
+            });
+            if !same {
                 return false;
             }
             if let ResolvedRow::Src(rec) = resolved {
@@ -8608,7 +8874,11 @@ impl BigFile {
                 }
                 true
             }
-            Op::Paste { changes, inserted } => {
+            Op::Columns { change } => {
+                self.schema = Arc::clone(&change.before);
+                true
+            }
+            Op::Paste { changes, inserted, schema_change } => {
                 if let Some(inserted) = inserted {
                     if !self.remove_inserted_block_for_undo(
                         inserted.vpos,
@@ -8620,6 +8890,9 @@ impl BigFile {
                 }
                 for change in changes {
                     self.write_value(change.cell, &change.old);
+                }
+                if let Some(change) = schema_change {
+                    self.schema = Arc::clone(&change.before);
                 }
                 true
             }
@@ -9166,6 +9439,15 @@ impl BigFile {
     fn build_baseline_transform(&self) -> Result<(BaselineTransform, usize), String> {
         let mut transform = BaselineTransform::default();
         transform.deleted_sources = self.seg.tombstones.clone();
+        for (id, column) in self.schema.columns() {
+            let mapped = match column.storage {
+                ColumnStorage::Source(slot) => transform.source_columns.insert(slot, id),
+                ColumnStorage::Inserted(slot) => transform.inserted_columns.insert(slot, id),
+            };
+            if mapped.is_some() {
+                return Err("物理列槽对应多个稳定身份".into());
+            }
+        }
         for (index, id) in self.schema.visible().iter().enumerate() {
             let index = u32::try_from(index).map_err(|_| "保存列号溢出")?;
             transform.columns.insert(*id, index);
@@ -9219,7 +9501,7 @@ impl BigFile {
                         }
                     }
                 }
-                Op::InsertRows { .. } => {}
+                Op::Columns { .. } | Op::InsertRows { .. } => {}
             }
         }
         let mut suspended = BTreeSet::new();
@@ -9240,13 +9522,31 @@ impl BigFile {
         Ok((transform, block_slots))
     }
 
+    /// 同一旧 Schema Arc 在双栈转换中只创建一个新 Arc，保留共享计费身份。
+    fn map_schema_for_save(
+        schema: &Arc<Schema>,
+        transform: &BaselineTransform,
+        cache: &mut HashMap<usize, Arc<Schema>>,
+    ) -> Result<Arc<Schema>, String> {
+        let key = Arc::as_ptr(schema) as usize;
+        if let Some(mapped) = cache.get(&key) {
+            return Ok(Arc::clone(mapped));
+        }
+        let mapped = Arc::new(schema.rebind_saved(&transform.columns)?);
+        cache.insert(key, Arc::clone(&mapped));
+        Ok(mapped)
+    }
+
     /// 将一条历史操作转换到新物理基线；旧 backing 的 Source 值迁移为 Text。
-    fn transform_op_for_save(&self, op: &Op, transform: &BaselineTransform)
-        -> Result<Op, String> {
+    fn transform_op_for_save(
+        &self,
+        op: &Op,
+        transform: &BaselineTransform,
+        schema_cache: &mut HashMap<usize, Arc<Schema>>,
+    ) -> Result<Op, String> {
         let map_cell = |cell: &CellId| -> Result<CellId, String> {
-            if !transform.columns.contains_key(&cell.col) {
-                return Err("历史列已不在保存结构中".into());
-            }
+            let col = transform.columns.get(&cell.col).copied().map(ColumnId)
+                .ok_or("历史列已不在保存结构中")?;
             let row = match cell.row {
                 RowId::Source(rec) => {
                     if let Some(mapped) = transform.map_source(rec) {
@@ -9265,7 +9565,7 @@ impl BigFile {
                     }
                 }
             };
-            Ok(CellId { row, col: cell.col })
+            Ok(CellId { row, col })
         };
         let map_value = |value: &ValueRef| -> Result<ValueRef, String> {
             match value {
@@ -9282,15 +9582,73 @@ impl BigFile {
                 })
             }).collect()
         };
+        let map_row = |row: &Vec<String>| -> Result<Vec<String>, String> {
+            let mut mapped = Vec::new();
+            for (slot, value) in row.iter().enumerate() {
+                let column = if slot < self.base_ncols {
+                    let slot = u32::try_from(slot).map_err(|_| "保存源列槽溢出")?;
+                    transform.source_columns.get(&slot)
+                } else {
+                    let slot = u32::try_from(slot - self.base_ncols)
+                        .map_err(|_| "保存插入列槽溢出")?;
+                    transform.inserted_columns.get(&slot)
+                };
+                let Some(new_slot) = column.and_then(|id| transform.columns.get(id)).copied()
+                else {
+                    continue;
+                };
+                let new_index = usize::try_from(new_slot).map_err(|_| "保存列槽越界")?;
+                if new_index >= mapped.len() {
+                    if value.is_empty() {
+                        continue;
+                    }
+                    let end = new_index.checked_add(1).ok_or("保存列槽越界")?;
+                    mapped.resize(end, String::new());
+                }
+                mapped[new_index] = value.clone();
+            }
+            Ok(mapped)
+        };
+        let map_rows = |rows: &Vec<Vec<String>>| -> Result<Vec<Vec<String>>, String> {
+            rows.iter().map(map_row).collect()
+        };
+        let mut map_schema = |schema: &Arc<Schema>| -> Result<Arc<Schema>, String> {
+            Self::map_schema_for_save(schema, transform, schema_cache)
+        };
         Ok(match op {
             Op::SetCell { cell, old, new } => Op::SetCell {
                 cell: map_cell(cell)?, old: map_value(old)?, new: map_value(new)?,
             },
             Op::SetCells { changes } => Op::SetCells { changes: map_changes(changes)? },
-            Op::Paste { changes, inserted } => Op::Paste {
-                changes: map_changes(changes)?, inserted: inserted.clone(),
+            Op::Columns { change } => Op::Columns {
+                change: SchemaChange {
+                    before: map_schema(&change.before)?,
+                    after: map_schema(&change.after)?,
+                },
             },
-            Op::InsertRows { .. } => op.clone(),
+            Op::Paste { changes, inserted, schema_change } => Op::Paste {
+                changes: map_changes(changes)?,
+                inserted: match inserted {
+                    Some(inserted) => Some(PasteInsert {
+                        vpos: inserted.vpos,
+                        block: inserted.block,
+                        rows: map_rows(&inserted.rows)?,
+                    }),
+                    None => None,
+                },
+                schema_change: match schema_change {
+                    Some(change) => Some(SchemaChange {
+                        before: map_schema(&change.before)?,
+                        after: map_schema(&change.after)?,
+                    }),
+                    None => None,
+                },
+            },
+            Op::InsertRows { vpos, block, rows } => Op::InsertRows {
+                vpos: *vpos,
+                block: *block,
+                rows: map_rows(rows)?,
+            },
             Op::RemoveRows { items } => {
                 let mut mapped = Vec::with_capacity(items.len());
                 for item in items {
@@ -9378,17 +9736,19 @@ impl BigFile {
         &self,
         entries: impl Iterator<Item = &'a HistoryEntry<Op>>,
         transform: &BaselineTransform,
+        schema_cache: &mut HashMap<usize, Arc<Schema>>,
     ) -> Result<VecDeque<HistoryEntry<Op>>, String> {
         let mut converted = VecDeque::new();
         for entry in entries {
             let operation = match &entry.op {
                 Op::SetCell { .. } => "编辑单元格",
                 Op::SetCells { .. } => "批量编辑单元格",
+                Op::Columns { .. } => "执行列操作",
                 Op::Paste { .. } => "粘贴区域",
                 Op::InsertRows { .. } => "插入行",
                 Op::RemoveRows { .. } => "删除行",
             };
-            let op = self.transform_op_for_save(&entry.op, transform)
+            let op = self.transform_op_for_save(&entry.op, transform, schema_cache)
                 .map_err(|error| format!("{operation}：{error}"))?;
             let mut transformed = op.history_entry().map_err(history_cost_error)?;
             transformed.revision_delta = entry.revision_delta;
@@ -9400,8 +9760,17 @@ impl BigFile {
     /// 在旧数据与旧账本仍有效时完成全部可失败的历史转换和重建计费。
     fn prepare_history_for_save(&self) -> Result<PreparedSaveHistory, String> {
         let (transform, block_slots) = self.build_baseline_transform()?;
-        let undo = self.transform_entries_for_save(self.history.iter_undo(), &transform)?;
-        let redo = self.transform_entries_for_save(self.history.iter_redo(), &transform)?;
+        let mut schema_cache = HashMap::new();
+        // 当前结构只保留实际保存的可见列；历史仍引用的隐藏列在转换该历史时触发固定点。
+        let schema = Arc::new(Schema::from_headers(self.view_headers())?);
+        // 当前 Arc 若也出现在历史中，继续复用同一新 Arc 和共享计费身份。
+        schema_cache.insert(Arc::as_ptr(&self.schema) as usize, Arc::clone(&schema));
+        let undo = self.transform_entries_for_save(
+            self.history.iter_undo(), &transform, &mut schema_cache,
+        )?;
+        let redo = self.transform_entries_for_save(
+            self.history.iter_redo(), &transform, &mut schema_cache,
+        )?;
         let history = HistoryLedger::prepare_rebuild(
             undo,
             redo,
@@ -9411,7 +9780,7 @@ impl BigFile {
         blocks.try_reserve_exact(block_slots)
             .map_err(|_| "保存历史块槽内存不足".to_string())?;
         blocks.resize(block_slots, None);
-        Ok(PreparedSaveHistory { history, blocks })
+        Ok(PreparedSaveHistory { history, blocks, schema })
     }
 
     /// `save`/`save_as` 共用实现。
@@ -9444,6 +9813,8 @@ impl BigFile {
                 return Err("无列名模式需至少保留一列".into());
             }
         }
+        let saved_headers = self.view_headers();
+        let saved_schema = Arc::new(Schema::from_headers(saved_headers.clone())?);
         let next_history_generation = self.next_history_generation()?;
         let next_index_epoch = self.index_epoch.checked_add(1).ok_or("索引代际溢出")?;
         // 整表重写数十秒：本线程降为背景优先级，让出 UI/系统调度。
@@ -9492,14 +9863,21 @@ impl BigFile {
         }
         // 表头模式先写列名；无列名模式段表第一行就是数据第一行。
         if !self.headerless {
-            let header = self.view_headers();
-            w.write_all(&encode_record(&header, b',', self.enc))
+            w.write_all(&encode_record(&saved_headers, b',', self.enc))
                 .map_err(|e| e.to_string())?;
         }
         let total = self.seg.vrow_count();
         // 有覆盖层编辑的源行（透传判定的"不洁净"集；覆盖层通常极小）
         let edited: std::collections::HashSet<u32> =
             self.overlay.keys().map(|k| k.0).collect();
+        // 列槽不是原始恒等布局时，旧 Source 字节不再代表当前逻辑行，必须逐行重编码。
+        let source_layout_changed = self.schema.visible().len() != self.base_ncols
+            || self.schema.visible().iter().enumerate().any(|(slot, id)| {
+                match u32::try_from(slot) {
+                    Ok(slot) => self.schema.storage(*id) != Some(ColumnStorage::Source(slot)),
+                    Err(_) => true,
+                }
+            });
         let mut done = 0u64;
         let mut last_emit: Option<Instant> = None;
         if let Some(order) = &sorted_order {
@@ -9507,7 +9885,7 @@ impl BigFile {
             for &orig in order.iter() {
                 match self.seg.resolve(orig as u64) {
                     Some(ResolvedRow::Src(rec)) => {
-                        if edited.contains(&rec) {
+                        if source_layout_changed || edited.contains(&rec) {
                             let f = self.src_fields(rec);
                             w.write_all(&encode_record(&f, b',', self.enc))
                                 .map_err(|e| e.to_string())?;
@@ -9544,6 +9922,9 @@ impl BigFile {
             progress(renamed_weighted(total), total, PHASE_FLUSH, done);
             self.commit_reopen(prepared_reopen);
             self.index_epoch = next_index_epoch;
+            self.schema = saved_schema;
+            self.base_ncols = saved_headers.len();
+            self.base_headers = saved_headers;
             // 排序物化仍是固定点；成功保存本身重新建立干净保存点。
             self.order = None;
             self.history.clear();
@@ -9567,7 +9948,7 @@ impl BigFile {
                     let seg_end = start + len;
                     let mut run: Option<u32> = None;
                     for rec in start..seg_end {
-                        if edited.contains(&rec) {
+                        if source_layout_changed || edited.contains(&rec) {
                             if let Some(rs) = run.take() {
                                 self.write_raw_range(&mut w, rs, rec)?;
                             }
@@ -9617,12 +9998,16 @@ impl BigFile {
         progress(renamed_weighted(total), total, PHASE_FLUSH, done);
         self.commit_reopen(prepared_reopen);
         self.index_epoch = next_index_epoch;
+        self.base_ncols = saved_headers.len();
+        self.base_headers = saved_headers;
         if let Some(prepared) = prepared_history {
             self.seg.blocks = prepared.blocks;
             self.history.commit_rebuild(prepared.history);
+            self.schema = prepared.schema;
         } else {
             self.history.clear();
             self.fixed_point = true;
+            self.schema = saved_schema;
         }
         self.revision = 0;
         self.savepoint_detached = false;
@@ -9635,12 +10020,8 @@ impl BigFile {
         })
     }
 
-    /// 执行待执行的列操作：流式重写（物理列映射），完成后重建会话。
-    /// 此操作不可撤销（撤销栈清空）。进度回调契约同 `save`。
-    pub fn apply_col_ops<F: FnMut(u64, u64, u8, u64)>(
-        &mut self,
-        mut progress: F,
-    ) -> Result<(), String> {
+    /// 执行待执行列操作：只提交共享 Schema，不改写源文件或行索引。
+    pub fn apply_col_ops(&mut self, approval: Approval) -> Result<EditOutcome, String> {
         if self.order.is_some() {
             return Err("排序模式下暂不支持列操作，请先退出排序".into());
         }
@@ -9649,16 +10030,12 @@ impl BigFile {
             return Err("文件仍在索引中，暂不支持列操作".into());
         }
         if self.pending_cols.is_empty() {
-            return Ok(());
+            return Ok(EditOutcome::unchanged());
         }
-        let next_history_generation = self.next_history_generation()?;
-        let history_budget = self.history.stats().budget_bytes;
-        // 视图→物理映射（apply 后 view == 物理，映射只是本次重写用）
-        let ncols = self.view_ncols();
-        let total = self.seg.vrow_count();
-        // 无列名模式没有独立表头；零行/零列都会写出无法重开的文件
+        let after = self.pending_schema.clone().ok_or("列操作预览已失效")?;
+        let ncols = after.visible().len();
         if self.headerless {
-            if total == 0 {
+            if self.seg.vrow_count() == 0 {
                 return Err("无列名模式需至少保留一行".into());
             }
             if ncols == 0 {
@@ -9667,86 +10044,21 @@ impl BigFile {
         } else if ncols == 0 {
             return Err("没有列：无法执行列操作".into());
         }
-        // 整表物理重写数十秒：本线程降为背景优先级，让出 UI/系统调度。
-        let _bg = bg::BackgroundGuard::enter();
-        let new_headers = self.view_headers();
-
-        let dest = self.path.clone();
-        let tmp = tmp_path_for(&dest);
-        // 无路径内存档：写入内存缓冲（不落临时文件），apply 后内存内重建。
-        let target = if self.has_path() {
-            ColWriteTarget::File(
-                fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?,
-            )
-        } else {
-            ColWriteTarget::Mem(Vec::new())
+        let before = Arc::clone(&self.schema);
+        let (mut prepared, fixed_point) = match self.preflight_history(
+            Op::Columns { change: SchemaChange { before, after } },
+            "执行列操作",
+            approval,
+        )? {
+            HistoryDecision::Normal(p) => (p, false),
+            HistoryDecision::FixedPoint(p) => (p, true),
+            HistoryDecision::Confirm(outcome) => return Ok(outcome),
         };
-        let mut w = BufWriter::new(target);
-        if self.has_bom {
-            w.write_all(&[0xEF, 0xBB, 0xBF]).map_err(|e| e.to_string())?;
-        }
-        // 无列名模式不写独立表头：第一行记录就是数据
-        if !self.headerless {
-            w.write_all(&encode_record(&new_headers, b',', self.enc))
-                .map_err(|e| e.to_string())?;
-        }
-        let mut done = 0u64;
-        let mut last_emit: Option<Instant> = None;
-        for s in &self.seg.segs {
-            match s.kind {
-                SegKind::Src { start, len } => {
-                    for rec in start..start + len {
-                        let mapped = self.map_fields_to_view(&self.src_fields(rec));
-                        w.write_all(&encode_record(&mapped, b',', self.enc))
-                            .map_err(|e| e.to_string())?;
-                        done += 1;
-                        // 16 行粒度过闸：磁盘拖慢时进度仍按 80ms 节拍更新。
-                        if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
-                            progress(stream_weighted(done), total, PHASE_STREAM, done);
-                        }
-                    }
-                }
-                SegKind::Ins { block } => {
-                    if let Some(Some(rows)) = self.seg.blocks.get(block as usize) {
-                        for (row_index, _) in rows.iter().enumerate() {
-                            let row = u32::try_from(row_index).map_err(|_| "插入行号越界")?;
-                            let mapped = self.map_fields_to_view(&self.ins_fields(block, row));
-                            w.write_all(&encode_record(&mapped, b',', self.enc))
-                                .map_err(|e| e.to_string())?;
-                            done += 1;
-                            if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
-                                progress(stream_weighted(done), total, PHASE_STREAM, done);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // 阶段交接无条件各发一次：小文件也保证契约完整（有阶段 0/1 事件）。
-        progress(stream_weighted(done), total, PHASE_STREAM, done);
-        // into_inner 内含 flush；取出写出目标以分流落盘/内存两条重建路径。
-        let target = w.into_inner().map_err(|e| e.to_string())?;
-        progress(flushed_weighted(total), total, PHASE_FLUSH, done);
-        // 全量重建：列结构变化，编辑层与撤销历史一并失效；保持首行语义
-        let mut fresh = match target {
-            ColWriteTarget::File(_) => {
-                self.replace_with_retry(&tmp, &dest)?;
-                progress(renamed_weighted(total), total, PHASE_FLUSH, done);
-                Self::open_with(&self.path, self.headerless)?
-            }
-            // 无路径内存档：缓冲直接重建会话，全程不写盘。
-            ColWriteTarget::Mem(buf) => Self::from_bytes(buf, self.headerless)?,
-        };
-        fresh.schema = Arc::new(Schema::from_headers(new_headers.clone())?);
-        fresh.pending_schema = None;
-        fresh.base_headers = new_headers;
-        fresh.base_ncols = ncols as usize;
-        fresh.history = HistoryLedger::new(history_budget);
-        fresh.history_generation = next_history_generation;
-        fresh.fixed_point = true;
-        *self = fresh;
-        progress(total, total, PHASE_REINDEX, total); // 收尾必到满
-        Ok(())
+        self.apply(&mut prepared.entry_mut().op);
+        self.pending_cols.clear();
+        self.pending_schema = None;
+        self.last_spec = None;
+        self.finish_history(prepared, fixed_point, 0, 0)
     }
 
     /// 重新映射原文件并重建行索引（不动 Segment/覆盖层/撤销栈）。
@@ -9937,29 +10249,4 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     let mut tmp = name;
     tmp.push(".simpletable-tmp");
     dir.join(tmp)
-}
-
-/// 列操作重写写出目标：有路径档流式落临时文件；无路径内存档写内存缓冲。
-enum ColWriteTarget {
-    File(fs::File),
-    Mem(Vec<u8>),
-}
-
-impl std::io::Write for ColWriteTarget {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Self::File(f) => f.write(buf),
-            Self::Mem(v) => {
-                v.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::File(f) => f.flush(),
-            Self::Mem(_) => Ok(()),
-        }
-    }
 }

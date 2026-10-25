@@ -869,7 +869,6 @@ function makeHooks(side) {
   const focused = () => focusedSide === side;
   return {
     statusMsg,
-    confirmColOps: () => confirmColOpsHistoryLoss(),
     countsChanged: (v, t) => { if (focused()) onCountsChanged(v, t); },
     zoomed: (f) => { if (focused()) statusMsg(`表格缩放 ${Math.round(f * 100)}%`, 1500); },
     undoRequested: () => { if (focused()) undo(); },
@@ -1312,43 +1311,25 @@ async function runBigFilter(opts = {}) {
   }
 }
 
-/**
- * 确认执行将清空撤销/重做历史的列操作。
- *
- * @returns {Promise<boolean>} 用户是否确认继续。
- */
-function confirmColOpsHistoryLoss() {
-  return confirmDialog("执行列操作将清空此前所有撤销/重做历史，且无法恢复。是否继续？");
-}
-
-/** 执行 pending 列操作（确认历史丢失后物理重写 + 进度条） */
+/** 执行 pending 列操作；成功后可撤销，固定点确认由模型统一处理。 */
 async function applyColOps() {
   if (!model.colOpsPending()) return;
   if (model.indexing?.()) {
     statusMsg("文件仍在索引中，暂不支持列操作", 2500);
     return;
   }
-  const confirmed = await confirmColOpsHistoryLoss();
-  if (!confirmed) return;
-  const dlg = progressDialog("执行列操作…");
-  const un = await model.onProgress((done, total, phase, rows) => dlg.set(done, total, phase, rows));
-  let ok = false;
   try {
-    await model.applyColOps();
-    // 物理重写已把内存状态（含覆盖层编辑/插删行）落盘：文件与内存一致。
-    // applyColOps 的 _emitData 经 onData 标了脏，此处复位——否则保存会再做
-    // 一次全量流式重写（用户看到的"莫名其妙第二根进度条"）。
-    setDirty(false);
-    statusMsg("列操作已完成（物理重写，撤销历史已清空）", 4000);
-    ok = true;
+    const outcome = await model.applyColOps();
+    if (outcome?.cancelled) {
+      statusMsg("已取消列操作", 2500);
+      return;
+    }
+    if (!outcome?.changed) return;
+    setDirty(true);
+    statusMsg("列操作已应用，可撤销", 3000);
   } catch (err) {
     await errorDialog("列操作失败", String(err?.message ?? err));
   } finally {
-    un();
-    // 完成帧短暂停留再关闭：重写期间磁盘 IO 可能饿死渲染管线，进度停在
-    // 中间的旧帧上——保证"100% 完成"被看到，而不是"卡住后消失"。
-    if (ok) await dlg.finish();
-    else dlg.close();
     refreshBigUi();
   }
 }
@@ -1438,7 +1419,7 @@ for (const spec of [
 // 大模式工具按钮：执行/撤销列操作（pending 时出现）
 for (const [key, text, fn, title] of [
   ["exitSort", "退出排序", () => void exitSortMode(), "恢复排序前的行顺序并释放排序内存；未保存的单元格修改保留"],
-  ["execColOps", "执行列操作", () => applyColOps(), "物理重写整个文件（显示进度），完成后不可撤销"],
+  ["execColOps", "执行列操作", () => applyColOps(), "应用列操作（可撤销）"],
   ["cancelColOps", "撤销列操作预览", () => cancelColOps(), "放弃待执行的列操作，恢复原结构"],
 ]) {
   const b = document.createElement("button");

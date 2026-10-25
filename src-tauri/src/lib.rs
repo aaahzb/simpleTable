@@ -842,35 +842,14 @@ fn big_col_clear(state: tauri::State<BigShared>, session: u64) -> Result<(), Str
     })
 }
 
-/// 执行待处理的列操作（物理重写整个文件，带进度事件）。
-/// 同 big_save：spawn_blocking + 专用 emit 转发线程（见 big_save 注释）。
+/// 执行待处理列操作；只提交可撤销 Schema，不做物理重写。
 #[tauri::command]
-async fn big_col_apply(
-    window: tauri::Window,
-    state: tauri::State<'_, BigShared>,
+fn big_col_apply(
+    state: tauri::State<BigShared>,
     session: u64,
-) -> Result<(), String> {
-    let entry = big_entry(state.inner(), session)?;
-    entry.bump_gate(); // 物理重写前先让本会话的筛选扫描退出
-    tauri::async_runtime::spawn_blocking(move || {
-        let (tx, rx) = std::sync::mpsc::channel::<(u64, u64, u8, u64)>();
-        let emitter = std::thread::spawn(move || {
-            while let Ok((done, total, phase, rows)) = rx.recv() {
-                let _ = window.emit("big-progress", (done, total, phase, rows));
-            }
-        });
-        let result = (|| {
-            let mut bf = entry.file.lock().map_err(|e| e.to_string())?;
-            bf.refresh_indexed();
-            bf.apply_col_ops(move |done, total, phase, rows| {
-                let _ = tx.send((done, total, phase, rows));
-            })
-        })();
-        emitter.join().map_err(|e| format!("进度转发线程异常：{e:?}"))?;
-        result
-    })
-    .await
-    .map_err(|e| format!("列操作任务被取消：{e}"))?
+    approval: Approval,
+) -> Result<EditOutcome, String> {
+    with_big(&state, session, |bf| bf.apply_col_ops(approval))
 }
 
 /// 取命令行第一个 .csv 路径（启动时由前端拉取并打开）。
