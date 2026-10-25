@@ -1737,6 +1737,84 @@ mod tests {
         fs::remove_file(&p).ok();
     }
 
+    /// 删除插入行再撤销必须恢复原块，供更早的单元格历史继续寻址。
+    #[test]
+    fn remove_inserted_row_undo_preserves_older_cell_history() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        let original = bf.rows(0, 5);
+        bf.insert_rows(
+            1,
+            Some(vec![vec!["INS".into(), "0".into(), "X".into()]]),
+            0,
+            Approval::deny(),
+        )
+        .unwrap();
+        bf.set_cell(1, 0, "EDITED".into(), Approval::deny()).unwrap();
+        assert_eq!(bf.remove_rows(vec![1], Approval::deny()).unwrap().removed_rows, 1);
+        assert_eq!(bf.meta().rows, 5);
+
+        assert!(bf.undo(), "撤销删除");
+        assert_eq!(bf.rows(1, 1)[0][0], "EDITED");
+        assert!(bf.undo(), "撤销插入行上的旧编辑");
+        assert_eq!(bf.rows(1, 1)[0][0], "INS", "旧编辑必须写回原插入块");
+        assert!(bf.undo(), "撤销插行");
+        assert_eq!(bf.rows(0, 5), original);
+
+        assert!(bf.redo(), "重做插行");
+        assert!(bf.redo(), "重做编辑");
+        assert_eq!(bf.rows(1, 1)[0][0], "EDITED");
+        assert!(bf.redo(), "重做删除");
+        assert_eq!(bf.rows(0, 5), original);
+    }
+
+    /// 内部段表异常在部分删除后暴露时，整批必须报错并保持原状态。
+    #[test]
+    fn remove_rows_internal_failure_restores_data_and_history() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.insert_rows(
+            1,
+            Some(vec![vec!["FIRST".into(), "1".into(), "X".into()]]),
+            0,
+            Approval::deny(),
+        )
+        .unwrap();
+        bf.insert_rows(
+            2,
+            Some(vec![vec!["SECOND".into(), "2".into(), "Y".into()]]),
+            0,
+            Approval::deny(),
+        )
+        .unwrap();
+        bf.set_cell(0, 0, "TEMP".into(), Approval::deny()).unwrap();
+        assert!(bf.undo(), "保留一条 redo 用于失败原子性断言");
+
+        // 两个 Ins 段异常共享单块：高行删除会摘块，使随后的低行删除失败。
+        let block = match bf.seg.segs[1].kind {
+            SegKind::Ins { block } => block,
+            other => panic!("首段应为插入块：{other:?}"),
+        };
+        bf.seg.segs[2].kind = SegKind::Ins { block };
+        let before_rows = bf.rows(0, 7);
+        assert_eq!(before_rows[1][0], "FIRST");
+        assert_eq!(before_rows[2][0], "FIRST", "故障应使两个段共享同一块");
+        let before_stats = bf.history_stats();
+        let before_revision = bf.revision;
+        let before_generation = bf.history_generation;
+        let before_modified = bf.modified();
+        let before_redo = bf.history.redo_op().cloned();
+
+        let err = bf
+            .remove_rows(vec![1, 2], Approval::deny())
+            .expect_err("部分删除后的内部失败不得按固定点成功");
+        assert!(err.contains("内部"), "应明确报告内部一致性错误：{err}");
+        assert_eq!(bf.rows(0, 7), before_rows, "失败后必须恢复原数据");
+        assert_eq!(bf.history_stats(), before_stats, "历史账目不得变化");
+        assert_eq!(bf.history.redo_op(), before_redo.as_ref(), "redo 不得清空");
+        assert_eq!(bf.revision, before_revision);
+        assert_eq!(bf.history_generation, before_generation);
+        assert_eq!(bf.modified(), before_modified);
+    }
+
     #[test]
     fn big_remove_redo_descending_safe() {
         let p = tmp_csv("redodel", &people_csv());
@@ -2035,6 +2113,25 @@ mod tests {
         assert_eq!(bf.rows(0, 5), before);
         assert_eq!(bf.history_generation, u64::MAX);
         assert_eq!(bf.history_stats().undo_count, 0);
+    }
+
+    /// 缩容固定点切断保存点后的 redo 时，revision 回到 0 仍须保持脏。
+    #[test]
+    fn p1_budget_fixed_point_detaches_unreachable_savepoint() {
+        let p = tmp_csv("p1_budget_detached", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "saved".into(), Approval::deny()).unwrap();
+        bf.save(|_, _, _, _| {}).unwrap();
+        assert!(bf.undo());
+        let change = bf.set_history_budget(1).unwrap();
+        assert!(change.fixed_point);
+        assert!(bf.modified());
+        bf.set_history_budget(4_096).unwrap();
+        bf.set_cell(0, 0, "branch".into(), Approval::deny()).unwrap();
+        assert!(bf.modified(), "revision=0 也不能回到已不可达的保存点");
+        assert!(bf.undo());
+        assert!(bf.modified());
+        fs::remove_file(&p).ok();
     }
 
     #[test]
@@ -4138,21 +4235,29 @@ impl Segments {
         let s = self.segs[i];
         match s.kind {
             SegKind::Src { start, len } => {
-                let rec = start + off;
+                if len != s.len {
+                    return None;
+                }
+                let rec = start.checked_add(off)?;
+                let next_start = rec.checked_add(1)?;
+                let right_len = len.checked_sub(off)?.checked_sub(1)?;
                 self.tombstones.insert(rec);
                 // [start,rec) + [rec+1, start+len)：被删记录从段中剔除（位图保留身份）
                 self.segs[i] = Seg { kind: SegKind::Src { start, len: off }, len: off };
                 self.segs.insert(
                     i + 1,
                     Seg {
-                        kind: SegKind::Src { start: rec + 1, len: len - off - 1 },
-                        len: len - off - 1,
+                        kind: SegKind::Src { start: next_start, len: right_len },
+                        len: right_len,
                     },
                 );
                 Some(DeletedRow::Src { vpos: vrow, rec })
             }
             SegKind::Ins { block } => {
-                let rows = self.blocks[block as usize].as_mut()?;
+                let rows = self.blocks.get_mut(block as usize)?.as_mut()?;
+                if off as usize >= rows.len() {
+                    return None;
+                }
                 let cells = rows.remove(off as usize);
                 if rows.is_empty() {
                     self.blocks[block as usize] = None;
@@ -4160,8 +4265,94 @@ impl Segments {
                 } else {
                     self.segs[i].len -= 1;
                 }
-                Some(DeletedRow::Ins { vpos: vrow, cells })
+                Some(DeletedRow::Ins { vpos: vrow, block, row: off, cells })
             }
+        }
+    }
+
+    /// 删除中途发现内部不一致时，按相反顺序恢复已完成的删除。
+    fn rollback_deleted(
+        &mut self,
+        mut items: Vec<DeletedRow>,
+        mut rollbacks: Vec<DeleteRollback>,
+    ) {
+        while let Some(item) = items.pop() {
+            let rollback = rollbacks.pop().expect("成功删除必须有对应回滚项");
+            match item {
+                DeletedRow::Src { rec, .. } => {
+                    if rollback.tombstone_was_present {
+                        self.tombstones.insert(rec);
+                    } else {
+                        self.tombstones.remove(&rec);
+                    }
+                    self.segs.remove(rollback.index + 1);
+                    self.segs[rollback.index] = rollback.seg;
+                }
+                DeletedRow::Ins { block, row, cells, .. } => {
+                    let slot = self.blocks.get_mut(block as usize).expect("删除块必须存在");
+                    let rows = slot.get_or_insert_with(Vec::new);
+                    rows.insert(row as usize, cells);
+                    if rollback.removed_seg {
+                        self.segs.insert(rollback.index, rollback.seg);
+                    } else {
+                        self.segs[rollback.index] = rollback.seg;
+                    }
+                }
+            }
+        }
+        debug_assert!(rollbacks.is_empty());
+    }
+
+    /// 按原块号和块内行号恢复删除的插入行，保留旧历史的 CellId。
+    ///
+    /// # Parameters
+    /// - `vpos`: 整块已删除时用于恢复原段位置的逻辑行号。
+    /// - `block`: 删除前的稳定插入块号。
+    /// - `row`: 删除前的块内行号。
+    /// - `cells`: 待恢复的一整行内容。
+    ///
+    /// # Returns
+    /// 身份和位置一致时恢复并返回 true；内部状态不匹配时返回 false。
+    fn restore_inserted(
+        &mut self,
+        vpos: u64,
+        block: u32,
+        row: u32,
+        cells: Vec<String>,
+    ) -> bool {
+        let Some(slot) = self.blocks.get(block as usize) else { return false };
+        let occupied = slot.is_some();
+        let seg_index = self.segs.iter().position(|seg| {
+            matches!(seg.kind, SegKind::Ins { block: id } if id == block)
+        });
+        match (occupied, seg_index) {
+            (true, Some(i)) => {
+                let rows = self.blocks[block as usize].as_mut().unwrap();
+                let next_len = self.segs[i].len.checked_add(1);
+                if row as usize > rows.len()
+                    || self.segs[i].len as usize != rows.len()
+                    || next_len.is_none()
+                {
+                    return false;
+                }
+                rows.insert(row as usize, cells);
+                self.segs[i].len = next_len.unwrap();
+                true
+            }
+            (false, None) => {
+                // 整块删除后的首条恢复必为原第 0 行；后续行走上面的分支。
+                if row != 0 {
+                    return false;
+                }
+                let at = self.split_at(vpos);
+                self.blocks[block as usize] = Some(vec![cells]);
+                self.segs.insert(
+                    at,
+                    Seg { kind: SegKind::Ins { block }, len: 1 },
+                );
+                true
+            }
+            _ => false,
         }
     }
 
@@ -4192,7 +4383,15 @@ impl Segments {
 #[derive(Clone, PartialEq, Debug)]
 enum DeletedRow {
     Src { vpos: u64, rec: u32 },
-    Ins { vpos: u64, cells: Vec<String> },
+    Ins { vpos: u64, block: u32, row: u32, cells: Vec<String> },
+}
+
+/// 单次删除的执行前段状态，仅在批量删除中途失败时用于回滚。
+struct DeleteRollback {
+    index: usize,
+    seg: Seg,
+    removed_seg: bool,
+    tombstone_was_present: bool,
 }
 
 // ============================================================
@@ -6887,24 +7086,61 @@ impl BigFile {
             HistoryDecision::FixedPoint(p) => (p, true),
             HistoryDecision::Confirm(outcome) => return Ok(outcome),
         };
-        let (removed_rows, complete) = {
+        let (removed_rows, complete, rollbacks) = {
             let Op::RemoveRows { items } = &mut prepared.entry_mut().op else {
                 unreachable!();
             };
+            let mut rollbacks = Vec::with_capacity(vrows.len());
             let mut complete = true;
             for &vpos in vrows.iter().rev() {
-                if let Some(deleted) = self.seg.delete_one(vpos) {
-                    items.push(deleted);
-                } else {
+                let Some((index, off)) = self.seg.locate(vpos) else {
                     complete = false;
-                }
+                    break;
+                };
+                let original_seg = self.seg.segs[index];
+                let removed_seg = match original_seg.kind {
+                    SegKind::Ins { block } => self
+                        .seg
+                        .blocks
+                        .get(block as usize)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|rows| rows.len() == 1),
+                    SegKind::Src { .. } => false,
+                };
+                let tombstone_was_present = match original_seg.kind {
+                    SegKind::Src { start, .. } => start
+                        .checked_add(off)
+                        .is_some_and(|rec| self.seg.tombstones.contains(&rec)),
+                    SegKind::Ins { .. } => false,
+                };
+                let Some(deleted) = self.seg.delete_one(vpos) else {
+                    complete = false;
+                    break;
+                };
+                rollbacks.push(DeleteRollback {
+                    index,
+                    seg: original_seg,
+                    removed_seg,
+                    tombstone_was_present,
+                });
+                items.push(deleted);
             }
-            items.reverse();
-            (items.len() as u64, complete)
+            if complete {
+                items.reverse();
+            }
+            (items.len() as u64, complete, rollbacks)
         };
+        if !complete {
+            let Op::RemoveRows { items } = &mut prepared.entry_mut().op else {
+                unreachable!();
+            };
+            let items = std::mem::take(items);
+            self.seg.rollback_deleted(items, rollbacks);
+            return Err("内部行索引不一致，删除已取消".into());
+        }
+        drop(rollbacks);
         self.last_spec = None;
-        // 正常路径预检已保证 complete；内部不一致时也不能留下不可撤销的半条历史。
-        self.finish_history(prepared, fixed_point || !complete, 0, removed_rows)
+        self.finish_history(prepared, fixed_point, 0, removed_rows)
     }
 
     /// 原地执行并归一化插入块号；不克隆整条操作。
@@ -7099,8 +7335,10 @@ impl BigFile {
                                 Seg { kind: SegKind::Src { start: *rec, len: 1 }, len: 1 },
                             );
                         }
-                        DeletedRow::Ins { vpos, cells } => {
-                            self.seg.insert_block(*vpos, vec![cells.clone()]);
+                        DeletedRow::Ins { vpos, block, row, cells } => {
+                            if !self.seg.restore_inserted(*vpos, *block, *row, cells.clone()) {
+                                return false;
+                            }
                         }
                     }
                 }
