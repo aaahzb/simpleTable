@@ -227,7 +227,7 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
           // 真实引擎保存/另存为后重开文件：筛选结果被丢弃、排序视图已物理落盘
           filter = null;
           sorted = false;
-          return null;
+          return { saved: true, fixedPoint: null, cancelled: false };
         case "big_sort_estimate":
           return {
             file_bytes: 1024,
@@ -568,6 +568,93 @@ test("saveAs 把目标路径交给引擎，并按保存语义复位视图", asyn
   assert.equal(model.rowCount(), 200);
   assert.deepEqual(events.at(-1), [true, "view"],
     "另存为后应按 origin=view 重建全量视图");
+});
+
+
+function makeFixedPointSaveModel(confirm, first, retry) {
+  const calls = [];
+  let refreshes = 0;
+  let dataEvents = 0;
+  const model = new BigModel({
+    invoke: async (cmd, args = {}) => {
+      calls.push([cmd, args]);
+      if (cmd !== "big_save") throw new Error("unexpected " + cmd);
+      const saveCalls = calls.filter(([name]) => name === "big_save").length;
+      return saveCalls === 1 ? first : retry;
+    },
+    listen: async () => () => {},
+    confirmFixedPoint: confirm,
+  });
+  model._filterOn = true;
+  model._filterCount = 1;
+  model._refreshMeta = async () => { refreshes += 1; };
+  model._emitData = () => { dataEvents += 1; };
+  return { model, calls, counts: () => ({ refreshes, dataEvents }) };
+}
+
+test("保存固定点取消不重试、不复位视图并返回 false", async () => {
+  const fixedPoint = {
+    kind: "sortMaterialization", operation: "sort", requiredBytes: 100,
+    budgetBytes: 4096, preflightId: 11,
+  };
+  const { model, calls, counts } = makeFixedPointSaveModel(
+    async () => false,
+    { saved: false, fixedPoint, cancelled: false },
+    null,
+  );
+  const saved = await model.save();
+  assert.equal(saved, false);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0][1].approval, { allowFixedPoint: false, preflightId: null });
+  assert.equal(model.filterActive(), true);
+  assert.deepEqual(counts(), { refreshes: 0, dataEvents: 0 });
+});
+
+test("保存固定点确认带原 preflightId 重试，saved=true 才复位", async () => {
+  const fixedPoint = {
+    kind: "saveTransform", operation: "deleted Source", requiredBytes: 100,
+    budgetBytes: 4096, preflightId: 12,
+  };
+  const { model, calls, counts } = makeFixedPointSaveModel(
+    async () => true,
+    { saved: false, fixedPoint, cancelled: false },
+    { saved: true, fixedPoint: null, cancelled: false },
+  );
+  const saved = await model.save();
+  assert.equal(saved, true);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1][1].approval, { allowFixedPoint: true, preflightId: 12 });
+  assert.equal(model.filterActive(), false);
+  assert.deepEqual(counts(), { refreshes: 1, dataEvents: 1 });
+});
+
+test("saved=false 无 fixedPoint 时不确认、不刷新、不发数据通知", async () => {
+  let confirms = 0;
+  const { model, calls, counts } = makeFixedPointSaveModel(
+    async () => { confirms += 1; return true; },
+    { saved: false, fixedPoint: null, cancelled: true },
+    null,
+  );
+  const saved = await model.save();
+  assert.equal(saved, false);
+  assert.equal(confirms, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(model.filterActive(), true);
+  assert.deepEqual(counts(), { refreshes: 0, dataEvents: 0 });
+});
+
+test("保存确认后再次收到 fixedPoint 视为过期且不复位", async () => {
+  const fixedPoint = {
+    kind: "saveTransform", operation: "changed", requiredBytes: 100,
+    budgetBytes: 4096, preflightId: 13,
+  };
+  const { model, counts } = makeFixedPointSaveModel(
+    async () => true,
+    { saved: false, fixedPoint, cancelled: false },
+    { saved: false, fixedPoint: { ...fixedPoint, preflightId: 14 }, cancelled: false },
+  );
+  await assert.rejects(model.save(), /预检已过期/);
+  assert.deepEqual(counts(), { refreshes: 0, dataEvents: 0 });
 });
 
 test("筛选：rowNumber 三态——命中给原始行号，未缓存/非筛选给 null", async () => {

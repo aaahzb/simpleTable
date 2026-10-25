@@ -1415,17 +1415,45 @@ export class BigModel {
     this._emitData(true);
   }
 
+  /**
+   * 调保存命令；固定点确认只携带原预检代际重试一次。
+   *
+   * @param {string} cmd - big_save 或 big_save_as。
+   * @param {object} [args] - 不含 approval 的命令参数。
+   * @returns {Promise<boolean>} 仅引擎 saved=true 时返回 true。
+   */
+  async _invokeSave(cmd, args = {}) {
+    const first = await this._invoke(cmd, {
+      ...args,
+      approval: { allowFixedPoint: false, preflightId: null },
+    });
+    if (first.saved) return true;
+    if (!first.fixedPoint) return false;
+    const confirmed = await this._confirmFixedPoint(first.fixedPoint);
+    if (!confirmed) return false;
+    const retry = await this._invoke(cmd, {
+      ...args,
+      approval: {
+        allowFixedPoint: true,
+        preflightId: first.fixedPoint.preflightId,
+      },
+    });
+    if (retry.fixedPoint) throw new Error("固定点预检已过期，请重试");
+    return retry.saved === true;
+  }
+
   // ---- 保存 ----
 
   /**
    * 保存（引擎流式重写 + 原子换名，进度经 onProgress 订阅）。
    *
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} true = 已保存；false = 固定点确认取消。
    */
   async save() {
     this._requireNotIndexing("文件仍在索引中，请稍候再保存");
-    await this._invoke("big_save");
+    if (!(await this._invokeSave("big_save"))) return false;
     await this._afterWrite();
+    return true;
   }
 
   /**
@@ -1433,12 +1461,13 @@ export class BigModel {
    * 原文件保持不变；成功后引擎会话切到新路径，后续 save() 写新文件。
    *
    * @param {string} target - 目标 CSV 全路径。
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} true = 已保存；false = 固定点确认取消。
    */
   async saveAs(target) {
     this._requireNotIndexing("文件仍在索引中，请稍候再另存为");
-    await this._invoke("big_save_as", { path: target });
+    if (!(await this._invokeSave("big_save_as", { path: target }))) return false;
     await this._afterWrite();
+    return true;
   }
 
   /**

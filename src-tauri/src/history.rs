@@ -7,6 +7,8 @@ pub const DEFAULT_HISTORY_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistoryError {
     CostOverflow,
+    BudgetExceeded,
+    AllocationFailed,
     SharedCostConflict,
 }
 
@@ -136,6 +138,11 @@ pub struct CommitStats { pub evicted_undo: usize, pub cleared_redo: usize }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BudgetChange { pub evicted: usize, pub fixed_point: bool }
 
+
+pub struct PreparedHistory<T> {
+    ledger: HistoryLedger<T>,
+}
+
 pub struct HistoryLedger<T> {
     undo: VecDeque<HistoryEntry<T>>,
     redo: VecDeque<HistoryEntry<T>>,
@@ -174,6 +181,29 @@ impl<T> HistoryLedger<T> {
         Ok(Prepared { entry, entry_bytes, budget_bytes: self.budget_bytes })
     }
 
+
+    pub fn iter_undo(&self) -> impl DoubleEndedIterator<Item = &HistoryEntry<T>> {
+        self.undo.iter()
+    }
+    pub fn iter_redo(&self) -> impl DoubleEndedIterator<Item = &HistoryEntry<T>> {
+        self.redo.iter()
+    }
+    pub fn prepare_rebuild(
+        undo: VecDeque<HistoryEntry<T>>,
+        redo: VecDeque<HistoryEntry<T>>,
+        budget_bytes: u64,
+    ) -> Result<PreparedHistory<T>, HistoryError> {
+        let mut rebuilt = HistoryLedger::new(budget_bytes);
+        for entry in undo.iter().chain(redo.iter()) {
+            rebuilt.charge_rebuild(entry)?;
+        }
+        rebuilt.undo = undo;
+        rebuilt.redo = redo;
+        Ok(PreparedHistory { ledger: rebuilt })
+    }
+    pub fn commit_rebuild(&mut self, prepared: PreparedHistory<T>) {
+        *self = prepared.ledger;
+    }
     pub fn undo_op(&self) -> Option<&T> { self.undo.back().map(|e| &e.op) }
     pub fn redo_op(&self) -> Option<&T> { self.redo.back().map(|e| &e.op) }
     /// 重做换块后只重绑稳定格地址，不移动条目也不改变账本。
@@ -187,6 +217,41 @@ impl<T> HistoryLedger<T> {
 }
 
 impl<T> HistoryLedger<T> {
+
+    fn charge_rebuild(&mut self, entry: &HistoryEntry<T>) -> Result<(), HistoryError> {
+        let mut unique = BTreeMap::<u64, u64>::new();
+        for charge in &entry.shared {
+            if unique.insert(charge.id, charge.bytes)
+                .is_some_and(|old| old != charge.bytes) {
+                return Err(HistoryError::SharedCostConflict);
+            }
+        }
+        let mut incremental_bytes = entry.own_bytes;
+        let mut new_shared = 0usize;
+        for (&id, &bytes) in &unique {
+            if let Some((old, refs)) = self.shared.get(&id) {
+                if *old != bytes { return Err(HistoryError::SharedCostConflict); }
+                refs.checked_add(1).ok_or(HistoryError::CostOverflow)?;
+            } else {
+                incremental_bytes = incremental_bytes.checked_add(bytes)
+                    .ok_or(HistoryError::CostOverflow)?;
+                new_shared = new_shared.checked_add(1).ok_or(HistoryError::CostOverflow)?;
+            }
+        }
+        let next_total = self.total_bytes.checked_add(incremental_bytes)
+            .ok_or(HistoryError::CostOverflow)?;
+        if next_total > self.budget_bytes {
+            return Err(HistoryError::BudgetExceeded);
+        }
+        self.shared.try_reserve(new_shared).map_err(|_| HistoryError::AllocationFailed)?;
+        self.total_bytes = next_total;
+        for (id, bytes) in unique {
+            let item = self.shared.entry(id).or_insert((bytes, 0));
+            item.1 += 1;
+        }
+        Ok(())
+    }
+
 fn charge(&mut self, entry: &HistoryEntry<T>) {
     self.total_bytes += entry.own_bytes;
     let mut seen = BTreeSet::new();
@@ -361,6 +426,63 @@ mod tests {
         assert_eq!(h.stats().bytes, 0);
     }
 
+
+    fn copied_entries<'a>(
+        entries: impl Iterator<Item = &'a HistoryEntry<&'static str>>,
+    ) -> VecDeque<HistoryEntry<&'static str>> {
+        entries.map(|entry| HistoryEntry::new(
+            entry.op,
+            entry.own_bytes,
+            entry.shared.clone(),
+            entry.revision_delta,
+        )).collect()
+    }
+
+    #[test]
+    fn rebuild_preserves_order_and_shared_accounting() {
+        let shared = Arc::new(String::from("shared"));
+        let charge = SharedCharge::of(&shared, 40);
+        let mut h = HistoryLedger::new(1_000);
+        h.commit_prepared(h.prepare(HistoryEntry::new("a", 10, vec![charge], 1)).unwrap());
+        h.commit_prepared(h.prepare(HistoryEntry::new("b", 10, vec![charge], 1)).unwrap());
+        h.commit_prepared(h.prepare(item("c", 5)).unwrap());
+        let entry = h.take_undo().unwrap();
+        h.finish_undo(entry);
+
+        let undo = copied_entries(h.iter_undo());
+        let redo = copied_entries(h.iter_redo());
+        let prepared = HistoryLedger::prepare_rebuild(undo, redo, 1_000).unwrap();
+        h.commit_rebuild(prepared);
+
+        assert_eq!(h.iter_undo().map(|entry| entry.op).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(h.iter_redo().map(|entry| entry.op).collect::<Vec<_>>(), ["c"]);
+        assert_eq!(h.stats().bytes, 65);
+        assert_eq!(h.audited_bytes(), h.stats().bytes);
+    }
+
+    #[test]
+    fn rebuild_rejects_invalid_replacement_without_mutating_original() {
+        let mut original = HistoryLedger::new(100);
+        original.commit_prepared(original.prepare(item("a", 60)).unwrap());
+        let replacement = copied_entries(original.iter_undo());
+        assert!(matches!(
+            HistoryLedger::prepare_rebuild(replacement, VecDeque::new(), 50),
+            Err(HistoryError::BudgetExceeded)
+        ));
+        assert_eq!(original.stats().bytes, 60);
+        assert_eq!(original.undo_op(), Some(&"a"));
+        assert_eq!(original.audited_bytes(), 60);
+
+        let shared = Arc::new(String::from("shared"));
+        let conflict = VecDeque::from([
+            HistoryEntry::new("a", 0, vec![SharedCharge::of(&shared, 40)], 1),
+            HistoryEntry::new("b", 0, vec![SharedCharge::of(&shared, 41)], 1),
+        ]);
+        assert!(matches!(
+            HistoryLedger::prepare_rebuild(conflict, VecDeque::new(), 100),
+            Err(HistoryError::SharedCostConflict)
+        ));
+    }
     #[test]
     fn cost_accumulation_is_checked() {
         let mut cost = Cost::new();

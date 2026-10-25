@@ -13,20 +13,22 @@
 //! - 撤销 = 逆操作日志（全表快照在大文件上不可行）。
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::baseline::{BaselineTransform, RowId};
 use crate::history::{
     Approval, BudgetChange, Cost, EditOutcome, FixedPointKind, FixedPointRequest,
-    HistoryEntry, HistoryError, HistoryLedger, HistoryStats, Prepared,
+    HistoryEntry, HistoryError, HistoryLedger, HistoryStats, Prepared, PreparedHistory,
+    SharedCharge,
     DEFAULT_HISTORY_BUDGET_BYTES,
 };
 use crate::schema::{ColumnId, ColumnStorage, Schema};
-use crate::spool::{RowSnapshot, SessionSpool};
+use crate::spool::{history_text_bytes, RowSnapshot, SessionSpool};
 use memchr::{memchr, memchr_iter};
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
@@ -979,7 +981,7 @@ mod tests {
         assert!(bf.insert_rows(0, None, 1, Approval::deny()).is_err());
         assert!(bf.remove_rows(vec![0], Approval::deny()).is_err());
         assert!(bf.run_filter(&FilterSpec::default()).is_err());
-        assert!(bf.save(|_, _, _, _| {}).is_err());
+        assert!(bf.save(Approval::deny(), |_, _, _, _| {}).is_err());
         assert!(bf
             .push_col_op(ColOp::Rename { col: 0, name: "A".into() })
             .is_err());
@@ -1207,6 +1209,33 @@ mod tests {
         fs::remove_file(&p).ok();
     }
 
+
+    #[test]
+    fn source_edit_history_uses_backing_reference() {
+        let p = tmp_csv("source_value_ref", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "Changed".into(), Approval::deny()).unwrap();
+        let Some(Op::SetCell { old, new, .. }) = bf.history.undo_op() else {
+            panic!("单格编辑必须产生 SetCell 历史");
+        };
+        assert!(matches!(
+            old,
+            ValueRef::Source {
+                row: RowId::Source(1),
+                col: ColumnId(0),
+                utf8_len: 5,
+                index_epoch: 0,
+                ..
+            }
+        ));
+        assert!(matches!(new, ValueRef::Text(text) if text.text.as_ref() == "Changed"));
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 1)[0][0], "Alice");
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 1)[0][0], "Changed");
+        fs::remove_file(&p).ok();
+    }
+
     #[test]
     fn big_set_cell_undo_redo_src_and_ins() {
         let p = tmp_csv("cell", &people_csv());
@@ -1334,8 +1363,11 @@ mod tests {
             panic!("应形成一条批量格快照");
         };
         assert_eq!(changes.len(), 1, "只有 bob 年龄实际变化");
-        assert_eq!(changes[0].old, "25");
-        assert_eq!(changes[0].new, "26");
+        assert!(matches!(
+            &changes[0].old,
+            ValueRef::Source { row: RowId::Source(2), col: ColumnId(1), utf8_len: 2, .. }
+        ));
+        assert!(matches!(&changes[0].new, ValueRef::Text(text) if text.text.as_ref() == "26"));
         assert!(bf.undo());
         assert_eq!(bf.rows(1, 1)[0][1], "25");
     }
@@ -1802,7 +1834,7 @@ a,b
         let block = match bf.history.undo_op().unwrap() {
             Op::RemoveRows { items } => items.iter().find_map(|item| match item {
                 DeletedRow::Ins { block, .. } => Some(*block),
-                DeletedRow::Src { .. } => None,
+                DeletedRow::Src { .. } | DeletedRow::Suspended { .. } => None,
             }).unwrap(),
             other => panic!("应为删除行记录：{other:?}"),
         };
@@ -2317,7 +2349,7 @@ a,b
         let p = tmp_csv("p1_signed_revision", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         bf.set_cell(0, 0, "changed".into(), Approval::deny()).unwrap();
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         assert!(!bf.modified());
         assert!(bf.undo());
         assert!(bf.modified());
@@ -2331,7 +2363,7 @@ a,b
         let p = tmp_csv("p1_detached_savepoint", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         bf.set_cell(0, 0, "saved".into(), Approval::deny()).unwrap();
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         assert!(bf.undo());
         bf.set_cell(0, 0, "branch".into(), Approval::deny()).unwrap();
         assert!(bf.modified());
@@ -2345,7 +2377,7 @@ a,b
         let p = tmp_csv("p1_fixed_detached", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         bf.set_cell(0, 0, "saved".into(), Approval::deny()).unwrap();
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         assert!(bf.undo());
         bf.set_history_budget(4_096).unwrap();
         let large = "x".repeat(128 * 1024);
@@ -2406,7 +2438,7 @@ a,b
         let p = tmp_csv("p1_budget_detached", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         bf.set_cell(0, 0, "saved".into(), Approval::deny()).unwrap();
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         assert!(bf.undo());
         let change = bf.set_history_budget(1).unwrap();
         assert!(change.fixed_point);
@@ -2431,15 +2463,35 @@ a,b
         fs::remove_file(&p).ok();
     }
 
+
     #[test]
-    #[ignore = "P8 baseline transform"]
+    fn p8_save_migrates_source_values_to_shared_text() {
+        let p = tmp_csv("p8_save_value_refs", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "Changed".into(), Approval::deny()).unwrap();
+        let before_bytes = bf.history_stats().bytes;
+        assert!(bf.save(Approval::deny(), |_, _, _, _| {}).unwrap().saved);
+        assert_eq!(bf.history_stats().bytes, before_bytes);
+        let Some(Op::SetCell { old, new, .. }) = bf.history.undo_op() else {
+            panic!("保存后必须保留 SetCell 历史");
+        };
+        assert!(matches!(old, ValueRef::Text(text) if text.text.as_ref() == "Alice"));
+        assert!(matches!(new, ValueRef::Text(text) if text.text.as_ref() == "Changed"));
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 1)[0][0], "Alice");
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 1)[0][0], "Changed");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
     fn p8_save_insert_then_undo_removes_materialized_row() {
         let p = tmp_csv("p8_save_insert", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         let before = bf.rows(0, 5);
         let inserted = vec![vec!["X".to_string(), "Y".to_string(), "Z".to_string()]];
         bf.insert_rows(1, Some(inserted.clone()), 1, Approval::deny()).unwrap();
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         assert!(bf.undo());
         assert_eq!(bf.rows(0, 5), before);
         assert!(bf.redo());
@@ -2447,14 +2499,246 @@ a,b
         fs::remove_file(&p).ok();
     }
 
+    /// 保存后交错撤销插入、删除和更早源格编辑，身份必须按顺序重绑定。
     #[test]
-    #[ignore = "P8 deleted row recovery"]
+    fn p3_save_interleaved_delete_cell_history_rebinds_in_order() {
+        let p = tmp_csv("p3_interleaved", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 5);
+        bf.set_cell(4, 0, "last-before-delete".into(), Approval::deny()).unwrap();
+        bf.remove_rows(vec![4], Approval::deny()).unwrap();
+        bf.insert_rows(1, Some(vec![vec!["X".into(), "Y".into(), "Z".into()]]), 1,
+            Approval::deny()).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(bf.undo());
+        assert!(bf.undo());
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.redo());
+        assert!(bf.redo());
+        assert!(bf.redo());
+        fs::remove_file(&p).ok();
+    }
+
+
+    #[test]
+    fn p3_save_delete_middle_undo_restores_all_original_positions() {
+        let p = tmp_csv("p3_save_delete_middle", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 5);
+        bf.set_cell(2, 0, "Carol-before-delete".into(), Approval::deny()).unwrap();
+        bf.remove_rows(vec![2], Approval::deny()).unwrap();
+        let deleted = bf.rows(0, 4);
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+
+        assert!(bf.undo());
+        let mut restored = before.clone();
+        restored[2][0] = "Carol-before-delete".into();
+        assert_eq!(bf.rows(0, 5), restored);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 5), restored);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 4), deleted);
+        fs::remove_file(&p).ok();
+    }
+
+
+    #[test]
+    fn p8_save_insert_edit_rebinds_materialized_history() {
+        let p = tmp_csv("p8_save_insert_edit", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 5);
+        bf.insert_rows(1, Some(vec![vec!["X".into(), "Y".into(), "Z".into()]]), 1,
+            Approval::deny()).unwrap();
+        bf.set_cell(1, 0, "Edited".into(), Approval::deny()).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(bf.undo());
+        assert_eq!(bf.rows(1, 1)[0][0], "X");
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(1, 1)[0][0], "X");
+        assert!(bf.redo());
+        assert_eq!(bf.rows(1, 1)[0][0], "Edited");
+        assert!(bf.undo());
+        assert_eq!(bf.rows(1, 1)[0][0], "X");
+        assert!(bf.redo());
+        assert_eq!(bf.rows(1, 1)[0][0], "Edited");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p8_repeat_save_preserves_suspended_deleted_identity() {
+        let p = tmp_csv("p8_suspended_collision", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 5);
+        bf.set_cell(3, 0, "dave-edited".into(), Approval::deny()).unwrap();
+        bf.set_cell(2, 0, "Carol-edited".into(), Approval::deny()).unwrap();
+        bf.remove_rows(vec![2], Approval::deny()).unwrap();
+        let deleted = bf.rows(0, 4);
+        assert!(bf.save(Approval::deny(), |_, _, _, _| {}).unwrap().saved);
+        assert!(bf.save(Approval::deny(), |_, _, _, _| {}).unwrap().saved);
+
+        assert!(bf.undo());
+        let mut restored = before.clone();
+        restored[2][0] = "Carol-edited".into();
+        restored[3][0] = "dave-edited".into();
+        assert_eq!(bf.rows(0, 5), restored);
+        assert!(bf.undo());
+        restored[2][0] = "Carol".into();
+        assert_eq!(bf.rows(0, 5), restored);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.redo());
+        assert!(bf.redo());
+        assert!(bf.redo());
+        let mut deleted_edited = deleted;
+        deleted_edited[2][0] = "dave-edited".into();
+        assert_eq!(bf.rows(0, 4), deleted_edited);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p8_save_deleted_inserted_row_restores_original_block() {
+        let p = tmp_csv("p8_deleted_inserted", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 5);
+        let inserted = vec!["X".to_string(), "Y".to_string(), "Z".to_string()];
+        bf.insert_rows(1, Some(vec![inserted.clone()]), 1, Approval::deny()).unwrap();
+        bf.remove_rows(vec![1], Approval::deny()).unwrap();
+        assert!(bf.save(Approval::deny(), |_, _, _, _| {}).unwrap().saved);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(1, 1)[0], inserted);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 5), before);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p8_save_after_undo_delete_preserves_redo_identity() {
+        let p = tmp_csv("p8_suspended_redo", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 5);
+        bf.remove_rows(vec![2], Approval::deny()).unwrap();
+        let deleted = bf.rows(0, 4);
+        assert!(bf.save(Approval::deny(), |_, _, _, _| {}).unwrap().saved);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.save(Approval::deny(), |_, _, _, _| {}).unwrap().saved);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 4), deleted);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 4), deleted);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p8_suspended_restore_failure_is_atomic() {
+        let p = tmp_csv("p8_suspended_atomic", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.insert_rows(
+            1,
+            Some(vec![vec!["TMP".into(), "1".into(), "X".into()]]),
+            0,
+            Approval::deny(),
+        ).unwrap();
+        let inserted_state = bf.rows(0, 6);
+        bf.remove_rows(vec![0, 1, 3], Approval::deny()).unwrap();
+        let deleted_state = bf.rows(0, 3);
+        assert!(bf.save(Approval::deny(), |_, _, _, _| {}).unwrap().saved);
+        let before_stats = bf.history_stats();
+        let before_revision = bf.revision;
+        let before_generation = bf.history_generation;
+        let block = match bf.history.undo_op().unwrap() {
+            Op::RemoveRows { items } => items.iter().find_map(|item| match item {
+                DeletedRow::Ins { block, .. } => Some(*block),
+                DeletedRow::Src { .. } | DeletedRow::Suspended { .. } => None,
+            }).unwrap(),
+            other => panic!("应为删除行记录：{other:?}"),
+        };
+        bf.seg.blocks[block as usize] = Some(Vec::new());
+        assert!(!bf.undo());
+        assert_eq!(bf.rows(0, 3), deleted_state);
+        assert_eq!(bf.history_stats(), before_stats);
+        assert_eq!(bf.revision, before_revision);
+        assert_eq!(bf.history_generation, before_generation);
+        bf.seg.blocks[block as usize] = None;
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 6), inserted_state);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 3), deleted_state);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p8_save_temp_validation_failure_keeps_file_and_history() {
+        let p = tmp_csv("p8_temp_validation", &people_csv());
+        let original = fs::read(&p).unwrap();
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+        let before = bf.rows(0, 5);
+        let before_stats = bf.history_stats();
+        let before_revision = bf.revision;
+        let tmp = tmp_path_for(&p);
+        let mut corrupted = false;
+        let err = bf.save(Approval::deny(), |_, _, phase, _| {
+            if phase == PHASE_FLUSH && !corrupted {
+                corrupted = true;
+                fs::write(&tmp, b"").unwrap();
+            }
+        }).unwrap_err();
+        assert!(corrupted);
+        assert!(err.contains("行数校验"), "错误应来自临时重开校验：{err}");
+        assert_eq!(fs::read(&p).unwrap(), original, "校验失败不得替换目标");
+        assert_eq!(bf.rows(0, 5), before);
+        assert_eq!(bf.history_stats(), before_stats);
+        assert_eq!(bf.revision, before_revision);
+        assert_eq!(bf.path, p);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p8_save_as_temp_validation_failure_keeps_paths() {
+        let p = tmp_csv("p8_temp_validation_source", &people_csv());
+        let target = tmp_csv("p8_temp_validation_target", b"h1,h2,h3
+keep,old,target
+");
+        let source_bytes = fs::read(&p).unwrap();
+        let target_bytes = fs::read(&target).unwrap();
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+        let before = bf.rows(0, 5);
+        let before_stats = bf.history_stats();
+        let tmp = tmp_path_for(&target);
+        let mut corrupted = false;
+        let err = bf.save_as(&target, Approval::deny(), |_, _, phase, _| {
+            if phase == PHASE_FLUSH && !corrupted {
+                corrupted = true;
+                fs::write(&tmp, b"").unwrap();
+            }
+        }).unwrap_err();
+        assert!(corrupted);
+        assert!(err.contains("行数校验"), "错误应来自临时重开校验：{err}");
+        assert_eq!(fs::read(&p).unwrap(), source_bytes);
+        assert_eq!(fs::read(&target).unwrap(), target_bytes);
+        assert_eq!(bf.rows(0, 5), before);
+        assert_eq!(bf.history_stats(), before_stats);
+        assert_eq!(bf.path, p);
+        fs::remove_file(&p).ok();
+        fs::remove_file(&target).ok();
+    }
+
+    #[test]
     fn p8_save_delete_last_then_undo_restores_row() {
         let p = tmp_csv("p8_save_delete", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         let before = bf.rows(0, 5);
         assert_eq!(bf.remove_rows(vec![4], Approval::deny()).unwrap().removed_rows, 1);
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         assert!(bf.undo());
         assert_eq!(bf.rows(0, 5), before);
         assert!(bf.redo());
@@ -2463,7 +2747,6 @@ a,b
     }
 
     #[test]
-    #[ignore = "P8 source cell rebind"]
     fn p8_save_undo_source_edit_after_insert_targets_original_row() {
         let p = tmp_csv("p8_save_source_edit", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
@@ -2476,7 +2759,7 @@ a,b
         )
         .unwrap();
         bf.set_cell(2, 0, "changed".to_string(), Approval::deny()).unwrap();
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         assert!(bf.undo());
         assert_eq!(bf.rows(1, 1)[0][0], "X");
         assert_eq!(bf.rows(2, 1)[0][0], before[1][0]);
@@ -2494,7 +2777,7 @@ a,b
             .unwrap();
         bf.remove_rows(vec![3], Approval::deny()).unwrap(); // 删 Carol（插入位移后 vrow 3）
         let mut prog = 0u32;
-        bf.save(|done, _total, _phase, _rows| prog = prog.max(done as u32))
+        bf.save(Approval::deny(), |done, _total, _phase, _rows| prog = prog.max(done as u32))
             .unwrap();
         assert!(prog > 0, "进度回调应至少触发一次");
         assert!(bf.meta().can_undo, "保存后撤销栈保留（rec 稳定）");
@@ -2525,7 +2808,7 @@ a,b
         let mut bf = BigFile::open(&p).unwrap();
         bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap(); // Alice age 30→31
 
-        bf.save_as(&target, |_, _, _, _| {}).unwrap();
+        bf.save_as(&target, Approval::deny(), |_, _, _, _| {}).unwrap();
 
         // 另存为绝不能改写原文件；目标文件必须包含当前视图（含未保存编辑）
         assert_eq!(fs::read(&p).unwrap(), orig_bytes, "另存为不得改写原文件");
@@ -2534,7 +2817,7 @@ a,b
 
         // 会话身份已切到新路径：后续普通保存只更新目标文件
         bf.set_cell(1, 1, "26".into(), Approval::deny()).unwrap(); // bob 25→26
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         let bf_after = BigFile::open(&target).unwrap();
         assert_eq!(bf_after.rows(1, 1)[0][1], "26");
         assert_eq!(fs::read(&p).unwrap(), orig_bytes, "另存为后保存不得碰原文件");
@@ -2554,13 +2837,13 @@ a,b
             .join(format!("st_engine_saveas_missing_{}", std::process::id()))
             .join("dst.csv");
 
-        let err = bf.save_as(&bad, |_, _, _, _| {}).unwrap_err();
+        let err = bf.save_as(&bad, Approval::deny(), |_, _, _, _| {}).unwrap_err();
 
         assert!(err.contains("创建临时文件失败"), "错误信息应指出目标不可写：{err}");
         assert_eq!(fs::read(&p).unwrap(), orig_bytes, "失败时原文件不得变化");
         assert_eq!(bf.rows(0, 1)[0][1], "31", "失败时会话编辑不得丢失");
         // 会话仍指向原文件，普通保存照常可用
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         let bf2 = BigFile::open(&p).unwrap();
         assert_eq!(bf2.rows(0, 1)[0][1], "31");
         fs::remove_file(&p).ok();
@@ -2573,7 +2856,7 @@ a,b
         let mut bf = BigFile::open(&p).unwrap();
         assert_eq!(bf.meta().encoding, "gbk");
         bf.set_cell(0, 1, "上海".into(), Approval::deny()).unwrap();
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         let bf2 = BigFile::open(&p).unwrap();
         assert_eq!(bf2.meta().encoding, "gbk");
         assert_eq!(bf2.rows(0, 1)[0], vec!["张三", "上海"]);
@@ -2589,7 +2872,7 @@ a,b
         let p = tmp_csv("passthru", content);
         let mut bf = BigFile::open(&p).unwrap();
         bf.remove_rows(vec![2], Approval::deny()).unwrap(); // 删 Carol（中间行）
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         let out = fs::read(&p).unwrap();
         let expected: &[u8] = b"name,note\r\n\"Alice\",\"line1\nline2\"\r\n\"Bob \",\" spaced \"\r\nDave,x";
         assert_eq!(out, expected, "未触碰行必须逐字节保留");
@@ -2607,7 +2890,7 @@ a,b
         bf.remove_rows(vec![0], Approval::deny()).unwrap(); // 删 Alice
         bf.insert_rows(1, Some(vec![vec!["Zed".into(), "1".into()]]), 0, Approval::deny())
             .unwrap(); // vrow 1 插 Zed（Bob 之后）
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         let out = fs::read(&p).unwrap();
         let expected: &[u8] = b"name,age\r\nBob,41\r\nZed,1\r\nCarol,50";
         assert_eq!(out, expected, "混合改动后的物理字节");
@@ -2703,7 +2986,7 @@ a,b
         // 模拟外部程序占用：读共享但拒绝删除共享（FILE_SHARE_READ|WRITE=0x3，
         // 同 Excel/资源管理器预览类句柄），rename 必失败（os error 32）
         let lock = fs::OpenOptions::new().read(true).share_mode(0x3).open(&p).unwrap();
-        let err = bf.save(|_, _, _, _| {}).unwrap_err();
+        let err = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap_err();
         drop(lock);
         assert!(err.contains("临时文件"), "错误应告知临时文件位置: {err}");
         let tmp = tmp_path_for(&p);
@@ -2731,7 +3014,7 @@ a,b
             std::thread::sleep(std::time::Duration::from_millis(400));
             drop(lock);
         });
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         t.join().unwrap();
         let bf2 = BigFile::open(&p).unwrap();
         assert_eq!(bf2.rows(0, 1)[0][0], "Bob", "新文件应落盘生效");
@@ -3392,7 +3675,7 @@ a,b
         let mut bf = BigFile::open_with(&p, true).unwrap();
         assert_eq!(bf.rows(0, 1)[0], vec!["a", "b"], "首格不得含 U+FEFF");
         bf.set_cell(0, 0, "A".into(), Approval::deny()).unwrap();
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         let out = fs::read(&p).unwrap();
         assert!(out.starts_with(&[0xEF, 0xBB, 0xBF]), "应保留原 BOM");
         assert!(!out[3..].starts_with(&[0xEF, 0xBB, 0xBF]), "BOM 只能有一个");
@@ -3416,7 +3699,7 @@ a,b
         bf.schema = Arc::new(Schema::from_headers(generic_headers(2)).unwrap());
         assert_eq!(bf.rows(0, 1)[0], vec!["a", "b"]);
         bf.set_cell(0, 1, "B".into(), Approval::deny()).unwrap();
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         let out = fs::read(&p).unwrap();
         assert!(out.starts_with(&[0xEF, 0xBB, 0xBF]), "保存应保留 BOM");
         assert_eq!(&out[3..], b"a,B\r\n1,2\r\n");
@@ -3459,7 +3742,7 @@ a,b
         assert_eq!(bf.meta().rows, 2);
         // 被提升的是插入行；物理记录 0 仍是数据（读路径不得假设数据从 1 开始）
         assert_eq!(bf.rows(0, 2), vec![vec!["a", "b"], vec!["1", "2"]]);
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         let bf2 = BigFile::open(&p).unwrap();
         assert_eq!(bf2.meta().headers, vec!["X", "9"]);
         assert_eq!(bf2.rows(0, 2), vec![vec!["a", "b"], vec!["1", "2"]]);
@@ -3493,7 +3776,7 @@ a,b
         let p = tmp_csv("hlsave", b"x,1\r\ny,2\r\n");
         let mut bf = BigFile::open_with(&p, true).unwrap();
         bf.set_cell(1, 0, "Y".into(), Approval::deny()).unwrap();
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"x,1\r\nY,2\r\n", "不得注入表头");
         let bf2 = BigFile::open_with(&p, true).unwrap();
         assert_eq!(bf2.meta().rows, 2);
@@ -3509,7 +3792,7 @@ a,b
         assert_eq!(bf.meta().encoding, "gbk");
         assert_eq!(bf.rows(0, 1)[0], vec!["张三", "1"]);
         bf.set_cell(0, 1, "9".into(), Approval::deny()).unwrap();
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         let bf2 = BigFile::open_with(&p, true).unwrap();
         assert_eq!(bf2.meta().encoding, "gbk");
         assert_eq!(
@@ -3585,7 +3868,7 @@ a,b
         let err = bf.set_headerless(false).unwrap_err();
         assert!(err.contains("没有数据行可作为列名"), "{err}");
         assert!(bf.meta().headerless, "失败不得切换模式");
-        let err = bf.save(|_, _, _, _| {}).unwrap_err();
+        let err = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap_err();
         assert!(err.contains("至少保留一行"), "{err}");
         bf.push_col_op(ColOp::Insert { pos: 0, name: "x".into() })
             .unwrap();
@@ -3787,7 +4070,7 @@ a,b
         let cancel = AtomicBool::new(false);
         assert!(bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap());
         bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         // 保存后回到 mmap 后备（排序模式结束/重建）
         assert!(!bf.is_ram_backed());
         let bf2 = BigFile::open(&p).unwrap();
@@ -4043,7 +4326,8 @@ a,b
         bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
             .unwrap(); // z,e,d,c,b,a
         assert!(bf.meta().sorted);
-        bf.save(|_, _, _, _| {}).unwrap();
+        // 进入排序已经建立固定点并清空此前历史，保存无需再次确认。
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         assert!(!bf.meta().sorted, "保存后应退出排序视图");
         assert!(!bf.is_ram_backed());
         assert_eq!(first_col(&bf, 6), vec!["z", "e", "d", "c", "b", "a"]);
@@ -4065,7 +4349,7 @@ a,b
         assert!(bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap());
         bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }])
             .unwrap();
-        bf.save(&mut |_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), &mut |_, _, _, _| {}).unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"a,1\r\nb,2\r\nc,3\r\n");
         // 重开仍按无列名解释：三行全是数据，没有被注入表头
         let bf2 = BigFile::open_with(&p, true).unwrap();
@@ -4081,12 +4365,34 @@ a,b
         let mut bf = load_ram(&p);
         bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }])
             .unwrap();
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         let bf2 = BigFile::open(&p).unwrap();
         assert_eq!(bf2.rows(0, 2), vec![
             vec!["a".to_string(), "1".to_string()],
             vec!["b".to_string(), "2".to_string()],
         ]);
+        fs::remove_file(&p).ok();
+    }
+
+
+    #[test]
+    fn save_sorted_history_requires_fixed_point_confirmation() {
+        let p = tmp_csv("sort_save_fixed_point", &sort_fixture());
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }]).unwrap();
+        bf.set_cell(0, 0, "A".into(), Approval::deny()).unwrap();
+        let before = std::fs::read(&p).unwrap();
+
+        let denied = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(!denied.saved);
+        let request = denied.fixed_point.expect("排序保存必须请求固定点");
+        assert_eq!(request.kind, FixedPointKind::SortMaterialization);
+        assert!(bf.meta().can_undo && bf.meta().modified);
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+
+        let saved = bf.save(Approval::allow(request.preflight_id), |_, _, _, _| {}).unwrap();
+        assert!(saved.saved);
+        assert!(!bf.meta().can_undo && !bf.meta().modified);
         fs::remove_file(&p).ok();
     }
 
@@ -4100,7 +4406,11 @@ a,b
         bf.set_cell(0, 0, "A".into(), Approval::deny()).unwrap();
         assert!(bf.meta().can_undo);
         assert!(bf.meta().modified);
-        bf.save(|_, _, _, _| {}).unwrap();
+        let denied = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(!denied.saved);
+        assert!(bf.meta().can_undo, "取消确认前历史必须保留");
+        let request = denied.fixed_point.unwrap();
+        bf.save(Approval::allow(request.preflight_id), |_, _, _, _| {}).unwrap();
         assert!(!bf.meta().can_undo, "物理重排后旧记录号失效，撤销栈必须清空");
         assert!(!bf.meta().modified, "保存后回到干净状态");
         fs::remove_file(&p).ok();
@@ -4283,7 +4593,7 @@ a,b
     fn save_without_path_requires_save_as() {
         let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
         bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
-        let err = bf.save(|_, _, _, _| {}).unwrap_err();
+        let err = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap_err();
         assert!(err.contains("另存为"), "实际错误：{err}");
     }
 
@@ -4293,11 +4603,11 @@ a,b
         let p = tmp_csv("mem_save_as", b"placeholder\n");
         let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
         bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
-        bf.save_as(&p, |_, _, _, _| {}).unwrap();
+        bf.save_as(&p, Approval::deny(), |_, _, _, _| {}).unwrap();
         assert!(bf.has_path());
         assert!(!bf.is_ram_backed(), "另存为成功后应回到 mmap 后备");
         bf.set_cell(1, 1, "26".into(), Approval::deny()).unwrap();
-        bf.save(|_, _, _, _| {}).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
         let bf2 = BigFile::open(&p).unwrap();
         assert_eq!(
             bf2.rows(0, 2),
@@ -4317,7 +4627,7 @@ a,b
         fs::create_dir(&dir).unwrap();
         let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
         bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
-        let err = bf.save_as(&dir, |_, _, _, _| {}).unwrap_err();
+        let err = bf.save_as(&dir, Approval::deny(), |_, _, _, _| {}).unwrap_err();
         assert!(!err.is_empty());
         assert!(!bf.has_path() && bf.is_ram_backed());
         assert_eq!(bf.rows(0, 1)[0], vec!["Alice", "31", "Beijing"]);
@@ -4343,7 +4653,7 @@ a,b
         assert!(m.ram_backed && !m.has_path);
         assert_eq!(bf.rows(0, 1)[0], vec!["Alice", "", "30", "Beijing"]);
         let p = tmp_csv("mem_colops", b"x\n");
-        bf.save_as(&p, |_, _, _, _| {}).unwrap();
+        bf.save_as(&p, Approval::deny(), |_, _, _, _| {}).unwrap();
         let bf2 = BigFile::open(&p).unwrap();
         assert_eq!(bf2.rows(0, 1)[0], vec!["Alice", "", "30", "Beijing"]);
         fs::remove_file(&p).ok();
@@ -4588,29 +4898,32 @@ impl Segments {
     fn validate_restore_inserted(&self, items: &[DeletedRow]) -> bool {
         let mut simulated = HashMap::<u32, (bool, usize, Option<u32>)>::new();
         for item in items {
-            let DeletedRow::Ins { block, row, .. } = item else { continue };
-            if !simulated.contains_key(block) {
-                let Some(slot) = self.blocks.get(*block as usize) else { return false };
+            let (block, row) = match item {
+                DeletedRow::Ins { block, row, .. } => (*block, *row),
+                DeletedRow::Suspended { block, .. } => (*block, 0),
+                DeletedRow::Src { .. } => continue,
+            };
+            if !simulated.contains_key(&block) {
+                let Some(slot) = self.blocks.get(block as usize) else { return false };
                 let occupied = slot.is_some();
                 let rows_len = slot.as_ref().map_or(0, Vec::len);
                 let seg_len = self.segs.iter().find(|seg| {
-                    matches!(seg.kind, SegKind::Ins { block: id } if id == *block)
+                    matches!(seg.kind, SegKind::Ins { block: id } if id == block)
                 }).map(|seg| seg.len);
-                simulated.insert(*block, (occupied, rows_len, seg_len));
+                simulated.insert(block, (occupied, rows_len, seg_len));
             }
-            let (occupied, rows_len, seg_len) = simulated.get_mut(block).unwrap();
+            let (occupied, rows_len, seg_len) = simulated.get_mut(&block).unwrap();
             match (*occupied, *seg_len) {
                 (true, Some(current_seg_len)) => {
                     let Some(next_len) = current_seg_len.checked_add(1) else { return false };
-                    if *row as usize > *rows_len || current_seg_len as usize != *rows_len {
+                    if row as usize > *rows_len || current_seg_len as usize != *rows_len {
                         return false;
                     }
                     *rows_len += 1;
                     *seg_len = Some(next_len);
                 }
                 (false, None) => {
-                    // 整块删除后的首条恢复必须为原第 0 行。
-                    if *row != 0 {
+                    if row != 0 {
                         return false;
                     }
                     *occupied = true;
@@ -4704,6 +5017,25 @@ impl Segments {
 enum DeletedRow {
     Src { vpos: u64, rec: u32, snapshot: RowSnapshot, snapshot_row: u32 },
     Ins { vpos: u64, block: u32, row: u32, snapshot: RowSnapshot, snapshot_row: u32 },
+    /// 保存后原 Source 已物化消失；撤销时恢复快照到预留块第 0 行。
+    Suspended { vpos: u64, block: u32, snapshot: RowSnapshot, snapshot_row: u32 },
+}
+
+/// 保存前完成历史重建和块槽预留，替换目标后只做无失败移动。
+struct PreparedSaveHistory {
+    history: PreparedHistory<Op>,
+    blocks: Vec<Option<Vec<Vec<String>>>>,
+}
+
+/// 临时文件阶段已验证的 backing/index；目标换名后只做无失败提交。
+struct PreparedReopen {
+    backing: Backing,
+    idx: RawIndex,
+    index_ms: u64,
+    total_bytes: u64,
+    modified: std::time::SystemTime,
+    offset: u32,
+    n_data: u32,
 }
 
 /// 单次删除的执行前段状态，仅在批量删除中途失败时用于回滚。
@@ -4722,17 +5054,17 @@ struct DeleteRollback {
 
 /// 单元格稳定地址。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum CellId {
-    Src { rec: u32, col: ColumnId },
-    Ins { block: u32, row: u32, col: ColumnId },
+struct CellId {
+    row: RowId,
+    col: ColumnId,
 }
 
 /// 一个实际变化格子的批前/批后稀疏快照。
 #[derive(Clone, PartialEq, Debug)]
 struct CellChange {
     cell: CellId,
-    old: String,
-    new: String,
+    old: ValueRef,
+    new: ValueRef,
 }
 
 /// 一次清除操作的结构化目标；坐标均为未筛选的显示坐标。
@@ -4837,6 +5169,55 @@ impl NormalizedClear {
     }
 }
 
+/// 历史中独立拥有的 UTF-8 文本；Arc 只共享实际文本分配。
+#[derive(Debug, PartialEq)]
+struct SharedText {
+    text: Box<str>,
+}
+
+/// 历史值直接引用当前 backing 的源记录，或共享独立文本。
+#[derive(Clone, PartialEq, Debug)]
+enum ValueRef {
+    Source {
+        row: RowId,
+        col: ColumnId,
+        offset: u64,
+        raw_len: u64,
+        utf8_len: u64,
+        index_epoch: u64,
+    },
+    Text(Arc<SharedText>),
+}
+
+impl ValueRef {
+    fn text(value: String) -> Self {
+        if value.is_empty() {
+            static EMPTY: OnceLock<Arc<SharedText>> = OnceLock::new();
+            let text = EMPTY.get_or_init(|| {
+                Arc::new(SharedText { text: String::new().into_boxed_str() })
+            });
+            return Self::Text(Arc::clone(text));
+        }
+        Self::Text(Arc::new(SharedText { text: value.into_boxed_str() }))
+    }
+
+    fn add_own_cost(&self, cost: &mut Cost) -> Result<(), HistoryError> {
+        if let Self::Source { utf8_len, .. } = self {
+            cost.add(history_text_bytes(*utf8_len)?)?;
+        }
+        Ok(())
+    }
+
+    fn add_shared_charge(&self, charges: &mut Vec<SharedCharge>)
+        -> Result<(), HistoryError> {
+        if let Self::Text(text) = self {
+            let bytes = history_text_bytes(text.text.len() as u64)?;
+            charges.push(SharedCharge::of(text, bytes));
+        }
+        Ok(())
+    }
+}
+
 /// 粘贴末尾新增行的最终内容及其实际插入块。
 #[derive(Clone, PartialEq, Debug)]
 struct PasteInsert {
@@ -4848,7 +5229,7 @@ struct PasteInsert {
 /// 前向操作（重做执行它，撤销执行其逆）。
 #[derive(Clone, PartialEq, Debug)]
 enum Op {
-    SetCell { cell: CellId, old: String, new: String },
+    SetCell { cell: CellId, old: ValueRef, new: ValueRef },
     SetCells { changes: Vec<CellChange> },
     Paste { changes: Vec<CellChange>, inserted: Option<PasteInsert> },
     InsertRows { vpos: u64, block: u32, rows: Vec<Vec<String>> },
@@ -4878,21 +5259,21 @@ impl Op {
         cost.add_value::<Op>()?;
         match self {
             Op::SetCell { old, new, .. } => {
-                cost.add_string(old)?;
-                cost.add_string(new)?;
+                old.add_own_cost(&mut cost)?;
+                new.add_own_cost(&mut cost)?;
             }
             Op::SetCells { changes } => {
                 cost.add_vec(changes)?;
                 for change in changes {
-                    cost.add_string(&change.old)?;
-                    cost.add_string(&change.new)?;
+                    change.old.add_own_cost(&mut cost)?;
+                    change.new.add_own_cost(&mut cost)?;
                 }
             }
             Op::Paste { changes, inserted } => {
                 cost.add_vec(changes)?;
                 for change in changes {
-                    cost.add_string(&change.old)?;
-                    cost.add_string(&change.new)?;
+                    change.old.add_own_cost(&mut cost)?;
+                    change.new.add_own_cost(&mut cost)?;
                 }
                 if let Some(inserted) = inserted {
                     Self::rows_cost(&mut cost, &inserted.rows)?;
@@ -4908,14 +5289,30 @@ impl Op {
 
     fn history_entry(self) -> Result<HistoryEntry<Op>, HistoryError> {
         let own_bytes = self.history_cost()?;
-        let shared = match &self {
-            Op::RemoveRows { items } => items.iter().map(|item| match item {
-                DeletedRow::Src { snapshot, .. } | DeletedRow::Ins { snapshot, .. } => {
-                    snapshot.shared_charge()
+        let mut shared = Vec::new();
+        match &self {
+            Op::SetCell { old, new, .. } => {
+                old.add_shared_charge(&mut shared)?;
+                new.add_shared_charge(&mut shared)?;
+            }
+            Op::SetCells { changes } | Op::Paste { changes, .. } => {
+                for change in changes {
+                    change.old.add_shared_charge(&mut shared)?;
+                    change.new.add_shared_charge(&mut shared)?;
                 }
-            }).collect(),
-            _ => Vec::new(),
-        };
+            }
+            Op::RemoveRows { items } => {
+                for item in items {
+                    let snapshot = match item {
+                        DeletedRow::Src { snapshot, .. }
+                        | DeletedRow::Ins { snapshot, .. }
+                        | DeletedRow::Suspended { snapshot, .. } => snapshot,
+                    };
+                    shared.push(snapshot.shared_charge());
+                }
+            }
+            Op::InsertRows { .. } => {}
+        }
         Ok(HistoryEntry::new(self, own_bytes, shared, 1))
     }
 }
@@ -4965,6 +5362,15 @@ pub struct FilterPage {
 pub struct FilterStats {
     /// 实际参与匹配的行数（前缀收窄时小于总行数；完全相同条件为 0）。
     pub scanned_rows: u64,
+}
+
+/// 保存是否落盘，或需要用户确认的固定点请求。
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveOutcome {
+    pub saved: bool,
+    pub fixed_point: Option<crate::history::FixedPointRequest>,
+    pub cancelled: bool,
 }
 
 /// 打开后的元数据。
@@ -6003,6 +6409,8 @@ pub struct BigFile {
     /// 删除快照和后续固定点 generation 的会话独占临时目录。
     spool: SessionSpool,
     history_generation: u64,
+    /// backing 与索引替换代际；Source 历史值只能读取同一代。
+    index_epoch: u64,
     fixed_point: bool,
     savepoint_detached: bool,
     base_size: u64,
@@ -6153,6 +6561,7 @@ impl BigFile {
             history: HistoryLedger::new(DEFAULT_HISTORY_BUDGET_BYTES),
             spool,
             history_generation: 0,
+            index_epoch: 0,
             fixed_point: false,
             savepoint_detached: false,
             base_size: total_bytes,
@@ -6342,6 +6751,7 @@ impl BigFile {
             history: HistoryLedger::new(DEFAULT_HISTORY_BUDGET_BYTES),
             spool,
             history_generation: 0,
+            index_epoch: 0,
             fixed_point: false,
             savepoint_detached: false,
             base_size: meta.len(),
@@ -7219,8 +7629,9 @@ impl BigFile {
 
     /// 读取单元格当前值（编辑前旧值用）。
     fn cell_value(&self, cell: CellId) -> String {
-        match cell {
-            CellId::Src { rec, col } => {
+        match cell.row {
+            RowId::Source(rec) => {
+                let col = cell.col;
                 if let Some(value) = self.overlay.get(&(rec, col)) {
                     return value.clone();
                 }
@@ -7233,7 +7644,8 @@ impl BigFile {
                     _ => String::new(),
                 }
             }
-            CellId::Ins { block, row, col } => {
+            RowId::Inserted { block, row } => {
+                let col = cell.col;
                 let Some(slot) = self
                     .schema
                     .storage(col)
@@ -7251,6 +7663,29 @@ impl BigFile {
                     .unwrap_or_default()
             }
         }
+    }
+
+    /// 将批前文本转换为稳定历史值；未覆盖源格只记录 backing 范围。
+    fn history_value(&self, cell: CellId, old: String) -> ValueRef {
+        if !old.is_empty() {
+            if let RowId::Source(rec) = cell.row {
+                if !self.overlay.contains_key(&(rec, cell.col))
+                    && matches!(self.schema.storage(cell.col), Some(ColumnStorage::Source(_)))
+                {
+                    if let Some((start, end)) = self.src_span(rec) {
+                        return ValueRef::Source {
+                            row: cell.row,
+                            col: cell.col,
+                            offset: start as u64,
+                            raw_len: (end - start) as u64,
+                            utf8_len: old.len() as u64,
+                            index_epoch: self.index_epoch,
+                        };
+                    }
+                }
+            }
+        }
+        ValueRef::text(old)
     }
 
     /// 将显示行与 committed 视图列解析为稳定格地址，供批量写入预检使用。
@@ -7280,8 +7715,8 @@ impl BigFile {
             self.seg.resolve(vrow).ok_or("行号越界")?
         };
         Ok(match resolved {
-            ResolvedRow::Src(rec) => CellId::Src { rec, col },
-            ResolvedRow::Ins { block, row } => CellId::Ins { block, row, col },
+            ResolvedRow::Src(rec) => CellId { row: RowId::Source(rec), col },
+            ResolvedRow::Ins { block, row } => CellId { row: RowId::Inserted { block, row }, col },
         })
     }
 
@@ -7318,7 +7753,8 @@ impl BigFile {
         for (cell, new) in deduped {
             let old = self.cell_value(cell);
             if old != new {
-                changes.push(CellChange { cell, old, new });
+                let old = self.history_value(cell, old);
+                changes.push(CellChange { cell, old, new: ValueRef::text(new) });
             }
         }
         Ok(changes)
@@ -7347,6 +7783,21 @@ impl BigFile {
 
     fn next_history_generation(&self) -> Result<u64, String> {
         self.history_generation.checked_add(1).ok_or("历史代际溢出".into())
+    }
+
+    fn save_fixed_point_request(
+        &self,
+        kind: FixedPointKind,
+        operation: String,
+    ) -> FixedPointRequest {
+        let stats = self.history.stats();
+        FixedPointRequest {
+            kind,
+            operation,
+            required_bytes: stats.bytes,
+            budget_bytes: stats.budget_bytes,
+            preflight_id: self.history_generation,
+        }
     }
 
     fn clear_history_at_fixed_point(&mut self, next_generation: u64) {
@@ -7462,8 +7913,9 @@ impl BigFile {
                 .checked_add(1)
                 .ok_or_else(|| history_cost_error(HistoryError::CostOverflow))?;
             estimated.add_value::<CellChange>().map_err(history_cost_error)?;
-            estimated.add_string(&old).map_err(history_cost_error)?;
-            // 新值为空 String，容量成本为 0。
+            let old_bytes = history_text_bytes(old.len() as u64).map_err(history_cost_error)?;
+            estimated.add(old_bytes).map_err(history_cost_error)?;
+            // 新空值共享一份空文本；实际共享账目在 preflight_history 复核。
             Ok(())
         })?;
         if change_count == 0 {
@@ -7498,7 +7950,8 @@ impl BigFile {
             let cell = self.resolve_batch_cell(vrow, col)?;
             let old = self.cell_value(cell);
             if !old.is_empty() {
-                changes.push(CellChange { cell, old, new: String::new() });
+                let old = self.history_value(cell, old);
+                changes.push(CellChange { cell, old, new: ValueRef::text(String::new()) });
             }
             Ok(())
         })?;
@@ -7673,15 +8126,15 @@ impl BigFile {
             self.seg.resolve(vrow).ok_or("行号越界")?
         };
         let cell = match resolved {
-            ResolvedRow::Src(rec) => CellId::Src { rec, col },
-            ResolvedRow::Ins { block, row } => CellId::Ins { block, row, col },
+            ResolvedRow::Src(rec) => CellId { row: RowId::Source(rec), col },
+            ResolvedRow::Ins { block, row } => CellId { row: RowId::Inserted { block, row }, col },
         };
         let old = self.cell_value(cell);
         if old == value {
             return Ok(EditOutcome::unchanged());
         }
         let (mut prepared, fixed_point) = match self.preflight_history(
-            Op::SetCell { cell, old, new: value },
+            Op::SetCell { cell, old: self.history_value(cell, old), new: ValueRef::text(value) },
             "编辑单元格",
             approval,
         )? {
@@ -7869,10 +8322,10 @@ impl BigFile {
     /// 原地执行并归一化插入块号；不克隆整条操作。
     fn apply(&mut self, op: &mut Op) {
         match op {
-            Op::SetCell { cell, new, .. } => self.write_cell(*cell, new),
+            Op::SetCell { cell, new, .. } => self.write_value(*cell, new),
             Op::SetCells { changes } => {
                 for change in changes {
-                    self.write_cell(change.cell, &change.new);
+                    self.write_value(change.cell, &change.new);
                 }
             }
             Op::Paste { changes, inserted } => {
@@ -7880,7 +8333,7 @@ impl BigFile {
                     inserted.block = self.seg.insert_block(inserted.vpos, inserted.rows.clone());
                 }
                 for change in changes {
-                    self.write_cell(change.cell, &change.new);
+                    self.write_value(change.cell, &change.new);
                 }
             }
             Op::InsertRows { vpos, block, rows } => {
@@ -7888,11 +8341,15 @@ impl BigFile {
             }
             Op::RemoveRows { items } => {
                 items.sort_by_key(|item| match item {
-                    DeletedRow::Src { vpos, .. } | DeletedRow::Ins { vpos, .. } => *vpos,
+                    DeletedRow::Src { vpos, .. }
+                    | DeletedRow::Ins { vpos, .. }
+                    | DeletedRow::Suspended { vpos, .. } => *vpos,
                 });
                 for item in items.iter().rev() {
                     let vpos = match item {
-                        DeletedRow::Src { vpos, .. } | DeletedRow::Ins { vpos, .. } => *vpos,
+                        DeletedRow::Src { vpos, .. }
+                    | DeletedRow::Ins { vpos, .. }
+                    | DeletedRow::Suspended { vpos, .. } => *vpos,
                     };
                     let _ = self.seg.delete_one(vpos);
                 }
@@ -7900,12 +8357,26 @@ impl BigFile {
         }
     }
 
+    /// 从共享文本或其原始 backing 记录读取历史值，再写入稳定格地址。
+    fn write_value(&mut self, cell: CellId, value: &ValueRef) {
+        match value {
+            ValueRef::Text(text) => self.write_cell(cell, &text.text),
+            ValueRef::Source { .. } => {
+                if let Ok(value) = self.source_value_text(value) {
+                    self.write_cell(cell, &value);
+                }
+            }
+        }
+    }
+
     fn write_cell(&mut self, cell: CellId, value: &str) {
-        match cell {
-            CellId::Src { rec, col } => {
+        match cell.row {
+            RowId::Source(rec) => {
+                let col = cell.col;
                 self.overlay.insert((rec, col), value.to_string());
             }
-            CellId::Ins { block, row, col } => {
+            RowId::Inserted { block, row } => {
+                let col = cell.col;
                 let Some(slot) = self
                     .schema
                     .storage(col)
@@ -7984,7 +8455,7 @@ impl BigFile {
     /// 插行/扩行粘贴重做换块后，重写后续重做记录里的稳定格地址。
     fn rebind_redo_cells(&mut self, old_block: u32, new_block: u32) {
         fn rebind(cell: &mut CellId, old_block: u32, new_block: u32) {
-            if let CellId::Ins { block, .. } = cell {
+            if let RowId::Inserted { block, .. } = &mut cell.row {
                 if *block == old_block {
                     *block = new_block;
                 }
@@ -7998,32 +8469,129 @@ impl BigFile {
                         rebind(&mut change.cell, old_block, new_block);
                     }
                 }
-                Op::InsertRows { .. } | Op::RemoveRows { .. } => {}
+                Op::InsertRows { .. } => {}
+                Op::RemoveRows { items } => {
+                    for item in items {
+                        if let DeletedRow::Ins { block, .. } = item {
+                            if *block == old_block {
+                                *block = new_block;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
-    /// 校验并摘除撤销所需的完整插入块；失败时不修改段表。
-    fn remove_inserted_block_for_undo(&mut self, vpos: u64, rows: &[Vec<String>]) -> bool {
-        let Some((i, off)) = self.seg.locate(vpos) else {
-            return false;
-        };
-        let SegKind::Ins { block } = self.seg.segs[i].kind else {
-            return false;
-        };
-        let same = off == 0
-            && self.seg.segs[i].len == rows.len() as u32
-            && self
-                .seg
-                .blocks
-                .get(block as usize)
-                .and_then(|b| b.as_ref())
-                .is_some_and(|r| *r == rows);
-        if !same {
-            return false;
+    /// 保存后撤销物化插行：后续 redo 中的 Source 行改回原 Inserted 身份。
+    fn rebind_redo_materialized(&mut self, mappings: &[(u32, u32)], block: u32) {
+        if mappings.is_empty() {
+            return;
         }
-        self.seg.segs.remove(i);
-        self.seg.blocks[block as usize] = None;
+        let rows_by_rec: HashMap<u32, u32> = mappings.iter().copied().collect();
+        fn rebind_cell(cell: &mut CellId, mappings: &HashMap<u32, u32>, block: u32) {
+            if let RowId::Source(rec) = cell.row {
+                if let Some(row) = mappings.get(&rec) {
+                    cell.row = RowId::Inserted { block, row: *row };
+                }
+            }
+        }
+        for op in self.history.redo_ops_mut() {
+            match op {
+                Op::SetCell { cell, .. } => rebind_cell(cell, &rows_by_rec, block),
+                Op::SetCells { changes } | Op::Paste { changes, .. } => {
+                    for change in changes {
+                        rebind_cell(&mut change.cell, &rows_by_rec, block);
+                    }
+                }
+                Op::RemoveRows { items } => {
+                    for item in items {
+                        let replacement = match item {
+                            DeletedRow::Src { vpos, rec, snapshot, snapshot_row } => {
+                                rows_by_rec.get(rec).map(|row| DeletedRow::Ins {
+                                    vpos: *vpos,
+                                    block,
+                                    row: *row,
+                                    snapshot: snapshot.clone(),
+                                    snapshot_row: *snapshot_row,
+                                })
+                            }
+                            DeletedRow::Ins { .. } | DeletedRow::Suspended { .. } => None,
+                        };
+                        if let Some(replacement) = replacement {
+                            *item = replacement;
+                        }
+                    }
+                }
+                Op::InsertRows { .. } => {}
+            }
+        }
+    }
+
+    /// 校验并摘除撤销插入；保存后的物化 Source 行也按同一逻辑块处理。
+    fn remove_inserted_block_for_undo(
+        &mut self,
+        vpos: u64,
+        block: u32,
+        rows: &[Vec<String>],
+    ) -> bool {
+        if let Some((i, off)) = self.seg.locate(vpos) {
+            if let SegKind::Ins { block: current } = self.seg.segs[i].kind {
+                let covers = off == 0 && self.seg.segs[i].len == rows.len() as u32;
+                if covers && current != block {
+                    return false;
+                }
+                let same = covers
+                    && self.seg.blocks.get(current as usize)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|current_rows| current_rows.as_slice() == rows);
+                if same {
+                    self.seg.segs.remove(i);
+                    self.seg.blocks[current as usize] = None;
+                    return true;
+                }
+            }
+        }
+
+        // 保存把插入行物化为 Source。先验证整段身份和最终内容，再倒序删除，
+        // 使任何可预见失败都发生在首次写入之前。
+        let mut materialized = Vec::new();
+        for (offset, expected) in rows.iter().enumerate() {
+            let Ok(offset_u64) = u64::try_from(offset) else { return false };
+            let Some(vrow) = vpos.checked_add(offset_u64) else { return false };
+            let Some(resolved) = self.seg.resolve(vrow) else { return false };
+            let actual = match resolved {
+                ResolvedRow::Src(rec) => {
+                    if rec.checked_add(1).is_none() {
+                        return false;
+                    }
+                    self.src_fields(rec)
+                }
+                ResolvedRow::Ins { block, row } => {
+                    let exists = self.seg.blocks.get(block as usize)
+                        .and_then(Option::as_ref)
+                        .and_then(|block_rows| block_rows.get(row as usize))
+                        .is_some();
+                    if !exists {
+                        return false;
+                    }
+                    self.ins_fields(block, row)
+                }
+            };
+            if actual.as_slice() != expected.as_slice() {
+                return false;
+            }
+            if let ResolvedRow::Src(rec) = resolved {
+                let Ok(row) = u32::try_from(offset) else { return false };
+                materialized.push((rec, row));
+            }
+        }
+        for offset in (0..rows.len()).rev() {
+            let vrow = vpos + offset as u64;
+            let removed = self.seg.delete_one(vrow);
+            debug_assert!(removed.is_some(), "预检后的插行逆删除必须成功");
+        }
+        self.rebind_redo_materialized(&materialized, block);
         true
     }
 
@@ -8031,28 +8599,32 @@ impl BigFile {
     fn apply_inverse(&mut self, op: &Op) -> bool {
         match op {
             Op::SetCell { cell, old, .. } => {
-                self.write_cell(*cell, old);
+                self.write_value(*cell, old);
                 true
             }
             Op::SetCells { changes } => {
                 for change in changes {
-                    self.write_cell(change.cell, &change.old);
+                    self.write_value(change.cell, &change.old);
                 }
                 true
             }
             Op::Paste { changes, inserted } => {
                 if let Some(inserted) = inserted {
-                    if !self.remove_inserted_block_for_undo(inserted.vpos, &inserted.rows) {
+                    if !self.remove_inserted_block_for_undo(
+                        inserted.vpos,
+                        inserted.block,
+                        &inserted.rows,
+                    ) {
                         return false;
                     }
                 }
                 for change in changes {
-                    self.write_cell(change.cell, &change.old);
+                    self.write_value(change.cell, &change.old);
                 }
                 true
             }
-            Op::InsertRows { vpos, rows, .. } => {
-                self.remove_inserted_block_for_undo(*vpos, rows)
+            Op::InsertRows { vpos, block, rows } => {
+                self.remove_inserted_block_for_undo(*vpos, *block, rows)
             }
             Op::RemoveRows { items } => {
                 // 任何写入前验证全部插入块，后续失败不得留下前序源行恢复。
@@ -8063,16 +8635,27 @@ impl BigFile {
                 let visible = self.schema.visible().to_vec();
                 let restored = items.iter().map(|item| match item {
                     DeletedRow::Src { snapshot, snapshot_row, .. }
-                    | DeletedRow::Ins { snapshot, snapshot_row, .. } => {
+                    | DeletedRow::Ins { snapshot, snapshot_row, .. }
+                    | DeletedRow::Suspended { snapshot, snapshot_row, .. } => {
                         snapshot.read_row(*snapshot_row as usize)
                     }
                 }).collect::<Result<Vec<_>, _>>();
                 let Ok(restored) = restored else { return false };
                 if items.iter().zip(&restored).any(|(item, cells)| {
-                    matches!(item, DeletedRow::Src { .. }) && cells.len() != visible.len()
+                    matches!(item, DeletedRow::Src { .. } | DeletedRow::Suspended { .. })
+                        && cells.len() != visible.len()
                 }) {
                     return false;
                 }
+                // suspended 快照是逻辑列序；所有存储转换都在首次写入前完成。
+                let restored = items.iter().zip(restored).map(|(item, cells)| {
+                    if matches!(item, DeletedRow::Suspended { .. }) {
+                        self.logical_rows_to_storage(vec![cells]).ok()?.pop()
+                    } else {
+                        Some(cells)
+                    }
+                }).collect::<Option<Vec<_>>>();
+                let Some(restored) = restored else { return false };
                 for (item, cells) in items.iter().zip(restored) {
                     match item {
                         DeletedRow::Src { vpos, rec, .. } => {
@@ -8088,6 +8671,11 @@ impl BigFile {
                         }
                         DeletedRow::Ins { vpos, block, row, .. } => {
                             if !self.seg.restore_inserted(*vpos, *block, *row, cells) {
+                                return false;
+                            }
+                        }
+                        DeletedRow::Suspended { vpos, block, .. } => {
+                            if !self.seg.restore_inserted(*vpos, *block, 0, cells) {
                                 return false;
                             }
                         }
@@ -8545,13 +9133,17 @@ impl BigFile {
     /// 进度回调 `(加权done, total, 阶段, 行数)`：加权把总体进度切给
     /// 流式 0-70% / 落盘 70-78% / 重建索引至 100%（见 PHASE_* 常量注释）。
     /// 保存后重建 mmap 与索引；撤销栈保留（操作按稳定记录号寻址，仍有效）。
-    pub fn save<F: FnMut(u64, u64, u8, u64)>(&mut self, progress: F) -> Result<(), String> {
+    pub fn save<F: FnMut(u64, u64, u8, u64)>(
+        &mut self,
+        approval: Approval,
+        progress: F,
+    ) -> Result<SaveOutcome, String> {
         // 新建内存档没有磁盘路径：直存无目标，必须另存为。
         if !self.has_path() {
             return Err("未命名表格：请先另存为".into());
         }
         let dest = self.path.clone();
-        self.save_to(&dest, false, progress)
+        self.save_to(&dest, false, approval, progress)
     }
 
     /// 另存为：把当前视图（覆盖层/插入/删除/排序合并）流式写到 `target`。
@@ -8560,25 +9152,284 @@ impl BigFile {
     pub fn save_as<F: FnMut(u64, u64, u8, u64)>(
         &mut self,
         target: &Path,
+        approval: Approval,
         progress: F,
-    ) -> Result<(), String> {
+    ) -> Result<SaveOutcome, String> {
         // 目标就是当前文件：按普通保存处理（同一路径无需“切换会话”）
         if target == self.path {
-            return self.save(progress);
+            return self.save(approval, progress);
         }
-        self.save_to(target, true, progress)
+        self.save_to(target, true, approval, progress)
+    }
+
+    /// 当前逻辑行序对应的普通保存基线映射。
+    fn build_baseline_transform(&self) -> Result<(BaselineTransform, usize), String> {
+        let mut transform = BaselineTransform::default();
+        transform.deleted_sources = self.seg.tombstones.clone();
+        for (index, id) in self.schema.visible().iter().enumerate() {
+            let index = u32::try_from(index).map_err(|_| "保存列号溢出")?;
+            transform.columns.insert(*id, index);
+        }
+        let mut new_rec = self.record_offset();
+        for seg in &self.seg.segs {
+            match seg.kind {
+                SegKind::Src { start, len } => {
+                    for offset in 0..len {
+                        let old_rec = start.checked_add(offset).ok_or("源记录号溢出")?;
+                        transform.push_surviving_source(old_rec, new_rec)?;
+                        new_rec = new_rec.checked_add(1).ok_or("保存记录号溢出")?;
+                    }
+                }
+                SegKind::Ins { block } => {
+                    let rows = self.seg.blocks.get(block as usize)
+                        .and_then(Option::as_ref).ok_or("插入块在保存前已失效")?;
+                    for row in 0..rows.len() {
+                        let row = u32::try_from(row).map_err(|_| "插入行号溢出")?;
+                        if transform.inserted_rows.insert((block, row), new_rec).is_some() {
+                            return Err("插入行保存映射重复".into());
+                        }
+                        new_rec = new_rec.checked_add(1).ok_or("保存记录号溢出")?;
+                    }
+                }
+            }
+        }
+
+        // 仅为历史仍引用的已删除 Source 分配 suspended 块，避免按全部 tombstone 扩容。
+        fn collect_cell(cell: &CellId, deleted: &BTreeSet<u32>, out: &mut BTreeSet<u32>) {
+            if let RowId::Source(rec) = cell.row {
+                if deleted.contains(&rec) {
+                    out.insert(rec);
+                }
+            }
+        }
+        fn collect_op(op: &Op, deleted: &BTreeSet<u32>, out: &mut BTreeSet<u32>) {
+            match op {
+                Op::SetCell { cell, .. } => collect_cell(cell, deleted, out),
+                Op::SetCells { changes } | Op::Paste { changes, .. } => {
+                    for change in changes {
+                        collect_cell(&change.cell, deleted, out);
+                    }
+                }
+                Op::RemoveRows { items } => {
+                    for item in items {
+                        if let DeletedRow::Src { rec, .. } = item {
+                            if deleted.contains(rec) {
+                                out.insert(*rec);
+                            }
+                        }
+                    }
+                }
+                Op::InsertRows { .. } => {}
+            }
+        }
+        let mut suspended = BTreeSet::new();
+        for entry in self.history.iter_undo() {
+            collect_op(&entry.op, &transform.deleted_sources, &mut suspended);
+        }
+        for entry in self.history.iter_redo() {
+            collect_op(&entry.op, &transform.deleted_sources, &mut suspended);
+        }
+        let mut next_block = u32::try_from(self.seg.blocks.len())
+            .map_err(|_| "suspended 块号溢出")?;
+        for rec in suspended {
+            let block = next_block;
+            next_block = next_block.checked_add(1).ok_or("suspended 块号溢出")?;
+            transform.suspended_rows.insert(rec, block);
+        }
+        let block_slots = usize::try_from(next_block).map_err(|_| "suspended 块槽越界")?;
+        Ok((transform, block_slots))
+    }
+
+    /// 将一条历史操作转换到新物理基线；旧 backing 的 Source 值迁移为 Text。
+    fn transform_op_for_save(&self, op: &Op, transform: &BaselineTransform)
+        -> Result<Op, String> {
+        let map_cell = |cell: &CellId| -> Result<CellId, String> {
+            if !transform.columns.contains_key(&cell.col) {
+                return Err("历史列已不在保存结构中".into());
+            }
+            let row = match cell.row {
+                RowId::Source(rec) => {
+                    if let Some(mapped) = transform.map_source(rec) {
+                        RowId::Source(mapped)
+                    } else if let Some(block) = transform.suspended_rows.get(&rec) {
+                        RowId::Inserted { block: *block, row: 0 }
+                    } else {
+                        return Err(format!("Source 记录 {rec} 无法映射到保存基线"));
+                    }
+                }
+                RowId::Inserted { block, row } => {
+                    if let Some(mapped) = transform.inserted_rows.get(&(block, row)) {
+                        RowId::Source(*mapped)
+                    } else {
+                        RowId::Inserted { block, row }
+                    }
+                }
+            };
+            Ok(CellId { row, col: cell.col })
+        };
+        let map_value = |value: &ValueRef| -> Result<ValueRef, String> {
+            match value {
+                ValueRef::Text(text) => Ok(ValueRef::Text(Arc::clone(text))),
+                ValueRef::Source { .. } => Ok(ValueRef::text(self.source_value_text(value)?)),
+            }
+        };
+        let map_changes = |changes: &[CellChange]| -> Result<Vec<CellChange>, String> {
+            changes.iter().map(|change| {
+                Ok(CellChange {
+                    cell: map_cell(&change.cell)?,
+                    old: map_value(&change.old)?,
+                    new: map_value(&change.new)?,
+                })
+            }).collect()
+        };
+        Ok(match op {
+            Op::SetCell { cell, old, new } => Op::SetCell {
+                cell: map_cell(cell)?, old: map_value(old)?, new: map_value(new)?,
+            },
+            Op::SetCells { changes } => Op::SetCells { changes: map_changes(changes)? },
+            Op::Paste { changes, inserted } => Op::Paste {
+                changes: map_changes(changes)?, inserted: inserted.clone(),
+            },
+            Op::InsertRows { .. } => op.clone(),
+            Op::RemoveRows { items } => {
+                let mut mapped = Vec::with_capacity(items.len());
+                for item in items {
+                    mapped.push(match item {
+                        DeletedRow::Src { vpos, rec, snapshot, snapshot_row } => {
+                            if let Some(mapped) = transform.map_source(*rec) {
+                                DeletedRow::Src {
+                                    vpos: *vpos, rec: mapped, snapshot: snapshot.clone(),
+                                    snapshot_row: *snapshot_row,
+                                }
+                            } else if let Some(block) = transform.suspended_rows.get(rec) {
+                                DeletedRow::Suspended {
+                                    vpos: *vpos, block: *block, snapshot: snapshot.clone(),
+                                    snapshot_row: *snapshot_row,
+                                }
+                            } else {
+                                return Err(format!("删除历史 Source 记录 {rec} 无法映射"));
+                            }
+                        }
+                        DeletedRow::Ins { vpos, block, row, snapshot, snapshot_row } => {
+                            if let Some(rec) = transform.inserted_rows.get(&(*block, *row)) {
+                                DeletedRow::Src {
+                                    vpos: *vpos, rec: *rec, snapshot: snapshot.clone(),
+                                    snapshot_row: *snapshot_row,
+                                }
+                            } else {
+                                DeletedRow::Ins {
+                                    vpos: *vpos, block: *block, row: *row,
+                                    snapshot: snapshot.clone(), snapshot_row: *snapshot_row,
+                                }
+                            }
+                        }
+                        DeletedRow::Suspended { vpos, block, snapshot, snapshot_row } => {
+                            if let Some(rec) = transform.inserted_rows.get(&(*block, 0)) {
+                                DeletedRow::Src {
+                                    vpos: *vpos, rec: *rec, snapshot: snapshot.clone(),
+                                    snapshot_row: *snapshot_row,
+                                }
+                            } else {
+                                DeletedRow::Suspended {
+                                    vpos: *vpos, block: *block, snapshot: snapshot.clone(),
+                                    snapshot_row: *snapshot_row,
+                                }
+                            }
+                        }
+                    });
+                }
+                Op::RemoveRows { items: mapped }
+            }
+        })
+    }
+
+    /// 读取 Source 历史值，并核对 backing 代际、记录区间和逻辑长度。
+    fn source_value_text(&self, value: &ValueRef) -> Result<String, String> {
+        let ValueRef::Source { row, col, offset, raw_len, utf8_len, index_epoch } = value else {
+            return Err("非 Source 历史值".into());
+        };
+        if *index_epoch != self.index_epoch {
+            return Err("Source 历史值所属 backing 代际已过期".into());
+        }
+        let RowId::Source(rec) = *row else {
+            return Err("Source 历史值没有源记录身份".into());
+        };
+        let start = usize::try_from(*offset).map_err(|_| "Source 偏移越界")?;
+        let raw_len = usize::try_from(*raw_len).map_err(|_| "Source 长度越界")?;
+        let end = start.checked_add(raw_len).ok_or("Source 区间溢出")?;
+        if self.src_span(rec) != Some((start, end)) {
+            return Err("Source 历史值记录区间已变化".into());
+        }
+        let raw = self.bytes().get(start..end).ok_or("Source 区间越界")?;
+        let Some(ColumnStorage::Source(slot)) = self.schema.storage(*col) else {
+            return Err("Source 历史值列已不是物理源列".into());
+        };
+        let decoded = decode_slice(self.enc, raw);
+        let fields = parse_record(&decoded, b',');
+        let value = fields.get(slot as usize).cloned().unwrap_or_default();
+        if value.len() as u64 != *utf8_len {
+            return Err("Source 历史值逻辑长度已变化".into());
+        }
+        Ok(value)
+    }
+
+    /// 转换一个方向的完整历史栈，保留原始 revision_delta。
+    fn transform_entries_for_save<'a>(
+        &self,
+        entries: impl Iterator<Item = &'a HistoryEntry<Op>>,
+        transform: &BaselineTransform,
+    ) -> Result<VecDeque<HistoryEntry<Op>>, String> {
+        let mut converted = VecDeque::new();
+        for entry in entries {
+            let operation = match &entry.op {
+                Op::SetCell { .. } => "编辑单元格",
+                Op::SetCells { .. } => "批量编辑单元格",
+                Op::Paste { .. } => "粘贴区域",
+                Op::InsertRows { .. } => "插入行",
+                Op::RemoveRows { .. } => "删除行",
+            };
+            let op = self.transform_op_for_save(&entry.op, transform)
+                .map_err(|error| format!("{operation}：{error}"))?;
+            let mut transformed = op.history_entry().map_err(history_cost_error)?;
+            transformed.revision_delta = entry.revision_delta;
+            converted.push_back(transformed);
+        }
+        Ok(converted)
+    }
+
+    /// 在旧数据与旧账本仍有效时完成全部可失败的历史转换和重建计费。
+    fn prepare_history_for_save(&self) -> Result<PreparedSaveHistory, String> {
+        let (transform, block_slots) = self.build_baseline_transform()?;
+        let undo = self.transform_entries_for_save(self.history.iter_undo(), &transform)?;
+        let redo = self.transform_entries_for_save(self.history.iter_redo(), &transform)?;
+        let history = HistoryLedger::prepare_rebuild(
+            undo,
+            redo,
+            self.history.stats().budget_bytes,
+        ).map_err(history_cost_error)?;
+        let mut blocks = Vec::new();
+        blocks.try_reserve_exact(block_slots)
+            .map_err(|_| "保存历史块槽内存不足".to_string())?;
+        blocks.resize(block_slots, None);
+        Ok(PreparedSaveHistory { history, blocks })
     }
 
     /// `save`/`save_as` 共用实现。
     ///
     /// @param dest 写盘目标（另存为的新路径，或当前文件路径）。
     /// @param switch_path 成功后是否把会话路径切到 `dest`（另存为为 true）。
-    fn save_to<F: FnMut(u64, u64, u8, u64)>(
+    pub fn save_to<F: FnMut(u64, u64, u8, u64)>(
         &mut self,
         dest: &Path,
         switch_path: bool,
+        approval: Approval,
         mut progress: F,
-    ) -> Result<(), String> {
+    ) -> Result<SaveOutcome, String> {
+        if approval.allow_fixed_point
+            && approval.preflight_id != Some(self.history_generation)
+        {
+            return Err("固定点预检已过期，请重试本次保存".into());
+        }
         self.require_editable()?;
         self.refresh_indexed();
         if self.is_indexing() {
@@ -8594,8 +9445,44 @@ impl BigFile {
             }
         }
         let next_history_generation = self.next_history_generation()?;
+        let next_index_epoch = self.index_epoch.checked_add(1).ok_or("索引代际溢出")?;
         // 整表重写数十秒：本线程降为背景优先级，让出 UI/系统调度。
         let _bg = bg::BackgroundGuard::enter();
+        let sorted_order = self.order.clone();
+        if sorted_order.is_some()
+            && self.history.stats().undo_count + self.history.stats().redo_count > 0
+            && !approval.allow_fixed_point
+        {
+            let request = self.save_fixed_point_request(
+                FixedPointKind::SortMaterialization,
+                "按当前排序保存并物化行序".into(),
+            );
+            return Ok(SaveOutcome {
+                saved: false,
+                fixed_point: Some(request),
+                cancelled: false,
+            });
+        }
+        let prepared_history = if sorted_order.is_some() {
+            None
+        } else {
+            match self.prepare_history_for_save() {
+                Ok(prepared) => Some(prepared),
+                Err(operation) => {
+                    if !approval.allow_fixed_point {
+                        return Ok(SaveOutcome {
+                            saved: false,
+                            fixed_point: Some(self.save_fixed_point_request(
+                                FixedPointKind::SaveTransform,
+                                operation,
+                            )),
+                            cancelled: false,
+                        });
+                    }
+                    None
+                }
+            }
+        };
         // 临时文件放在目标同目录：换名是同卷原子操作，也保证另存为不碰原文件
         let tmp = tmp_path_for(dest);
         let out = fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
@@ -8615,7 +9502,6 @@ impl BigFile {
             self.overlay.keys().map(|k| k.0).collect();
         let mut done = 0u64;
         let mut last_emit: Option<Instant> = None;
-        let sorted_order = self.order.clone();
         if let Some(order) = &sorted_order {
             // 排序保存：按当前视图顺序逐行写出；物理顺序即所得。
             for &orig in order.iter() {
@@ -8650,12 +9536,14 @@ impl BigFile {
             w.flush().map_err(|e| e.to_string())?;
             drop(w);
             progress(flushed_weighted(total), total, PHASE_FLUSH, done);
+            let prepared_reopen = self.prepare_reopen(&tmp)?;
             self.replace_with_retry(&tmp, dest)?;
             if switch_path {
                 self.path = dest.to_path_buf();
             }
             progress(renamed_weighted(total), total, PHASE_FLUSH, done);
-            self.reopen_after_write()?;
+            self.commit_reopen(prepared_reopen);
+            self.index_epoch = next_index_epoch;
             // 排序物化仍是固定点；成功保存本身重新建立干净保存点。
             self.order = None;
             self.history.clear();
@@ -8664,7 +9552,11 @@ impl BigFile {
             self.savepoint_detached = false;
             self.history_generation = next_history_generation;
             progress(total, total, PHASE_REINDEX, total);
-            return Ok(());
+            return Ok(SaveOutcome {
+                saved: true,
+                fixed_point: None,
+                cancelled: false,
+            });
         }
         for s in &self.seg.segs {
             match s.kind {
@@ -8717,17 +9609,30 @@ impl BigFile {
         w.flush().map_err(|e| e.to_string())?;
         drop(w);
         progress(flushed_weighted(total), total, PHASE_FLUSH, done);
+        let prepared_reopen = self.prepare_reopen(&tmp)?;
         self.replace_with_retry(&tmp, dest)?;
         if switch_path {
             self.path = dest.to_path_buf();
         }
         progress(renamed_weighted(total), total, PHASE_FLUSH, done);
-        self.reopen_after_write()?;
+        self.commit_reopen(prepared_reopen);
+        self.index_epoch = next_index_epoch;
+        if let Some(prepared) = prepared_history {
+            self.seg.blocks = prepared.blocks;
+            self.history.commit_rebuild(prepared.history);
+        } else {
+            self.history.clear();
+            self.fixed_point = true;
+        }
         self.revision = 0;
         self.savepoint_detached = false;
         self.history_generation = next_history_generation; // 内存状态与磁盘一致
         progress(total, total, PHASE_REINDEX, total); // 收尾必到满，前端进度条归零前显示 100%
-        Ok(())
+        Ok(SaveOutcome {
+            saved: true,
+            fixed_point: None,
+            cancelled: false,
+        })
     }
 
     /// 执行待执行的列操作：流式重写（物理列映射），完成后重建会话。
@@ -8908,36 +9813,52 @@ impl BigFile {
         ))
     }
 
-    /// 写盘后重建 mmap/索引；编辑层已落盘故清空，撤销栈保留。
-    fn reopen_after_write(&mut self) -> Result<(), String> {
-        debug_assert!(self.has_path(), "reopen_after_write 需要磁盘路径（save_to 落位后必达）");
+    /// 在临时路径完成 mmap、索引和预期记录数校验，失败时尚未替换目标。
+    fn prepare_reopen(&self, path: &Path) -> Result<PreparedReopen, String> {
         let t0 = Instant::now();
         let n_data = self.seg.vrow_count();
         let offset = self.record_offset();
-        let file = fs::File::open(&self.path).map_err(|e| e.to_string())?;
+        let file = fs::File::open(path).map_err(|e| e.to_string())?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
         let mmap = Arc::new(unsafe {
             memmap2::MmapOptions::new().map(&file).map_err(|e| e.to_string())?
         });
         let bytes: &[u8] = &mmap;
         let idx = build_index(bytes);
-        if idx.n_records() as u64 != n_data + offset as u64 {
+        let expected = n_data.checked_add(offset as u64).ok_or("写入后记录数溢出")?;
+        if idx.n_records() as u64 != expected {
             return Err("写入后行数校验失败".into());
         }
-        self.backing = Backing::Mmap(mmap);
-        self.idx = idx;
+        let n_data = u32::try_from(n_data).map_err(|_| "写入后行数溢出")?;
+        let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        Ok(PreparedReopen {
+            backing: Backing::Mmap(mmap),
+            idx,
+            index_ms: t0.elapsed().as_millis() as u64,
+            total_bytes: meta.len(),
+            modified,
+            offset,
+            n_data,
+        })
+    }
+
+    /// 目标换名后的唯一状态提交；不再执行 IO、分配或可失败身份转换。
+    fn commit_reopen(&mut self, prepared: PreparedReopen) {
+        self.backing = prepared.backing;
+        self.idx = prepared.idx;
         self.partial = None;
-        self.index_ms = t0.elapsed().as_millis() as u64;
+        self.index_ms = prepared.index_ms;
         self.index_sync = true;
-        self.total_bytes = meta.len();
-        self.seg = Segments::new(offset, n_data as u32);
+        self.total_bytes = prepared.total_bytes;
+        self.backing_path = self.path.clone();
+        self.seg = Segments::new(prepared.offset, prepared.n_data);
         self.overlay.clear();
         self.filter = None;
         self.last_spec = None;
-        self.base_size = meta.len();
-        self.base_mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        Ok(())
+        self.base_size = prepared.total_bytes;
+        self.base_mtime = prepared.modified;
     }
+
 }
 
 /// 无列名模式的虚拟列名：列1..列N。

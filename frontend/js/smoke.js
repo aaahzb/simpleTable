@@ -2463,7 +2463,31 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
   check("排序模式：保存按当前视图顺序物理重写并退出排序", async () => {
     const bm = bigM();
     assert(bm.filterActive() === true, "前置：保存前应处于筛选视图");
-    assert(await window.__app.saveFile() === true, "排序保存应成功");
+    const fixedPointMask = () => [...document.querySelectorAll(".modal-mask")]
+      .find((mask) => mask.querySelector(".modal-title")?.textContent === "确认固定点");
+    const clickFixedPoint = (text) => {
+      const button = [...(fixedPointMask()?.querySelectorAll("button") ?? [])]
+        .find((item) => item.textContent === text);
+      button?.click();
+      return !!button;
+    };
+    const original = (await invoke("read_csv_file", { path: TMP + "/sortm.csv" })).text;
+    const cancelPending = window.__app.saveFile();
+    await waitFor(() => fixedPointMask()?.textContent.includes("按当前排序保存会物化当前行序"),
+      "排序保存固定点取消前的确认框");
+    assert(clickFixedPoint("取消"), "取消排序保存固定点");
+    assert(await cancelPending === false, "取消固定点保存应返回 false");
+    assert((await invoke("read_csv_file", { path: TMP + "/sortm.csv" })).text === original,
+      "取消固定点保存不得改原文件");
+    assert(bm.meta().sorted === true && bm.filterActive() === true && window.__app.isDirty(),
+      "取消固定点保存应保留排序、筛选和脏态");
+    const pendingSave = window.__app.saveFile();
+    await waitFor(() => fixedPointMask()?.textContent.includes("按当前排序保存会物化当前行序"),
+      "排序保存固定点确认框");
+    assert(fixedPointMask().textContent.includes("此前历史与本次操作不可撤销"),
+      "排序保存应说明固定点撤销边界");
+    assert(clickFixedPoint("继续"), "确认排序保存固定点");
+    assert(await pendingSave === true, "确认固定点后排序保存应成功");
     const back = await invoke("read_csv_file", { path: `${TMP}/sortm.csv` });
     const parsed = parseCsv(back.text);
     assert(JSON.stringify(parsed.headers) === JSON.stringify(["name", "score", "note"]),

@@ -16,6 +16,7 @@ static FORCE_BIG: AtomicBool = AtomicBool::new(false);
 use serde::Serialize;
 use tauri::{Emitter, Manager};
 
+mod baseline;
 mod engine;
 // Task 2 先建立独立账本；接口在 Task 3–14 接入，Task 15 移除本豁免。
 #[allow(dead_code)]
@@ -755,8 +756,9 @@ async fn big_save(
     window: tauri::Window,
     state: tauri::State<'_, BigShared>,
     session: u64,
-) -> Result<(), String> {
-    run_big_save(window, state, session, None).await
+    approval: crate::history::Approval,
+) -> Result<engine::SaveOutcome, String> {
+    run_big_save(window, state, session, None, approval).await
 }
 
 /// 另存为：把当前视图流式写到 `path`，原文件保持不变；成功后会话切到新路径。
@@ -767,8 +769,9 @@ async fn big_save_as(
     state: tauri::State<'_, BigShared>,
     session: u64,
     path: String,
-) -> Result<(), String> {
-    run_big_save(window, state, session, Some(path)).await
+    approval: crate::history::Approval,
+) -> Result<engine::SaveOutcome, String> {
+    run_big_save(window, state, session, Some(path), approval).await
 }
 
 /// `big_save`/`big_save_as` 共用实现。`target=None` 写回当前文件。
@@ -777,7 +780,8 @@ async fn run_big_save(
     state: tauri::State<'_, BigShared>,
     session: u64,
     target: Option<String>,
-) -> Result<(), String> {
+    approval: crate::history::Approval,
+) -> Result<engine::SaveOutcome, String> {
     let entry = big_entry(state.inner(), session)?;
     entry.bump_gate(); // 重写文件前先让本会话的筛选扫描退出
     tauri::async_runtime::spawn_blocking(move || {
@@ -795,8 +799,12 @@ async fn run_big_save(
                 let _ = tx.send((done, total, phase, rows));
             };
             match target {
-                Some(path) => bf.save_as(std::path::Path::new(&path), &mut on_progress),
-                None => bf.save(&mut on_progress),
+                Some(path) => bf.save_as(
+                    std::path::Path::new(&path),
+                    approval,
+                    &mut on_progress,
+                ),
+                None => bf.save(approval, &mut on_progress),
             }
         })();
         // save 返回后进度闭包随 tx 一并释放，emit 线程 recv 出错即退出。

@@ -1751,7 +1751,7 @@ async function openPath(p, opts = {}) {
 /**
  * 大文件模式写盘共用流程：进度框 + 引擎调用 + 视图/筛选/脏态复位。
  *
- * @param {() => Promise<void>} write - 实际写盘（model.save 或 model.saveAs）。
+ * @param {() => Promise<boolean>} write - 实际写盘（model.save 或 model.saveAs）。
  * @param {string} action - 动作名（用于失败对话框标题）。
  * @param {string} okMsg - 成功后的状态栏文案。
  * @param {string} hint - 失败对话框的操作建议。
@@ -1762,7 +1762,12 @@ async function runBigWrite(write, action, okMsg, hint) {
   const dlg = progressDialog("保存大文件…");
   const un = await model.onProgress((done, total, phase, rows) => dlg.set(done, total, phase, rows));
   try {
-    await write();
+    const saved = await write();
+    if (!saved) {
+      un();
+      dlg.close();
+      return false;
+    }
   } catch (err) {
     un();
     dlg.close();
