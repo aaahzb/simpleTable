@@ -25,6 +25,7 @@ use crate::history::{
     HistoryEntry, HistoryError, HistoryLedger, HistoryStats, Prepared,
     DEFAULT_HISTORY_BUDGET_BYTES,
 };
+use crate::schema::{ColumnId, ColumnStorage, Schema};
 use memchr::{memchr, memchr_iter};
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
@@ -1458,6 +1459,80 @@ mod tests {
         assert_eq!(bf.rows(0, 5), pasted);
     }
 
+    /// 已提交 Inserted 列的逻辑行必须转换到物理存储槽，并可完整撤销重做。
+    #[test]
+    fn insert_rows_use_inserted_storage_slots() {
+        let mut bf = BigFile::from_bytes(b"A,B
+a,b
+".to_vec(), false).unwrap();
+        let mut schema = (*bf.schema).clone();
+        let inserted = schema.insert(1, "X".into()).unwrap();
+        assert_eq!(schema.storage(inserted), Some(ColumnStorage::Inserted(0)));
+        bf.schema = Arc::new(schema);
+
+        bf.insert_rows(
+            1,
+            Some(vec![vec!["a2".into(), "x2".into(), "b2".into()]]),
+            0,
+            Approval::deny(),
+        )
+        .unwrap();
+        let expected = vec!["a2", "x2", "b2"];
+        assert_eq!(bf.rows(1, 1)[0], expected);
+        assert!(bf.undo());
+        assert_eq!(bf.meta().rows, 1);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(1, 1)[0], expected);
+    }
+
+    /// 扩行粘贴按起始稳定列写入逻辑行，再映射到 Inserted 物理槽。
+    #[test]
+    fn paste_append_uses_inserted_storage_slots() {
+        let mut bf = BigFile::from_bytes(b"A,B
+a,b
+".to_vec(), false).unwrap();
+        let mut schema = (*bf.schema).clone();
+        schema.insert(1, "X".into()).unwrap();
+        bf.schema = Arc::new(schema);
+
+        let out = bf
+            .paste_rows(1, 1, vec![vec!["x2".into(), "b2".into()]], Approval::deny())
+            .unwrap();
+        assert_eq!(out.inserted_rows, 1);
+        let expected = vec!["", "x2", "b2"];
+        assert_eq!(bf.rows(1, 1)[0], expected);
+        assert!(bf.undo());
+        assert_eq!(bf.meta().rows, 1);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(1, 1)[0], expected);
+    }
+
+    /// 空白插入行保持稀疏，只在实际写入目标列时扩到对应物理槽。
+    #[test]
+    fn blank_rows_keep_inserted_storage_sparse() {
+        let mut bf = BigFile::from_bytes(b"A,B
+a,b
+".to_vec(), false).unwrap();
+        let mut schema = (*bf.schema).clone();
+        schema.insert(1, "X".into()).unwrap();
+        bf.schema = Arc::new(schema);
+        bf.insert_rows(1, None, 1, Approval::deny()).unwrap();
+
+        let ResolvedRow::Ins { block, row } = bf.seg.resolve(1).unwrap() else {
+            panic!("应解析为插入行");
+        };
+        let physical_len = |bf: &BigFile| {
+            bf.seg.blocks[block as usize].as_ref().unwrap()[row as usize].len()
+        };
+        assert_eq!(physical_len(&bf), 0, "空白行不得预占所有物理槽");
+        bf.set_cell(1, 2, "b2".into(), Approval::deny()).unwrap();
+        assert_eq!(bf.rows(1, 1)[0], vec!["", "", "b2"]);
+        assert_eq!(physical_len(&bf), 2, "Source(1) 只需扩到物理槽 1");
+        bf.set_cell(1, 1, "x2".into(), Approval::deny()).unwrap();
+        assert_eq!(bf.rows(1, 1)[0], vec!["", "x2", "b2"]);
+        assert_eq!(physical_len(&bf), 3, "Inserted(0) 位于源区之后的槽 2");
+    }
+
     /// 跨末尾粘贴把既有格变化和新增行最终内容合并为一条记录。
     #[test]
     fn paste_rows_append_and_existing_changes_one_step() {
@@ -2672,7 +2747,7 @@ mod tests {
 
     /// 直调 FieldScan 扫一条记录（特征化/对拍共用；ncols 给足 32 覆盖超界列）。
     fn scan_one(spec: &FilterSpec, enc: Encoding, rec: &[u8]) -> bool {
-        let overlay: HashMap<(u32, u32), String> = HashMap::new();
+        let overlay: HashMap<(u32, ColumnId), String> = HashMap::new();
         let mut fs = FieldScan::new(spec, enc, &overlay, 32);
         fs.record_matches(0, rec)
     }
@@ -2772,8 +2847,8 @@ mod tests {
         assert!(scan_one(&spec_one(1, "值"), Encoding::Gbk, &gbk));
         assert!(!scan_one(&spec_one(1, "名"), Encoding::Gbk, &gbk));
         // 覆盖层优先于原始字节（同列同 rec）
-        let mut ov: HashMap<(u32, u32), String> = HashMap::new();
-        ov.insert((0, 0), "zzz".to_string());
+        let mut ov: HashMap<(u32, ColumnId), String> = HashMap::new();
+        ov.insert((0, ColumnId(0)), "zzz".to_string());
         let mut fs = FieldScan::new(&spec_one(0, "zzz"), u, &ov, 32);
         assert!(fs.record_matches(0, b"a,b\r\n"));
         let mut fs = FieldScan::new(&spec_one(0, "a"), u, &ov, 32);
@@ -2861,7 +2936,7 @@ mod tests {
         // GBK 非 ASCII 记录路由标量（严格 mode 同样成立）
         let gbk_rec = encoding_rs::GBK.encode("北京,ab
 ").0.into_owned();
-        let ov: HashMap<(u32, u32), String> = HashMap::new();
+        let ov: HashMap<(u32, ColumnId), String> = HashMap::new();
         let fs = FieldScan::new(&spec_mode(0, "北京", 1), g, &ov, 32);
         assert!(!fs.route_fast(&gbk_rec), "GBK 非 ASCII → 标量（严格模式同）");
         // 标量路径：CJK 严格相等（无大小写折叠问题）
@@ -2936,7 +3011,7 @@ mod tests {
 
     /// 同一记录分别走强分发 / 强制快路径 / 强制标量，三者必须逐位一致。
     fn scan_three(spec: &FilterSpec, enc: Encoding, rec: &[u8]) -> (bool, bool, bool) {
-        let overlay: HashMap<(u32, u32), String> = HashMap::new();
+        let overlay: HashMap<(u32, ColumnId), String> = HashMap::new();
         let mut a = FieldScan::new(spec, enc, &overlay, 32);
         let mut b = FieldScan::new(spec, enc, &overlay, 32);
         let mut c = FieldScan::new(spec, enc, &overlay, 32);
@@ -2960,7 +3035,7 @@ mod tests {
     /// 路由断言：GBK 非 ASCII 记录走标量；GBK 纯 ASCII 与 UTF-8 走快路径。
     #[test]
     fn field_scan_gbk_non_ascii_routes_to_scalar() {
-        let overlay: HashMap<(u32, u32), String> = HashMap::new();
+        let overlay: HashMap<(u32, ColumnId), String> = HashMap::new();
         let gbk = encoding_rs::GBK.encode("名字,值\r\n").0.into_owned();
         let fs = FieldScan::new(&spec_one(0, "名字"), Encoding::Gbk, &overlay, 32);
         assert!(!fs.route_fast(&gbk), "GBK 非 ASCII → 标量慢路径");
@@ -3246,6 +3321,7 @@ mod tests {
         bf.seg = Segments::new(0, 2);
         bf.base_ncols = 2;
         bf.base_headers = generic_headers(2);
+        bf.schema = Arc::new(Schema::from_headers(generic_headers(2)).unwrap());
         assert_eq!(bf.rows(0, 1)[0], vec!["a", "b"]);
         bf.set_cell(0, 1, "B".into(), Approval::deny()).unwrap();
         bf.save(|_, _, _, _| {}).unwrap();
@@ -4519,8 +4595,8 @@ struct DeleteRollback {
 /// 单元格稳定地址。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum CellId {
-    Src { rec: u32, col: u32 },
-    Ins { block: u32, row: u32, col: u32 },
+    Src { rec: u32, col: ColumnId },
+    Ins { block: u32, row: u32, col: ColumnId },
 }
 
 /// 一个实际变化格子的批前/批后稀疏快照。
@@ -4799,9 +4875,70 @@ pub struct BigMeta {
     pub elapsed_ms: u64,
 }
 
+/// 筛选开始时由视图列解析出的稳定身份与存储来源。
+#[derive(Clone, Copy)]
+enum ResolvedFilterColumn {
+    Source { id: ColumnId, col: u32 },
+    Inserted(ColumnId),
+    Missing,
+}
+
+/// 已解析的筛选条件；Source 的 col 只用于本次原始字节扫描定位。
+struct ResolvedFilterSpec {
+    cols: Vec<(ResolvedFilterColumn, String, u8)>,
+    multi_cols: Vec<ResolvedFilterColumn>,
+    multi_text: String,
+}
+
+impl ResolvedFilterSpec {
+    fn from_view(spec: &FilterSpec, schema: &Schema) -> Self {
+        fn resolve(schema: &Schema, view_col: u32) -> ResolvedFilterColumn {
+            let Some(id) = schema.view_id(view_col) else {
+                return ResolvedFilterColumn::Missing;
+            };
+            match schema.storage(id) {
+                Some(ColumnStorage::Source(col)) => ResolvedFilterColumn::Source { id, col },
+                Some(ColumnStorage::Inserted(_)) => ResolvedFilterColumn::Inserted(id),
+                None => ResolvedFilterColumn::Missing,
+            }
+        }
+        Self {
+            cols: spec
+                .cols
+                .iter()
+                .map(|(col, text, mode)| (resolve(schema, *col), text.clone(), *mode))
+                .collect(),
+            multi_cols: spec.multi_cols.iter().map(|col| resolve(schema, *col)).collect(),
+            multi_text: spec.multi_text.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    fn identity_for_test(spec: &FilterSpec, ncols: u32) -> Self {
+        fn resolve(view_col: u32, ncols: u32) -> ResolvedFilterColumn {
+            if view_col < ncols {
+                ResolvedFilterColumn::Source { id: ColumnId(view_col), col: view_col }
+            } else {
+                ResolvedFilterColumn::Missing
+            }
+        }
+        Self {
+            cols: spec
+                .cols
+                .iter()
+                .map(|(col, text, mode)| (resolve(*col, ncols), text.clone(), *mode))
+                .collect(),
+            multi_cols: spec.multi_cols.iter().map(|col| resolve(*col, ncols)).collect(),
+            multi_text: spec.multi_text.clone(),
+        }
+    }
+}
+
 /// 单条筛选关键字（mode 0/1 已小写；mode 2 保持原样大小写）。
 struct Needle {
     col: u32,
+    column: Option<ColumnId>,
+    overlay_only: bool,
     text: String,
     /// 匹配模式：0 包含 / 1 严格等于·不分大小写 / 2 严格等于·区分大小写。
     mode: u8,
@@ -4843,7 +4980,7 @@ impl RowSource<'_> {
 /// 字节级字段扫描器：引号感知解析，逐字段匹配（不建任何投影缓存）。
 struct FieldScan<'a> {
     enc: Encoding,
-    overlay: &'a HashMap<(u32, u32), String>,
+    overlay: &'a HashMap<(u32, ColumnId), String>,
     needles: Vec<Needle>,
     needle_by_col: HashMap<u32, Vec<usize>>,
     /// 列 → 位标记：1 = 参与匹配。
@@ -4871,46 +5008,77 @@ impl<'a> FieldScan<'a> {
     /// - `enc`: 文件编码（GBK 需要跳过双字节次字节）。
     /// - `overlay`: 单元格覆盖层（编辑值优先于原始字节）。
     /// - `ncols`: 物理列数。
+    #[cfg(test)]
     fn new(
         spec: &FilterSpec,
         enc: Encoding,
-        overlay: &'a HashMap<(u32, u32), String>,
+        overlay: &'a HashMap<(u32, ColumnId), String>,
+        ncols: usize,
+    ) -> Self {
+        let resolved = ResolvedFilterSpec::identity_for_test(spec, ncols as u32);
+        Self::new_resolved(&resolved, enc, overlay, ncols)
+    }
+
+    fn new_resolved(
+        spec: &ResolvedFilterSpec,
+        enc: Encoding,
+        overlay: &'a HashMap<(u32, ColumnId), String>,
         ncols: usize,
     ) -> Self {
         let mut needles = Vec::new();
         let mut needle_by_col: HashMap<u32, Vec<usize>> = HashMap::new();
-        for (col, kw, mode) in &spec.cols {
-            let idx = needles.len();
+        for (target, text, mode) in &spec.cols {
+            let (col, column, overlay_only) = match *target {
+                ResolvedFilterColumn::Source { id, col } => (col, Some(id), false),
+                ResolvedFilterColumn::Inserted(id) => (0, Some(id), true),
+                ResolvedFilterColumn::Missing => (0, None, false),
+            };
+            let index = needles.len();
             needles.push(Needle {
-                col: *col,
-                text: kw.clone(),
+                col,
+                column,
+                overlay_only,
+                text: text.clone(),
                 mode: *mode,
-                ascii: kw.is_ascii(),
+                ascii: text.is_ascii(),
                 multi: false,
                 hit: false,
             });
-            needle_by_col.entry(*col).or_default().push(idx);
+            if let ResolvedFilterColumn::Source { col, .. } = *target {
+                if (col as usize) < ncols {
+                    needle_by_col.entry(col).or_default().push(index);
+                }
+            }
         }
         if !spec.multi_text.is_empty() {
-            for col in &spec.multi_cols {
-                let idx = needles.len();
+            for target in &spec.multi_cols {
+                let (col, column, overlay_only) = match *target {
+                    ResolvedFilterColumn::Source { id, col } => (col, Some(id), false),
+                    ResolvedFilterColumn::Inserted(id) => (0, Some(id), true),
+                    ResolvedFilterColumn::Missing => (0, None, false),
+                };
+                let index = needles.len();
                 needles.push(Needle {
-                    col: *col,
+                    col,
+                    column,
+                    overlay_only,
                     text: spec.multi_text.clone(),
-                    mode: 0, // 多重筛选恒为包含匹配
+                    mode: 0,
                     ascii: spec.multi_text.is_ascii(),
                     multi: true,
                     hit: false,
                 });
-                needle_by_col.entry(*col).or_default().push(idx);
+                if let ResolvedFilterColumn::Source { col, .. } = *target {
+                    if (col as usize) < ncols {
+                        needle_by_col.entry(col).or_default().push(index);
+                    }
+                }
             }
         }
-        let keep_raw = needles.iter().any(|n| n.mode == 2);
+        let keep_raw = needles.iter().any(|needle| needle.mode == 2);
         let mut col_flags = vec![0u8; ncols];
         for col in needle_by_col.keys() {
-            if (*col as usize) < ncols {
-                col_flags[*col as usize] |= 1;
-            }
+            col_flags[*col as usize] |= 1;
         }
         Self {
             enc,
@@ -4928,62 +5096,66 @@ impl<'a> FieldScan<'a> {
         }
     }
 
+    /// 记录开始时重置命中，并解析没有原始物理槽的 Inserted 列。
+    fn begin_record(&mut self, rec: u32) {
+        for index in 0..self.needles.len() {
+            self.needles[index].hit = false;
+            if !self.needles[index].overlay_only {
+                continue;
+            }
+            let hit = {
+                let needle = &self.needles[index];
+                let value = needle
+                    .column
+                    .and_then(|id| self.overlay.get(&(rec, id)))
+                    .map(String::as_str)
+                    .unwrap_or("");
+                Self::value_hit(needle, value)
+            };
+            self.needles[index].hit = hit;
+        }
+    }
+
+    /// 对已解码的稳定列值应用与原始字节扫描一致的匹配语义。
+    fn value_hit(needle: &Needle, value: &str) -> bool {
+        match needle.mode {
+            2 => value == needle.text,
+            1 if needle.ascii => value.to_ascii_lowercase() == needle.text,
+            1 => value.to_lowercase() == needle.text,
+            _ if needle.ascii => value.to_ascii_lowercase().contains(needle.text.as_str()),
+            _ => value.to_lowercase().contains(needle.text.as_str()),
+        }
+    }
+
     /// 字段结束：匹配该列关键字（覆盖层优先）。
     /// 三态：0 包含（折叠子串）/ 1 严格等于·不分大小写（折叠整等）/
     /// 2 严格等于·区分大小写（比未折叠 raw_buf）。
     fn end_field(&mut self, rec: u32, col: u32) {
-        let flag = self
-            .col_flags
-            .get(col as usize)
-            .copied()
-            .unwrap_or(0);
-        let overlay_val = self.overlay.get(&(rec, col));
+        let flag = self.col_flags.get(col as usize).copied().unwrap_or(0);
         if flag & 1 != 0 {
-            if let Some(ids) = self.needle_by_col.get(&col) {
-                for &i in ids {
-                    if self.needles[i].hit {
+            if let Some(indices) = self.needle_by_col.get(&col) {
+                for &index in indices {
+                    if self.needles[index].hit {
                         continue;
                     }
-                    let nd = &self.needles[i];
-                    let hit = match nd.mode {
-                        2 => match overlay_val {
-                            Some(v) => *v == nd.text,
-                            None if nd.ascii => self.raw_buf.as_slice() == nd.text.as_bytes(),
-                            None => decode_slice(self.enc, &self.raw_buf) == nd.text,
-                        },
-                        1 => match overlay_val {
-                            Some(v) => {
-                                if nd.ascii {
-                                    v.to_ascii_lowercase() == nd.text
-                                } else {
-                                    v.to_lowercase() == nd.text
-                                }
+                    let needle = &self.needles[index];
+                    let overlay = needle.column.and_then(|id| self.overlay.get(&(rec, id)));
+                    let hit = match overlay {
+                        Some(value) => Self::value_hit(needle, value),
+                        None => match needle.mode {
+                            2 if needle.ascii => self.raw_buf.as_slice() == needle.text.as_bytes(),
+                            2 => decode_slice(self.enc, &self.raw_buf) == needle.text,
+                            1 if needle.ascii => self.match_buf.as_slice() == needle.text.as_bytes(),
+                            1 => decode_slice(self.enc, &self.field_buf).to_lowercase() == needle.text,
+                            _ if needle.ascii => {
+                                memchr::memmem::find(&self.match_buf, needle.text.as_bytes()).is_some()
                             }
-                            None if nd.ascii => {
-                                self.match_buf.as_slice() == nd.text.as_bytes()
-                            }
-                            None => {
-                                decode_slice(self.enc, &self.field_buf).to_lowercase() == nd.text
-                            }
-                        },
-                        _ => match overlay_val {
-                            Some(v) => {
-                                if nd.ascii {
-                                    v.to_ascii_lowercase().contains(nd.text.as_str())
-                                } else {
-                                    v.to_lowercase().contains(nd.text.as_str())
-                                }
-                            }
-                            None if nd.ascii => {
-                                memchr::memmem::find(&self.match_buf, nd.text.as_bytes())
-                                    .is_some()
-                            }
-                            None => decode_slice(self.enc, &self.field_buf)
+                            _ => decode_slice(self.enc, &self.field_buf)
                                 .to_lowercase()
-                                .contains(nd.text.as_str()),
+                                .contains(needle.text.as_str()),
                         },
                     };
-                    self.needles[i].hit = hit;
+                    self.needles[index].hit = hit;
                 }
             }
         }
@@ -5040,9 +5212,7 @@ impl<'a> FieldScan<'a> {
     /// 标量状态机（逐字节）。GBK 双字节记录的正确性基准；同时是快路径的
     /// 对拍参照——任何语义分歧以本函数为准。
     fn record_matches_scalar(&mut self, rec: u32, bytes: &[u8]) -> bool {
-        for n in &mut self.needles {
-            n.hit = false;
-        }
+        self.begin_record(rec);
         let n = bytes.len();
         let mut i = 0usize;
         let mut col = 0u32;
@@ -5161,9 +5331,7 @@ impl<'a> FieldScan<'a> {
     /// 搜索，未参与列零拷贝跳过。与 `record_matches_scalar` 语义逐位一致
     ///（特征化测试 + 固定种子随机对拍双保险）。
     fn record_matches_fast(&mut self, rec: u32, bytes: &[u8]) -> bool {
-        for nd in &mut self.needles {
-            nd.hit = false;
-        }
+        self.begin_record(rec);
         let n = bytes.len();
         // 1) 引号位收集（缓冲逐记录复用；无引号记录首个 memchr 即 None，零分配）
         self.quote_pos.clear();
@@ -5678,11 +5846,15 @@ pub struct BigFile {
     index_sync: bool,
     /// 文件总字节数（meta 展示进度用）。
     total_bytes: u64,
+    /// 仅表示原始记录中的物理源列数，不承担历史身份。
     base_ncols: usize,
     base_headers: Vec<String>,
+    /// 已提交逻辑结构；历史与 pending 预览共享不可变列级对象。
+    schema: Arc<Schema>,
+    pending_schema: Option<Arc<Schema>>,
     seg: Segments,
-    /// 源记录编辑层：稳定身份 → 新值（插入行直接改块，不经此层）。
-    overlay: HashMap<(u32, u32), String>,
+    /// 源记录编辑层：(稳定记录号, 稳定列身份) → 新值。
+    overlay: HashMap<(u32, ColumnId), String>,
     pending_cols: Vec<ColOp>,
     filter: Option<Vec<u32>>,
     /// 上次完成的筛选条件（前缀收窄 / 完全相同条件直接返回）。
@@ -5811,6 +5983,7 @@ impl BigFile {
             first_fields
         };
         let base_ncols = headers.len();
+        let schema = Arc::new(Schema::from_headers(headers.clone())?);
         let open_ms = t0.elapsed().as_millis() as u64;
         Ok(Self {
             path,
@@ -5826,6 +5999,8 @@ impl BigFile {
             total_bytes,
             base_ncols,
             base_headers: headers,
+            schema,
+            pending_schema: None,
             seg: Segments::new(offset, n_data as u32),
             overlay: HashMap::new(),
             pending_cols: Vec::new(),
@@ -5963,6 +6138,7 @@ impl BigFile {
             first_fields
         };
         let base_ncols = headers.len();
+        let schema = Arc::new(Schema::from_headers(headers.clone())?);
         let cancel = Arc::new(AtomicBool::new(false));
         let open_ms = t0.elapsed().as_millis() as u64;
         let total_bytes = meta.len();
@@ -6009,6 +6185,8 @@ impl BigFile {
             total_bytes,
             base_ncols,
             base_headers: headers,
+            schema,
+            pending_schema: None,
             seg: Segments::new(offset as u32, n_data as u32),
             overlay: HashMap::new(),
             pending_cols: Vec::new(),
@@ -6218,7 +6396,7 @@ impl BigFile {
         match self.seg.resolve(vrow) {
             Some(ResolvedRow::Src(rec)) => self.src_fields(rec),
             Some(ResolvedRow::Ins { block, row }) => self.ins_fields(block, row),
-            None => vec![String::new(); self.base_ncols],
+            None => vec![String::new(); self.schema.visible().len()],
         }
     }
 
@@ -6249,6 +6427,19 @@ impl BigFile {
         if let Some(l) = levels.iter().find(|l| l.col >= ncols) {
             return Err(format!("排序列越界：{}（共 {} 列）", l.col, ncols));
         }
+        let sort_columns: Vec<(ColumnId, usize)> = levels
+            .iter()
+            .map(|level| {
+                let id = self.schema.view_id(level.col).ok_or("排序列越界")?;
+                let position = self
+                    .schema
+                    .visible()
+                    .iter()
+                    .position(|candidate| *candidate == id)
+                    .ok_or("排序列越界")?;
+                Ok((id, position))
+            })
+            .collect::<Result<_, String>>()?;
         let total = self.seg.vrow_count();
         if total > u32::MAX as u64 {
             return Err("文件过大（超过 42.9 亿行），暂不支持排序".into());
@@ -6262,7 +6453,7 @@ impl BigFile {
 
         // 逐级建键：一次遍历取一行；键按旧显示位置索引。
         let mut keys: Vec<SortKeys> = Vec::with_capacity(levels.len());
-        for level in levels {
+        for (level, (_, position)) in levels.iter().zip(&sort_columns) {
             let mut out = if level.numeric {
                 SortKeys::Num(Vec::with_capacity(total))
             } else {
@@ -6276,10 +6467,7 @@ impl BigFile {
             }
             for &orig in &old_order {
                 let fields = self.orig_fields(orig as u64);
-                let text = fields
-                    .get(level.col as usize)
-                    .map(String::as_str)
-                    .unwrap_or("");
+                let text = fields.get(*position).map(String::as_str).unwrap_or("");
                 match &mut out {
                     SortKeys::Num(v) => {
                         v.push(js_number_parse(text).unwrap_or(f64::NAN));
@@ -6520,17 +6708,72 @@ impl BigFile {
 
     // ---- 列视图（pending 映射） ----
 
+    /// 当前用于读取的结构：pending 存在时只改变投影，不改 committed Schema。
+    fn view_schema(&self) -> &Schema {
+        self.pending_schema.as_deref().unwrap_or(self.schema.as_ref())
+    }
+
+    /// 把当前视图列解析为稳定身份和物理存储来源。
+    fn view_column(&self, view_col: u32) -> Option<(ColumnId, ColumnStorage)> {
+        let schema = self.view_schema();
+        let id = schema.view_id(view_col)?;
+        let storage = schema.storage(id)?;
+        Some((id, storage))
+    }
+
+    /// 写路径只接受 committed 视图列；pending 期间由编辑闸门先行拒绝。
+    fn committed_column(&self, view_col: u32) -> Result<(ColumnId, ColumnStorage), String> {
+        let id = self.schema.view_id(view_col).ok_or("列号越界")?;
+        let storage = self.schema.storage(id).ok_or("列身份不存在")?;
+        Ok((id, storage))
+    }
+
+    /// 插入行的物理槽：原始列沿用源槽，新增列使用源区之后的稀疏扩展槽。
+    fn inserted_slot(&self, storage: ColumnStorage) -> Option<usize> {
+        match storage {
+            ColumnStorage::Source(slot) => Some(slot as usize),
+            ColumnStorage::Inserted(slot) => self.base_ncols.checked_add(slot as usize),
+        }
+    }
+
+    /// 把 committed 逻辑行转换为插入块物理行；尾部空值不 materialize 存储槽。
+    fn logical_rows_to_storage(&self, rows: Vec<Vec<String>>) -> Result<Vec<Vec<String>>, String> {
+        rows.into_iter()
+            .map(|row| {
+                let mut stored = Vec::new();
+                for (id, value) in self.schema.visible().iter().zip(row) {
+                    let storage = self.schema.storage(*id).ok_or("列身份不存在")?;
+                    let slot = self.inserted_slot(storage).ok_or("插入列存储槽越界")?;
+                    if slot >= stored.len() {
+                        if value.is_empty() {
+                            continue;
+                        }
+                        let end = slot.checked_add(1).ok_or("插入列存储槽越界")?;
+                        stored.resize(end, String::new());
+                    }
+                    stored[slot] = value;
+                }
+                Ok(stored)
+            })
+            .collect()
+    }
+
+    /// 在列级候选上替换可见列名，保留稳定身份与存储来源。
+    fn schema_with_headers(&self, headers: &[String]) -> Result<Schema, String> {
+        let mut candidate = (*self.schema).clone();
+        let ids = candidate.visible().to_vec();
+        if ids.len() != headers.len() {
+            return Err("列名与列结构不一致".into());
+        }
+        for (id, header) in ids.into_iter().zip(headers.iter().cloned()) {
+            candidate.rename(id, header)?;
+        }
+        Ok(candidate)
+    }
+
     /// 映射后列数 = 基准列 + 插入 − 删除。
     fn view_ncols(&self) -> u32 {
-        let mut n = self.base_ncols as i64;
-        for op in &self.pending_cols {
-            match op {
-                ColOp::Insert { .. } => n += 1,
-                ColOp::Delete { .. } => n -= 1,
-                ColOp::Rename { .. } => {}
-            }
-        }
-        n.max(0) as u32
+        self.view_schema().visible().len() as u32
     }
 
     /// 映射后表头。无列名模式下列名是虚拟的 列1..N。
@@ -6538,62 +6781,37 @@ impl BigFile {
         if self.headerless {
             return generic_headers(self.view_ncols() as usize);
         }
-        let mut cols: Vec<Option<String>> =
-            self.base_headers.iter().cloned().map(Some).collect();
-        for op in &self.pending_cols {
-            match op {
-                ColOp::Insert { pos, name } => {
-                    cols.insert((*pos as usize).min(cols.len()), Some(name.clone()));
-                }
-                ColOp::Delete { col } => {
-                    if (*col as usize) < cols.len() {
-                        cols.remove(*col as usize);
-                    }
-                }
-                ColOp::Rename { col, name } => {
-                    if let Some(Some(h)) = cols.get_mut(*col as usize) {
-                        *h = name.clone();
-                    }
-                }
-            }
-        }
-        cols.into_iter().map(|c| c.unwrap_or_default()).collect()
+        let schema = self.view_schema();
+        schema
+            .visible()
+            .iter()
+            .map(|id| schema.resolve(*id).map(|column| column.header.clone()).unwrap_or_default())
+            .collect()
     }
 
-    /// 视图列 → 物理列（None = 待插入的虚拟列）。
-    fn view_to_phys(&self, vc: u32) -> Option<u32> {
-        let mut phys: Vec<Option<u32>> = (0..self.base_ncols as u32).map(Some).collect();
-        for op in &self.pending_cols {
-            match op {
-                ColOp::Insert { pos, .. } => {
-                    phys.insert((*pos as usize).min(phys.len()), None);
-                }
-                ColOp::Delete { col } => {
-                    if (*col as usize) < phys.len() {
-                        phys.remove(*col as usize);
-                    }
-                }
-                ColOp::Rename { .. } => {}
-            }
-        }
-        phys.get(vc as usize).copied().flatten()
-    }
-
-    /// 物理字段数组 → 视图字段数组（pending 期读路径）。
+    /// committed 逻辑字段数组 → pending 视图字段数组。
     fn map_fields_to_view(&self, fields: &[String]) -> Vec<String> {
-        if self.pending_cols.is_empty() {
+        let Some(pending) = &self.pending_schema else {
             return fields.to_vec();
-        }
-        let n = self.view_ncols() as usize;
-        let mut out = vec![String::new(); n];
-        for vc in 0..n {
-            if let Some(p) = self.view_to_phys(vc as u32) {
-                if let Some(f) = fields.get(p as usize) {
-                    out[vc] = f.clone();
-                }
-            }
-        }
-        out
+        };
+        let positions: HashMap<ColumnId, usize> = self
+            .schema
+            .visible()
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (*id, index))
+            .collect();
+        pending
+            .visible()
+            .iter()
+            .map(|id| {
+                positions
+                    .get(id)
+                    .and_then(|index| fields.get(*index))
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     fn require_editable(&self) -> Result<(), String> {
@@ -6633,45 +6851,61 @@ impl BigFile {
         Some((s, e))
     }
 
-    /// 读取物理记录 rec 的字段（解码 + 解析 + pad/truncate + 覆盖层）。
-    fn src_fields(&self, rec: u32) -> Vec<String> {
-        // 渐进索引期间只允许读已完整发布的记录；未命中给空行（调用方已按
-        // 可见行数过滤，正常不会发生）。
+    /// 读取原始记录物理字段；覆盖层不在这里按键应用。
+    fn raw_src_fields(&self, rec: u32) -> Vec<String> {
         let Some((s, e)) = self.src_span(rec) else {
             return vec![String::new(); self.base_ncols];
         };
-        let mut f = parse_record(&decode_slice(self.enc, &self.bytes()[s..e]), b',');
-        let n = self.base_ncols;
-        if f.len() < n {
-            f.resize(n, String::new());
-        } else if f.len() > n {
-            f.truncate(n);
+        let mut fields = parse_record(&decode_slice(self.enc, &self.bytes()[s..e]), b',');
+        if fields.len() < self.base_ncols {
+            fields.resize(self.base_ncols, String::new());
+        } else if fields.len() > self.base_ncols {
+            fields.truncate(self.base_ncols);
         }
-        for c in 0..n {
-            if let Some(v) = self.overlay.get(&(rec, c as u32)) {
-                f[c].clone_from(v);
-            }
-        }
-        f
+        fields
     }
 
-    /// 读取插入行字段（pad/truncate；无覆盖层，编辑直改块）。
+    /// 按 committed Schema 读取源记录；Source 读物理槽，Inserted 只读覆盖层。
+    fn src_fields(&self, rec: u32) -> Vec<String> {
+        let raw = self.raw_src_fields(rec);
+        self.schema
+            .visible()
+            .iter()
+            .map(|id| {
+                let mut value = match self.schema.storage(*id) {
+                    Some(ColumnStorage::Source(slot)) => {
+                        raw.get(slot as usize).cloned().unwrap_or_default()
+                    }
+                    _ => String::new(),
+                };
+                if let Some(edited) = self.overlay.get(&(rec, *id)) {
+                    value.clone_from(edited);
+                }
+                value
+            })
+            .collect()
+    }
+
+    /// 按 committed Schema 读取插入行；扩展槽缺值保持稀疏，不逐行补齐。
     fn ins_fields(&self, block: u32, row: u32) -> Vec<String> {
-        let n = self.base_ncols;
-        let mut f = self
+        let cells = self
             .seg
             .blocks
             .get(block as usize)
-            .and_then(|b| b.as_ref())
-            .and_then(|rows| rows.get(row as usize))
-            .cloned()
-            .unwrap_or_default();
-        if f.len() < n {
-            f.resize(n, String::new());
-        } else if f.len() > n {
-            f.truncate(n);
-        }
-        f
+            .and_then(|block| block.as_ref())
+            .and_then(|rows| rows.get(row as usize));
+        self.schema
+            .visible()
+            .iter()
+            .map(|id| {
+                self.schema
+                    .storage(*id)
+                    .and_then(|storage| self.inserted_slot(storage))
+                    .and_then(|slot| cells.and_then(|cells| cells.get(slot)))
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     /// 取 vrow 的视图行（排序映射 + pending 列映射；渐进期按模式偏移换算）。
@@ -6720,8 +6954,7 @@ impl BigFile {
     /// 单元格有内容时为 true；越界/虚拟待插入列/未索引行返回 false。
     fn cell_nonempty_at(&self, vrow: u64, col: u32) -> bool {
         let vrow = self.orig_vrow(vrow);
-        // pending 列插入：物理记录里没有这一列，值恒为空
-        let Some(phys) = self.view_to_phys(col) else {
+        let Some((id, storage)) = self.view_column(col) else {
             return false;
         };
         let resolved = if self.partial.is_some() {
@@ -6731,25 +6964,31 @@ impl BigFile {
             ResolvedRow::Src(vrow as u32 + self.record_offset())
         } else {
             match self.seg.resolve(vrow) {
-                Some(r) => r,
+                Some(row) => row,
                 None => return false,
             }
         };
         match resolved {
             ResolvedRow::Src(rec) => {
-                if let Some(v) = self.overlay.get(&(rec, phys)) {
-                    return !v.is_empty();
+                if let Some(value) = self.overlay.get(&(rec, id)) {
+                    return !value.is_empty();
                 }
-                self.record_field_nonempty(rec, phys)
+                match storage {
+                    ColumnStorage::Source(slot) => self.record_field_nonempty(rec, slot),
+                    ColumnStorage::Inserted(_) => false,
+                }
             }
             ResolvedRow::Ins { block, row } => self
-                .seg
-                .blocks
-                .get(block as usize)
-                .and_then(|b| b.as_ref())
-                .and_then(|rows| rows.get(row as usize))
-                .and_then(|cells| cells.get(phys as usize))
-                .is_some_and(|v| !v.is_empty()),
+                .inserted_slot(storage)
+                .and_then(|slot| {
+                    self.seg
+                        .blocks
+                        .get(block as usize)
+                        .and_then(|block| block.as_ref())
+                        .and_then(|rows| rows.get(row as usize))
+                        .and_then(|cells| cells.get(slot))
+                })
+                .is_some_and(|value| !value.is_empty()),
         }
     }
 
@@ -6835,28 +7074,43 @@ impl BigFile {
     fn cell_value(&self, cell: CellId) -> String {
         match cell {
             CellId::Src { rec, col } => {
-                if let Some(v) = self.overlay.get(&(rec, col)) {
-                    return v.clone();
+                if let Some(value) = self.overlay.get(&(rec, col)) {
+                    return value.clone();
                 }
-                self.src_fields(rec).get(col as usize).cloned().unwrap_or_default()
+                match self.schema.storage(col) {
+                    Some(ColumnStorage::Source(slot)) => self
+                        .raw_src_fields(rec)
+                        .get(slot as usize)
+                        .cloned()
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                }
             }
-            CellId::Ins { block, row, col } => self
-                .seg
-                .blocks
-                .get(block as usize)
-                .and_then(|b| b.as_ref())
-                .and_then(|rows| rows.get(row as usize))
-                .and_then(|cells| cells.get(col as usize))
-                .cloned()
-                .unwrap_or_default(),
+            CellId::Ins { block, row, col } => {
+                let Some(slot) = self
+                    .schema
+                    .storage(col)
+                    .and_then(|storage| self.inserted_slot(storage))
+                else {
+                    return String::new();
+                };
+                self.seg
+                    .blocks
+                    .get(block as usize)
+                    .and_then(|block| block.as_ref())
+                    .and_then(|rows| rows.get(row as usize))
+                    .and_then(|cells| cells.get(slot))
+                    .cloned()
+                    .unwrap_or_default()
+            }
         }
     }
 
-    /// 将显示行与物理列解析为稳定格地址，供批量写入预检使用。
+    /// 将显示行与 committed 视图列解析为稳定格地址，供批量写入预检使用。
     ///
     /// # Parameters
     /// - `vrow`: 当前显示行号。
-    /// - `col`: 物理列号。
+    /// - `col`: committed 视图列号。
     ///
     /// # Returns
     /// 稳定的源记录或插入块单元格地址。
@@ -6864,9 +7118,7 @@ impl BigFile {
     /// # Errors
     /// 行号、列号越界时返回中文错误；不会修改数据。
     fn resolve_batch_cell(&self, vrow: u64, col: u32) -> Result<CellId, String> {
-        if (col as usize) >= self.base_ncols {
-            return Err("列号越界".into());
-        }
+        let (col, _) = self.committed_column(col)?;
         let vrow = self.orig_vrow(vrow);
         let resolved = if self.partial.is_some() {
             if vrow >= self.indexed_data_rows() {
@@ -6874,7 +7126,7 @@ impl BigFile {
             }
             let rec = u32::try_from(vrow)
                 .ok()
-                .and_then(|v| v.checked_add(self.record_offset()))
+                .and_then(|row| row.checked_add(self.record_offset()))
                 .ok_or("行号越界")?;
             ResolvedRow::Src(rec)
         } else {
@@ -7046,13 +7298,14 @@ impl BigFile {
         self.require_editable()?;
         self.refresh_indexed();
         let total_rows = self.indexed_data_rows();
-        let target = target.normalize(total_rows, self.base_ncols)?;
+        let ncols = self.schema.visible().len();
+        let target = target.normalize(total_rows, ncols)?;
 
         // 第一遍只累计实际非空旧值的确定性成本，不创建全量 CellChange。
         let mut estimated = Cost::new();
         estimated.add_value::<Op>().map_err(history_cost_error)?;
         let mut change_count = 0u64;
-        target.visit(total_rows, self.base_ncols, |vrow, col| {
+        target.visit(total_rows, ncols, |vrow, col| {
             let cell = self.resolve_batch_cell(vrow, col)?;
             let old = self.cell_value(cell);
             if old.is_empty() {
@@ -7094,7 +7347,7 @@ impl BigFile {
         let capacity = usize::try_from(change_count)
             .map_err(|_| history_cost_error(HistoryError::CostOverflow))?;
         let mut changes = Vec::with_capacity(capacity);
-        target.visit(total_rows, self.base_ncols, |vrow, col| {
+        target.visit(total_rows, ncols, |vrow, col| {
             let cell = self.resolve_batch_cell(vrow, col)?;
             let old = self.cell_value(cell);
             if !old.is_empty() {
@@ -7123,7 +7376,7 @@ impl BigFile {
         target: &NormalizedClear,
         total_rows: u64,
     ) -> Result<(), String> {
-        let ncols = self.base_ncols;
+        let ncols = self.schema.visible().len();
         target.visit(total_rows, ncols, |vrow, col| {
             let cell = self.resolve_batch_cell(vrow, col)?;
             if !self.cell_value(cell).is_empty() {
@@ -7173,9 +7426,18 @@ impl BigFile {
             return Ok(EditOutcome::unchanged());
         }
         let max_width = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let ncols = self.schema.visible().len();
+        let mut paste_start = 0;
         if max_width > 0 {
-            let col_end = (col as usize).checked_add(max_width).ok_or("列号越界")?;
-            if col_end > self.base_ncols {
+            let start_id = self.schema.view_id(col).ok_or("粘贴列号越界")?;
+            paste_start = self
+                .schema
+                .visible()
+                .iter()
+                .position(|id| *id == start_id)
+                .ok_or("粘贴列号越界")?;
+            let col_end = paste_start.checked_add(max_width).ok_or("列号越界")?;
+            if col_end > ncols {
                 return Err("粘贴列号越界".into());
             }
         }
@@ -7205,18 +7467,22 @@ impl BigFile {
                 cells.push((vrow + i as u64, col + j as u32, value.clone()));
             }
         }
-        let mut inserted = if inserted_rows > 0 {
+        let inserted = if inserted_rows > 0 {
             rows.split_off(existing_count)
         } else {
             Vec::new()
         };
-        for row in &mut inserted {
-            if row.len() < self.base_ncols {
-                row.resize(self.base_ncols, String::new());
-            } else if row.len() > self.base_ncols {
-                row.truncate(self.base_ncols);
-            }
-        }
+        let inserted = inserted
+            .into_iter()
+            .map(|row| {
+                let mut logical = vec![String::new(); ncols];
+                for (j, value) in row.into_iter().enumerate() {
+                    logical[paste_start + j] = value;
+                }
+                logical
+            })
+            .collect();
+        let inserted = self.logical_rows_to_storage(inserted)?;
         let changes = self.prepare_cell_changes(cells)?;
         if changes.is_empty() && inserted.is_empty() {
             return Ok(EditOutcome::unchanged());
@@ -7249,6 +7515,7 @@ impl BigFile {
         approval: Approval,
     ) -> Result<EditOutcome, String> {
         self.require_editable()?;
+        let col = self.schema.view_id(col).ok_or("列号越界")?;
         let vrow = self.orig_vrow(vrow);
         let resolved = if self.partial.is_some() {
             if vrow >= self.indexed_data_rows() {
@@ -7303,13 +7570,13 @@ impl BigFile {
             Some(rows) => rows,
             None => {
                 let count = usize::try_from(count).map_err(|_| "插入行数过多")?;
-                vec![vec![String::new(); self.base_ncols]; count]
+                vec![vec![String::new(); self.schema.visible().len()]; count]
             }
         };
         if rows.is_empty() {
             return Ok(EditOutcome::unchanged());
         }
-        let ncols = self.base_ncols;
+        let ncols = self.schema.visible().len();
         let rows: Vec<Vec<String>> = rows
             .into_iter()
             .map(|mut row| {
@@ -7321,6 +7588,7 @@ impl BigFile {
                 row
             })
             .collect();
+        let rows = self.logical_rows_to_storage(rows)?;
         let inserted_rows = rows.len() as u64;
         let (mut prepared, fixed_point) = match self.preflight_history(
             Op::InsertRows { vpos, block: 0, rows },
@@ -7499,12 +7767,19 @@ impl BigFile {
                 self.overlay.insert((rec, col), value.to_string());
             }
             CellId::Ins { block, row, col } => {
+                let Some(slot) = self
+                    .schema
+                    .storage(col)
+                    .and_then(|storage| self.inserted_slot(storage))
+                else {
+                    return;
+                };
                 if let Some(Some(rows)) = self.seg.blocks.get_mut(block as usize) {
                     if let Some(cells) = rows.get_mut(row as usize) {
-                        if (col as usize) >= cells.len() {
-                            cells.resize(col as usize + 1, String::new());
+                        if slot >= cells.len() {
+                            cells.resize(slot + 1, String::new());
                         }
-                        cells[col as usize] = value.to_string();
+                        cells[slot] = value.to_string();
                     }
                 }
             }
@@ -7803,6 +8078,7 @@ impl BigFile {
             Some(rows) => RowSource::Subset(rows),
             None => RowSource::All(total),
         };
+        let resolved = ResolvedFilterSpec::from_view(&spec, &self.schema);
         let chunk = 1u64 << 16;
         let nchunks = source.len().div_ceil(chunk).max(1) as usize;
         let parts: Vec<Option<ChunkOut>> = (0..nchunks)
@@ -7810,7 +8086,7 @@ impl BigFile {
             .map(|ci| {
                 let start = ci as u64 * chunk;
                 let end = (start + chunk).min(source.len());
-                self.scan_chunk(&spec, gate, source, start, end)
+                self.scan_chunk(&spec, &resolved, gate, source, start, end)
             })
             .collect();
 
@@ -7840,13 +8116,14 @@ impl BigFile {
     fn scan_chunk(
         &self,
         spec: &FilterSpec,
+        resolved: &ResolvedFilterSpec,
         gate: Option<(&AtomicU64, u64)>,
         source: RowSource,
         start: u64,
         end: u64,
     ) -> Option<ChunkOut> {
         let mut hits = Vec::new();
-        let mut scan = FieldScan::new(spec, self.enc, &self.overlay, self.base_ncols);
+        let mut scan = FieldScan::new_resolved(resolved, self.enc, &self.overlay, self.base_ncols);
         for i in start..end {
             if let Some((g, id)) = gate {
                 if i & 0xFFF == 0 && g.load(Ordering::Relaxed) != id {
@@ -7959,6 +8236,35 @@ impl BigFile {
 
     // ---- 列操作 ----
 
+    /// 从 committed Schema 重放 pending IPC，得到纯逻辑预览结构。
+    fn projected_schema(&self, ops: &[ColOp]) -> Result<Option<Arc<Schema>>, String> {
+        if ops.is_empty() {
+            return Ok(None);
+        }
+        let mut candidate = (*self.schema).clone();
+        for op in ops {
+            match op {
+                ColOp::Insert { pos, name } => {
+                    let pos = (*pos as usize).min(candidate.visible().len());
+                    let pos = u32::try_from(pos).map_err(|_| "插入列位置越界")?;
+                    candidate.insert(pos, name.clone())?;
+                }
+                ColOp::Delete { col } => {
+                    if let Some(id) = candidate.view_id(*col) {
+                        // pending 允许预览零列；apply 仍按既有契约拒绝。
+                        candidate.delete_preview(id)?;
+                    }
+                }
+                ColOp::Rename { col, name } => {
+                    if let Some(id) = candidate.view_id(*col) {
+                        candidate.rename(id, name.clone())?;
+                    }
+                }
+            }
+        }
+        Ok(Some(Arc::new(candidate)))
+    }
+
     /// 追加待执行列操作（渲染预览即时，物理重写延迟到 apply）。
     ///
     /// # Errors
@@ -7975,7 +8281,11 @@ impl BigFile {
         if self.headerless && matches!(op, ColOp::Rename { .. }) {
             return Err("无列名模式不可重命名列".into());
         }
-        self.pending_cols.push(op);
+        let mut ops = self.pending_cols.clone();
+        ops.push(op);
+        let pending_schema = self.projected_schema(&ops)?;
+        self.pending_cols = ops;
+        self.pending_schema = pending_schema;
         self.filter = None; // 列映射变化，旧筛选结果作废
         self.last_spec = None;
         Ok(())
@@ -7983,12 +8293,22 @@ impl BigFile {
 
     /// 撤销最近一次待执行列操作。
     pub fn pop_col_op(&mut self) {
-        self.pending_cols.pop();
+        if self.pending_cols.is_empty() {
+            self.pending_schema = None;
+            return;
+        }
+        let ops = self.pending_cols[..self.pending_cols.len() - 1].to_vec();
+        let pending_schema = self
+            .projected_schema(&ops)
+            .expect("已接受的 pending 操作必须能无损重放");
+        self.pending_cols = ops;
+        self.pending_schema = pending_schema;
     }
 
     /// 清空待执行列操作（用户放弃）。
     pub fn clear_col_ops(&mut self) {
         self.pending_cols.clear();
+        self.pending_schema = None;
     }
 
     /// 切换「首行非列名」。
@@ -8014,14 +8334,17 @@ impl BigFile {
             return Err("列操作待执行：请先执行或撤销列操作".into());
         }
         self.refresh_indexed();
+        let mut renamed_schema = None;
         if self.partial.is_some() {
             if !on {
                 if self.indexed_data_rows() == 0 {
                     return Err("没有数据行可作为列名".into());
                 }
                 // 记录 0 是当前首行（无列名模式 offset = 0）；覆盖层编辑一并带上
-                self.base_headers = self.src_fields(0);
-                self.base_ncols = self.base_headers.len();
+                let headers = self.src_fields(0);
+                renamed_schema = Some(self.schema_with_headers(&headers)?);
+                self.base_ncols = headers.len();
+                self.base_headers = headers;
             }
             self.headerless = on;
         } else {
@@ -8038,12 +8361,17 @@ impl BigFile {
                 let Some(row) = self.row_at(0) else {
                     return Err("没有数据行可作为列名".into());
                 };
+                renamed_schema = Some(self.schema_with_headers(&row)?);
+                self.base_ncols = row.len();
                 self.base_headers = row;
-                self.base_ncols = self.base_headers.len();
                 self.seg.delete_one(0);
             }
             self.headerless = on;
         }
+        if let Some(schema) = renamed_schema {
+            self.schema = Arc::new(schema);
+        }
+        self.pending_schema = None;
         // 开关是视图属性：筛选、收窄基准、撤销历史全部作废
         self.filter = None;
         self.last_spec = None;
@@ -8147,13 +8475,7 @@ impl BigFile {
                         }
                     }
                     Some(ResolvedRow::Ins { block, row }) => {
-                        let mut f = self.ins_fields(block, row);
-                        let n = self.base_ncols;
-                        if f.len() < n {
-                            f.resize(n, String::new());
-                        } else if f.len() > n {
-                            f.truncate(n);
-                        }
+                        let f = self.ins_fields(block, row);
                         w.write_all(&encode_record(&f, b',', self.enc))
                             .map_err(|e| e.to_string())?;
                     }
@@ -8216,14 +8538,9 @@ impl BigFile {
                 }
                 SegKind::Ins { block } => {
                     if let Some(Some(rows)) = self.seg.blocks.get(block as usize) {
-                        for row in rows {
-                            let mut f = row.clone();
-                            let n = self.base_ncols;
-                            if f.len() < n {
-                                f.resize(n, String::new());
-                            } else if f.len() > n {
-                                f.truncate(n);
-                            }
+                        for (row_index, _) in rows.iter().enumerate() {
+                            let row = u32::try_from(row_index).map_err(|_| "插入行号越界")?;
+                            let f = self.ins_fields(block, row);
                             w.write_all(&encode_record(&f, b',', self.enc))
                                 .map_err(|e| e.to_string())?;
                             done += 1;
@@ -8288,7 +8605,6 @@ impl BigFile {
         // 整表物理重写数十秒：本线程降为背景优先级，让出 UI/系统调度。
         let _bg = bg::BackgroundGuard::enter();
         let new_headers = self.view_headers();
-        let mapping: Vec<Option<u32>> = (0..ncols).map(|vc| self.view_to_phys(vc)).collect();
 
         let dest = self.path.clone();
         let tmp = tmp_path_for(&dest);
@@ -8315,14 +8631,7 @@ impl BigFile {
             match s.kind {
                 SegKind::Src { start, len } => {
                     for rec in start..start + len {
-                        let base = self.src_fields(rec);
-                        let mapped: Vec<String> = mapping
-                            .iter()
-                            .map(|m| match m {
-                                Some(p) => base.get(*p as usize).cloned().unwrap_or_default(),
-                                None => String::new(),
-                            })
-                            .collect();
+                        let mapped = self.map_fields_to_view(&self.src_fields(rec));
                         w.write_all(&encode_record(&mapped, b',', self.enc))
                             .map_err(|e| e.to_string())?;
                         done += 1;
@@ -8334,16 +8643,9 @@ impl BigFile {
                 }
                 SegKind::Ins { block } => {
                     if let Some(Some(rows)) = self.seg.blocks.get(block as usize) {
-                        for row in rows {
-                            let mapped: Vec<String> = mapping
-                                .iter()
-                                .map(|m| match m {
-                                    Some(p) => {
-                                        row.get(*p as usize).cloned().unwrap_or_default()
-                                    }
-                                    None => String::new(),
-                                })
-                                .collect();
+                        for (row_index, _) in rows.iter().enumerate() {
+                            let row = u32::try_from(row_index).map_err(|_| "插入行号越界")?;
+                            let mapped = self.map_fields_to_view(&self.ins_fields(block, row));
                             w.write_all(&encode_record(&mapped, b',', self.enc))
                                 .map_err(|e| e.to_string())?;
                             done += 1;
@@ -8370,6 +8672,8 @@ impl BigFile {
             // 无路径内存档：缓冲直接重建会话，全程不写盘。
             ColWriteTarget::Mem(buf) => Self::from_bytes(buf, self.headerless)?,
         };
+        fresh.schema = Arc::new(Schema::from_headers(new_headers.clone())?);
+        fresh.pending_schema = None;
         fresh.base_headers = new_headers;
         fresh.base_ncols = ncols as usize;
         fresh.history = HistoryLedger::new(history_budget);
