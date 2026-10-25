@@ -716,21 +716,19 @@ fn big_clear_filter(state: tauri::State<BigShared>, session: u64) -> Result<(), 
     })
 }
 
-/// 切换「首行非列名」：返回最新 meta（行数/表头随模式变化）。
+/// 切换「首行非列名」并返回统一 EditOutcome。
 ///
-/// 切换是视图属性，不改文件；筛选结果/撤销栈/列缓存在引擎内清空，
-/// 因此先 bump 代数让在跑的筛选扫描退出。
+/// 切换记录 HeaderMode 历史且不改文件；实际变化后清空筛选结果。
+/// 先 bump 代数让在跑的筛选扫描退出，取消和空改动不写数据。
 #[tauri::command]
 fn big_set_headerless(
     state: tauri::State<BigShared>,
     session: u64,
     on: bool,
-) -> Result<BigMeta, String> {
+    approval: Approval,
+) -> Result<EditOutcome, String> {
     big_entry(state.inner(), session)?.bump_gate();
-    with_big(&state, session, |bf| {
-        bf.set_headerless(on)?;
-        Ok(bf.meta())
-    })
+    with_big(&state, session, |bf| bf.set_headerless(on, approval))
 }
 
 /// 大选区复制（TSV，\r\n 行尾）。

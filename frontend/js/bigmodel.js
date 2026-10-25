@@ -334,11 +334,11 @@ export class BigModel {
   /**
    * 切换「首行非列名」模式（引擎段表 O(1) 插/删首行）。
    *
-   * 引擎同时清空筛选/撤销/列缓存；本模型同步丢弃窗口缓存与筛选态。
-   * 开关属于视图属性：以 origin="view" 通知，不标脏。
+   * 实际切换后清空筛选和窗口缓存，并记录可撤销的 HeaderMode 历史。
+   * 开关属于视图属性：以 origin="view" 通知，不额外标脏。
    *
    * @param {boolean} on - true=首行不是列名；false=首行是列名。
-   * @returns {Promise<void>}
+   * @returns {Promise<object|undefined>} EditOutcome；同态时返回 undefined。
    * @throws {Error} 引擎拒绝（无行可提升列名、待执行列操作等）。
    */
   async setHeaderless(on) {
@@ -346,14 +346,13 @@ export class BigModel {
     if (want === this.isHeaderless()) {
       return;
     }
-    this._meta = await this._invoke("big_set_headerless", { on: want });
+    const outcome = await this._invokeEdit("big_set_headerless", { on: want });
+    if (!outcome.changed || outcome.cancelled) return outcome;
     // 引擎已清空筛选；让迟到响应作废，前端视图同步回全量。
     this._filterGen += 1;
     this._filterOn = false;
     this._filterCount = 0;
-    this._invalidate();
-    this._emitData(true, "view");
-    this._emitUndo();
+    return this._afterEdit(outcome, "view");
   }
 
   /**

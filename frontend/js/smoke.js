@@ -3110,6 +3110,117 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     "页签快照中的开关状态应各自独立");
   });
 
+  const setHeaderTestBudget = async (value) => {
+    document.getElementById("btn-undo-budget").click();
+    await waitFor(() => document.querySelector(".modal-mask"), "首行测试预算设置框");
+    const mask = document.querySelector(".modal-mask");
+    mask.querySelector('input[type="number"]').value = String(value);
+    assert(clickModalButton("确定"), "应用首行测试预算");
+    await waitFor(() => document.getElementById("status-text").textContent
+      .includes(`每文档 ${value} MiB`), "首行测试预算落定");
+  };
+
+  check("首行非列名：undo/redo 恢复内容与模式且不额外标脏", async () => {
+    await loadBasic();
+    const before = tableSnapshot();
+    const headersBefore = model.headers();
+    assert(!window.__app.isDirty(), "首行历史测试应从干净文档开始");
+
+    tbBtn("首行非列名").click();
+    await waitFor(() => window.__app.isHeaderless() && model.rowCount() === 4,
+      "开启首行模式进入历史");
+    await waitFor(() => model.rawData(0, 0) === "目的地", "开启后顶部行落定");
+    assert(model.canUndo() && !model.canRedo(), "首行切换应产生一步 undo");
+    assert(!window.__app.isDirty(), "纯首行切换不得额外标脏");
+
+    await window.__app.undo();
+    await waitFor(() => !window.__app.isHeaderless() && tableEquals(before),
+      "撤销首行切换应完整恢复内容");
+    assert(JSON.stringify(model.headers()) === JSON.stringify(headersBefore),
+      "撤销应恢复原表头");
+    assert(model.canRedo() && !window.__app.isDirty(), "撤销首行切换不得改变干净保存点");
+
+    await window.__app.redo();
+    await waitFor(() => window.__app.isHeaderless() && model.rowCount() === 4,
+      "重做首行切换");
+    await waitFor(() => model.rawData(0, 0) === "目的地", "重做后顶部行重新取页");
+    assert(model.canUndo() && !window.__app.isDirty(), "重做首行切换仍不得额外标脏");
+    await window.__app.undo();
+    await waitFor(() => tableEquals(before), "首行历史测试恢复基础夹具");
+  });
+
+  check("首行非列名：固定点取消保留筛选、redo 和脏点", async () => {
+    await loadBasic();
+    const p = `${TMP}/hl-fixed-cancel-${Date.now()}.csv`;
+    await writeText(p, `${"H".repeat(2 * 1024 * 1024)},b
+x,y
+z,w
+`);
+    await window.__app.openPath(p);
+    await waitFor(() => model.rowCount() === 2 && model.rawData(0, 0) === "x",
+      "首行固定点取消夹具落定");
+    await setHeaderTestBudget(1);
+    try {
+      await model.setData(0, 0, "one");
+      await model.setData(0, 0, "two");
+      await window.__app.undo();
+      await waitFor(() => model.rawData(0, 0) === "one", "固定点预检前保留 redo");
+      assert(model.canUndo() && model.canRedo() && window.__app.isDirty(),
+        "预检前应同时具备 undo、redo 和脏点");
+      grid.filters.set(1, "y");
+      await window.__app.runBigFilter();
+      assert(model.filterActive() && model.rowCount() === 1, "预检前筛选应生效");
+
+      const pending = window.__app.toggleHeaderless();
+      await waitFor(() => document.querySelector(".modal-mask")?.textContent
+        .includes("确认固定点"), "首行切换超预算确认");
+      assert(clickModalButton("取消"), "取消首行固定点");
+      await pending;
+      assert(!window.__app.isHeaderless(), "取消不得改变首行模式");
+      assert(model.filterActive() && model.rowCount() === 1,
+        "取消必须保留引擎筛选，不得预先清筛选");
+      assert(grid.filters.get(1) === "y", "取消必须保留筛选输入现场");
+      assert(model.rawData(0, 0) === "one", "取消不得改变数据");
+      assert(model.canUndo() && model.canRedo() && window.__app.isDirty(),
+        "取消必须保留 undo、redo 和脏点");
+    } finally {
+      if (document.querySelector(".modal-mask")) clickModalButton("取消");
+      await setHeaderTestBudget(64);
+    }
+  });
+
+  check("首行非列名：确认固定点后只能撤销到固定点", async () => {
+    await loadBasic();
+    const p = `${TMP}/hl-fixed-confirm-${Date.now()}.csv`;
+    await writeText(p, `${"H".repeat(2 * 1024 * 1024)},b
+x,y
+`);
+    await window.__app.openPath(p);
+    await waitFor(() => model.rowCount() === 1 && model.rawData(0, 0) === "x",
+      "首行固定点确认夹具落定");
+    await setHeaderTestBudget(1);
+    try {
+      const pending = window.__app.toggleHeaderless();
+      await waitFor(() => document.querySelector(".modal-mask")?.textContent
+        .includes("确认固定点"), "确认首行固定点对话框");
+      assert(clickModalButton("继续"), "确认首行固定点");
+      await pending;
+      await waitFor(() => window.__app.isHeaderless() && model.rowCount() === 2,
+        "固定点后的无表头模式");
+      assert(!model.canUndo() && !model.canRedo(), "固定点操作与其前历史均不可撤销");
+      assert(!window.__app.isDirty(), "无内容修改的固定点不得伪造脏点");
+      await model.setData(1, 0, "after");
+      assert(model.canUndo() && window.__app.isDirty(), "固定点后的新编辑应可撤销");
+      await window.__app.undo();
+      await waitFor(() => model.rawData(1, 0) === "x", "只能撤销到首行固定点内容");
+      assert(!model.canUndo() && !window.__app.isDirty(),
+        "撤销到固定点后应停止并恢复干净保存点");
+    } finally {
+      if (document.querySelector(".modal-mask")) clickModalButton("取消");
+      await setHeaderTestBudget(64);
+    }
+  });
+
   function deferModelCommand(m, cmd) {
     const original = m._rawInvoke;
     let entered;

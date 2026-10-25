@@ -1170,10 +1170,11 @@ function refreshHeaderlessUi() {
 }
 
 /**
- * 切换「首行非列名」：先落定未提交编辑，再清筛选/视图，最后换模型状态。
+ * 切换「首行非列名」：先落定编辑与固定点确认，实际切换后再清筛选/视图。
  *
  * 大模式格内编辑与编辑窗格写回是异步的；必须在改变行坐标前等待，
- * 否则写回会落到错误的行。切换是视图属性：清空筛选/选区/撤销，但不标脏。
+ * 否则写回会落到错误的行。切换进入撤销历史但不增加内容脏点；
+ * 取消或空改动不得提前清筛选、选区或滚动现场。
  *
  * @returns {Promise<boolean>} true = 切换后处于无列名状态。
  */
@@ -1190,11 +1191,14 @@ async function toggleHeaderless() {
     // 1) 未提交的格内编辑与窗格异步写回先落定（行坐标即将 ±1）
     await fgrid().commitEdit();
     await paneWrite;
-    // 2) 先退出筛选：旧命中行号在切换后的坐标系里会错位
-    if (model.filterActive()) {
-      try { await model.clearFilter(); } catch { /* 会话已关闭：继续切换 */ }
+    // 2) 模型统一完成预检、固定点确认和切换；引擎只在实际变更后清筛选
+    const outcome = await model.setHeaderless(want);
+    if (outcome?.cancelled) {
+      statusMsg("已取消首行模式切换", 2500);
+      return model.isHeaderless?.() === true;
     }
-    // 3) 清视图（筛选框/多重输入/选区/滚动/窗格）
+    if (!outcome?.changed) return model.isHeaderless?.() === true;
+    // 3) 仅实际切换后清视图（筛选框/多重输入/选区/滚动/窗格）
     fgrid().clearFilters({ anchor: false });
     fgrid().clearSelection();
     fgrid().resetScroll();
@@ -1203,9 +1207,7 @@ async function toggleHeaderless() {
     lastFilterMs = 0;
     clearTimeout(bigFilterTimer);
     bigFilterSeq += 1;
-    // 4) 模型/引擎切换；失败信息原样给用户，状态保持不变
-    await model.setHeaderless(want);
-    // 5) 页签镜像 + 计数与按钮（不做持久化：绿色轻量，重开即默认）
+    // 4) 页签镜像 + 计数与按钮（不持久化视图属性，不额外标脏）
     const t = activeTab();
     if (t) t.headerless = model.isHeaderless?.() === true;
     onCountsChanged(model.rowCount(), model.rowCount());

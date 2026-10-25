@@ -3820,11 +3820,11 @@ keep,old,target
         let mut bf = BigFile::open_with(&p, true).unwrap();
         assert_eq!(bf.meta().rows, 1);
         assert_eq!(bf.rows(0, 1)[0], vec!["only", "row"]);
-        bf.set_headerless(false).unwrap();
+        bf.set_headerless(false, Approval::deny()).unwrap();
         assert_eq!(bf.meta().rows, 0);
         assert_eq!(bf.meta().headers, vec!["only", "row"]);
         // 变成表头后无行：再开启会把表头放回为数据行
-        bf.set_headerless(true).unwrap();
+        bf.set_headerless(true, Approval::deny()).unwrap();
         assert_eq!(bf.meta().rows, 1);
         assert_eq!(bf.rows(0, 1)[0], vec!["only", "row"]);
         fs::remove_file(&p).ok();
@@ -3872,21 +3872,21 @@ keep,old,target
         let p = tmp_csv("hltoggle", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         assert_eq!(bf.meta().rows, 5);
-        bf.set_headerless(true).unwrap();
+        bf.set_headerless(true, Approval::deny()).unwrap();
         let m = bf.meta();
         assert!(m.headerless);
         assert_eq!(m.rows, 6, "原表头进入数据");
         assert_eq!(m.headers, vec!["列1", "列2", "列3"]);
         assert_eq!(bf.rows(0, 1)[0], vec!["name", "age", "city"]);
         bf.set_cell(0, 0, "NAME".into(), Approval::deny()).unwrap();
-        bf.set_headerless(false).unwrap();
+        bf.set_headerless(false, Approval::deny()).unwrap();
         let m = bf.meta();
         assert!(!m.headerless);
         assert_eq!(m.rows, 5);
         assert_eq!(m.headers, vec!["NAME", "age", "city"], "应含未保存编辑");
         assert_eq!(bf.rows(0, 1)[0], vec!["Alice", "30", "Beijing"]);
         // 再次开启：首行回到数据
-        bf.set_headerless(true).unwrap();
+        bf.set_headerless(true, Approval::deny()).unwrap();
         assert_eq!(bf.meta().rows, 6);
         assert_eq!(bf.rows(0, 1)[0], vec!["NAME", "age", "city"]);
         fs::remove_file(&p).ok();
@@ -3898,7 +3898,7 @@ keep,old,target
         let mut bf = BigFile::open_with(&p, true).unwrap();
         bf.insert_rows(0, Some(vec![vec!["X".into(), "9".into()]]), 0, Approval::deny())
             .unwrap();
-        bf.set_headerless(false).unwrap();
+        bf.set_headerless(false, Approval::deny()).unwrap();
         assert_eq!(bf.meta().headers, vec!["X", "9"]);
         assert_eq!(bf.meta().rows, 2);
         // 被提升的是插入行；物理记录 0 仍是数据（读路径不得假设数据从 1 开始）
@@ -3989,7 +3989,7 @@ keep,old,target
         // 待执行列操作期间禁止切换模式
         bf.push_col_op(ColOp::Insert { pos: 2, name: "新列".into() })
             .unwrap();
-        let err = bf.set_headerless(false).unwrap_err();
+        let err = bf.set_headerless(false, Approval::deny()).unwrap_err();
         assert!(err.contains("列操作"), "{err}");
         assert!(bf.meta().headerless);
         bf.apply_col_ops(Approval::deny()).unwrap();
@@ -4028,7 +4028,7 @@ keep,old,target
         let mut bf = BigFile::open_with(&p, true).unwrap();
         // 正常路径已禁止删最后一行；这里直接构造 0 行状态验证兜底
         bf.seg = Segments::new(0, 0);
-        let err = bf.set_headerless(false).unwrap_err();
+        let err = bf.set_headerless(false, Approval::deny()).unwrap_err();
         assert!(err.contains("没有数据行可作为列名"), "{err}");
         assert!(bf.meta().headerless, "失败不得切换模式");
         let err = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap_err();
@@ -4041,17 +4041,22 @@ keep,old,target
     }
 
     #[test]
-    fn big_headerless_toggle_clears_filter_and_undo() {
+    fn big_headerless_toggle_clears_filter_and_preserves_history() {
         let p = tmp_csv("hlclear", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         assert_eq!(bf.run_filter(&spec_one(2, "beijing")).unwrap(), 2);
         bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
         assert!(bf.meta().can_undo);
-        bf.set_headerless(true).unwrap();
+        bf.set_headerless(true, Approval::deny()).unwrap();
         assert!(!bf.has_filter(), "切换后筛选清空");
         assert_eq!(bf.filter_len(), 0);
-        assert!(!bf.meta().can_undo, "切换清空撤销");
+        assert!(bf.meta().can_undo, "首行切换自身进入撤销历史");
         assert!(!bf.meta().can_redo);
+        assert!(bf.undo());
+        assert!(!bf.meta().headerless, "撤销恢复原有表头模式");
+        assert!(bf.meta().can_redo);
+        assert!(bf.redo());
+        assert!(bf.meta().headerless, "重做恢复无表头模式");
         // 开关是视图属性：不改变文件
         assert_eq!(fs::read(&p).unwrap(), people_csv());
         fs::remove_file(&p).ok();
@@ -4074,11 +4079,11 @@ keep,old,target
         assert_eq!(bf.rows(0, 1)[0], vec!["a", "b"]);
         assert_eq!(bf.copy_tsv(0, 1, 0, 2).unwrap(), "a\tb\r\n");
         // 索引期关闭开关：只翻 offset，首行变表头
-        bf.set_headerless(false).unwrap();
+        bf.set_headerless(false, Approval::deny()).unwrap();
         assert_eq!(bf.meta().rows, 3);
         assert_eq!(bf.meta().headers, vec!["a", "b"]);
         assert_eq!(bf.rows(0, 1)[0], vec!["0000", "x"]);
-        bf.set_headerless(true).unwrap();
+        bf.set_headerless(true, Approval::deny()).unwrap();
         assert_eq!(bf.meta().rows, 4);
         // 完成索引后段表从物理记录 0 开始
         bf.drive_index_for_test();
@@ -4087,6 +4092,165 @@ keep,old,target
         assert_eq!(bf.meta().rows, 21);
         assert_eq!(bf.rows(0, 1)[0], vec!["a", "b"]);
         assert_eq!(bf.rows(20, 1)[0], vec!["0019", "x"]);
+        fs::remove_file(&p).ok();
+    }
+
+
+    #[test]
+    fn p4_header_mode_noop_preserves_redo_and_dirty() {
+        let p = tmp_csv("p4_header_noop", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "redo-base".into(), Approval::deny()).unwrap();
+        assert!(bf.undo());
+        let history = bf.history_stats();
+        let before = bf.rows(0, u32::try_from(bf.meta().rows).unwrap());
+        let headers = bf.meta().headers;
+        let dirty = bf.modified();
+        let out = bf.set_headerless(false, Approval::deny()).unwrap();
+        assert!(!out.changed && !out.cancelled && out.fixed_point.is_none());
+        assert_eq!(out.inserted_rows, 0);
+        assert_eq!(out.removed_rows, 0);
+        assert_eq!(bf.history_stats(), history);
+        assert_eq!(bf.rows(0, u32::try_from(bf.meta().rows).unwrap()), before);
+        assert_eq!(bf.meta().headers, headers);
+        assert_eq!(bf.modified(), dirty);
+        assert!(bf.redo(), "同态 unchanged 不得清 redo");
+        assert_eq!(bf.rows(0, 1)[0][0], "redo-base");
+        assert!(bf.modified());
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p4_header_mode_roundtrip_without_renumbering_records() {
+        let p = tmp_csv("p4_header_history", &people_csv());
+        let original = fs::read(&p).unwrap();
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, u32::try_from(bf.meta().rows).unwrap());
+        let dirty = bf.modified();
+        let out = bf.set_headerless(true, Approval::deny()).unwrap();
+        assert!(out.changed && out.inserted_rows == 1 && out.removed_rows == 0);
+        assert_eq!(bf.rows(0, 1)[0], vec!["name", "age", "city"]);
+        assert_eq!(bf.modified(), dirty);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, u32::try_from(bf.meta().rows).unwrap()), before);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 1)[0], vec!["name", "age", "city"]);
+        assert!(bf.undo());
+        bf.set_headerless(true, Approval::deny()).unwrap();
+        bf.set_headerless(false, Approval::deny()).unwrap();
+        assert_eq!(bf.meta().headers, vec!["name", "age", "city"]);
+        assert!(bf.undo());
+        assert!(bf.meta().headerless);
+        assert!(bf.redo());
+        assert!(!bf.meta().headerless);
+        assert_eq!(fs::read(&p).unwrap(), original);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p4_header_mode_progressive_history_survives_index_completion() {
+        let mut csv = String::from("a,b\r\n");
+        for i in 0..20 {
+            csv.push_str(&format!("{i:04},x\r\n"));
+        }
+        let p = tmp_csv("p4_header_progressive_history", csv.as_bytes());
+        let mut bf = BigFile::open_progressive_full(&p, 29, 1000, 8, false, true).unwrap();
+        assert!(bf.partial.is_some());
+        let epoch = bf.index_epoch;
+        let out = bf.set_headerless(false, Approval::deny()).unwrap();
+        assert!(out.changed && out.removed_rows == 1 && out.inserted_rows == 0);
+        assert_eq!(bf.meta().rows, 3);
+        assert_eq!(bf.meta().headers, vec!["a", "b"]);
+        assert_eq!(bf.rows(0, 1)[0], vec!["0000", "x"]);
+        assert!(bf.undo());
+        assert!(bf.meta().headerless);
+        assert_eq!(bf.meta().rows, 4);
+        assert_eq!(bf.rows(0, 1)[0], vec!["a", "b"]);
+        assert!(bf.redo());
+        assert!(!bf.meta().headerless);
+        assert_eq!(bf.rows(0, 1)[0], vec!["0000", "x"]);
+        bf.set_headerless(true, Approval::deny()).unwrap();
+        assert_eq!(bf.rows(0, 1)[0], vec!["a", "b"]);
+        bf.drive_index_for_test();
+        bf.refresh_indexed();
+        assert!(bf.partial.is_none());
+        assert_eq!(bf.index_epoch, epoch, "后台索引不得更换 backing 代际");
+        assert_eq!(bf.meta().rows, 21);
+        assert_eq!(bf.rows(20, 1)[0], vec!["0019", "x"]);
+        assert!(bf.undo(), "索引完成后仍撤销同一条 Source(0) 表头历史");
+        assert!(!bf.meta().headerless);
+        assert_eq!(bf.meta().rows, 20);
+        assert_eq!(bf.meta().headers, vec!["a", "b"]);
+        assert_eq!(bf.rows(0, 1)[0], vec!["0000", "x"]);
+        assert_eq!(bf.rows(19, 1)[0], vec!["0019", "x"]);
+        assert!(bf.redo());
+        assert!(bf.meta().headerless);
+        assert_eq!(bf.rows(0, 1)[0], vec!["a", "b"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p4_header_mode_history_rebinds_after_save() {
+        let p = tmp_csv("p4_header_save_rebind", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, u32::try_from(bf.meta().rows).unwrap());
+        let headers = bf.meta().headers;
+        bf.set_headerless(true, Approval::deny()).unwrap();
+        assert_eq!(bf.rows(0, 1)[0], vec!["name", "age", "city"]);
+        let saved = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(saved.saved && saved.fixed_point.is_none());
+        assert!(bf.undo(), "顶部 Inserted 物化为 Source 后仍可撤销");
+        assert!(!bf.meta().headerless);
+        assert_eq!(bf.meta().headers, headers);
+        assert_eq!(bf.rows(0, u32::try_from(bf.meta().rows).unwrap()), before);
+        assert!(bf.redo(), "物化 Source(0) 可恢复为顶部数据行");
+        assert!(bf.meta().headerless);
+        assert_eq!(bf.rows(0, 1)[0], vec!["name", "age", "city"]);
+        assert!(bf.undo());
+        assert!(!bf.meta().headerless);
+        let saved = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(saved.saved && saved.fixed_point.is_none(),
+            "已删除 Source(0) 应通过 suspended 身份保留 redo");
+        assert!(bf.redo(), "suspended Inserted 身份应保留表头 redo");
+        assert!(bf.meta().headerless);
+        assert_eq!(bf.rows(0, 1)[0], vec!["name", "age", "city"]);
+        assert!(bf.undo());
+        assert!(!bf.meta().headerless);
+        assert_eq!(bf.meta().headers, headers);
+        assert_eq!(bf.rows(0, u32::try_from(bf.meta().rows).unwrap()), before);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p4_header_over_budget_cancel_preserves_filter_redo_and_dirty() {
+        let p = tmp_csv("p4_header_fixed", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "redo-base".into(), Approval::deny()).unwrap();
+        assert!(bf.undo());
+        let old = bf.history_stats();
+        bf.set_history_budget(old.bytes).unwrap();
+        let history = bf.history_stats();
+        bf.run_filter(&spec_one(2, "beijing")).unwrap();
+        let hits = bf.filter_page(0, bf.filter_len()).rows;
+        assert_eq!(hits.len(), 2);
+        let before = bf.rows(0, u32::try_from(bf.meta().rows).unwrap());
+        let headers = bf.meta().headers;
+        let dirty = bf.modified();
+        let first = bf.set_headerless(true, Approval::deny()).unwrap();
+        assert!(!first.changed);
+        let request = first.fixed_point.unwrap();
+        assert_eq!(bf.rows(0, u32::try_from(bf.meta().rows).unwrap()), before);
+        assert_eq!(bf.filter_page(0, bf.filter_len()).rows, hits);
+        assert_eq!(bf.meta().headers, headers);
+        assert_eq!(bf.modified(), dirty);
+        assert_eq!(bf.history_stats(), history);
+        let done = bf.set_headerless(true, Approval::allow(request.preflight_id)).unwrap();
+        assert!(done.changed);
+        assert_eq!(done.inserted_rows, 1);
+        assert_eq!(bf.history_stats().undo_count, 0);
+        assert_eq!(bf.history_stats().redo_count, 0);
+        assert_eq!(bf.modified(), dirty);
+        assert!(!bf.undo());
         fs::remove_file(&p).ok();
     }
 
@@ -4606,7 +4770,7 @@ keep,old,target
                 .unwrap_err()
                 .contains("排序")
         );
-        assert!(bf.set_headerless(true).unwrap_err().contains("排序"));
+        assert!(bf.set_headerless(true, Approval::deny()).unwrap_err().contains("排序"));
         fs::remove_file(&p).ok();
     }
 
@@ -4898,11 +5062,11 @@ keep,old,target
     #[test]
     fn memory_doc_set_headerless_toggle() {
         let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
-        bf.set_headerless(true).unwrap();
+        bf.set_headerless(true, Approval::deny()).unwrap();
         let m = bf.meta();
         assert!(m.headerless && m.rows == 6);
         assert_eq!(m.headers, vec!["列1", "列2", "列3"]);
-        bf.set_headerless(false).unwrap();
+        bf.set_headerless(false, Approval::deny()).unwrap();
         let m = bf.meta();
         assert!(!m.headerless && m.rows == 5);
         assert_eq!(m.headers, vec!["name", "age", "city"]);
@@ -5567,6 +5731,25 @@ impl SchemaChange {
     }
 }
 
+/// 首行模式中，在数据与表头之间往返的稳定顶部行。
+#[derive(Clone, PartialEq, Debug)]
+pub struct HeaderTop {
+    pub row: RowId,
+    pub vpos: u64,
+    pub snapshot: RowSnapshot,
+    pub source_record: Option<u32>,
+}
+
+/// 首行模式切换的完整可逆状态；顶部行与前后 Schema 独立计共享成本。
+#[derive(Clone, PartialEq, Debug)]
+pub struct HeaderModeChange {
+    pub before_headerless: bool,
+    pub after_headerless: bool,
+    pub schema_change: SchemaChange,
+    pub top: Option<HeaderTop>,
+    pub index_epoch: u64,
+}
+
 /// 执行前已从视图列号解析为稳定列身份的排序级别。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StableSortLevel {
@@ -5581,6 +5764,7 @@ enum Op {
     SetCell { cell: CellId, old: ValueRef, new: ValueRef },
     SetCells { changes: Vec<CellChange> },
     Columns { change: SchemaChange },
+    HeaderMode(HeaderModeChange),
     Paste {
         changes: Vec<CellChange>,
         inserted: Option<PasteInsert>,
@@ -5624,7 +5808,7 @@ impl Op {
                     change.new.add_own_cost(&mut cost)?;
                 }
             }
-            Op::Columns { .. } => {}
+            Op::Columns { .. } | Op::HeaderMode(_) => {}
             Op::Sort { levels, .. } => { cost.add_vec(levels)?; }
             Op::Paste { changes, inserted, .. } => {
                 cost.add_vec(changes)?;
@@ -5659,6 +5843,12 @@ impl Op {
                 }
             }
             Op::Columns { change } => change.add_shared_charge(&mut shared),
+            Op::HeaderMode(change) => {
+                change.schema_change.add_shared_charge(&mut shared);
+                if let Some(top) = &change.top {
+                    shared.push(top.snapshot.shared_charge());
+                }
+            }
             Op::Paste { changes, schema_change, .. } => {
                 for change in changes {
                     change.old.add_shared_charge(&mut shared)?;
@@ -5684,7 +5874,11 @@ impl Op {
                 shared.extend(after.shared_charge());
             }
         }
-        let revision_delta = if matches!(&self, Op::Sort { .. }) { 0 } else { 1 };
+        let revision_delta = if matches!(&self, Op::Sort { .. } | Op::HeaderMode(_)) {
+            0
+        } else {
+            1
+        };
         Ok(HistoryEntry::new(self, own_bytes, shared, revision_delta))
     }
 }
@@ -6734,7 +6928,12 @@ static NEXT_SESSION_SPOOL: AtomicU64 = AtomicU64::new(0);
 
 fn new_session_spool() -> Result<SessionSpool, String> {
     let id = NEXT_SESSION_SPOOL.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("simpletable-{}-{id}", std::process::id()));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("读取 spool 时间戳失败：{e}"))?
+        .as_nanos();
+    let root = std::env::temp_dir()
+        .join(format!("simpletable-{}-{nonce}-{id}", std::process::id()));
     SessionSpool::create(&root)
 }
 
@@ -8710,17 +8909,170 @@ impl BigFile {
         self.finish_history(prepared, fixed_point, 0, removed_rows)
     }
 
-    /// 原地执行并归一化插入块号；不克隆整条操作。
-    fn apply(&mut self, op: &mut Op) {
+    /// 按目标模式恢复或摘除顶部行；可预见失败发生在状态写入前。
+    fn apply_header_mode(&mut self, change: &HeaderModeChange, target: bool) -> bool {
+        if change.index_epoch != self.index_epoch
+            || change.before_headerless == change.after_headerless
+            || self.headerless == target
+            || self.is_sorted()
+            || !self.pending_cols.is_empty()
+        {
+            return false;
+        }
+        let target_schema = if target == change.after_headerless {
+            Arc::clone(&change.schema_change.after)
+        } else {
+            Arc::clone(&change.schema_change.before)
+        };
+        let headerless_schema = if change.before_headerless {
+            Arc::clone(&change.schema_change.before)
+        } else {
+            Arc::clone(&change.schema_change.after)
+        };
+        let Some(top) = &change.top else {
+            self.headerless = target;
+            self.schema = target_schema;
+            self.pending_schema = None;
+            self.stable_hits = None;
+            self.display_hits = None;
+            self.last_spec = None;
+            return true;
+        };
+        if top.vpos != 0 {
+            return false;
+        }
+        let Ok(cells) = top.snapshot.read_row(0) else { return false };
+        if cells.len() != headerless_schema.visible().len() {
+            return false;
+        }
+        let next_base_headers = if target {
+            generic_headers(headerless_schema.visible().len())
+        } else {
+            cells.clone()
+        };
+
+        if self.partial.is_some() {
+            // 渐进期只改变 record_offset；Source(0) 的物理记录号保持不变。
+            if top.row != RowId::Source(0)
+                || top.source_record != Some(0)
+                || self.src_fields(0) != cells
+            {
+                return false;
+            }
+        } else if target {
+            match top.row {
+                RowId::Source(rec) => {
+                    if top.source_record != Some(rec) {
+                        return false;
+                    }
+                    let present = self.seg.segs.iter().any(|seg| {
+                        matches!(seg.kind, SegKind::Src { start, len }
+                            if rec >= start && rec - start < len)
+                    });
+                    if present {
+                        if self.seg.resolve(0) != Some(ResolvedRow::Src(rec)) {
+                            return false;
+                        }
+                    } else {
+                        self.seg.segs.retain(|seg| seg.len > 0);
+                        let at = self.seg.split_at(0);
+                        self.seg.segs.insert(
+                            at,
+                            Seg { kind: SegKind::Src { start: rec, len: 1 }, len: 1 },
+                        );
+                    }
+                    self.seg.tombstones.remove(&rec);
+                    for (id, value) in headerless_schema.visible().iter().zip(cells) {
+                        self.overlay.insert((rec, *id), value);
+                    }
+                    self.seg.compact();
+                }
+                RowId::Inserted { block, row: 0 } => {
+                    if top.source_record.is_some() {
+                        return false;
+                    }
+                    let Ok(mut stored) = self.logical_rows_to_storage_in_schema(
+                        &headerless_schema,
+                        vec![cells],
+                    ) else {
+                        return false;
+                    };
+                    let Some(stored) = stored.pop() else { return false };
+                    let index = block as usize;
+                    if index == self.seg.blocks.len() {
+                        let inserted = self.seg.insert_block(0, vec![stored]);
+                        debug_assert_eq!(inserted, block, "预分配顶部块号必须稳定");
+                    } else if index < self.seg.blocks.len() {
+                        if !self.seg.restore_inserted(0, block, 0, stored) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                RowId::Inserted { .. } => return false,
+            }
+        } else {
+            match top.row {
+                RowId::Source(rec) => {
+                    if top.source_record != Some(rec)
+                        || self.seg.resolve(0) != Some(ResolvedRow::Src(rec))
+                        || self.src_fields(rec) != cells
+                    {
+                        return false;
+                    }
+                    if self.seg.delete_one(0).is_none() {
+                        return false;
+                    }
+                }
+                RowId::Inserted { block, row: 0 } => {
+                    if top.source_record.is_some() {
+                        return false;
+                    }
+                    let Ok(mut stored) = self.logical_rows_to_storage_in_schema(
+                        &headerless_schema,
+                        vec![cells],
+                    ) else {
+                        return false;
+                    };
+                    let Some(stored) = stored.pop() else { return false };
+                    if !self.remove_inserted_block_for_undo(0, block, &[stored]) {
+                        return false;
+                    }
+                }
+                RowId::Inserted { .. } => return false,
+            }
+        }
+        self.headerless = target;
+        self.schema = target_schema;
+        self.base_headers = next_base_headers;
+        self.pending_schema = None;
+        self.stable_hits = None;
+        self.display_hits = None;
+        self.last_spec = None;
+        true
+    }
+
+    /// 原地执行并归一化插入块号；失败时不得移动历史栈。
+    fn apply(&mut self, op: &mut Op) -> bool {
         match op {
-            Op::SetCell { cell, new, .. } => self.write_value(*cell, new),
+            Op::SetCell { cell, new, .. } => {
+                self.write_value(*cell, new);
+                true
+            }
             Op::SetCells { changes } => {
                 for change in changes {
                     self.write_value(change.cell, &change.new);
                 }
+                true
             }
             Op::Columns { change } => {
                 self.schema = Arc::clone(&change.after);
+                true
+            }
+            Op::HeaderMode(change) => {
+                let target = change.after_headerless;
+                self.apply_header_mode(change, target)
             }
             Op::Paste { changes, inserted, schema_change } => {
                 if let Some(change) = schema_change {
@@ -8732,13 +9084,16 @@ impl BigFile {
                 for change in changes {
                     self.write_value(change.cell, &change.new);
                 }
+                true
             }
             Op::Sort { after, .. } => {
                 self.order = after.clone();
                 self.refresh_filter_projection();
+                true
             }
             Op::InsertRows { vpos, block, rows } => {
                 *block = self.seg.insert_block(*vpos, rows.clone());
+                true
             }
             Op::RemoveRows { items } => {
                 items.sort_by_key(|item| match item {
@@ -8749,11 +9104,12 @@ impl BigFile {
                 for item in items.iter().rev() {
                     let vpos = match item {
                         DeletedRow::Src { vpos, .. }
-                    | DeletedRow::Ins { vpos, .. }
-                    | DeletedRow::Suspended { vpos, .. } => *vpos,
+                        | DeletedRow::Ins { vpos, .. }
+                        | DeletedRow::Suspended { vpos, .. } => *vpos,
                     };
                     let _ = self.seg.delete_one(vpos);
                 }
+                true
             }
         }
     }
@@ -8835,7 +9191,10 @@ impl BigFile {
             Op::Paste { inserted: Some(inserted), .. } => Some(inserted.block),
             _ => None,
         };
-        self.apply(&mut entry.op);
+        if !self.apply(&mut entry.op) {
+            self.history.restore_redo(entry);
+            return false;
+        }
         let new_block = match &entry.op {
             Op::InsertRows { block, .. } => Some(*block),
             Op::Paste { inserted: Some(inserted), .. } => Some(inserted.block),
@@ -8855,12 +9214,15 @@ impl BigFile {
 
     /// 插行/扩行粘贴重做换块后，重写后续重做记录里的稳定格地址。
     fn rebind_redo_cells(&mut self, old_block: u32, new_block: u32) {
-        fn rebind(cell: &mut CellId, old_block: u32, new_block: u32) {
-            if let RowId::Inserted { block, .. } = &mut cell.row {
+        fn rebind_row(row: &mut RowId, old_block: u32, new_block: u32) {
+            if let RowId::Inserted { block, .. } = row {
                 if *block == old_block {
                     *block = new_block;
                 }
             }
+        }
+        fn rebind(cell: &mut CellId, old_block: u32, new_block: u32) {
+            rebind_row(&mut cell.row, old_block, new_block);
         }
         for op in self.history.redo_ops_mut() {
             match op {
@@ -8868,6 +9230,11 @@ impl BigFile {
                 Op::SetCells { changes } | Op::Paste { changes, .. } => {
                     for change in changes {
                         rebind(&mut change.cell, old_block, new_block);
+                    }
+                }
+                Op::HeaderMode(change) => {
+                    if let Some(top) = &mut change.top {
+                        rebind_row(&mut top.row, old_block, new_block);
                     }
                 }
                 Op::Columns { .. } | Op::InsertRows { .. } | Op::Sort { .. } => {}
@@ -8921,6 +9288,15 @@ impl BigFile {
                         };
                         if let Some(replacement) = replacement {
                             *item = replacement;
+                        }
+                    }
+                }
+                Op::HeaderMode(change) => {
+                    if let Some(top) = &mut change.top {
+                        let RowId::Source(rec) = top.row else { continue };
+                        if let Some(row) = rows_by_rec.get(&rec) {
+                            top.row = RowId::Inserted { block, row: *row };
+                            top.source_record = None;
                         }
                     }
                 }
@@ -9029,6 +9405,10 @@ impl BigFile {
             Op::Columns { change } => {
                 self.schema = Arc::clone(&change.before);
                 true
+            }
+            Op::HeaderMode(change) => {
+                let target = change.before_headerless;
+                self.apply_header_mode(change, target)
             }
             Op::Paste { changes, inserted, schema_change } => {
                 if let Some(inserted) = inserted {
@@ -9493,73 +9873,91 @@ impl BigFile {
         self.pending_schema = None;
     }
 
-    /// 切换「首行非列名」。
+    /// 切换「首行非列名」并记录一条可逆 HeaderMode 历史。
     ///
-    /// 开启：表头行作为普通数据进入顶部，列名虚拟为 列1..N。
-    /// 关闭：当前首行（含未保存编辑）提升为表头并从数据中移除。
-    /// 渐进索引期没有段表，仅翻转模式偏移；关闭时把当前首行记为表头。
+    /// 完整索引 false→true 只增加一个顶部 Inserted 行；渐进索引只改变
+    /// Source(0) 的模式偏移。切换本身不增加内容 revision，筛选在实际变化后清除。
     ///
     /// # Parameters
     /// - `on`: true = 首行是数据；false = 首行是列名。
+    /// - `approval`: 单步完整保留成本超预算时的固定点确认。
+    ///
+    /// # Returns
+    /// 实际切换、空变化、固定点确认请求或取消结果。
     ///
     /// # Errors
-    /// 待执行列操作未清空 / 关闭时没有数据行时返回错误字符串。
-    pub fn set_headerless(&mut self, on: bool) -> Result<(), String> {
+    /// 排序、待执行列操作、缺少顶部行、快照或历史成本失败时返回错误字符串。
+    pub fn set_headerless(&mut self, on: bool, approval: Approval) -> Result<EditOutcome, String> {
         if on == self.headerless {
-            return Ok(());
+            return Ok(EditOutcome::unchanged());
         }
-        let next_history_generation = self.next_history_generation()?;
         if self.is_sorted() {
             return Err("排序模式下暂不支持切换首行语义，请先退出排序".into());
         }
-        if !self.pending_cols.is_empty() {
-            return Err("列操作待执行：请先执行或撤销列操作".into());
-        }
+        self.require_editable()?;
         self.refresh_indexed();
-        let mut renamed_schema = None;
-        if self.partial.is_some() {
-            if !on {
-                if self.indexed_data_rows() == 0 {
-                    return Err("没有数据行可作为列名".into());
-                }
-                // 记录 0 是当前首行（无列名模式 offset = 0）；覆盖层编辑一并带上
-                let headers = self.src_fields(0);
-                renamed_schema = Some(self.schema_with_headers(&headers)?);
-                self.base_ncols = headers.len();
-                self.base_headers = headers;
+
+        let before = Arc::clone(&self.schema);
+        let before_headerless = self.headerless;
+        let (row, cells) = if self.partial.is_some() {
+            if !on && self.indexed_data_rows() == 0 {
+                return Err("没有数据行可作为列名".into());
             }
-            self.headerless = on;
+            let cells = if on { self.src_fields(0) } else {
+                self.row_at(0).ok_or("没有数据行可作为列名")?
+            };
+            (RowId::Source(0), cells)
+        } else if on {
+            if self.base_headers.is_empty() {
+                return Err("没有列可作为列名".into());
+            }
+            let block = u32::try_from(self.seg.blocks.len()).map_err(|_| "顶部块号溢出")?;
+            (RowId::Inserted { block, row: 0 }, self.base_headers.clone())
         } else {
-            if on {
-                if self.base_headers.is_empty() {
-                    return Err("没有列可作为列名".into());
-                }
-                // O(1)：原表头变成顶部插入行，可正常编辑/删除/筛选
-                self.seg.insert_block(0, vec![self.base_headers.clone()]);
-            } else {
-                if self.seg.vrow_count() == 0 {
-                    return Err("没有数据行可作为列名".into());
-                }
-                let Some(row) = self.row_at(0) else {
-                    return Err("没有数据行可作为列名".into());
-                };
-                renamed_schema = Some(self.schema_with_headers(&row)?);
-                self.base_ncols = row.len();
-                self.base_headers = row;
-                self.seg.delete_one(0);
+            if self.seg.vrow_count() == 0 {
+                return Err("没有数据行可作为列名".into());
             }
-            self.headerless = on;
+            let row = match self.seg.resolve(0) {
+                Some(ResolvedRow::Src(rec)) => RowId::Source(rec),
+                Some(ResolvedRow::Ins { block, row }) => RowId::Inserted { block, row },
+                None => return Err("没有数据行可作为列名".into()),
+            };
+            let cells = self.row_at(0).ok_or("没有数据行可作为列名")?;
+            (row, cells)
+        };
+        let source_record = match row {
+            RowId::Source(rec) => Some(rec),
+            RowId::Inserted { .. } => None,
+        };
+        let after_headers = if on {
+            generic_headers(before.visible().len())
+        } else {
+            cells.clone()
+        };
+        let after = Arc::new(self.schema_with_headers(&after_headers)?);
+        let snapshot = RowSnapshot::write(&self.spool, std::iter::once(cells))?;
+        let change = HeaderModeChange {
+            before_headerless,
+            after_headerless: on,
+            schema_change: SchemaChange { before, after },
+            top: Some(HeaderTop { row, vpos: 0, snapshot, source_record }),
+            index_epoch: self.index_epoch,
+        };
+        let (mut prepared, fixed_point) = match self.preflight_history(
+            Op::HeaderMode(change),
+            "切换首行模式",
+            approval,
+        )? {
+            HistoryDecision::Normal(prepared) => (prepared, false),
+            HistoryDecision::FixedPoint(prepared) => (prepared, true),
+            HistoryDecision::Confirm(outcome) => return Ok(outcome),
+        };
+        if !self.apply(&mut prepared.entry_mut().op) {
+            return Err("首行模式历史状态不一致，操作已取消".into());
         }
-        if let Some(schema) = renamed_schema {
-            self.schema = Arc::new(schema);
-        }
-        self.pending_schema = None;
-        // 开关是视图属性：筛选、收窄基准、撤销历史全部作废
-        self.stable_hits = None;
-        self.display_hits = None;
-        self.last_spec = None;
-        self.clear_history_at_fixed_point(next_history_generation);
-        Ok(())
+        let inserted_rows = u64::from(on);
+        let removed_rows = u64::from(!on);
+        self.finish_history(prepared, fixed_point, inserted_rows, removed_rows)
     }
 
     // ---- 序列化与落盘 ----
@@ -9660,6 +10058,13 @@ impl BigFile {
                             if deleted.contains(rec) {
                                 out.insert(*rec);
                             }
+                        }
+                    }
+                }
+                Op::HeaderMode(change) => {
+                    if let Some(HeaderTop { row: RowId::Source(rec), .. }) = &change.top {
+                        if deleted.contains(rec) {
+                            out.insert(*rec);
                         }
                     }
                 }
@@ -9806,6 +10211,53 @@ impl BigFile {
                     None => None,
                 },
             },
+            Op::HeaderMode(change) => {
+                let top = match &change.top {
+                    Some(top) => {
+                        let row = match top.row {
+                            RowId::Source(rec) => {
+                                if let Some(mapped) = transform.map_source(rec) {
+                                    RowId::Source(mapped)
+                                } else if let Some(block) = transform.suspended_rows.get(&rec) {
+                                    RowId::Inserted { block: *block, row: 0 }
+                                } else {
+                                    return Err(format!(
+                                        "首行历史 Source 记录 {rec} 无法映射到保存基线"
+                                    ));
+                                }
+                            }
+                            RowId::Inserted { block, row } => {
+                                if let Some(mapped) = transform.inserted_rows.get(&(block, row)) {
+                                    RowId::Source(*mapped)
+                                } else {
+                                    RowId::Inserted { block, row }
+                                }
+                            }
+                        };
+                        let source_record = match row {
+                            RowId::Source(rec) => Some(rec),
+                            RowId::Inserted { .. } => None,
+                        };
+                        Some(HeaderTop {
+                            row,
+                            vpos: top.vpos,
+                            snapshot: top.snapshot.clone(),
+                            source_record,
+                        })
+                    }
+                    None => None,
+                };
+                Op::HeaderMode(HeaderModeChange {
+                    before_headerless: change.before_headerless,
+                    after_headerless: change.after_headerless,
+                    schema_change: SchemaChange {
+                        before: map_schema(&change.schema_change.before)?,
+                        after: map_schema(&change.schema_change.after)?,
+                    },
+                    top,
+                    index_epoch: self.index_epoch.checked_add(1).ok_or("索引代际溢出")?,
+                })
+            }
             Op::Sort { before, after, levels } => {
                 if !transform.row_layout_is_identity() {
                     return Err("排序历史依赖已变化的物理行布局，需固定当前状态".into());
@@ -9920,6 +10372,7 @@ impl BigFile {
                 Op::SetCell { .. } => "编辑单元格",
                 Op::SetCells { .. } => "批量编辑单元格",
                 Op::Columns { .. } => "执行列操作",
+                Op::HeaderMode(_) => "切换首行模式",
                 Op::Paste { .. } => "粘贴区域",
                 Op::InsertRows { .. } => "插入行",
                 Op::Sort { .. } => "排序视图",

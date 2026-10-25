@@ -75,17 +75,22 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
         }
         case "big_set_headerless": {
           const on = !!args.on;
-          if (on !== headerless) {
+          const changed = on !== headerless;
+          let insertedRows = 0;
+          let removedRows = 0;
+          if (changed) {
             if (on) {
               data.unshift(baseHeaders.slice());
+              insertedRows = 1;
             } else {
               if (!data.length) throw new Error("没有数据行可作为列名");
               baseHeaders = data.shift().slice();
+              removedRows = 1;
             }
             headerless = on;
+            filter = null;
           }
-          filter = null;
-          return meta();
+          return editOutcome({ changed, insertedRows, removedRows });
         }
         case "big_set_undo_budget":
         case "big_meta":
@@ -351,9 +356,16 @@ function makeIndexingEngine({ rows = 100, cols = 2, openRows = 20, steps = [], p
           return 0;
         case "big_clear_filter":
           return null;
-        case "big_set_headerless":
-          meta = { ...meta, headerless: !!args.on };
-          return { ...meta };
+        case "big_set_headerless": {
+          const on = !!args.on;
+          const changed = on !== !!meta.headerless;
+          if (changed) meta = { ...meta, headerless: on };
+          return editOutcome({
+            changed,
+            insertedRows: changed && on ? 1 : 0,
+            removedRows: changed && !on ? 1 : 0,
+          });
+        }
         default:
           return null;
       }
@@ -1194,9 +1206,11 @@ test("setHeaderless 调引擎并更新元数据/表头/行数", async () => {
   const { model, calls } = makeFakeEngine({ rows: 3, cols: 2 });
   await model.open("/x.csv");
   await model.setHeaderless(true);
-  assert.equal(calls.at(-1)[0], "big_set_headerless");
-  assert.equal(calls.at(-1)[1].on, true);
-  assert.equal(typeof calls.at(-1)[1].session, "number");
+  assert.equal(calls.at(-1)[0], "big_meta", "changed 后必须重新读取元数据");
+  const toggleCall = calls.find(([cmd]) => cmd === "big_set_headerless");
+  assert.ok(toggleCall, "必须调用首行模式编辑命令");
+  assert.equal(toggleCall[1].on, true);
+  assert.equal(typeof toggleCall[1].session, "number");
   assert.equal(model.isHeaderless(), true);
   assert.deepEqual(model.headers(), ["列1", "列2"]);
   assert.equal(model.rowCount(), 4);
@@ -1239,6 +1253,111 @@ test("相同状态不重复调用引擎", async () => {
   const before = calls.length;
   await model.setHeaderless(false);
   assert.equal(calls.length, before);
+});
+
+test("setHeaderless approval：changed 后刷新 meta 并以 view 通知", async () => {
+  const calls = [];
+  const events = [];
+  const model = new BigModel({
+    invoke: async (cmd, args = {}) => {
+      calls.push([cmd, args]);
+      if (cmd === "big_set_headerless") {
+        return { changed: true, insertedRows: 1, removedRows: 0,
+          fixedPoint: null, cancelled: false };
+      }
+      if (cmd === "big_meta") {
+        return { rows: 3, cols: 2, headers: ["列1", "列2"], headerless: true,
+          modified: false, can_undo: true, can_redo: false, pending_cols: false,
+          indexing: false, sorted: false, ram_backed: false };
+      }
+      throw new Error("unexpected " + cmd);
+    },
+    listen: async () => () => {},
+  });
+  model._meta = { rows: 2, cols: 2, headers: ["a", "b"], headerless: false,
+    modified: false, can_undo: false, can_redo: true };
+  model._filterOn = true;
+  model._filterCount = 1;
+  model.onData((structural, origin) => events.push([structural, origin]));
+  const outcome = await model.setHeaderless(true);
+  assert.equal(outcome?.changed, true);
+  const apply = calls.find(([cmd]) => cmd === "big_set_headerless");
+  assert.deepEqual(apply[1].approval, { allowFixedPoint: false, preflightId: null });
+  assert.equal(calls.at(-1)[0], "big_meta", "changed 后必须重新读取引擎 meta");
+  assert.equal(model.meta().headerless, true);
+  assert.equal(model.rowCount(), 3);
+  assert.deepEqual(events, [[true, "view"]]);
+  assert.equal(model.filterActive(), false);
+});
+
+test("setHeaderless fixedPoint 取消保留筛选、redo 和通知现场", async () => {
+  const calls = [];
+  let refreshes = 0;
+  let dataEvents = 0;
+  const fixedPoint = { kind: "stepOverBudget", operation: "切换首行模式",
+    requiredBytes: 100, budgetBytes: 10, preflightId: 91 };
+  const model = new BigModel({
+    invoke: async (cmd, args = {}) => {
+      calls.push([cmd, args]);
+      if (cmd !== "big_set_headerless") throw new Error("unexpected " + cmd);
+      return { changed: false, insertedRows: 0, removedRows: 0,
+        fixedPoint, cancelled: false };
+    },
+    listen: async () => () => {},
+    confirmFixedPoint: async () => false,
+  });
+  model._meta = { rows: 2, cols: 2, headers: ["a", "b"], headerless: false,
+    modified: true, can_undo: true, can_redo: true };
+  model._filterOn = true;
+  model._filterCount = 2;
+  model._filterGen = 4;
+  model._refreshMeta = async () => { refreshes += 1; };
+  model._emitData = () => { dataEvents += 1; };
+  const beforeMeta = model._meta;
+  const outcome = await model.setHeaderless(true);
+  assert.equal(outcome?.cancelled, true);
+  assert.equal(calls.length, 1);
+  assert.equal(refreshes, 0);
+  assert.equal(dataEvents, 0);
+  assert.strictEqual(model._meta, beforeMeta);
+  assert.equal(model.meta().can_redo, true);
+  assert.equal(model.filterActive(), true);
+  assert.equal(model._filterCount, 2);
+  assert.equal(model._filterGen, 4);
+});
+
+test("setHeaderless fixedPoint 确认只带原 preflightId 重试", async () => {
+  const calls = [];
+  const fixedPoint = { kind: "stepOverBudget", operation: "切换首行模式",
+    requiredBytes: 100, budgetBytes: 10, preflightId: 91 };
+  const model = new BigModel({
+    invoke: async (cmd, args = {}) => {
+      calls.push([cmd, args]);
+      if (cmd === "big_meta") {
+        return { rows: 3, cols: 2, headers: ["列1", "列2"], headerless: true,
+          modified: false, can_undo: false, can_redo: false, pending_cols: false,
+          indexing: false, sorted: false, ram_backed: false };
+      }
+      if (cmd !== "big_set_headerless") throw new Error("unexpected " + cmd);
+      if (calls.filter(([name]) => name === "big_set_headerless").length === 1) {
+        return { changed: false, insertedRows: 0, removedRows: 0,
+          fixedPoint, cancelled: false };
+      }
+      return { changed: true, insertedRows: 1, removedRows: 0,
+        fixedPoint: null, cancelled: false };
+    },
+    listen: async () => () => {},
+    confirmFixedPoint: async () => true,
+  });
+  model._meta = { rows: 2, cols: 2, headers: ["a", "b"], headerless: false,
+    modified: false, can_undo: true, can_redo: false };
+  const outcome = await model.setHeaderless(true);
+  assert.equal(outcome?.changed, true);
+  const applyCalls = calls.filter(([cmd]) => cmd === "big_set_headerless");
+  assert.equal(applyCalls.length, 2);
+  assert.deepEqual(applyCalls[1][1].approval,
+    { allowFixedPoint: true, preflightId: 91 });
+  assert.equal(calls.filter(([cmd]) => cmd === "big_meta").length, 1);
 });
 
 test("排序模式：估算/载入/取消都带 session，载入后刷新 meta", async () => {
