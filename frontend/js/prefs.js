@@ -12,6 +12,66 @@
 /** localStorage 键名（v1：值形如 { "/path/a.csv": true }）。 */
 export const HEADERLESS_PREF_KEY = "simpletable.headerless.v1";
 
+/** 撤销/重做历史预算的 localStorage 键。 */
+export const UNDO_BUDGET_PREF_KEY = "simpletable.undo_budget.v1";
+/** 每个文档的默认历史预算（MiB）。 */
+export const DEFAULT_UNDO_BUDGET_MIB = 64;
+
+/**
+ * 把撤销预算归一化为 1–1024 MiB 的整数。
+ *
+ * @param {unknown} raw - 原始设置值。
+ * @returns {number} 合法整数；缺失、损坏或越界时回退 64。
+ */
+export function normalizeUndoBudgetMiB(raw) {
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 1 && n <= 1024
+    ? n : DEFAULT_UNDO_BUDGET_MIB;
+}
+
+/**
+ * 把撤销预算从 MiB 转为字节。
+ *
+ * @param {unknown} raw - 原始 MiB 值。
+ * @returns {number} 归一化后的字节预算。
+ */
+export function undoBudgetBytes(raw) {
+  return normalizeUndoBudgetMiB(raw) * 1024 * 1024;
+}
+
+/**
+ * 创建撤销/重做历史预算偏好存取器。
+ *
+ * @param {Storage | null | undefined} storage - localStorage 或同接口对象。
+ * @returns {{get: () => number, set: (value: unknown) => number}}
+ *   读取归一化值；写入返回实际采用的 MiB 值，存储异常不阻断设置。
+ */
+export function createUndoBudgetPrefs(storage) {
+  return {
+    /** @returns {number} 当前预算；读取失败时返回默认值。 */
+    get() {
+      try {
+        return normalizeUndoBudgetMiB(storage?.getItem(UNDO_BUDGET_PREF_KEY));
+      } catch {
+        return DEFAULT_UNDO_BUDGET_MIB;
+      }
+    },
+    /**
+     * @param {unknown} value - 待保存的 MiB 值。
+     * @returns {number} 实际采用的归一化预算。
+     */
+    set(value) {
+      const normalized = normalizeUndoBudgetMiB(value);
+      try {
+        storage?.setItem(UNDO_BUDGET_PREF_KEY, String(normalized));
+      } catch {
+        // 配额或隐私模式只影响持久化，不阻断本次设置。
+      }
+      return normalized;
+    },
+  };
+}
+
 /**
  * 探测当前平台标识（用于路径大小写规则）。
  *

@@ -618,6 +618,19 @@ fn big_remove_rows(
     with_big(&state, session, |bf| bf.remove_rows(vrows, approval))
 }
 
+/// 设置单个文档的撤销/重做历史字节预算，并返回最新元数据。
+#[tauri::command]
+fn big_set_undo_budget(
+    state: tauri::State<BigShared>,
+    session: u64,
+    budget_bytes: u64,
+) -> Result<BigMeta, String> {
+    with_big(&state, session, |bf| {
+        bf.set_history_budget(budget_bytes)?;
+        Ok(bf.meta())
+    })
+}
+
 #[tauri::command]
 fn big_undo(state: tauri::State<BigShared>, session: u64) -> Result<bool, String> {
     with_big(&state, session, |bf| Ok(bf.undo()))
@@ -937,6 +950,7 @@ pub fn run() {
             big_remove_rows,
             big_undo,
             big_redo,
+            big_set_undo_budget,
             big_filter,
             big_filter_count,
             big_filter_page,

@@ -5,6 +5,8 @@
  * 添加 N 行、通用确认（是/否）、未保存三选（保存/放弃/取消）、信息/错误提示。
  */
 
+import { normalizeUndoBudgetMiB } from "./prefs.js";
+
 /**
  * 底层模态框：遮罩 + 标题 + 内容 + 按钮行。
  *
@@ -91,6 +93,79 @@ export function fmtBytes(n) {
     i += 1;
   }
   return `${i === 0 ? Math.round(x) : x.toFixed(1)} ${units[i]}`;
+}
+
+/**
+ * 生成固定点确认文案。
+ *
+ * @param {{kind: "stepOverBudget" | "saveTransform" | "sortMaterialization",
+ *   operation: string, requiredBytes: number, budgetBytes: number,
+ *   preflightId: number}} request - 引擎固定点请求。
+ * @returns {string} 包含操作原因和撤销边界的完整提示。
+ * @throws {Error} 固定点类型未知时抛出。
+ */
+export function fixedPointMessage(request) {
+  const tail = "\n继续后，此前历史与本次操作不可撤销；之后的新操作可以撤销到固定点。\n是否继续？";
+  if (request.kind === "stepOverBudget") {
+    return "操作：" + request.operation
+      + "\n所需历史体量：" + fmtBytes(request.requiredBytes)
+      + "\n当前每文档预算：" + fmtBytes(request.budgetBytes) + tail;
+  }
+  if (request.kind === "saveTransform") {
+    return "保存无法安全保留全部历史：" + request.operation
+      + "\n此次保存将建立固定点，保留的此前历史将清空。" + tail;
+  }
+  if (request.kind === "sortMaterialization") {
+    return "按当前排序保存会物化当前行序。" + tail;
+  }
+  throw new Error("未知固定点类型");
+}
+
+/**
+ * 请求用户确认建立不可撤销的历史固定点。
+ *
+ * @param {object} request - 引擎 FixedPointRequest。
+ * @returns {Promise<boolean>} 仅点击“继续”返回 true，取消和 Esc 均返回 false。
+ */
+export async function confirmFixedPointDialog(request) {
+  const body = document.createElement("div");
+  body.style.whiteSpace = "pre-line";
+  body.textContent = fixedPointMessage(request);
+  const confirmed = await modal("确认固定点", body, [
+    { text: "取消", value: false },
+    { text: "继续", value: true, primary: true },
+  ]);
+  return confirmed === true;
+}
+
+/**
+ * 设置每个文档的撤销/重做共用历史预算。
+ *
+ * @param {unknown} def - 当前 MiB 预算。
+ * @returns {Promise<number | null>} 确认返回 1–1024 的整数；取消返回 null，
+ *   非法输入按统一规则回退 64。
+ */
+export async function undoBudgetDialog(def) {
+  const body = document.createElement("div");
+  const hint = document.createElement("div");
+  hint.className = "dialog-tip";
+  hint.textContent = "撤销/重做共用此预算，每页签独立记账。"
+    + "降低预算可能淘汰最旧历史；连一步也无法保留时会建立固定点。";
+  const label = document.createElement("label");
+  label.textContent = "每文档预算（MiB，1–1024）：";
+  const input = document.createElement("input");
+  input.type = "number";
+  input.min = "1";
+  input.max = "1024";
+  input.step = "1";
+  input.value = String(def);
+  label.appendChild(input);
+  body.append(hint, label);
+  const value = await modal("撤销内存", body, [
+    { text: "取消", value: null },
+    { text: "确定", value: () => normalizeUndoBudgetMiB(input.value), primary: true },
+  ]);
+  return typeof value === "function" ? value() : null;
 }
 
 /**

@@ -4,8 +4,11 @@ import { test } from "node:test";
 
 import {
   HEADERLESS_PREF_KEY,
+  UNDO_BUDGET_PREF_KEY,
   createHeaderlessPrefs,
+  createUndoBudgetPrefs,
   normalizePath,
+  undoBudgetBytes,
 } from "../frontend/js/prefs.js";
 
 /** 内存版 Storage（只实现 prefs 用到的方法）。 */
@@ -116,4 +119,33 @@ test("clear 清空全部记录", () => {
   prefs.clear();
   assert.equal(prefs.get("C:/a.csv"), false);
   assert.equal(storage.getItem(HEADERLESS_PREF_KEY), null);
+});
+
+test("撤销预算默认 64，损坏与越界回退 64", () => {
+  const storage = makeStorage();
+  const prefs = createUndoBudgetPrefs(storage);
+  assert.equal(prefs.get(), 64);
+  for (const raw of ["", "abc", "0", "1025", "1.5", "null", "{}"]) {
+    storage.setItem(UNDO_BUDGET_PREF_KEY, raw);
+    assert.equal(prefs.get(), 64, raw);
+  }
+  storage.setItem(UNDO_BUDGET_PREF_KEY, "128");
+  assert.equal(prefs.get(), 128);
+  assert.equal(undoBudgetBytes(128), 128 * 1024 * 1024);
+});
+
+test("撤销预算持久化合法整数且 storage 失败不阻断", () => {
+  const storage = makeStorage();
+  const prefs = createUndoBudgetPrefs(storage);
+  assert.equal(prefs.set(1024), 1024);
+  assert.equal(prefs.get(), 1024);
+  assert.equal(storage.getItem(UNDO_BUDGET_PREF_KEY), "1024");
+  assert.equal(createUndoBudgetPrefs(null).get(), 64);
+  const denied = createUndoBudgetPrefs({
+    getItem() { throw new Error("denied"); },
+    setItem() { throw new Error("quota"); },
+  });
+  assert.equal(denied.get(), 64);
+  assert.equal(denied.set(128), 128);
+  assert.equal(denied.get(), 64);
 });

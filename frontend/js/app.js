@@ -6,24 +6,46 @@
  */
 
 import { serializeCsv, serializeRecords } from "./csv.js";
-import { BigModel } from "./bigmodel.js";
+import { BigModel, setDefaultUndoBudgetMiB } from "./bigmodel.js";
 import { Grid } from "./grid.js";
 import { EditPane } from "./pane.js";
 import { showMenu } from "./menu.js";
 import {
   busyDialog, columnDialog, confirmDialog, confirmDiscardDialog,
-  confirmExitSortDialog, confirmRamSortDialog, errorDialog, fmtBytes,
-  infoDialog, intDialog, newTableDialog, progressDialog, shortcutsDialog, sortDialog,
+  confirmExitSortDialog, confirmFixedPointDialog, confirmRamSortDialog,
+  errorDialog, fmtBytes, infoDialog, intDialog, newTableDialog, progressDialog,
+  shortcutsDialog, sortDialog, undoBudgetDialog,
 } from "./dialogs.js";
+import { createUndoBudgetPrefs } from "./prefs.js";
 
 /** @type {any} Tauri v2 全局对象（withGlobalTauri） */
 const tauri = window.__TAURI__;
 const invoke = (cmd, args) => tauri.core.invoke(cmd, args);
 
+const undoPrefs = createUndoBudgetPrefs(window.localStorage);
+let undoBudgetMiB = undoPrefs.get();
+setDefaultUndoBudgetMiB(undoBudgetMiB);
+
+/**
+ * 创建带统一固定点确认的文档模型。
+ *
+ * @param {object | undefined} io - 可选的 invoke/listen 测试替身。
+ * @returns {BigModel} 独立文档模型。
+ */
+function makeDocumentModel(io) {
+  // 部分 io 也要保留默认 invoke/listen，不能只传确认回调。
+  return new BigModel({
+    invoke,
+    listen: (ev, cb) => tauri.event.listen(ev, cb),
+    ...io,
+    confirmFixedPoint: confirmFixedPointDialog,
+  });
+}
+
 // ============ 全局状态 ============
 
 /** 当前模型：统一 BigModel（启动为无会话占位空表；打开/新建时替换或复用） */
-let model = new BigModel();
+let model = makeDocumentModel();
 let path = null;      // 当前文件路径（null = 未命名）
 let dirty = false;    // 未保存修改
 // 工具栏就绪旗标：gridA 构造期（const tb 初始化前）refreshBigUi/refreshHeaderlessUi
@@ -515,7 +537,7 @@ for (const [gid, side] of [["tab-group-a", "A"], ["tab-group-b", "B"]]) {
  * @returns {Promise<BigModel | null>} 失败返回 null（已弹窗）。
  */
 async function openBigEngineFor(tabId, p, headerless = false, reuseModel = null) {
-  const bm = reuseModel ?? new BigModel();
+  const bm = reuseModel ?? makeDocumentModel();
   if (!reuseModel) bindModelEvents(bm); // 先绑事件再 open：reset/data 通知才能到达外壳
   try {
     await bm.open(p, { headerless: !!headerless });
@@ -783,7 +805,7 @@ function resetToEmpty() {
   document.body.classList.remove("split");
   document.getElementById("grid-area").style.flex = ""; // 清掉分屏拖拽残留的主侧定宽
   syncTabSplit(); // 页签左组定宽同步复位
-  model = new BigModel();
+  model = makeDocumentModel();
   bindModelEvents(model);
   path = null;
   activeId = null;
@@ -882,7 +904,7 @@ const gridA = new Grid({
 // 副网格挂独立空模型：不镜像活动档（否则隐藏副网格也在渲染，双份 DOM 会
 // 污染全局类选择器的断言/交互）；分屏建立时经 setModel 换绑分屏签。
 const gridB = new Grid({
-    model: new BigModel(),
+    model: makeDocumentModel(),
   scrollEl: document.getElementById("grid-scroll2"),
   canvasEl: document.getElementById("grid-canvas2"),
   headerEl: document.getElementById("col-header2"),
@@ -1439,6 +1461,15 @@ multiInput.addEventListener("input", () => fgrid().setMultiText(multiInput.value
 multiWrap.appendChild(multiInput);
 tb.multiFilter.after(multiWrap);
 
+const btnUndoBudget = document.createElement("button");
+btnUndoBudget.id = "btn-undo-budget";
+btnUndoBudget.textContent = "撤销内存…";
+btnUndoBudget.title = "设置每个页签独立的撤销/重做历史内存预算";
+btnUndoBudget.addEventListener("click", () => { void changeUndoBudget(); });
+btnUndoBudget.addEventListener("mousedown", (e) => e.preventDefault());
+toolbar.appendChild(btnUndoBudget);
+tb.undoBudget = btnUndoBudget;
+
 // 快捷键说明：靠右对齐，位于编辑窗格「显示符号」按钮的正上方。
 // 窗口较窄/高 DPI 时工具栏换行，按钮仍保持在所在行的最右。
 const btnShortcuts = document.createElement("button");
@@ -1473,23 +1504,74 @@ function updateUndoButtons() {
   tb.redo.disabled = !model.canRedo();
 }
 
+/**
+ * 将引擎脏点同步到模型所属页签，不污染异步完成后的其他焦点外壳。
+ *
+ * @param {BigModel} m - 已完成预算或历史操作的模型。
+ * @returns {void}
+ */
+function syncModelDirty(m) {
+  const modified = m.modified();
+  if (m === model) {
+    setDirty(modified);
+    updateStatusText();
+  } else {
+    for (const t of tabs) if (t.model === m) t.dirty = modified;
+  }
+  renderTabbar();
+}
+
+/** 设置已打开及在途文档的历史预算，成功后再持久化之后新文档的默认值。 */
+async function changeUndoBudget() {
+  const value = await undoBudgetDialog(undoBudgetMiB);
+  if (value === null) return;
+  const models = new Set([model, ...tabs.map((t) => t.model), gridB.model]);
+  // 下发期间禁止再次发起，避免旧请求后完成覆盖新请求。
+  btnUndoBudget.disabled = true;
+  try {
+    // 设置期间及在途 open/create 都追随目标值；失败恢复旧默认，成功才持久化。
+    setDefaultUndoBudgetMiB(value);
+    for (const m of models) {
+      if (!m?.meta()) continue;
+      await m.setUndoBudget(value);
+      // 缩容可能淘汰历史或建立固定点；每个成功模型都立即同步自己的脏点。
+      syncModelDirty(m);
+    }
+    undoBudgetMiB = value;
+    undoPrefs.set(value);
+    statusMsg(`撤销/重做预算已设为每文档 ${value} MiB`, 3000);
+  } catch (err) {
+    setDefaultUndoBudgetMiB(undoBudgetMiB);
+    await errorDialog("设置撤销内存失败", String(err?.message ?? err));
+  } finally {
+    btnUndoBudget.disabled = false;
+  }
+}
+
 // ============ 撤销/重做（G3） ============
 
 /** 撤销一步表格改动（Ctrl+Z；大模型 undo 为异步） */
 async function undo() {
-  if (await model.undo()) {
-    fgrid().clearSelection();
-    clearDock();
-    markDirty();
+  const m = model;
+  if (await m.undo()) {
+    // await 后可能已切签，只清理仍属于发起模型的当前视图。
+    if (m === model) {
+      fgrid().clearSelection();
+      clearDock();
+    }
+    syncModelDirty(m);
   }
 }
 
 /** 重做一步表格改动（Ctrl+Y / Ctrl+Shift+Z） */
 async function redo() {
-  if (await model.redo()) {
-    fgrid().clearSelection();
-    clearDock();
-    markDirty();
+  const m = model;
+  if (await m.redo()) {
+    if (m === model) {
+      fgrid().clearSelection();
+      clearDock();
+    }
+    syncModelDirty(m);
   }
 }
 
@@ -1525,9 +1607,10 @@ function bindModelEvents(m) {
   m.onData((structural, origin) => {
     if (m !== model) return; // 副侧数据/预取落定：不得改写焦点侧外壳状态
     if (resetPending) resetPending = false;
-    // 视图属性变更（首行非列名开关）不标脏；预取页落定（origin="fetch"）
-    // 也是纯重绘，打开/滚动不得误标脏
-    else if (origin !== "view" && origin !== "fetch") markDirty();
+    // 视图属性、预取和历史通知不直接标脏；历史脏点由 wrapper 按引擎 meta 同步。
+    else if (origin !== "view" && origin !== "fetch" && origin !== "history") {
+      markDirty();
+    }
     refreshBigUi();
     if (currentCell === null) return;
     const [r, c] = currentCell;
@@ -1589,7 +1672,7 @@ async function newFile() {
   const text = spec.cols === 1
     ? Array.from({ length: spec.rows }, () => '""').join("\r\n") + "\r\n"
     : serializeRecords(rows);
-  const m = new BigModel();
+  const m = makeDocumentModel();
   bindModelEvents(m); // 先绑事件再建会话：与 openBigEngineFor 同序
   try {
     await m.create(text, { headerless: true });

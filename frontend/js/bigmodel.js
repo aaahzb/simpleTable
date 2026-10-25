@@ -10,6 +10,22 @@
  * 依赖注入：构造可传 {invoke, listen}，便于 node:test 脱离 Tauri 环境测试。
  */
 
+import { DEFAULT_UNDO_BUDGET_MIB, normalizeUndoBudgetMiB, undoBudgetBytes } from "./prefs.js";
+
+/** 之后新建会话使用的默认历史预算；已有会话只能由显式设置修改。 */
+let defaultUndoBudgetMiB = DEFAULT_UNDO_BUDGET_MIB;
+
+/**
+ * 设置之后 open/create 会话的默认历史预算。
+ *
+ * @param {unknown} raw - 原始 MiB 值；非法值回退 64。
+ * @returns {number} 实际采用的 MiB 值。
+ */
+export function setDefaultUndoBudgetMiB(raw) {
+  defaultUndoBudgetMiB = normalizeUndoBudgetMiB(raw);
+  return defaultUndoBudgetMiB;
+}
+
 /** 取页大小（行）。与引擎窗口一致；±2 屏缓存约 5 页 ≈ 1000 行。 */
 export const BIG_PAGE = 200;
 
@@ -169,6 +185,20 @@ export class BigModel {
   // ---- 生命周期 ----
 
   /**
+   * 按当前默认预算初始化新会话；并发设置改变目标时追平最新值。
+   *
+   * @returns {Promise<void>} 最新默认预算已下发后完成。
+   * @throws {Error} 引擎会话失效或预算命令失败。
+   */
+  async _applyDefaultUndoBudget() {
+    for (;;) {
+      const mib = defaultUndoBudgetMiB;
+      await this.setUndoBudget(mib);
+      if (mib === defaultUndoBudgetMiB) return;
+    }
+  }
+
+  /**
    * 打开大文件会话（引擎 mmap + 同步扫首批行，秒开）。
    *
    * 引擎打开后立即返回首批可用行（indexing=true），后台线程继续索引；
@@ -186,6 +216,7 @@ export class BigModel {
     this._openT0 = performance.now();
     this._firstPaintMs = 0;
     this._meta = await this._invoke("big_open", { path, headerless: !!headerless });
+    await this._applyDefaultUndoBudget();
     this._invalidate();
     this._emitReset();
     this._emitData(true);
@@ -208,6 +239,7 @@ export class BigModel {
     this._openT0 = performance.now();
     this._firstPaintMs = 0;
     this._meta = await this._invoke("big_new", { text, headerless: !!headerless });
+    await this._applyDefaultUndoBudget();
     this._invalidate();
     this._emitReset();
     this._emitData(true);
@@ -215,6 +247,30 @@ export class BigModel {
     this._emitProgress();
     this._startIndexPolling();
     return this._meta;
+  }
+
+  /**
+   * 设置本会话的撤销/重做共用历史预算。
+   *
+   * @param {unknown} mib - 每文档预算，合法范围 1–1024 MiB。
+   * @returns {Promise<object>} 设置后的最新 BigMeta。
+   * @throws {Error} 引擎会话失效或预算命令失败。
+   */
+  async setUndoBudget(mib) {
+    this._meta = await this._invoke("big_set_undo_budget", {
+      budgetBytes: undoBudgetBytes(mib),
+    });
+    this._emitUndo();
+    return this._meta;
+  }
+
+  /**
+   * 读取引擎保存点脏点，而不是由前端按操作方向猜测。
+   *
+   * @returns {boolean} 当前内容不能无修改地回到已保存状态时为 true。
+   */
+  modified() {
+    return this._meta?.modified === true;
   }
 
   /**

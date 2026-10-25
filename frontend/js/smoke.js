@@ -1213,15 +1213,14 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       "编辑应弄脏 b 签");
     const t = window.__app.tabs();
     assert(t.find((x) => x.id === ta.id)?.dirty === false, "a 签不应脏");
-    // 还原：撤销编辑 + 焦点回 A，避免影响后续（经外壳 undo 包装：撤销不改
-    // 文档的脏状态——onReset 会清脏，包装末尾重新标脏，这是既定语义）
+    // 还原：撤销编辑 + 焦点回 A。撤销回保存点必须按引擎清脏。
     await window.__app.activateTab(ta.id);
     assert(window.__app.split().focused === "A", "焦点应可切回主侧");
     await window.__app.activateTab(tb.id);
     await window.__app.undo();
     await waitFor(() => model.rawData(0, 0) === "乙B", "撤销后 b 签首格应复原");
-    assert(window.__app.tabs().find((x) => x.id === tb.id)?.dirty === true,
-      "撤销后 b 签应保持脏（供关签确认场景使用）");
+    assert(window.__app.tabs().find((x) => x.id === tb.id)?.dirty === false,
+      "撤销回保存点后 b 签应干净");
     await window.__app.activateTab(ta.id);
   });
 
@@ -1323,8 +1322,11 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(window.__app.tabs().find((x) => x.id === tb.id)?.side === "A",
       "收屏后原右组签应并入左组");
     assert(window.__app.tabs().at(-1)?.id === tb.id, "并入左组后应保持相对序（数组末尾）");
-    // 再建分屏后关掉分屏签（b 签仍脏）→ 弹三选，放弃后关签、分屏自动关
+    // 再建分屏并显式制造未保存修改：关脏分屏签弹三选，放弃后分屏自动关。
     await window.__app.openSplit(tb.id);
+    await window.__app.activateTab(tb.id);
+    await model.setData(0, 0, "乙B改");
+    await window.__app.activateTab(window.__app.tabs().find((x) => x.path === fa).id);
     const p = window.__app.closeTab(tb.id);
     await sleep(100);
     assert(clickDiscardDialog("放弃") === true, "关脏分屏签应弹未保存确认");
@@ -3019,6 +3021,411 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(snap.find((x) => x.path === p1)?.headerless === true
       && snap.find((x) => x.path === p2)?.headerless === false,
     "页签快照中的开关状态应各自独立");
+  });
+
+  function deferModelCommand(m, cmd) {
+    const original = m._rawInvoke;
+    let entered;
+    let release;
+    const enteredPromise = new Promise((r) => { entered = r; });
+    const gate = new Promise((r) => { release = r; });
+    m._rawInvoke = async function (c, args) {
+      if (c === cmd) {
+        entered();
+        await gate;
+      }
+      return original.call(this, c, args);
+    };
+    return {
+      entered: enteredPromise,
+      release: () => release(),
+      restore: () => { m._rawInvoke = original; },
+    };
+  }
+
+  function captureBudgetCalls(models, calls) {
+    const originals = models.map((m) => [m, m._rawInvoke]);
+    for (const [m, original] of originals) {
+      m._rawInvoke = async function (cmd, args) {
+        if (cmd === "big_set_undo_budget") calls.push(args);
+        return original.call(this, cmd, args);
+      };
+    }
+    return () => {
+      for (const [m, original] of originals) m._rawInvoke = original;
+    };
+  }
+
+  check("撤销重做：跨过保存点时按引擎同步脏点", async () => {
+    await loadBasic();
+    const target = `${TMP}/undo-savepoint-${Date.now()}.csv`;
+    assert(await window.__app.saveFileAs(target), "先建立磁盘保存点");
+    assert(window.__app.isDirty() === false, "保存后应干净");
+    await model.setData(0, 0, "dirty");
+    assert(window.__app.isDirty() === true, "编辑后应标脏");
+    await window.__app.undo();
+    assert(window.__app.isDirty() === false, "撤销回保存点必须清除脏点");
+    await window.__app.redo();
+    assert(window.__app.isDirty() === true, "重做离开保存点必须标脏");
+    await window.__app.undo();
+    assert(window.__app.isDirty() === false, "再次撤销应回到干净保存点");
+  });
+
+  check("撤销重做：跨页签异步完成仍同步发起页签", async () => {
+    await loadBasic();
+    const stamp = Date.now();
+    const pA = TMP + "/history-race-a-" + stamp + ".csv";
+    const pB = TMP + "/history-race-b-" + stamp + ".csv";
+    await writeText(pA, "a,b\r\nx,y\r\n");
+    await writeText(pB, "a,b\r\nm,n\r\n");
+    await window.__app.openPathsAsTabs([pA, pB]);
+    const ta = window.__app.tabs().find((t) => t.path === pA);
+    const tb = window.__app.tabs().find((t) => t.path === pB);
+    assert(ta?.active && tb, "竞态夹具应从 A 签开始");
+    const modelA = window.__app.model;
+    await model.setData(0, 0, "redo-me");
+    await window.__app.undo();
+    assert(!window.__app.isDirty() && model.canRedo(),
+      "A 应先回到干净保存点并保留 redo");
+
+    const redoDelay = deferModelCommand(modelA, "big_redo");
+    try {
+      const pending = window.__app.redo();
+      await redoDelay.entered;
+      await window.__app.activateTab(tb.id);
+      redoDelay.release();
+      await pending;
+    } finally {
+      redoDelay.release();
+      redoDelay.restore();
+    }
+    assert(window.__app.tabs().find((t) => t.id === ta.id)?.dirty === true,
+      "redo 在后台完成后必须把 A 标脏，不能留下假干净");
+    assert(window.__app.tabs().find((t) => t.id === tb.id)?.dirty === false,
+      "后台 A 的 redo 不得改写当前 B 的脏点");
+
+    const closePending = window.__app.closeTab(ta.id);
+    await waitFor(() => document.querySelector(".modal-mask"),
+      "后台 redo 后关闭 A 必须出现未保存确认");
+    assert(clickModalButton("取消"), "取消关闭 A");
+    assert((await closePending) === false, "取消后 A 必须保留");
+
+    await window.__app.activateTab(ta.id);
+    const undoDelay = deferModelCommand(modelA, "big_undo");
+    try {
+      const pending = window.__app.undo();
+      await undoDelay.entered;
+      await window.__app.activateTab(tb.id);
+      undoDelay.release();
+      await pending;
+    } finally {
+      undoDelay.release();
+      undoDelay.restore();
+    }
+    assert(window.__app.tabs().find((t) => t.id === ta.id)?.dirty === false,
+      "undo 在后台回到保存点后必须清除 A 的脏点");
+    assert(window.__app.tabs().find((t) => t.id === tb.id)?.dirty === false,
+      "后台 A 的 undo 不得改写当前 B 的脏点");
+  });
+
+  check("撤销内存：设置期间新开的文档也采用新预算", async () => {
+    await loadBasic();
+    const stamp = Date.now();
+    const pA = TMP + "/budget-race-a-" + stamp + ".csv";
+    const pB = TMP + "/budget-race-b-" + stamp + ".csv";
+    await writeText(pA, "a,b\r\nx,y\r\n");
+    await writeText(pB, "a,b\r\nm,n\r\n");
+    await window.__app.openPathsAsTabs([pA]);
+    const modelA = window.__app.model;
+    const delay = deferModelCommand(modelA, "big_set_undo_budget");
+    let configured = false;
+    try {
+      document.getElementById("btn-undo-budget").click();
+      await waitFor(() => document.querySelector(".modal-mask"), "竞态预算设置框");
+      const mask = document.querySelector(".modal-mask");
+      mask.querySelector('input[type="number"]').value = "1";
+      clickModalButton("确定");
+      await delay.entered;
+
+      await window.__app.openPathsAsTabs([pB]);
+      assert(window.__app.tabs().find((t) => t.path === pB)?.active,
+        "A 下发等待期间 B 应完成打开并入签");
+      delay.release();
+      await waitFor(() => document.getElementById("status-text").textContent
+        .includes("每文档 1 MiB"), "竞态预算下发完成");
+      configured = true;
+
+      await model.setData(0, 0, "c".repeat(600 * 1024));
+      await model.setData(0, 1, "d".repeat(600 * 1024));
+      await window.__app.undo();
+      assert(!model.canUndo(),
+        "设置期间新开的 B 也必须按 1 MiB 只保留最近一个大步骤");
+    } finally {
+      delay.release();
+      delay.restore();
+      if (configured) {
+        document.getElementById("btn-undo-budget").click();
+        await waitFor(() => document.querySelector(".modal-mask"), "竞态测试恢复 64 MiB");
+        const mask = document.querySelector(".modal-mask");
+        mask.querySelector('input[type="number"]').value = "64";
+        clickModalButton("确定");
+        await waitFor(() => document.getElementById("status-text").textContent
+          .includes("每文档 64 MiB"), "竞态测试恢复默认预算");
+      }
+    }
+  });
+
+  check("撤销内存：设置前在途打开也追平目标预算", async () => {
+    await loadBasic();
+    const stamp = Date.now();
+    const pA = TMP + "/budget-inflight-a-" + stamp + ".csv";
+    const pB = TMP + "/budget-inflight-b-" + stamp + ".csv";
+    await writeText(pA, "a,b\r\nx,y\r\n");
+    await writeText(pB, "a,b\r\nm,n\r\n");
+    await window.__app.openPathsAsTabs([pA]);
+    const modelA = window.__app.model;
+    const proto = Object.getPrototypeOf(modelA);
+    const original = proto._invoke;
+    let entered;
+    let release;
+    let watched = null;
+    const calls = [];
+    const enteredPromise = new Promise((r) => { entered = r; });
+    const gate = new Promise((r) => { release = r; });
+    proto._invoke = async function (cmd, args) {
+      if (cmd === "big_set_undo_budget" && this !== modelA) {
+        calls.push(args.budgetBytes);
+        if (this !== watched && watched === null) {
+          watched = this;
+          entered();
+          await gate;
+        }
+      }
+      return original.call(this, cmd, args);
+    };
+    let opening = null;
+    let configured = false;
+    try {
+      opening = window.__app.openPathsAsTabs([pB]);
+      await enteredPromise;
+      assert(!window.__app.tabs().some((t) => t.path === pB),
+        "B 的旧初始预算受阻时必须仍未入签");
+
+      document.getElementById("btn-undo-budget").click();
+      await waitFor(() => document.querySelector(".modal-mask"), "在途预算设置框");
+      const mask = document.querySelector(".modal-mask");
+      mask.querySelector('input[type="number"]').value = "1";
+      clickModalButton("确定");
+      await waitFor(() => document.getElementById("status-text").textContent
+        .includes("每文档 1 MiB"), "在途场景先完成 A 的预算设置");
+      configured = true;
+      release();
+      await opening;
+      opening = null;
+      assert(calls[0] === 64 * 1024 * 1024,
+        "夹具必须先延迟 B 的 64 MiB 初始命令");
+      assert(calls[calls.length - 1] === 1024 * 1024,
+        "B 的旧初始命令返回后必须补发最新 1 MiB 预算");
+    } finally {
+      release();
+      if (opening) {
+        try { await opening; } catch { /* 清理在途打开，保留原测试错误。 */ }
+      }
+      proto._invoke = original;
+      if (configured) {
+        document.getElementById("btn-undo-budget").click();
+        await waitFor(() => document.querySelector(".modal-mask"), "在途测试恢复 64 MiB");
+        const mask = document.querySelector(".modal-mask");
+        mask.querySelector('input[type="number"]').value = "64";
+        clickModalButton("确定");
+        await waitFor(() => document.getElementById("status-text").textContent
+          .includes("每文档 64 MiB"), "在途测试恢复默认预算");
+      }
+    }
+  });
+
+  check("撤销内存：下发期间禁止重复设置", async () => {
+    await loadBasic();
+    const m = window.__app.model;
+    const delay = deferModelCommand(m, "big_set_undo_budget");
+    const button = document.getElementById("btn-undo-budget");
+    let started = false;
+    try {
+      button.click();
+      await waitFor(() => document.querySelector(".modal-mask"), "首次预算设置框");
+      let mask = document.querySelector(".modal-mask");
+      mask.querySelector('input[type="number"]').value = "1";
+      clickModalButton("确定");
+      started = true;
+      await delay.entered;
+      assert(button.disabled, "预算下发期间必须禁用设置按钮，防止旧请求后完成覆盖新请求");
+      button.click();
+      assert(!document.querySelector(".modal-mask"), "下发期间不得打开第二个预算设置框");
+      delay.release();
+      await waitFor(() => document.getElementById("status-text").textContent
+        .includes("每文档 1 MiB"), "首次预算设置完成");
+      assert(!button.disabled, "首次设置完成后必须恢复设置按钮");
+
+      button.click();
+      await waitFor(() => document.querySelector(".modal-mask"), "第二次预算设置框");
+      mask = document.querySelector(".modal-mask");
+      mask.querySelector('input[type="number"]').value = "2";
+      clickModalButton("确定");
+      await waitFor(() => document.getElementById("status-text").textContent
+        .includes("每文档 2 MiB"), "第二次预算设置完成");
+      assert(window.localStorage.getItem("simpletable.undo_budget.v1") === "2",
+        "串行完成后的最新用户选择必须持久生效");
+    } finally {
+      delay.release();
+      delay.restore();
+      if (started) {
+        await waitFor(() => /每文档 [12] MiB/.test(
+          document.getElementById("status-text").textContent), "重复设置测试等待在途下发");
+        button.click();
+        await waitFor(() => document.querySelector(".modal-mask"), "重复设置测试恢复 64 MiB");
+        const mask = document.querySelector(".modal-mask");
+        mask.querySelector('input[type="number"]').value = "64";
+        clickModalButton("确定");
+        await waitFor(() => document.getElementById("status-text").textContent
+          .includes("每文档 64 MiB"), "重复设置测试恢复默认预算");
+      }
+    }
+  });
+
+  check("撤销内存：固定点取消保留现场，确认后仅可撤到固定点", async () => {
+    await loadBasic();
+    const budgetCalls = [];
+    const restoreBudgetSpy = captureBudgetCalls([window.__app.model], budgetCalls);
+    let configured = false;
+    try {
+      document.getElementById("btn-undo-budget").click();
+      await waitFor(() => document.querySelector(".modal-mask"), "撤销内存设置框");
+      let mask = document.querySelector(".modal-mask");
+      assert(mask.textContent.includes("每页签独立"), "应说明页签独立预算");
+      assert(mask.textContent.includes("撤销/重做共用"), "应说明 undo/redo 共用预算");
+      mask.querySelector('input[type="number"]').value = "1";
+      assert(clickModalButton("取消"), "取消预算设置");
+      await waitFor(() => !document.querySelector(".modal-mask"), "预算取消后关框");
+      assert(budgetCalls.length === 0, "取消预算设置不得下发命令");
+
+      document.getElementById("btn-undo-budget").click();
+      await waitFor(() => document.querySelector(".modal-mask"), "重新打开预算设置框");
+      mask = document.querySelector(".modal-mask");
+      mask.querySelector('input[type="number"]').value = "1";
+      assert(clickModalButton("确定"), "应用 1 MiB 预算");
+      await waitFor(() => document.getElementById("status-text").textContent
+        .includes("每文档 1 MiB"), "1 MiB 预算下发完成");
+      configured = true;
+      assert(budgetCalls.length === 1 && budgetCalls[0].budgetBytes === 1024 * 1024,
+        "预算取消后只应下发一次 1 MiB");
+
+      await model.setData(0, 0, "before");
+      const before = tableSnapshot();
+      assert(window.__app.isDirty() && model.canUndo() && !model.canRedo(),
+        "固定点预检前应先有一条可撤销修改");
+      const large = "X".repeat(2 * 1024 * 1024);
+      const cancelPending = model.setData(0, 0, large);
+      await waitFor(() => document.querySelector(".modal-mask")?.textContent
+        .includes("确认固定点"), "单步超预算固定点确认");
+      assert(document.querySelector(".modal-mask").textContent.includes("此前历史与本次操作不可撤销"),
+        "固定点文案必须说明撤销边界");
+      assert(clickModalButton("取消"), "取消固定点操作");
+      const cancelled = await cancelPending;
+      assert(cancelled.cancelled && !cancelled.changed, "取消结果不得写数据");
+      assert(tableEquals(before), "取消后内容与缓存必须恢复原值");
+      assert(window.__app.isDirty() && model.canUndo() && !model.canRedo(),
+        "取消后脏点与 undo/redo 不得变化");
+
+      const confirmPending = model.setData(0, 0, large);
+      await waitFor(() => document.querySelector(".modal-mask")?.textContent
+        .includes("确认固定点"), "再次请求固定点确认");
+      assert(clickModalButton("继续"), "确认固定点操作");
+      const confirmed = await confirmPending;
+      assert(confirmed.changed && !confirmed.cancelled, "确认后大编辑应执行");
+      assert(model.rawData(0, 0) === large, "确认后应写入大值");
+      assert(!model.canUndo() && !model.canRedo(), "固定点前后历史与 redo 均应清空");
+      const fixedPointSnapshot = tableSnapshot();
+      await model.setData(0, 1, "after");
+      assert(model.canUndo(), "固定点后的普通小编辑应可撤销");
+      await window.__app.undo();
+      await waitFor(() => tableEquals(fixedPointSnapshot),
+        "撤销后重新取页并完整恢复固定点现场");
+      assert(!model.canUndo(), "撤销不得越过固定点");
+    } finally {
+      if (configured) {
+        document.getElementById("btn-undo-budget").click();
+        await waitFor(() => document.querySelector(".modal-mask"), "恢复 64 MiB 设置框");
+        const mask = document.querySelector(".modal-mask");
+        mask.querySelector('input[type="number"]').value = "64";
+        clickModalButton("确定");
+        await waitFor(() => document.getElementById("status-text").textContent
+          .includes("每文档 64 MiB"), "恢复 64 MiB");
+      }
+      restoreBudgetSpy();
+    }
+  });
+
+  check("撤销内存：全局设置逐页签下放且各自淘汰历史", async () => {
+    await loadBasic();
+    const p1 = `${TMP}/budget-a-${Date.now()}.csv`;
+    const p2 = `${TMP}/budget-b-${Date.now()}.csv`;
+    await writeText(p1, "a,b\r\nx,y\r\n");
+    await writeText(p2, "a,b\r\nx,y\r\n");
+    await window.__app.openPathsAsTabs([p1, p2]);
+    const ta = window.__app.tabs().find((t) => t.path === p1);
+    const tb = window.__app.tabs().find((t) => t.path === p2);
+    assert(ta?.active && tb, "两个预算文档都应入签且首档激活");
+    const sidA = model.sessionId;
+    const modelA = window.__app.model;
+    await model.setData(0, 0, "a".repeat(300 * 1024));
+    await model.setData(0, 1, "b".repeat(300 * 1024));
+    await window.__app.activateTab(tb.id);
+    const sidB = model.sessionId;
+    const modelB = window.__app.model;
+    assert(sidA !== sidB, "两个页签必须使用独立会话");
+    await model.setData(0, 0, "c".repeat(600 * 1024));
+    await model.setData(0, 1, "d".repeat(600 * 1024));
+
+    const budgetCalls = [];
+    const restoreBudgetSpy = captureBudgetCalls([modelA, modelB], budgetCalls);
+    let configured = false;
+    try {
+      document.getElementById("btn-undo-budget").click();
+      await waitFor(() => document.querySelector(".modal-mask"), "双页签预算设置框");
+      let mask = document.querySelector(".modal-mask");
+      mask.querySelector('input[type="number"]').value = "1";
+      clickModalButton("确定");
+      await waitFor(() => document.getElementById("status-text").textContent
+        .includes("每文档 1 MiB"), "双页签 1 MiB 下发完成");
+      configured = true;
+      assert(new Set(budgetCalls.map((c) => c.session)).size === 2
+        && budgetCalls.every((c) => c.budgetBytes === 1024 * 1024),
+      `两个页签都应收到各自的 1 MiB 预算命令：${JSON.stringify({
+        sidA, sidB, sameModel: modelA === modelB, budgetCalls,
+      })}`);
+
+      await window.__app.activateTab(ta.id);
+      assert(model.canUndo(), "小历史页签缩容后仍有撤销");
+      await window.__app.undo();
+      assert(model.canUndo(), "两个小步骤都装得下，撤销一次后仍应剩一步");
+      await window.__app.activateTab(tb.id);
+      assert(model.canUndo(), "大历史页签缩容后仍保留最近一步");
+      await window.__app.undo();
+      assert(!model.canUndo(), "两个大步骤超过预算，最旧一步应已独立淘汰");
+    } finally {
+      if (configured) {
+        document.getElementById("btn-undo-budget").click();
+        await waitFor(() => document.querySelector(".modal-mask"), "双页签恢复 64 MiB");
+        const mask = document.querySelector(".modal-mask");
+        mask.querySelector('input[type="number"]').value = "64";
+        clickModalButton("确定");
+        await waitFor(() => document.getElementById("status-text").textContent
+          .includes("每文档 64 MiB"), "双页签恢复 64 MiB 完成");
+      }
+      restoreBudgetSpy();
+    }
+    assert(localStorage.getItem("simpletable.undo_budget.v1") === "64",
+      "测试结束必须恢复默认 64 MiB 偏好");
   });
 
   check("占位空表：保存被婉拒且不弹另存为（无会话守卫）", async () => {

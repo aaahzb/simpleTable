@@ -32,7 +32,7 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
     encoding: "utf-8",
     pending_cols: false,
     can_undo: false,
-    can_redo: false,
+    can_redo: false, modified: false,
     headerless,
     // 渐进索引字段：普通夹具视为"已索引完成"
     indexing: false,
@@ -87,6 +87,7 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
           filter = null;
           return meta();
         }
+        case "big_set_undo_budget":
         case "big_meta":
           return meta();
         case "big_rows": {
@@ -282,7 +283,7 @@ function makeIndexingEngine({ rows = 100, cols = 2, openRows = 20, steps = [], p
   const headers = Array.from({ length: cols }, (_, c) => `h${c}`);
   let meta = {
     rows: openRows, cols, headers, encoding: "utf-8",
-    pending_cols: false, can_undo: false, can_redo: false, headerless: false,
+    pending_cols: false, can_undo: false, can_redo: false, modified: false, headerless: false,
     indexing: true, indexed_bytes: 200, total_bytes: 1024,
     open_ms: 7, index_ms: 0, elapsed_ms: 30,
   };
@@ -293,6 +294,8 @@ function makeIndexingEngine({ rows = 100, cols = 2, openRows = 20, steps = [], p
       calls.push([cmd, args]);
       switch (cmd) {
         case "big_open":
+          return { ...meta };
+        case "big_set_undo_budget":
           return { ...meta };
         case "big_meta":
           if (step < steps.length) {
@@ -790,12 +793,13 @@ function makeDeferredFilterModel() {
   const pending = [];
   const meta = {
     rows: 100, cols: 1, headers: ["h"], encoding: "utf-8",
-    pending_cols: false, can_undo: false, can_redo: false,
+    pending_cols: false, can_undo: false, can_redo: false, modified: false,
   };
   const model = new BigModel({
     invoke: (cmd) => {
       switch (cmd) {
         case "big_open":
+        case "big_set_undo_budget":
         case "big_meta":
           return Promise.resolve(meta);
         case "big_filter":
@@ -1164,7 +1168,7 @@ function makeDeferredEngine({ rows = 100 * BIG_PAGE, cols = 2 } = {}) {
   );
   const meta = {
     rows, cols, headers: Array.from({ length: cols }, (_, c) => `h${c}`),
-    encoding: "utf-8", pending_cols: false, can_undo: false, can_redo: false,
+    encoding: "utf-8", pending_cols: false, can_undo: false, can_redo: false, modified: false,
     headerless: false, indexing: false, indexed_bytes: 1024, total_bytes: 1024,
     open_ms: 1, index_ms: 1, elapsed_ms: 1,
   };
@@ -1173,6 +1177,7 @@ function makeDeferredEngine({ rows = 100 * BIG_PAGE, cols = 2 } = {}) {
     invoke: (cmd, args = {}) => {
       switch (cmd) {
         case "big_open":
+        case "big_set_undo_budget":
         case "big_meta":
           return Promise.resolve({ ...meta });
         case "big_rows": {
@@ -1389,4 +1394,71 @@ test("固定点过期重试抛错且不刷新", async () => {
   await assert.rejects(model.setCells([[0, 0, "x"]]), /预检已过期/);
   assert.equal(calls.length, 2);
   assert.deepEqual(counts(), { refreshes: 0, dataEvents: 0 });
+});
+
+
+test("undo budget 按 MiB 转为字节下发并刷新元数据", async () => {
+  const calls = [];
+  let undoEvents = 0;
+  const model = new BigModel({
+    invoke: async (cmd, args = {}) => {
+      calls.push([cmd, args]);
+      if (cmd === "big_set_undo_budget") {
+        return { rows: 1, cols: 1, modified: false, can_undo: false, can_redo: false };
+      }
+      throw new Error("unexpected " + cmd);
+    },
+    listen: async () => () => {},
+  });
+  model._meta = { rows: 0, cols: 0, modified: true };
+  model._emitUndo = () => { undoEvents += 1; };
+  await model.setUndoBudget(128);
+  assert.deepEqual(calls.map(([cmd, args]) => [cmd, args.budgetBytes]),
+    [["big_set_undo_budget", 128 * 1024 * 1024]]);
+  assert.equal(typeof calls[0][1].session, "number");
+  assert.equal(undoEvents, 1);
+  assert.equal(model.meta().rows, 1);
+  assert.equal(model.modified(), false);
+});
+
+test("open/create 创建会话后立即下发默认 64 MiB 预算", async () => {
+  const opened = makeFakeEngine();
+  await opened.model.open("/x.csv");
+  assert.deepEqual(opened.calls.slice(0, 2).map(([cmd]) => cmd),
+    ["big_open", "big_set_undo_budget"]);
+  assert.equal(opened.calls[1][1].budgetBytes, 64 * 1024 * 1024);
+
+  const created = makeFakeEngine();
+  await created.model.create("a,b\n1,2\n");
+  assert.deepEqual(created.calls.slice(0, 2).map(([cmd]) => cmd),
+    ["big_new", "big_set_undo_budget"]);
+  assert.equal(created.calls[1][1].budgetBytes, 64 * 1024 * 1024);
+});
+
+test("默认撤销预算只影响之后 open/create 的会话", async () => {
+  const { setDefaultUndoBudgetMiB } = await import("../frontend/js/bigmodel.js");
+  assert.equal(typeof setDefaultUndoBudgetMiB, "function");
+  setDefaultUndoBudgetMiB(128);
+  try {
+    const existing = makeFakeEngine();
+    await existing.model.open("/old.csv");
+    assert.equal(existing.calls[1][1].budgetBytes, 128 * 1024 * 1024);
+    const before = existing.calls.length;
+    setDefaultUndoBudgetMiB(32);
+    const created = makeFakeEngine();
+    await created.model.create("a\n1\n", { headerless: true });
+    assert.equal(created.calls[1][1].budgetBytes, 32 * 1024 * 1024);
+    assert.equal(existing.calls.length, before, "已有会话不得被默认值 retroactive 修改");
+  } finally {
+    setDefaultUndoBudgetMiB(64);
+  }
+});
+
+test("modified() 读取引擎脏点且空模型安全", () => {
+  const model = new BigModel({ invoke: async () => null, listen: async () => () => {} });
+  assert.equal(model.modified(), false);
+  model._meta = { modified: true };
+  assert.equal(model.modified(), true);
+  model._meta.modified = false;
+  assert.equal(model.modified(), false);
 });
