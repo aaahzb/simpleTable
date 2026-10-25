@@ -27,6 +27,7 @@ use crate::history::{
     SharedCharge,
     DEFAULT_HISTORY_BUDGET_BYTES,
 };
+use crate::order::{project_filter, Perm, RowOrder};
 use crate::schema::{ColumnId, ColumnStorage, Schema};
 use crate::spool::{history_text_bytes, RowSnapshot, SessionSpool};
 use memchr::{memchr, memchr_iter};
@@ -1181,7 +1182,7 @@ mod tests {
         let mut bf = load_ram(&p);
         // 排序前：空格在第 0 行，Ctrl+↓ 落到 b(x)
         assert_eq!(bf.find_vertical_edge(0, 1, true, false).unwrap(), Some(1));
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }], Approval::deny())
             .unwrap();
         // 排序后显示顺序 d,c,b,a → val [y, 空, x, 空]
         assert_eq!(bf.find_vertical_edge(0, 1, true, false).unwrap(), Some(2));
@@ -1636,7 +1637,7 @@ a,b
     fn paste_rows_sorted_display_mapping() {
         let p = tmp_csv("paste_sorted", &sort_fixture());
         let mut bf = load_ram(&p);
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }], Approval::deny())
             .unwrap(); // e,d,c,b,a
         let out = bf
             .paste_rows(0, 1, vec![vec!["S0".into()], vec!["S1".into()]], Approval::deny())
@@ -1658,7 +1659,7 @@ a,b
     fn paste_rows_sorted_growth_rejected_atomically() {
         let p = tmp_csv("paste_sorted_growth", &sort_fixture());
         let mut bf = load_ram(&p);
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }], Approval::deny())
             .unwrap();
         let before = bf.rows(0, 5);
         let err = bf
@@ -1666,7 +1667,8 @@ a,b
             .unwrap_err();
         assert!(err.contains("排序"), "{err}");
         assert_eq!(bf.rows(0, 5), before);
-        assert!(bf.history_stats().undo_count == 0 && bf.history_stats().redo_count == 0);
+        assert_eq!(bf.history_stats().undo_count, 1, "拒绝粘贴不得清除既有排序历史");
+        assert_eq!(bf.history_stats().redo_count, 0);
         fs::remove_file(&p).ok();
     }
 
@@ -2094,7 +2096,7 @@ a,b
         let p = tmp_csv("filter_page_vrows_sort", &sort_fixture());
         let mut bf = load_ram(&p);
         assert_eq!(bf.run_filter(&spec_one(2, "foo")).unwrap(), 3); // a,c,e
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }], Approval::deny())
             .unwrap(); // id 降序 e,d,c,b,a → 命中显示位置 e=0,c=2,a=4
         let page = bf.filter_page(0, 3);
         assert_eq!(
@@ -2115,7 +2117,7 @@ a,b
         assert_eq!(bf.filter_hit_view_row(0), Some(0));
         assert_eq!(bf.filter_hit_view_row(2), Some(4));
         assert_eq!(bf.filter_hit_view_row(3), None, "越界 None");
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }], Approval::deny())
             .unwrap(); // 命中集换算为显示位置 [0,2,4]（e,c,a）
         assert_eq!(
             bf.filter_hit_view_row(1),
@@ -4267,10 +4269,159 @@ keep,old,target
     }
 
     #[test]
+    fn p4_sort_and_exit_are_exact_history_without_content_revision() {
+        let p = tmp_csv("p4_sort_history", &sort_fixture());
+        let mut bf = load_ram(&p);
+        let original = bf.rows(0, 5);
+        let modified = bf.modified();
+        bf.sort_by_levels(
+            &[SortLevel { col: 0, numeric: false, asc: false }],
+            Approval::deny(),
+        )
+        .unwrap();
+        let sorted = bf.rows(0, 5);
+        assert_ne!(sorted, original);
+        assert_eq!(bf.modified(), modified);
+        assert!(bf.meta().can_undo);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), original);
+        assert_eq!(bf.modified(), modified);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 5), sorted);
+        assert_eq!(bf.modified(), modified);
+
+        bf.exit_sort_mode(true, Approval::deny()).unwrap();
+        assert_eq!(bf.rows(0, 5), original);
+        assert!(!bf.meta().sorted);
+        assert!(!bf.is_ram_backed());
+        assert_eq!(bf.modified(), modified);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), sorted);
+        assert!(bf.meta().sorted);
+        assert!(!bf.is_ram_backed(), "撤销退出排序不得要求重新载入 RAM");
+        assert_eq!(bf.modified(), modified);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 5), original);
+        assert_eq!(bf.modified(), modified);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p4_sort_preserves_filter_members_and_history_flags() {
+        let p = tmp_csv("p4_sort_filter", &sort_fixture());
+        let mut bf = load_ram(&p);
+        bf.run_filter(&spec_one(2, "foo")).unwrap();
+        let before = bf.filter_page(0, bf.filter_len()).rows;
+        assert_eq!(before.len(), 3, "筛选夹具必须有非空且确定的命中");
+        bf.sort_by_levels(
+            &[SortLevel { col: 0, numeric: false, asc: false }],
+            Approval::deny(),
+        )
+        .unwrap();
+        let after = bf.filter_page(0, bf.filter_len()).rows;
+        assert_eq!(after.len(), 3);
+        assert_eq!(
+            after.iter().map(|row| row[0].as_str()).collect::<Vec<_>>(),
+            vec!["e", "c", "a"],
+            "筛选显示位置必须按新排列投影"
+        );
+        let mut before_members = before.clone();
+        let mut after_members = after.clone();
+        before_members.sort();
+        after_members.sort();
+        assert_eq!(after_members, before_members);
+        assert!(bf.meta().can_undo);
+        assert!(bf.undo());
+        assert_eq!(bf.filter_page(0, bf.filter_len()).rows, before);
+        assert!(bf.meta().can_redo);
+        assert!(bf.redo());
+        assert_eq!(bf.filter_page(0, bf.filter_len()).rows, after);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p4_unsorted_save_preserves_sort_history_for_identity_rows() {
+        let p = tmp_csv("p4_unsorted_save_sort_history", &sort_fixture());
+        let mut bf = load_ram(&p);
+        let original = bf.rows(0, 5);
+        bf.sort_by_levels(
+            &[SortLevel { col: 0, numeric: false, asc: false }],
+            Approval::deny(),
+        )
+        .unwrap();
+        let sorted = bf.rows(0, 5);
+        bf.exit_sort_mode(false, Approval::deny()).unwrap();
+        assert_eq!(bf.rows(0, 5), original);
+        bf.set_cell(0, 0, "A".into(), Approval::deny()).unwrap();
+        let saved = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(saved.saved, "恒等行布局的普通保存应保留可转换的排序历史");
+        assert!(saved.fixed_point.is_none());
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), original);
+        assert!(bf.undo(), "普通保存后仍应能撤销退出排序");
+        assert_eq!(bf.rows(0, 5), sorted);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 5), original);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 5)[0][0], "A");
+        assert!(!bf.modified(), "连续重做到保存点后应恢复干净");
+        fs::remove_file(&p).ok();
+    }
+
+    fn assert_sorted_save_fixed_point(with_redo: bool) {
+        let name = if with_redo { "p4_sort_save_redo" } else { "p4_sort_save_undo" };
+        let p = tmp_csv(name, &sort_fixture());
+        let original = fs::read(&p).unwrap();
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(
+            &[SortLevel { col: 0, numeric: false, asc: false }],
+            Approval::deny(),
+        )
+        .unwrap();
+        if with_redo {
+            bf.sort_by_levels(
+                &[SortLevel { col: 1, numeric: false, asc: true }],
+                Approval::deny(),
+            )
+            .unwrap();
+            assert!(bf.undo());
+            assert!(bf.meta().can_redo);
+        }
+        let row_count = bf.meta().rows as u32;
+        let sorted = bf.rows(0, row_count);
+        let undo_before = bf.history_stats().undo_count;
+        let redo_before = bf.history_stats().redo_count;
+        let first = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(!first.saved);
+        let request = first.fixed_point.unwrap();
+        assert_eq!(request.kind, FixedPointKind::SortMaterialization);
+        assert_eq!(request.required_bytes, bf.history_stats().bytes);
+        assert_eq!(bf.history_stats().undo_count, undo_before);
+        assert_eq!(bf.history_stats().redo_count, redo_before);
+        assert_eq!(fs::read(&p).unwrap(), original);
+        let done = bf
+            .save(Approval::allow(request.preflight_id), |_, _, _, _| {})
+            .unwrap();
+        assert!(done.saved);
+        assert_eq!(bf.history_stats().undo_count, 0);
+        assert_eq!(bf.history_stats().redo_count, 0);
+        assert!(!bf.modified());
+        let reopened = BigFile::open(&p).unwrap();
+        assert_eq!(reopened.rows(0, row_count), sorted);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p4_sorted_save_with_undo_or_redo_requires_fixed_point() {
+        assert_sorted_save_fixed_point(false);
+        assert_sorted_save_fixed_point(true);
+    }
+
+    #[test]
     fn sort_numeric_asc_puts_non_numbers_last() {
         let p = tmp_csv("sort_num_asc", &sort_fixture());
         let mut bf = load_ram(&p);
-        bf.sort_by_levels(&[SortLevel { col: 1, numeric: true, asc: true }])
+        bf.sort_by_levels(&[SortLevel { col: 1, numeric: true, asc: true }], Approval::deny())
             .unwrap();
         assert!(bf.meta().sorted);
         // 2(b),2(d),10(a)，非数字（c 空、e x）恒排最后且保持原相对顺序
@@ -4282,7 +4433,7 @@ keep,old,target
     fn sort_numeric_desc_still_puts_non_numbers_last() {
         let p = tmp_csv("sort_num_desc", &sort_fixture());
         let mut bf = load_ram(&p);
-        bf.sort_by_levels(&[SortLevel { col: 1, numeric: true, asc: false }])
+        bf.sort_by_levels(&[SortLevel { col: 1, numeric: true, asc: false }], Approval::deny())
             .unwrap();
         assert_eq!(first_col(&bf, 5), vec!["a", "b", "d", "c", "e"]);
         fs::remove_file(&p).ok();
@@ -4292,7 +4443,7 @@ keep,old,target
     fn sort_text_uses_byte_order_and_is_stable() {
         let p = tmp_csv("sort_text", &sort_fixture());
         let mut bf = load_ram(&p);
-        bf.sort_by_levels(&[SortLevel { col: 2, numeric: false, asc: true }])
+        bf.sort_by_levels(&[SortLevel { col: 2, numeric: false, asc: true }], Approval::deny())
             .unwrap();
         // "Bar" < "bar" < "foo"；三个 foo 保持原有 a,c,e 顺序
         assert_eq!(first_col(&bf, 5), vec!["d", "b", "a", "c", "e"]);
@@ -4306,7 +4457,7 @@ keep,old,target
         bf.sort_by_levels(&[
             SortLevel { col: 2, numeric: false, asc: true },
             SortLevel { col: 1, numeric: true, asc: false },
-        ])
+        ], Approval::deny())
         .unwrap();
         // 先按 key：Bar(d), bar(b), foo(a,c,e)；foo 内按 age 降序：10(a) 在前
         assert_eq!(first_col(&bf, 5), vec!["d", "b", "a", "c", "e"]);
@@ -4320,7 +4471,7 @@ keep,old,target
             b"k,v\r\na,2\r\nb,0x10\r\nc, 3 \r\nd,\r\ne,abc\r\nf,1e2\r\n",
         );
         let mut bf = load_ram(&p);
-        bf.sort_by_levels(&[SortLevel { col: 1, numeric: true, asc: true }])
+        bf.sort_by_levels(&[SortLevel { col: 1, numeric: true, asc: true }], Approval::deny())
             .unwrap();
         // 2(a) < 3(c) < 0x10=16(b) < 1e2=100(f)；空/abc 非数字最后（d,e）
         assert_eq!(first_col(&bf, 6), vec!["a", "c", "b", "f", "d", "e"]);
@@ -4338,7 +4489,7 @@ keep,old,target
         };
         assert_eq!(bf.run_filter(&spec).unwrap(), 3); // a,c,e
         // 按 id 降序：e,d,c,b,a
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }], Approval::deny())
             .unwrap();
         assert_eq!(bf.filter_len(), 3, "排序后命中集不应丢失");
         let page = bf.filter_page(0, 3).rows;
@@ -4367,7 +4518,7 @@ keep,old,target
         let p = tmp_csv("sort_refilt", &sort_fixture());
         let mut bf = load_ram(&p);
         // 按 id 降序：e,d,c,b,a
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }], Approval::deny())
             .unwrap();
         let spec_b = FilterSpec {
             cols: vec![(0, "b".into(), 0)],
@@ -4391,7 +4542,7 @@ keep,old,target
     fn sort_then_edit_undo_and_copy_use_display_rows() {
         let p = tmp_csv("sort_edit", &sort_fixture());
         let mut bf = load_ram(&p);
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }], Approval::deny())
             .unwrap(); // e,d,c,b,a
         assert_eq!(bf.copy_tsv(0, 2, 0, 2).unwrap(), "e\tx\r\nd\t2\r\n");
         bf.set_cell(0, 0, "E2".into(), Approval::deny()).unwrap();
@@ -4415,7 +4566,7 @@ keep,old,target
         .unwrap();
         let cancel = AtomicBool::new(false);
         bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap();
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }], Approval::deny())
             .unwrap();
         assert_eq!(first_col(&bf, 6), vec!["a", "b", "c", "d", "e", "z"]);
         assert_eq!(bf.rows(0, 1)[0][1], "99", "覆盖层编辑应跟随记录");
@@ -4428,14 +4579,14 @@ keep,old,target
         let p = tmp_csv("sort_bad", &sort_fixture());
         let mut bf = BigFile::open(&p).unwrap();
         let err = bf
-            .sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }])
+            .sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }], Approval::deny())
             .unwrap_err();
         assert!(err.contains("载入内存"), "未载入应拒绝：{err}");
         let cancel = AtomicBool::new(false);
         bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap();
-        assert!(bf.sort_by_levels(&[]).unwrap_err().contains("排序级别"));
+        assert!(bf.sort_by_levels(&[], Approval::deny()).unwrap_err().contains("排序级别"));
         assert!(
-            bf.sort_by_levels(&[SortLevel { col: 9, numeric: false, asc: true }])
+            bf.sort_by_levels(&[SortLevel { col: 9, numeric: false, asc: true }], Approval::deny())
                 .unwrap_err()
                 .contains("列")
         );
@@ -4446,7 +4597,7 @@ keep,old,target
     fn sort_blocks_structural_ops_until_exit() {
         let p = tmp_csv("sort_block", &sort_fixture());
         let mut bf = load_ram(&p);
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }], Approval::deny())
             .unwrap();
         assert!(bf.insert_rows(0, None, 1, Approval::deny()).unwrap_err().contains("排序"));
         assert!(bf.remove_rows(vec![0], Approval::deny()).unwrap_err().contains("排序"));
@@ -4464,9 +4615,9 @@ keep,old,target
         let p = tmp_csv("sort_exit", &sort_fixture());
         let mut bf = load_ram(&p);
         bf.set_cell(0, 1, "99".into(), Approval::deny()).unwrap();
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }], Approval::deny())
             .unwrap();
-        bf.exit_sort_mode(true).unwrap();
+        bf.exit_sort_mode(true, Approval::deny()).unwrap();
         assert!(!bf.meta().sorted);
         assert!(!bf.is_ram_backed(), "退出并要求释放后应回到 mmap");
         assert_eq!(first_col(&bf, 5), vec!["a", "b", "c", "d", "e"]);
@@ -4484,11 +4635,15 @@ keep,old,target
         bf.set_cell(0, 1, "77".into(), Approval::deny()).unwrap(); // a 行（原显示位置 0）
         bf.insert_rows(0, Some(vec![vec!["z".into(), "5".into(), "foo".into()]]), 0, Approval::deny())
             .unwrap();
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }], Approval::deny())
             .unwrap(); // z,e,d,c,b,a
         assert!(bf.meta().sorted);
-        // 进入排序已经建立固定点并清空此前历史，保存无需再次确认。
-        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        // 排序历史仍存在：先通过预检，再按原代际确认物化保存。
+        let denied = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(!denied.saved);
+        let request = denied.fixed_point.expect("排序保存必须请求物化固定点");
+        let saved = bf.save(Approval::allow(request.preflight_id), |_, _, _, _| {}).unwrap();
+        assert!(saved.saved);
         assert!(!bf.meta().sorted, "保存后应退出排序视图");
         assert!(!bf.is_ram_backed());
         assert_eq!(first_col(&bf, 6), vec!["z", "e", "d", "c", "b", "a"]);
@@ -4508,9 +4663,11 @@ keep,old,target
         let mut bf = BigFile::open_with(&p, true).unwrap();
         let cancel = AtomicBool::new(false);
         assert!(bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap());
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }], Approval::deny())
             .unwrap();
-        bf.save(Approval::deny(), &mut |_, _, _, _| {}).unwrap();
+        let denied = bf.save(Approval::deny(), &mut |_, _, _, _| {}).unwrap();
+        let request = denied.fixed_point.expect("无表头排序保存也必须先确认");
+        assert!(bf.save(Approval::allow(request.preflight_id), &mut |_, _, _, _| {}).unwrap().saved);
         assert_eq!(fs::read(&p).unwrap(), b"a,1\r\nb,2\r\nc,3\r\n");
         // 重开仍按无列名解释：三行全是数据，没有被注入表头
         let bf2 = BigFile::open_with(&p, true).unwrap();
@@ -4524,9 +4681,11 @@ keep,old,target
         // 末行无换行：排序后它可能落在中间，必须补行尾否则两行粘连。
         let p = tmp_csv("sort_save_nonl", b"id,v\r\nb,2\r\na,1");
         let mut bf = load_ram(&p);
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }], Approval::deny())
             .unwrap();
-        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        let denied = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        let request = denied.fixed_point.expect("末行无换行的排序保存也必须先确认");
+        assert!(bf.save(Approval::allow(request.preflight_id), |_, _, _, _| {}).unwrap().saved);
         let bf2 = BigFile::open(&p).unwrap();
         assert_eq!(bf2.rows(0, 2), vec![
             vec!["a".to_string(), "1".to_string()],
@@ -4540,7 +4699,7 @@ keep,old,target
     fn save_sorted_history_requires_fixed_point_confirmation() {
         let p = tmp_csv("sort_save_fixed_point", &sort_fixture());
         let mut bf = load_ram(&p);
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }]).unwrap();
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }], Approval::deny()).unwrap();
         bf.set_cell(0, 0, "A".into(), Approval::deny()).unwrap();
         let before = std::fs::read(&p).unwrap();
 
@@ -4561,7 +4720,7 @@ keep,old,target
     fn save_sorted_clears_undo_history() {
         let p = tmp_csv("sort_save_undo", &sort_fixture());
         let mut bf = load_ram(&p);
-        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }])
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }], Approval::deny())
             .unwrap();
         assert!(!bf.meta().modified, "排序只改视图，不算内容修改");
         bf.set_cell(0, 0, "A".into(), Approval::deny()).unwrap();
@@ -4727,10 +4886,10 @@ keep,old,target
         assert_eq!(hits, 2);
         bf.clear_filter();
         assert_eq!(bf.meta().rows, 5);
-        bf.sort_by_levels(&[SortLevel { col: 1, numeric: true, asc: false }])
+        bf.sort_by_levels(&[SortLevel { col: 1, numeric: true, asc: false }], Approval::deny())
             .unwrap();
         assert_eq!(bf.rows(0, 1)[0][1], "35", "年龄降序首行是 Carol");
-        bf.exit_sort_mode(true).unwrap();
+        bf.exit_sort_mode(true, Approval::deny()).unwrap();
         assert!(bf.is_ram_backed(), "无路径内存档退出排序必须保持 Ram 后备");
         assert_eq!(bf.rows(0, 1)[0], vec!["Alice", "30", "Beijing"]);
     }
@@ -5408,6 +5567,14 @@ impl SchemaChange {
     }
 }
 
+/// 执行前已从视图列号解析为稳定列身份的排序级别。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StableSortLevel {
+    col: ColumnId,
+    numeric: bool,
+    asc: bool,
+}
+
 /// 前向操作（重做执行它，撤销执行其逆）。
 #[derive(Clone, PartialEq, Debug)]
 enum Op {
@@ -5420,6 +5587,7 @@ enum Op {
         schema_change: Option<SchemaChange>,
     },
     InsertRows { vpos: u64, block: u32, rows: Vec<Vec<String>> },
+    Sort { before: RowOrder, after: RowOrder, levels: Vec<StableSortLevel> },
     /// items 按 vpos 升序（重做按身份重新定位）。
     RemoveRows { items: Vec<DeletedRow> },
 }
@@ -5457,6 +5625,7 @@ impl Op {
                 }
             }
             Op::Columns { .. } => {}
+            Op::Sort { levels, .. } => { cost.add_vec(levels)?; }
             Op::Paste { changes, inserted, .. } => {
                 cost.add_vec(changes)?;
                 for change in changes {
@@ -5510,8 +5679,13 @@ impl Op {
                 }
             }
             Op::InsertRows { .. } => {}
+            Op::Sort { before, after, .. } => {
+                shared.extend(before.shared_charge());
+                shared.extend(after.shared_charge());
+            }
         }
-        Ok(HistoryEntry::new(self, own_bytes, shared, 1))
+        let revision_delta = if matches!(&self, Op::Sort { .. }) { 0 } else { 1 };
+        Ok(HistoryEntry::new(self, own_bytes, shared, revision_delta))
     }
 }
 
@@ -6599,7 +6773,10 @@ pub struct BigFile {
     /// 源记录编辑层：(稳定记录号, 稳定列身份) → 新值。
     overlay: HashMap<(u32, ColumnId), String>,
     pending_cols: Vec<ColOp>,
-    filter: Option<Vec<u32>>,
+    /// 稳定原始 vrow 命中；筛选扫描与收窄只使用该身份。
+    stable_hits: Option<Vec<u32>>,
+    /// stable_hits 在当前 RowOrder 下的显示位置缓存。
+    display_hits: Option<Vec<u32>>,
     /// 上次完成的筛选条件（前缀收窄 / 完全相同条件直接返回）。
     last_spec: Option<FilterSpec>,
     filter_stats: FilterStats,
@@ -6617,8 +6794,8 @@ pub struct BigFile {
     has_bom: bool,
     /// 无列名模式：记录 0 也是数据，列名为虚拟的 列1..N。
     headerless: bool,
-    /// 排序排列：显示位置 → 原始 vrow；None = 未排序。
-    order: Option<Vec<u32>>,
+    /// 共享行排列：Identity 无分配，Perm 由活动状态和历史共同持有。
+    order: RowOrder,
     /// 内容修改计数：每次单元格/行结构变化递增，保存后归零。
     /// 排序只改变视图，不递增。
     revision: i64,
@@ -6753,7 +6930,8 @@ impl BigFile {
             seg: Segments::new(offset, n_data as u32),
             overlay: HashMap::new(),
             pending_cols: Vec::new(),
-            filter: None,
+            stable_hits: None,
+            display_hits: None,
             last_spec: None,
             filter_stats: FilterStats::default(),
             history: HistoryLedger::new(DEFAULT_HISTORY_BUDGET_BYTES),
@@ -6766,7 +6944,7 @@ impl BigFile {
             base_mtime,
             has_bom,
             headerless,
-            order: None,
+            order: RowOrder::Identity,
             revision: 0,
         })
     }
@@ -6943,7 +7121,8 @@ impl BigFile {
             seg: Segments::new(offset as u32, n_data as u32),
             overlay: HashMap::new(),
             pending_cols: Vec::new(),
-            filter: None,
+            stable_hits: None,
+            display_hits: None,
             last_spec: None,
             filter_stats: FilterStats::default(),
             history: HistoryLedger::new(DEFAULT_HISTORY_BUDGET_BYTES),
@@ -6956,7 +7135,7 @@ impl BigFile {
             base_mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
             has_bom,
             headerless,
-            order: None,
+            order: RowOrder::Identity,
             revision: 0,
         })
     }
@@ -7126,7 +7305,7 @@ impl BigFile {
 
     /// 当前是否处于排序视图。
     pub fn is_sorted(&self) -> bool {
-        self.order.is_some()
+        matches!(self.order, RowOrder::Perm(_))
     }
 
     /// 显示位置 → 原始 vrow（未排序时恒等）。
@@ -7137,13 +7316,13 @@ impl BigFile {
     /// # Returns
     /// 排序前的稳定行号；排列越界时原样返回（调用方会再判越界）。
     fn orig_vrow(&self, display: u64) -> u64 {
-        match &self.order {
-            Some(order) => order
-                .get(display as usize)
-                .copied()
-                .map_or(display, |v| v as u64),
-            None => display,
-        }
+        self.order.display_to_orig(display)
+    }
+
+    /// 只重建显示命中缓存；稳定原始行成员保持不变。
+    fn refresh_filter_projection(&mut self) {
+        self.display_hits = self.stable_hits.as_ref()
+            .map(|hits| project_filter(hits, &self.order));
     }
 
     /// 按原始 vrow 读取字段（键构建用；不做显示映射）。
@@ -7155,18 +7334,12 @@ impl BigFile {
         }
     }
 
-    /// 按级别对当前视图排序（排列层，不改文件；需要内存后备）。
-    ///
-    /// 语义对齐小模式：多级依次比较；数字级非数字恒排最后；
-    /// 文本按 UTF-8 字节序；完全相等时保持原显示顺序（稳定）。
-    /// 已激活的筛选结果会换算到新的显示位置，成员不变。
-    ///
-    /// # Parameters
-    /// - `levels`: 排序级别（列号按当前视图列号）。
-    ///
-    /// # Errors
-    /// 未载入内存 / 索引未完成 / 待执行列操作 / 级别为空或列越界时返回错误字符串。
-    pub fn sort_by_levels(&mut self, levels: &[SortLevel]) -> Result<(), String> {
+    /// 按级别排序并保存共享 Perm；确认取消时不改数据、历史或 backing。
+    pub fn sort_by_levels(
+        &mut self,
+        levels: &[SortLevel],
+        approval: Approval,
+    ) -> Result<EditOutcome, String> {
         self.require_editable()?;
         self.refresh_indexed();
         if self.is_indexing() {
@@ -7179,124 +7352,99 @@ impl BigFile {
             return Err("排序级别不能为空".into());
         }
         let ncols = self.view_ncols();
-        if let Some(l) = levels.iter().find(|l| l.col >= ncols) {
-            return Err(format!("排序列越界：{}（共 {} 列）", l.col, ncols));
+        if let Some(level) = levels.iter().find(|level| level.col >= ncols) {
+            return Err(format!("排序列越界：{}（共 {} 列）", level.col, ncols));
         }
-        let sort_columns: Vec<(ColumnId, usize)> = levels
-            .iter()
-            .map(|level| {
-                let id = self.schema.view_id(level.col).ok_or("排序列越界")?;
-                let position = self
-                    .schema
-                    .visible()
-                    .iter()
-                    .position(|candidate| *candidate == id)
-                    .ok_or("排序列越界")?;
-                Ok((id, position))
-            })
-            .collect::<Result<_, String>>()?;
+        let sort_columns: Vec<(ColumnId, usize)> = levels.iter().map(|level| {
+            let id = self.schema.view_id(level.col).ok_or("排序列越界")?;
+            let position = self.schema.visible().iter()
+                .position(|candidate| *candidate == id).ok_or("排序列越界")?;
+            Ok((id, position))
+        }).collect::<Result<_, String>>()?;
+        let stable_levels: Vec<StableSortLevel> = levels.iter().zip(&sort_columns)
+            .map(|(level, (col, _))| StableSortLevel {
+                col: *col, numeric: level.numeric, asc: level.asc,
+            }).collect();
         let total = self.seg.vrow_count();
         if total > u32::MAX as u64 {
             return Err("文件过大（超过 42.9 亿行），暂不支持排序".into());
         }
         let total = total as usize;
-        // 旧显示序：新排列以它为“原始顺序”，保证稳定与命中集换算。
-        let old_order: Vec<u32> = self
-            .order
-            .clone()
-            .unwrap_or_else(|| (0..total as u32).collect());
-
-        // 逐级建键：一次遍历取一行；键按旧显示位置索引。
+        let old_order: Vec<u32> = match &self.order {
+            RowOrder::Identity => (0..total as u32).collect(),
+            RowOrder::Perm(perm) => perm.as_slice().to_vec(),
+        };
+        if old_order.len() != total {
+            return Err("排序排列与当前行数不一致".into());
+        }
         let mut keys: Vec<SortKeys> = Vec::with_capacity(levels.len());
         for (level, (_, position)) in levels.iter().zip(&sort_columns) {
             let mut out = if level.numeric {
                 SortKeys::Num(Vec::with_capacity(total))
             } else {
-                SortKeys::Text {
-                    blob: Vec::new(),
-                    offs: Vec::with_capacity(total + 1),
-                }
+                SortKeys::Text { blob: Vec::new(), offs: Vec::with_capacity(total + 1) }
             };
-            if let SortKeys::Text { offs, .. } = &mut out {
-                offs.push(0);
-            }
+            if let SortKeys::Text { offs, .. } = &mut out { offs.push(0); }
             for &orig in &old_order {
                 let fields = self.orig_fields(orig as u64);
-                let text = fields.get(*position).map(String::as_str).unwrap_or("");
+                let value = fields.get(*position).map(String::as_str).unwrap_or("");
                 match &mut out {
-                    SortKeys::Num(v) => {
-                        v.push(js_number_parse(text).unwrap_or(f64::NAN));
+                    SortKeys::Num(values) => {
+                        values.push(js_number_parse(value).unwrap_or(f64::NAN));
                     }
                     SortKeys::Text { blob, offs } => {
-                        blob.extend_from_slice(text.as_bytes());
+                        blob.extend_from_slice(value.as_bytes());
                         offs.push(blob.len() as u64);
                     }
                 }
             }
             keys.push(out);
         }
-
-        // 排列：perm[新位置] = 旧显示位置；平局用旧显示序，等价稳定排序。
         let mut perm: Vec<u32> = (0..total as u32).collect();
-        perm.sort_unstable_by(|&a, &b| {
-            let (ai, bi) = (a as usize, b as usize);
-            for (i, level) in levels.iter().enumerate() {
-                let o = keys[i].cmp_at(ai, bi, level.asc);
-                if o != CmpOrdering::Equal {
-                    return o;
-                }
+        perm.sort_unstable_by(|&left, &right| {
+            let (left_index, right_index) = (left as usize, right as usize);
+            for (index, level) in levels.iter().enumerate() {
+                let ordering = keys[index].cmp_at(left_index, right_index, level.asc);
+                if ordering != CmpOrdering::Equal { return ordering; }
             }
-            a.cmp(&b)
+            left.cmp(&right)
         });
-
-        let mut new_order: Vec<u32> = Vec::with_capacity(total);
-        let mut rank: Vec<u32> = vec![0; total];
-        for (d, &old_d) in perm.iter().enumerate() {
-            let orig = old_order[old_d as usize];
-            new_order.push(orig);
-            rank[orig as usize] = d as u32;
+        for old_display in &mut perm {
+            *old_display = old_order[*old_display as usize];
         }
-
-        // 命中集存的是显示位置：换算并保持升序（= 新视图的浏览顺序）。
-        if let Some(hits) = self.filter.take() {
-            let mut mapped: Vec<u32> = hits
-                .iter()
-                .map(|&d| rank[old_order[d as usize] as usize])
-                .collect();
-            mapped.sort_unstable();
-            self.filter = Some(mapped);
-        }
-        let next_history_generation = self.next_history_generation()?;
-        self.order = Some(new_order);
-        // 当前排序实现仍截断历史；共享排列历史由后续任务接入。
-        self.clear_history_at_fixed_point(next_history_generation);
-        Ok(())
+        let after = RowOrder::Perm(Arc::new(Perm::new(perm).map_err(history_cost_error)?));
+        let op = Op::Sort { before: self.order.clone(), after, levels: stable_levels };
+        let (mut prepared, fixed_point) = match self.preflight_history(op, "排序", approval)? {
+            HistoryDecision::Normal(prepared) => (prepared, false),
+            HistoryDecision::FixedPoint(prepared) => (prepared, true),
+            HistoryDecision::Confirm(outcome) => return Ok(outcome),
+        };
+        self.apply(&mut prepared.entry_mut().op);
+        self.finish_history(prepared, fixed_point, 0, 0)
     }
 
-    /// 退出排序视图；命中集换算回原始行号。
-    ///
-    /// # Parameters
-    /// - `release_ram`: true = 同时释放私有内存缓冲，重新映射原文件。
-    ///
-    /// # Errors
-    /// 重新映射失败时返回错误字符串（此时已退出排序视图）。
-    pub fn exit_sort_mode(&mut self, release_ram: bool) -> Result<(), String> {
-        if let Some(order) = self.order.take() {
-            if let Some(hits) = self.filter.take() {
-                let mut mapped: Vec<u32> = hits
-                    .iter()
-                    .map(|&d| order.get(d as usize).copied().unwrap_or(d))
-                    .collect();
-                mapped.sort_unstable();
-                self.filter = Some(mapped);
-            }
+    /// 退出排序是可撤销的 Perm → Identity；remap 失败不提交历史或新排列。
+    pub fn exit_sort_mode(
+        &mut self,
+        release_ram: bool,
+        approval: Approval,
+    ) -> Result<EditOutcome, String> {
+        if !self.is_sorted() {
+            return Ok(EditOutcome::unchanged());
         }
-        // 无路径内存档没有可回落的磁盘原文件：保持 Ram 后备。
+        let op = Op::Sort {
+            before: self.order.clone(), after: RowOrder::Identity, levels: Vec::new(),
+        };
+        let (mut prepared, fixed_point) = match self.preflight_history(op, "退出排序", approval)? {
+            HistoryDecision::Normal(prepared) => (prepared, false),
+            HistoryDecision::FixedPoint(prepared) => (prepared, true),
+            HistoryDecision::Confirm(outcome) => return Ok(outcome),
+        };
         if release_ram && self.is_ram_backed() && self.has_path() {
-            // 文件本身未变（编辑都在覆盖层），可直接重建映射与索引。
             self.remap()?;
         }
-        Ok(())
+        self.apply(&mut prepared.entry_mut().op);
+        self.finish_history(prepared, fixed_point, 0, 0)
     }
 
     /// 估算排序模式需要的新增内存（不含磁盘页缓存）。
@@ -7805,7 +7953,7 @@ impl BigFile {
             return Err("列号越界".into());
         }
         if filtered {
-            let Some(hits) = &self.filter else {
+            let Some(hits) = &self.display_hits else {
                 return Ok(None);
             };
             return Ok(find_vertical_edge_by(
@@ -8294,7 +8442,7 @@ impl BigFile {
         let end = vrow.checked_add(input_count).ok_or("粘贴位置越界")?;
         let inserted_rows = end.saturating_sub(total);
         if inserted_rows > 0 {
-            if self.order.is_some() {
+            if self.is_sorted() {
                 return Err("排序模式下暂不支持扩行粘贴，请先退出排序".into());
             }
             if self.is_indexing() {
@@ -8399,7 +8547,7 @@ impl BigFile {
         approval: Approval,
     ) -> Result<EditOutcome, String> {
         self.require_editable()?;
-        if self.order.is_some() {
+        if self.is_sorted() {
             return Err("排序模式下暂不支持插入/删除行，请先退出排序".into());
         }
         self.refresh_indexed();
@@ -8487,7 +8635,7 @@ impl BigFile {
         approval: Approval,
     ) -> Result<EditOutcome, String> {
         self.require_editable()?;
-        if self.order.is_some() {
+        if self.is_sorted() {
             return Err("排序模式下暂不支持插入/删除行，请先退出排序".into());
         }
         self.refresh_indexed();
@@ -8584,6 +8732,10 @@ impl BigFile {
                 for change in changes {
                     self.write_value(change.cell, &change.new);
                 }
+            }
+            Op::Sort { after, .. } => {
+                self.order = after.clone();
+                self.refresh_filter_projection();
             }
             Op::InsertRows { vpos, block, rows } => {
                 *block = self.seg.insert_block(*vpos, rows.clone());
@@ -8718,7 +8870,7 @@ impl BigFile {
                         rebind(&mut change.cell, old_block, new_block);
                     }
                 }
-                Op::Columns { .. } | Op::InsertRows { .. } => {}
+                Op::Columns { .. } | Op::InsertRows { .. } | Op::Sort { .. } => {}
                 Op::RemoveRows { items } => {
                     for item in items {
                         if let DeletedRow::Ins { block, .. } = item {
@@ -8772,7 +8924,7 @@ impl BigFile {
                         }
                     }
                 }
-                Op::Columns { .. } | Op::InsertRows { .. } => {}
+                Op::Columns { .. } | Op::InsertRows { .. } | Op::Sort { .. } => {}
             }
         }
     }
@@ -8894,6 +9046,11 @@ impl BigFile {
                 if let Some(change) = schema_change {
                     self.schema = Arc::clone(&change.before);
                 }
+                true
+            }
+            Op::Sort { before, .. } => {
+                self.order = before.clone();
+                self.refresh_filter_projection();
                 true
             }
             Op::InsertRows { vpos, block, rows } => {
@@ -9066,7 +9223,7 @@ impl BigFile {
         spec.multi_text = spec.multi_text.to_lowercase();
 
         // 完全相同条件：直接复用上次结果（编辑/插删/撤销都会清空 last_spec）
-        if self.filter.is_some() && self.last_spec.as_ref() == Some(&spec) {
+        if self.stable_hits.is_some() && self.last_spec.as_ref() == Some(&spec) {
             self.filter_stats = FilterStats { scanned_rows: 0 };
             return Ok(Some(self.filter_len()));
         }
@@ -9074,7 +9231,8 @@ impl BigFile {
         // 无条件 = 全命中（不扫字节）
         if spec.cols.is_empty() && spec.multi_text.is_empty() {
             let all: Vec<u32> = (0..total as u32).collect();
-            self.filter = Some(all);
+            self.display_hits = Some(project_filter(&all, &self.order));
+            self.stable_hits = Some(all);
             self.last_spec = Some(spec);
             self.filter_stats = FilterStats { scanned_rows: total };
             return Ok(Some(total as u32));
@@ -9082,7 +9240,8 @@ impl BigFile {
 
         // 多重筛选启用却未勾选任何列：任何行都不可能命中
         if !spec.multi_text.is_empty() && spec.multi_cols.is_empty() {
-            self.filter = Some(Vec::new());
+            self.stable_hits = Some(Vec::new());
+            self.display_hits = Some(Vec::new());
             self.last_spec = Some(spec);
             self.filter_stats = FilterStats { scanned_rows: 0 };
             return Ok(Some(0));
@@ -9093,7 +9252,7 @@ impl BigFile {
             .last_spec
             .as_ref()
             .filter(|prev| can_narrow(prev, &spec))
-            .and_then(|_| self.filter.take());
+            .and_then(|_| self.stable_hits.take());
 
         let source = match narrow.as_deref() {
             Some(rows) => RowSource::Subset(rows),
@@ -9114,7 +9273,8 @@ impl BigFile {
         // 任一缺口被取消：恢复旧命中集，绝不覆盖
         if parts.iter().any(|p| p.is_none()) {
             if let Some(prev) = narrow {
-                self.filter = Some(prev);
+                self.display_hits = Some(project_filter(&prev, &self.order));
+                self.stable_hits = Some(prev);
             }
             return Ok(None);
         }
@@ -9127,7 +9287,8 @@ impl BigFile {
         }
 
         let n = all.len() as u32;
-        self.filter = Some(all);
+        self.display_hits = Some(project_filter(&all, &self.order));
+        self.stable_hits = Some(all);
         self.last_spec = Some(spec);
         self.filter_stats = FilterStats { scanned_rows: scanned };
         Ok(Some(n))
@@ -9151,23 +9312,21 @@ impl BigFile {
                     return None;
                 }
             }
-            let d = source.get(i) as u32;
-            match self.seg.resolve(self.orig_vrow(d as u64)) {
+            let orig = source.get(i) as u32;
+            match self.seg.resolve(orig as u64) {
                 Some(ResolvedRow::Src(rec)) => {
                     // rec 已是物理记录号（段表统一寻址）；记录 0 需剥 BOM
                     let (s, e) = self
                         .src_span(rec)
                         .unwrap_or((0, 0));
                     if scan.record_matches(rec, &self.bytes()[s..e]) {
-                        hits.push(d);
+                        hits.push(orig);
                     }
                 }
-                Some(ResolvedRow::Ins { .. }) => {
-                    if self
-                        .row_at(d as u64)
-                        .is_some_and(|f| spec_matches(spec, &f))
-                    {
-                        hits.push(d);
+                Some(ResolvedRow::Ins { block, row }) => {
+                    let fields = self.ins_fields(block, row);
+                    if spec_matches(spec, &self.map_fields_to_view(&fields)) {
+                        hits.push(orig);
                     }
                 }
                 None => {}
@@ -9181,23 +9340,24 @@ impl BigFile {
 
     /// 是否有生效的筛选结果。
     pub fn has_filter(&self) -> bool {
-        self.filter.is_some()
+        self.stable_hits.is_some()
     }
 
     /// 当前筛选命中数（无筛选时 0）。
     pub fn filter_len(&self) -> u32 {
-        self.filter.as_ref().map_or(0, |f| f.len() as u32)
+        self.display_hits.as_ref().map_or(0, |f| f.len() as u32)
     }
 
     /// 清除筛选结果与收窄基准。
     pub fn clear_filter(&mut self) {
-        self.filter = None;
+        self.stable_hits = None;
+        self.display_hits = None;
         self.last_spec = None;
     }
 
     /// 筛选命中分页取行：行内容与各命中行的原始数据行号（0 基）成对下发。
     pub fn filter_page(&self, from: u32, count: u32) -> FilterPage {
-        let Some(f) = &self.filter else { return FilterPage::default() };
+        let Some(f) = &self.display_hits else { return FilterPage::default() };
         // 起点也要夹取：筛选切换时，筛选前排队的深页请求（如 from=19000）
         // 可能晚到；此时命中集可能只有几十行，直接切片会 panic 崩掉整个进程。
         let lo = (from as usize).min(f.len());
@@ -9213,10 +9373,10 @@ impl BigFile {
         page
     }
 
-    /// 命中序号 → 清筛后全量视图中的行号（取消筛选锚定用）。
-    /// 命中集存的就是该值（未排序=原始 vrow；排序=排序显示位置），直接返回。
+    /// 将命中序号映射为当前显示行号，供清除筛选后的视口锚定使用。
+    /// display_hits 已保存当前 RowOrder 下的显示位置，可直接返回。
     pub fn filter_hit_view_row(&self, idx: u32) -> Option<u32> {
-        self.filter.as_ref()?.get(idx as usize).copied()
+        self.display_hits.as_ref()?.get(idx as usize).copied()
     }
 
     // ---- 复制（大选区走引擎） ----
@@ -9295,7 +9455,7 @@ impl BigFile {
         if self.is_indexing() {
             return Err("文件仍在索引中，暂不支持列操作".into());
         }
-        if self.order.is_some() {
+        if self.is_sorted() {
             return Err("排序模式下暂不支持列操作，请先退出排序".into());
         }
         // 无列名模式列名是自动生成的，重命名没有意义
@@ -9307,7 +9467,8 @@ impl BigFile {
         let pending_schema = self.projected_schema(&ops)?;
         self.pending_cols = ops;
         self.pending_schema = pending_schema;
-        self.filter = None; // 列映射变化，旧筛选结果作废
+        self.stable_hits = None;
+        self.display_hits = None; // 列映射变化，旧筛选结果作废
         self.last_spec = None;
         Ok(())
     }
@@ -9348,7 +9509,7 @@ impl BigFile {
             return Ok(());
         }
         let next_history_generation = self.next_history_generation()?;
-        if self.order.is_some() {
+        if self.is_sorted() {
             return Err("排序模式下暂不支持切换首行语义，请先退出排序".into());
         }
         if !self.pending_cols.is_empty() {
@@ -9394,7 +9555,8 @@ impl BigFile {
         }
         self.pending_schema = None;
         // 开关是视图属性：筛选、收窄基准、撤销历史全部作废
-        self.filter = None;
+        self.stable_hits = None;
+        self.display_hits = None;
         self.last_spec = None;
         self.clear_history_at_fixed_point(next_history_generation);
         Ok(())
@@ -9501,7 +9663,7 @@ impl BigFile {
                         }
                     }
                 }
-                Op::Columns { .. } | Op::InsertRows { .. } => {}
+                Op::Columns { .. } | Op::InsertRows { .. } | Op::Sort { .. } => {}
             }
         }
         let mut suspended = BTreeSet::new();
@@ -9644,6 +9806,20 @@ impl BigFile {
                     None => None,
                 },
             },
+            Op::Sort { before, after, levels } => {
+                if !transform.row_layout_is_identity() {
+                    return Err("排序历史依赖已变化的物理行布局，需固定当前状态".into());
+                }
+                let levels = levels.iter().map(|level| {
+                    Ok(StableSortLevel {
+                        col: transform.columns.get(&level.col).copied().map(ColumnId)
+                            .ok_or("排序历史列已不在保存结构中")?,
+                        numeric: level.numeric,
+                        asc: level.asc,
+                    })
+                }).collect::<Result<Vec<_>, String>>()?;
+                Op::Sort { before: before.clone(), after: after.clone(), levels }
+            }
             Op::InsertRows { vpos, block, rows } => Op::InsertRows {
                 vpos: *vpos,
                 block: *block,
@@ -9746,6 +9922,7 @@ impl BigFile {
                 Op::Columns { .. } => "执行列操作",
                 Op::Paste { .. } => "粘贴区域",
                 Op::InsertRows { .. } => "插入行",
+                Op::Sort { .. } => "排序视图",
                 Op::RemoveRows { .. } => "删除行",
             };
             let op = self.transform_op_for_save(&entry.op, transform, schema_cache)
@@ -9819,7 +9996,10 @@ impl BigFile {
         let next_index_epoch = self.index_epoch.checked_add(1).ok_or("索引代际溢出")?;
         // 整表重写数十秒：本线程降为背景优先级，让出 UI/系统调度。
         let _bg = bg::BackgroundGuard::enter();
-        let sorted_order = self.order.clone();
+        let sorted_order = match &self.order {
+            RowOrder::Identity => None,
+            RowOrder::Perm(perm) => Some(Arc::clone(perm)),
+        };
         if sorted_order.is_some()
             && self.history.stats().undo_count + self.history.stats().redo_count > 0
             && !approval.allow_fixed_point
@@ -9882,7 +10062,7 @@ impl BigFile {
         let mut last_emit: Option<Instant> = None;
         if let Some(order) = &sorted_order {
             // 排序保存：按当前视图顺序逐行写出；物理顺序即所得。
-            for &orig in order.iter() {
+            for &orig in order.as_slice() {
                 match self.seg.resolve(orig as u64) {
                     Some(ResolvedRow::Src(rec)) => {
                         if source_layout_changed || edited.contains(&rec) {
@@ -9926,7 +10106,7 @@ impl BigFile {
             self.base_ncols = saved_headers.len();
             self.base_headers = saved_headers;
             // 排序物化仍是固定点；成功保存本身重新建立干净保存点。
-            self.order = None;
+            self.order = RowOrder::Identity;
             self.history.clear();
             self.fixed_point = true;
             self.revision = 0;
@@ -10022,7 +10202,7 @@ impl BigFile {
 
     /// 执行待执行列操作：只提交共享 Schema，不改写源文件或行索引。
     pub fn apply_col_ops(&mut self, approval: Approval) -> Result<EditOutcome, String> {
-        if self.order.is_some() {
+        if self.is_sorted() {
             return Err("排序模式下暂不支持列操作，请先退出排序".into());
         }
         self.refresh_indexed();
@@ -10165,7 +10345,8 @@ impl BigFile {
         self.backing_path = self.path.clone();
         self.seg = Segments::new(prepared.offset, prepared.n_data);
         self.overlay.clear();
-        self.filter = None;
+        self.stable_hits = None;
+        self.display_hits = None;
         self.last_spec = None;
         self.base_size = prepared.total_bytes;
         self.base_mtime = prepared.modified;

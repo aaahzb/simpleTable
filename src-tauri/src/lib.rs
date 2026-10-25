@@ -21,6 +21,7 @@ mod engine;
 // Task 2 先建立独立账本；接口在 Task 3–14 接入，Task 15 移除本豁免。
 #[allow(dead_code)]
 mod history;
+mod order;
 mod schema;
 // Task 7 先以缺失类型测试驱动实现；Task 15 复查临时豁免。
 #[allow(dead_code)]
@@ -486,14 +487,14 @@ async fn big_sort_apply(
     state: tauri::State<'_, BigShared>,
     session: u64,
     levels: Vec<SortLevel>,
-) -> Result<BigMeta, String> {
+    approval: Approval,
+) -> Result<EditOutcome, String> {
     let entry = big_entry(state.inner(), session)?;
     entry.bump_gate(); // 排序会改命中集映射：先让本会话的筛选扫描退出
     tauri::async_runtime::spawn_blocking(move || {
         let mut bf = entry.file.lock().map_err(|e| e.to_string())?;
         bf.refresh_indexed();
-        bf.sort_by_levels(&levels)?;
-        Ok(bf.meta())
+        bf.sort_by_levels(&levels, approval)
     })
     .await
     .map_err(|e| format!("排序任务被取消：{e}"))?
@@ -505,13 +506,13 @@ async fn big_sort_exit(
     state: tauri::State<'_, BigShared>,
     session: u64,
     release_ram: Option<bool>,
-) -> Result<BigMeta, String> {
+    approval: Approval,
+) -> Result<EditOutcome, String> {
     let entry = big_entry(state.inner(), session)?;
     let release = release_ram.unwrap_or(true);
     tauri::async_runtime::spawn_blocking(move || {
         let mut bf = entry.file.lock().map_err(|e| e.to_string())?;
-        bf.exit_sort_mode(release)?;
-        Ok(bf.meta())
+        bf.exit_sort_mode(release, approval)
     })
     .await
     .map_err(|e| format!("退出排序任务被取消：{e}"))?

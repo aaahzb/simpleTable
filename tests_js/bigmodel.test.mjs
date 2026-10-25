@@ -267,12 +267,12 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
           });
           data.splice(0, data.length, ...idx.map((i) => data[i]));
           sorted = true;
-          return meta();
+          return editOutcome({ changed: true });
         }
         case "big_sort_exit":
           sorted = false;
           if (args.releaseRam !== false) ramBacked = false;
-          return meta();
+          return editOutcome({ changed: true });
         case "big_close":
           return null;
         case "big_stale":
@@ -1256,34 +1256,68 @@ test("排序模式：估算/载入/取消都带 session，载入后刷新 meta",
   assert.equal(calls.at(-1)[0], "big_sort_cancel");
 });
 
-test("sort 调引擎带级别，刷新 meta 并以 origin='sort' 通知", async () => {
+test("sort 走 approval，刷新 meta 并以 origin='view' 通知", async () => {
   const { model, calls } = makeFakeEngine({ rows: 5, cols: 2 });
   await model.open("/x.csv");
   const events = [];
   model.onData((s, o) => events.push([s, o]));
   const levels = [{ col: 1, numeric: false, asc: false }];
-  const meta = await model.sort(levels);
-  assert.equal(calls.at(-1)[0], "big_sort_apply");
-  assert.equal(typeof calls.at(-1)[1].session, "number");
-  assert.deepEqual(calls.at(-1)[1].levels, levels);
-  assert.equal(meta.sorted, true);
+  const outcome = await model.sort(levels);
+  const apply = calls.find(([cmd]) => cmd === "big_sort_apply");
+  assert.equal(outcome.changed, true);
+  assert.deepEqual(apply[1].approval, { allowFixedPoint: false, preflightId: null });
+  assert.equal(typeof apply[1].session, "number");
+  assert.deepEqual(apply[1].levels, levels);
+  assert.equal(calls.at(-1)[0], "big_meta", "changed 后必须重新读取引擎 meta");
+  assert.equal(model.meta().sorted, true);
   assert.equal(model.rowCount(), 5, "排序不改变行数");
-  assert.deepEqual(events.at(-1), [true, "sort"], "排序应标记为需保存");
+  assert.deepEqual(events.at(-1), [true, "view"], "排序是视图操作，不应标脏");
 });
 
-test("exitSort 默认释放内存并回到未排序 meta", async () => {
+test("sort fixedPoint 取消不重试、不刷新并返回 cancelled", async () => {
+  const calls = [];
+  let refreshes = 0;
+  let dataEvents = 0;
+  const fixedPoint = {
+    kind: "stepOverBudget", operation: "排序", requiredBytes: 100,
+    budgetBytes: 10, preflightId: 79,
+  };
+  const model = new BigModel({
+    invoke: async (cmd, args = {}) => {
+      calls.push([cmd, args]);
+      if (cmd !== "big_sort_apply") throw new Error("unexpected " + cmd);
+      return { changed: false, insertedRows: 0, removedRows: 0,
+        fixedPoint, cancelled: false };
+    },
+    listen: async () => () => {},
+    confirmFixedPoint: async () => false,
+  });
+  model._refreshMeta = async () => { refreshes += 1; };
+  model._emitData = () => { dataEvents += 1; };
+  const outcome = await model.sort([{ col: 0, numeric: false, asc: true }]);
+  assert.equal(outcome.cancelled, true);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0][1].approval, { allowFixedPoint: false, preflightId: null });
+  assert.equal(refreshes, 0);
+  assert.equal(dataEvents, 0);
+});
+
+test("exitSort 走 approval，默认释放内存并以 origin='view' 通知", async () => {
   const { model, calls } = makeFakeEngine();
   await model.open("/x.csv");
   await model.loadIntoRam();
   await model.sort([{ col: 0, numeric: false, asc: true }]);
   const events = [];
   model.onData((s, o) => events.push([s, o]));
-  const meta = await model.exitSort();
-  assert.equal(calls.at(-1)[0], "big_sort_exit");
-  assert.equal(calls.at(-1)[1].releaseRam, true);
-  assert.equal(typeof calls.at(-1)[1].session, "number");
-  assert.equal(meta.sorted, false);
-  assert.equal(meta.ram_backed, false);
+  const outcome = await model.exitSort();
+  const exit = calls.find(([cmd]) => cmd === "big_sort_exit");
+  assert.equal(outcome.changed, true);
+  assert.deepEqual(exit[1].approval, { allowFixedPoint: false, preflightId: null });
+  assert.equal(exit[1].releaseRam, true);
+  assert.equal(typeof exit[1].session, "number");
+  assert.equal(calls.at(-1)[0], "big_meta");
+  assert.equal(model.meta().sorted, false);
+  assert.equal(model.meta().ram_backed, false);
   assert.deepEqual(events.at(-1), [true, "view"]);
 });
 

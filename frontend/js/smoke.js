@@ -2458,13 +2458,21 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(sawCancel, "载入进度框必须提供「取消载入」");
     assert(bm.meta().sorted === true && bm.meta().ram_backed === true,
       `排序后 meta 异常：${JSON.stringify(bm.meta())}`);
-    assert(window.__app.isDirty() === true, "排序视图尚未落盘，应标脏");
+    assert(window.__app.isDirty() === false, "排序只改视图，不应额外标脏");
     await waitFor(() => bm.rawData(0, 0) === "d", "排序视图首行");
     assert(bm.rawData(1, 0) === "c" && bm.rawData(2, 0) === "b"
       && bm.rawData(3, 0) === "a", "文本降序应为 d,c,b,a");
     assert(!tbHidden("退出排序"), "排序视图应显示「退出排序」");
     assert(String(document.getElementById("status-text").textContent).includes("已排序"),
       "状态栏应提示已排序（内存、未保存）");
+    await window.__app.undo();
+    await waitFor(() => bm.rawData(0, 0) === "b" && bm.rawData(3, 0) === "d",
+      "撤销排序应恢复原始物理行序");
+    assert(window.__app.isDirty() === false, "撤销纯排序不得标脏");
+    await window.__app.redo();
+    await waitFor(() => bm.rawData(0, 0) === "d" && bm.rawData(3, 0) === "a",
+      "重做排序应恢复精确排列");
+    assert(window.__app.isDirty() === false, "重做纯排序不得标脏");
 
     // 排序后筛选：引擎命中集已重映射到新显示坐标系
     grid.filters.set(0, "b");
@@ -2547,29 +2555,49 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       "保存后视图应为物理顺序");
   });
 
-  check("排序模式：退出排序（放弃）恢复行序、释放内存、保留单元格修改", async () => {
+  check("排序模式：退出排序可撤销重做、释放内存并保留单元格修改", async () => {
     const bm = bigM();
     // 保存后的物理顺序 d,c,b,a；按 score 数字升序：c(1),b(2),a(10),d(99)
     assert(await window.__app.applyBigSort(
       [{ col: 1, numeric: true, asc: true }], { confirm: false }) === true,
     "第二次排序应完成");
     await waitFor(() => bm.rawData(0, 0) === "c", "按分数排序首行 c");
+    assert(await window.__app.exitSortMode() === true, "干净文档应能直接退出排序");
+    await waitFor(() => bm.rawData(0, 0) === "d" && bm.rawData(1, 0) === "c",
+      "干净文档退出排序应恢复物理行序");
+    assert(window.__app.isDirty() === false, "纯退出排序不得标脏");
+    await window.__app.undo();
+    await waitFor(() => bm.rawData(0, 0) === "c", "撤销纯退出应恢复排列");
+    assert(window.__app.isDirty() === false, "撤销纯退出排序不得标脏");
+    await window.__app.redo();
+    await waitFor(() => bm.rawData(0, 0) === "d", "重做纯退出应恢复物理行序");
+    assert(window.__app.isDirty() === false, "重做纯退出排序不得标脏");
+    assert(await window.__app.applyBigSort(
+      [{ col: 1, numeric: true, asc: true }], { confirm: false }) === true,
+    "重新进入排序以验证内容修改保留");
+    await waitFor(() => bm.rawData(0, 0) === "c", "重新排序首行 c");
     await bm.setData(0, 2, "changed");
     await waitFor(() => bm.rawData(0, 2) === "changed", "排序视图第二次编辑落定");
-    const pendingExit = window.__app.exitSortMode();
-    await waitFor(() => document.querySelector(".modal-mask"), "退出排序对话框");
-    const text = document.querySelector(".modal-mask").textContent;
-    assert(text.includes("放弃排序") && text.includes("单元格修改仍会保留"),
-      `退出排序文案异常：${text}`);
-    assert(clickModalButton("放弃排序"), "应能点击「放弃排序」");
-    assert(await pendingExit === true, "退出排序应完成");
+    assert(await window.__app.exitSortMode() === true, "退出排序不再要求保存/放弃确认");
     assert(bm.meta().sorted === false && bm.meta().ram_backed === false,
       "退出排序应释放内存并回到 mmap");
     await waitFor(() => bm.rawData(0, 0) === "d" && bm.rawData(1, 0) === "c",
       "恢复保存时的物理行序");
-    assert(bm.rawData(1, 2) === "changed", "放弃排序不得丢弃单元格修改");
+    assert(bm.rawData(1, 2) === "changed", "退出排序不得丢弃单元格修改");
     assert(window.__app.isDirty() === true, "仍有内容修改，应保持脏点");
     assert(tbHidden("退出排序") && !tbHidden("排序…"), "按钮状态应复原");
+
+    assert(await bm.undo() === true, "退出排序本身应可撤销");
+    assert(bm.meta().sorted === true && bm.meta().ram_backed === false,
+      "撤销退出排序应在 mmap 上恢复精确排列，无需重新载入 RAM");
+    await waitFor(() => bm.rawData(0, 0) === "c" && bm.rawData(0, 2) === "changed",
+      "撤销退出排序应恢复排序视图和原行编辑");
+    assert(await bm.redo() === true, "退出排序本身应可重做");
+    assert(bm.meta().sorted === false && bm.meta().ram_backed === false,
+      "重做退出排序应恢复恒等视图");
+    await waitFor(() => bm.rawData(0, 0) === "d" && bm.rawData(1, 2) === "changed",
+      "重做退出排序应回到物理行序并保留编辑");
+    assert(window.__app.isDirty() === true, "排序历史往返不得改变内容脏点");
   });
 
   check("行号语义：大模式筛选行号跳号（原始行号随命中页下发）", async () => {

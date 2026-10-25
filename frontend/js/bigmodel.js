@@ -171,9 +171,10 @@ export class BigModel {
    *
    * @param {object} outcome - 引擎 EditOutcome。
    * @param {string} [origin] - 数据通知来源。
+   * @param {boolean} [forceStructural] - 行序/结构变化时强制结构通知。
    * @returns {Promise<object>} 原 EditOutcome。
    */
-  async _afterEdit(outcome, origin = "edit") {
+  async _afterEdit(outcome, origin = "edit", forceStructural = false) {
     if (!outcome?.changed) return outcome;
     const previousCols = this._meta?.cols;
     this._invalidate();
@@ -181,7 +182,7 @@ export class BigModel {
     await this._refreshMeta();
     const columnsChanged = previousCols !== undefined && this._meta?.cols !== previousCols;
     this._emitData(
-      outcome.insertedRows > 0 || outcome.removedRows > 0 || columnsChanged,
+      forceStructural || outcome.insertedRows > 0 || outcome.removedRows > 0 || columnsChanged,
       origin,
     );
     return outcome;
@@ -558,34 +559,26 @@ export class BigModel {
   /**
    * 对当前视图排序（引擎侧排列层，不改文件；需先 {@link loadIntoRam}）。
    *
-   * 排序是物理保存的准备动作：发出结构通知（origin="sort"），由 app 标脏。
+   * 排序只改变视图：支持固定点确认，发出 origin="view" 的结构通知。
    * 已激活的筛选结果会随排序重新定位，成员不变。
    *
    * @param {Array<{col: number, numeric: boolean, asc: boolean}>} levels - 排序级别。
-   * @returns {Promise<object>} 最新 BigMeta（sorted=true）。
+   * @returns {Promise<object>} EditOutcome；取消时 changed=false、cancelled=true。
    */
   async sort(levels) {
-    const meta = await this._invoke("big_sort_apply", { levels });
-    this._meta = meta;
-    this._invalidate();
-    this._emitData(true, "sort");
-    this._emitUndo();
-    return meta;
+    const outcome = await this._invokeEdit("big_sort_apply", { levels });
+    return this._afterEdit(outcome, "view", true);
   }
 
   /**
    * 退出排序视图；默认同时释放私有内存缓冲、回到 mmap 视图。
    *
    * @param {{releaseRam?: boolean}} [opts] - releaseRam=false 时保留内存后备。
-   * @returns {Promise<object>} 最新 BigMeta（sorted=false）。
+   * @returns {Promise<object>} EditOutcome；取消时 changed=false、cancelled=true。
    */
   async exitSort({ releaseRam = true } = {}) {
-    const meta = await this._invoke("big_sort_exit", { releaseRam });
-    this._meta = meta;
-    this._invalidate();
-    this._emitData(true, "view");
-    this._emitUndo();
-    return meta;
+    const outcome = await this._invokeEdit("big_sort_exit", { releaseRam });
+    return this._afterEdit(outcome, "view", true);
   }
 
   /**

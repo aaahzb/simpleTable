@@ -11,8 +11,7 @@ import { Grid } from "./grid.js";
 import { EditPane } from "./pane.js";
 import { showMenu } from "./menu.js";
 import {
-  busyDialog, columnDialog, confirmDialog, confirmDiscardDialog,
-  confirmExitSortDialog, confirmFixedPointDialog, confirmRamSortDialog,
+  busyDialog, columnDialog, confirmDialog, confirmDiscardDialog, confirmFixedPointDialog, confirmRamSortDialog,
   errorDialog, fmtBytes, infoDialog, intDialog, newTableDialog, progressDialog,
   shortcutsDialog, sortDialog, undoBudgetDialog,
 } from "./dialogs.js";
@@ -1932,14 +1931,16 @@ async function applyBigSort(levels, opts = {}) {
     dlg.close();
   }
   const busy = busyDialog("正在排序…");
+  let outcome;
   try {
-    await model.sort(levels);
+    outcome = await model.sort(levels);
   } catch (err) {
     busy.close();
     await errorDialog("排序失败", String(err?.message ?? err));
     return false;
   }
   busy.close();
+  if (!outcome.changed) return false;
   fgrid().clearSelection();
   clearDock();
   fgrid().resetScroll();
@@ -1975,19 +1976,18 @@ async function openSortDialog() {
 }
 
 /**
- * 退出排序视图：提示保存/放弃，随后释放排序内存并恢复原行顺序。
+ * 退出排序视图：作为可撤销操作释放排序内存并恢复原行顺序。
  *
- * @returns {Promise<boolean>} true = 已退出（或保存成功）。
+ * @returns {Promise<boolean>} true = 已退出；固定点取消或失败为 false。
  */
 async function exitSortMode() {
   if (model.meta?.()?.sorted !== true) return false;
   await fgrid().commitEdit();
   await paneWrite;
-  const choice = await confirmExitSortDialog();
-  if (choice === "cancel") return false;
-  if (choice === "save") return saveFile();
   try {
-    const meta = await model.exitSort();
+    const outcome = await model.exitSort();
+    if (!outcome.changed) return false;
+    const meta = model.meta();
     fgrid().clearSelection();
     clearDock();
     fgrid().resetScroll();

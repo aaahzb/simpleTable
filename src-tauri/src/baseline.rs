@@ -55,6 +55,16 @@ impl BaselineTransform {
         Ok(())
     }
 
+    /// 判断保存前后的物理记录布局是否完全恒等。
+    ///
+    /// 仅恒等布局允许排列原样重绑定；存在插入、删除、悬挂或范围位移时返回 false。
+    pub fn row_layout_is_identity(&self) -> bool {
+        self.inserted_rows.is_empty()
+            && self.deleted_sources.is_empty()
+            && self.suspended_rows.is_empty()
+            && self.ranges.iter().all(|range| range.old_start == range.new_start)
+    }
+
     /// 将旧 Source 记录号映射为保存后的物理记录号；删除或未知记录不映射。
     pub fn map_source(&self, old_rec: u32) -> Option<u32> {
         let index = self.ranges.partition_point(|range| range.old_start <= old_rec);
@@ -86,6 +96,16 @@ mod tests {
         assert_eq!(transform.ranges.len(), 3);
         assert_eq!(transform.map_source(100_001), Some(100_000));
         assert_eq!(transform.map_source(100_000), None);
+    }
+
+    #[test]
+    fn baseline_identity_row_layout_is_detected() {
+        let mut transform = BaselineTransform::default();
+        transform.push_surviving_source(0, 0).unwrap();
+        transform.push_surviving_source(1, 1).unwrap();
+        assert!(transform.row_layout_is_identity());
+        transform.inserted_rows.insert((7, 2), 12);
+        assert!(!transform.row_layout_is_identity());
     }
 
     #[test]
