@@ -989,6 +989,20 @@ export class Grid {
   }
 
   /**
+   * 单块选区返回规范化矩形；多块或无块返回 null。
+   *
+   * @returns {{row: number, col: number, rows: number, cols: number} | null}
+   */
+  _singleSelectionRect() {
+    if (this.sel.blocks.length !== 1) return null;
+    const [r1, c1, r2, c2] = this.sel.blocks[0];
+    return {
+      row: Math.min(r1, r2), col: Math.min(c1, c2),
+      rows: Math.abs(r2 - r1) + 1, cols: Math.abs(c2 - c1) + 1,
+    };
+  }
+
+  /**
    * @returns {Array<[number, number]>} 选中的源坐标单元格列表。
    */
   selectedCells() {
@@ -1277,10 +1291,10 @@ export class Grid {
     const cur = this.sel.current;
     const mods = e.ctrlKey || e.metaKey;
     if (mods && !e.shiftKey && (e.key === "c" || e.key === "C")) {
-      e.preventDefault(); this.copySelection(); return;
+      e.preventDefault(); this._runClipboard(this.copySelection()); return;
     }
     if (mods && !e.shiftKey && (e.key === "x" || e.key === "X")) {
-      e.preventDefault(); this.cutSelection(); return;
+      e.preventDefault(); this._runClipboard(this.cutSelection()); return;
     }
     if (mods && !e.shiftKey && (e.key === "v" || e.key === "V")) {
       e.preventDefault(); this.pasteClipboard(false); return;
@@ -1289,7 +1303,7 @@ export class Grid {
     if (mods && (e.key === "y" || (e.shiftKey && e.key === "Z"))) {
       e.preventDefault(); this.hooks.redoRequested?.(); return;
     }
-    if (e.key === "Delete") { e.preventDefault(); this.deleteSelection(); return; }
+    if (e.key === "Delete") { e.preventDefault(); this._runClipboard(this.deleteSelection()); return; }
     if (e.key === "F2") {
       if (cur) { e.preventDefault(); this.openEditor(cur[0], cur[1], { selectAll: true }); }
       return;
@@ -1540,64 +1554,89 @@ export class Grid {
 
   // ============ 剪贴板（G1/G2/G4） ============
 
-  /** 复制选区为 TSV（含引号规则，与 Excel 互通） */
-  copySelection() {
-    if (!this.selectedSet.size) return;
-    const rows = this.selectedRows();
-    const cols = this.selectedCols();
-    const cc = this.model.columnCount();
-    // 完整矩形且超过逐格上限 → 引擎流式序列化（前端不取数）
-    const fullRect = this.selectedSet.size === rows.length * cols.length;
-    if (fullRect && this.selectedSet.size > 20000) {
-      Promise.resolve(this.model.copyRows(rows[0], rows[rows.length - 1] + 1,
-        cols[0], cols[cols.length - 1] + 1)).then((text) => {
-        this.lastCopiedText = text;
-        navigator.clipboard.writeText(text).then(() => {
-          this.hooks.statusMsg(`已复制 ${this.selectedSet.size} 个单元格`, 2000);
-        });
-      }).catch((err) => {
-        this.hooks.statusMsg(String(err?.message ?? err), 3000);
-      });
-      return;
-    }
-    if (!fullRect && this.selectedSet.size > 20000) {
-      this.hooks.statusMsg("大文件模式：大型选区仅支持完整矩形复制", 3000);
-      return;
-    }
-    const data = [];
-    for (const r of rows) {
-      const line = [];
-      for (const c of cols) {
-        line.push(this.selectedSet.has(r * cc + c) ? this.model.rawData(r, c) : "");
-      }
-      data.push(line);
-    }
-    const text = serializeRecords(data, "\t");
-    this.lastCopiedText = text;
-    navigator.clipboard.writeText(text).then(() => {
-      this.hooks.statusMsg(`已复制 ${this.selectedSet.size} 个单元格`, 2000);
+  /**
+   * 统一捕获复制、剪切和删除的异步拒绝。
+   *
+   * @param {Promise<unknown>} promise - 剪贴板或清除操作。
+   * @returns {void}
+   */
+  _runClipboard(promise) {
+    Promise.resolve(promise).catch((err) => {
+      this.hooks.statusMsg(String(err?.message ?? err), 3000);
     });
-  }
-
-  /** 剪切 = 复制 + 清除选区 */
-  cutSelection() {
-    if (!this.selectedSet.size) return;
-    this.copySelection();
-    this.deleteSelection(false);
   }
 
   /**
-   * Del：立即清除选区内容（Excel 行为，不弹确认）。
+   * 复制选区为 TSV；只有系统剪贴板写入成功才报告可复制。
    *
-   * @param {boolean} [say] - 是否发状态消息。
+   * @returns {Promise<boolean>} 写入成功为 true，失败或空选区为 false。
    */
-  deleteSelection(say = true) {
-    if (!this.selectedSet.size) return;
-    const n = this.selectedSet.size;
-    Promise.resolve(this.model.clearCells(this.selectedCells())).catch((err) => {
+  async copySelection() {
+    if (!this.selectedSet.size) return false;
+    const rows = this.selectedRows();
+    const cols = this.selectedCols();
+    const cc = this.model.columnCount();
+    const fullRect = this.selectedSet.size === rows.length * cols.length;
+    try {
+      let text;
+      if (fullRect && this.selectedSet.size > 20000) {
+        text = await this.model.copyRows(rows[0], rows[rows.length - 1] + 1,
+          cols[0], cols[cols.length - 1] + 1);
+      } else {
+        if (!fullRect && this.selectedSet.size > 20000) {
+          this.hooks.statusMsg("大文件模式：大型选区仅支持完整矩形复制", 3000);
+          return false;
+        }
+        const data = [];
+        for (const r of rows) {
+          const line = [];
+          for (const c of cols) {
+            line.push(this.selectedSet.has(r * cc + c) ? this.model.rawData(r, c) : "");
+          }
+          data.push(line);
+        }
+        text = serializeRecords(data, "\t");
+      }
+      this.lastCopiedText = text;
+      await navigator.clipboard.writeText(text);
+      this.hooks.statusMsg("已复制 " + this.selectedSet.size + " 个单元格", 2000);
+      return true;
+    } catch (err) {
       this.hooks.statusMsg(String(err?.message ?? err), 3000);
-    });
-    if (say) this.hooks.statusMsg(`已清除 ${n} 个单元格的内容`, 2000);
+      return false;
+    }
+  }
+
+  /**
+   * 剪切等于复制成功后才清除原选区。
+   *
+   * @returns {Promise<boolean>} 实际清除为 true，复制失败或空选区为 false。
+   */
+  async cutSelection() {
+    if (!this.selectedSet.size) return false;
+    const blocks = JSON.stringify(this.sel?.blocks ?? []);
+    const copied = await this.copySelection();
+    if (!copied || blocks !== JSON.stringify(this.sel?.blocks ?? [])) return false;
+    return this.deleteSelection(false);
+  }
+
+  /**
+   * Delete 清除选区；单块直接发矩形，多块保留稀疏坐标。
+   *
+   * @param {boolean} [say] - 是否在实际变化后发状态消息。
+   * @returns {Promise<boolean>} 是否实际清除内容。
+   */
+  async deleteSelection(say = true) {
+    const n = this.selectedSet.size;
+    if (!n) return false;
+    const rect = this._singleSelectionRect();
+    const outcome = rect
+      ? await this.model.clearRect(rect.row, rect.col, rect.rows, rect.cols)
+      : await this.model.clearCells(this.selectedCells());
+    if (outcome?.changed && say) {
+      this.hooks.statusMsg("已清除 " + n + " 个单元格的内容", 2000);
+    }
+    return outcome?.changed === true;
   }
 
   /**

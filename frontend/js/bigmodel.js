@@ -1053,61 +1053,74 @@ export class BigModel {
   }
 
   /**
-   * 清空一批单元格，整批只占一步撤销。
+   * 将结构化清除目标作为一次用户操作交给引擎。
+   *
+   * @param {object} target - cells/rows/columns/rect 目标。
+   * @returns {Promise<object>} 引擎 EditOutcome。
+   * @throws {Error} 筛选态、固定点预检过期或引擎拒绝时。
+   */
+  async _clearTarget(target) {
+    if (this._filterOn) {
+      throw new Error("筛选结果中不可编辑：请先清除筛选");
+    }
+    let outcome;
+    try {
+      outcome = await this._invokeEdit("big_clear", { target });
+    } catch (err) {
+      throw new Error(BIG_EDIT_ERR + "：" + err);
+    }
+    return this._afterEdit(outcome);
+  }
+
+  /**
+   * 清空一批稀疏单元格，整批只占一步撤销。
    *
    * @param {Array<[number, number]>} cells - [行, 列] 列表。
-   * @returns {Promise<void>}
-   * @throws {Error} 引擎拒绝批量写入时。
+   * @returns {Promise<object>} 引擎 EditOutcome。
    */
   async clearCells(cells) {
-    if (this._filterOn) {
-      throw new Error("筛选结果中不可编辑：请先清除筛选");
-    }
-    // 按 (row,col) 去重；同值过滤与快照由引擎按批前状态统一完成。
     const seen = new Set();
-    const jobs = [];
+    const unique = [];
     for (const [r, c] of cells) {
-      const k = r * 1048576 + c;
-      if (seen.has(k)) continue;
-      seen.add(k);
-      jobs.push([r, c, ""]);
+      const key = r * 1048576 + c;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push([r, c]);
     }
-    await this.setCells(jobs);
+    return this._clearTarget({ kind: "cells", cells: unique });
   }
 
   /**
-   * 清空若干整行。
+   * 清空若干整行；行列去重和旧值扫描由引擎完成。
    *
    * @param {number[]} rows - 视图行号列表。
-   * @returns {Promise<void>}
-   * @throws {Error} 引擎拒绝批量写入时。
+   * @returns {Promise<object>} 引擎 EditOutcome。
    */
   async clearRows(rows) {
-    const ncols = this.columnCount();
-    const cells = [];
-    for (const r of rows) {
-      for (let c = 0; c < ncols; c += 1) cells.push([r, c]);
-    }
-    await this.clearCells(cells);
+    return this._clearTarget({ kind: "rows", rows });
   }
 
   /**
-   * 清空若干整列，列号先去重，再一次提交所有目标格。
+   * 清空若干整列，不在前端生成行乘列的单元格数组。
    *
    * @param {number[]} cols - 视图列号列表。
-   * @returns {Promise<void>}
-   * @throws {Error} 引擎拒绝批量写入时。
+   * @returns {Promise<object>} 引擎 EditOutcome。
    */
   async clearColumns(cols) {
-    if (this._filterOn) {
-      throw new Error("筛选结果中不可编辑：请先清除筛选");
-    }
-    const uniqueCols = [...new Set(cols)];
-    const jobs = [];
-    for (let r = 0; r < this._meta.rows; r += 1) {
-      for (const c of uniqueCols) jobs.push([r, c, ""]);
-    }
-    await this.setCells(jobs);
+    return this._clearTarget({ kind: "columns", cols });
+  }
+
+  /**
+   * 清空连续矩形，直接发送范围而不是展开单元格。
+   *
+   * @param {number} row - 起始行。
+   * @param {number} col - 起始列。
+   * @param {number} rows - 行数。
+   * @param {number} cols - 列数。
+   * @returns {Promise<object>} 引擎 EditOutcome。
+   */
+  async clearRect(row, col, rows, cols) {
+    return this._clearTarget({ kind: "rect", row, col, rows, cols });
   }
 
   /**

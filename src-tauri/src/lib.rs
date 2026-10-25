@@ -20,7 +20,7 @@ mod engine;
 // Task 2 先建立独立账本；接口在 Task 3–14 接入，Task 15 移除本豁免。
 #[allow(dead_code)]
 mod history;
-use engine::{BigFile, BigMeta, ColOp, FilterPage, FilterSpec, SortEstimate, SortLevel};
+use engine::{BigFile, BigMeta, ClearTarget, ColOp, FilterPage, FilterSpec, SortEstimate, SortLevel};
 use history::{Approval, EditOutcome};
 
 /// 读文件结果：解码后的纯文本 + 实际使用的编码名（供状态栏展示）。
@@ -581,6 +581,17 @@ fn big_set_cells(
     with_big(&state, session, |bf| bf.set_cells(cells, approval))
 }
 
+/// 按结构化单元格、行、列或矩形目标清除内容。
+#[tauri::command]
+fn big_clear(
+    state: tauri::State<BigShared>,
+    session: u64,
+    target: ClearTarget,
+    approval: Approval,
+) -> Result<EditOutcome, String> {
+    with_big(&state, session, |bf| bf.clear(target, approval))
+}
+
 /// 粘贴不规则行块；既有格与自动扩行合并为一次用户操作。
 #[tauri::command]
 fn big_paste(
@@ -945,6 +956,7 @@ pub fn run() {
             big_find_edge,
             big_set_cell,
             big_set_cells,
+            big_clear,
             big_paste,
             big_insert_rows,
             big_remove_rows,

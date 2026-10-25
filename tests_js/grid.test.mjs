@@ -224,6 +224,92 @@ function makeEditGrid(model) {
   return { g, messages, selections };
 }
 
+test("Delete 单块反向矩形直接发 clearRect", async () => {
+  const calls = [];
+  const model = {
+    clearRect: async (...args) => { calls.push(args); return { changed: true }; },
+    clearCells: async () => { throw new Error("不得展开为单元格"); },
+  };
+  const { g } = makeEditGrid(model);
+  g.sel = { blocks: [[4, 2, 1, 0]] };
+  g.selectedSet = new Set([0]);
+  g.selectedCells = () => { throw new Error("不得调用 selectedCells"); };
+  assert.equal(await g.deleteSelection(), true);
+  assert.deepEqual(calls, [[1, 0, 4, 3]]);
+});
+
+test("Delete 多块选区保留稀疏坐标", async () => {
+  const cells = [[0, 0], [2, 2]];
+  const calls = [];
+  const model = {
+    clearCells: async (value) => { calls.push(value); return { changed: true }; },
+    clearRect: async () => { throw new Error("多块不得合并成大矩形"); },
+  };
+  const { g } = makeEditGrid(model);
+  g.sel = { blocks: [[0, 0, 0, 0], [2, 2, 2, 2]] };
+  g.selectedSet = new Set([0, 1]);
+  g.selectedCells = () => cells;
+  await g.deleteSelection();
+  assert.deepEqual(calls, [cells]);
+});
+
+test("剪切复制拒绝时不得清除", async () => {
+  const { g } = makeEditGrid({});
+  g.selectedSet = new Set([0]);
+  let clears = 0;
+  const denied = Promise.reject(new Error("clipboard denied"));
+  denied.catch(() => {});
+  g.copySelection = () => denied;
+  g.deleteSelection = async () => { clears += 1; return true; };
+  await assert.rejects(async () => g.cutSelection(), /clipboard denied/);
+  assert.equal(clears, 0);
+});
+
+test("剪切收到复制失败结果时不得清除", async () => {
+  const { g } = makeEditGrid({});
+  g.selectedSet = new Set([0]);
+  let clears = 0;
+  g.copySelection = async () => false;
+  g.deleteSelection = async () => { clears += 1; return true; };
+  assert.equal(await g.cutSelection(), false);
+  assert.equal(clears, 0);
+});
+
+test("剪切等待期间选区变化不得清除新选区", async () => {
+  const { g } = makeEditGrid({});
+  g.sel = { blocks: [[0, 0, 0, 0]] };
+  g.selectedSet = new Set([0]);
+  let clears = 0;
+  g.copySelection = async () => {
+    g.sel.blocks = [[2, 2, 2, 2]];
+    g.selectedSet = new Set([10]);
+    return true;
+  };
+  g.deleteSelection = async () => { clears += 1; return true; };
+  assert.equal(await g.cutSelection(), false);
+  assert.equal(clears, 0);
+});
+
+test("复制剪切和 Delete 统一经过拒绝捕获入口", () => {
+  const { g } = makeEditGrid({});
+  g.sel = { current: [0, 0] };
+  const calls = [];
+  g._runClipboard = (promise) => {
+    calls.push("run");
+    Promise.resolve(promise).catch(() => {});
+  };
+  g.copySelection = () => { calls.push("copy"); return Promise.resolve(true); };
+  g.cutSelection = () => { calls.push("cut"); return Promise.resolve(true); };
+  g.deleteSelection = () => { calls.push("delete"); return Promise.resolve(true); };
+  for (const [key, ctrlKey] of [["c", true], ["x", true], ["Delete", false]]) {
+    g._onKeyDown({
+      key, ctrlKey, metaKey: false, shiftKey: false, altKey: false,
+      target: { tagName: "CANVAS" }, preventDefault: () => {},
+    });
+  }
+  assert.deepEqual(calls, ["copy", "run", "cut", "run", "delete", "run"]);
+});
+
 test("单值填充把含未加载格的完整选区交给一次 setCells", async () => {
   const writes = [];
   const model = {

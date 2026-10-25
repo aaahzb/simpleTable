@@ -94,6 +94,38 @@ function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
           const from = Number(args.from);
           return data.slice(from, from + Number(args.count)).map((row) => [...row]);
         }
+        case "big_clear": {
+          const target = args.target;
+          let cells = [];
+          if (target.kind === "cells") {
+            cells = target.cells;
+          } else if (target.kind === "rows") {
+            for (const r of new Set(target.rows)) {
+              for (let c = 0; c < ncols; c += 1) cells.push([r, c]);
+            }
+          } else if (target.kind === "columns") {
+            for (let r = 0; r < data.length; r += 1) {
+              for (const c of new Set(target.cols)) cells.push([r, c]);
+            }
+          } else if (target.kind === "rect") {
+            for (let r = target.row; r < target.row + target.rows; r += 1) {
+              for (let c = target.col; c < target.col + target.cols; c += 1) {
+                cells.push([r, c]);
+              }
+            }
+          }
+          let changed = false;
+          for (const [rawR, rawC] of cells) {
+            const r = Number(rawR);
+            const c = Number(rawC);
+            if (!data[r] || c >= ncols) throw new Error("目标单元格越界");
+            if ((data[r][c] ?? "") !== "") {
+              data[r][c] = "";
+              changed = true;
+            }
+          }
+          return editOutcome({ changed });
+        }
         case "big_set_cells": {
           const cells = args.cells.map(([r, c, value]) => [Number(r), Number(c), value]);
           for (const [r, c] of cells) {
@@ -624,22 +656,55 @@ test("列操作 pending 后元数据刷新由引擎视图映射（mock 不映射
   assert.ok(calls.some(([c]) => c === "big_col_apply"));
 });
 
-test("clearCells 去重后只发一次批量命令", async () => {
+function makeModelWithMeta({ rows, cols }) {
+  const calls = [];
+  const model = new BigModel({
+    invoke: async (cmd, args = {}) => {
+      calls.push([cmd, args]);
+      if (cmd === "big_clear") {
+        return { changed: true, insertedRows: 0, removedRows: 0,
+          fixedPoint: null, cancelled: false };
+      }
+      throw new Error("unexpected " + cmd);
+    },
+    listen: async () => () => {},
+  });
+  model._meta = { rows, cols };
+  model._refreshMeta = async () => {};
+  model._emitData = () => {};
+  model._emitUndo = () => {};
+  return { model, calls };
+}
+
+test("整行整列清除只发送结构，不生成行列叉积", async () => {
+  const { model, calls } = makeModelWithMeta({ rows: 1_000_000, cols: 200 });
+  await model.clearRows([9, 3, 9]);
+  await model.clearColumns([7, 2, 7]);
+  await model.clearRect(10, 4, 1000, 20);
+  assert.deepEqual(calls.slice(-3).map(([cmd, args]) => [cmd, args.target]), [
+    ["big_clear", { kind: "rows", rows: [9, 3, 9] }],
+    ["big_clear", { kind: "columns", cols: [7, 2, 7] }],
+    ["big_clear", { kind: "rect", row: 10, col: 4, rows: 1000, cols: 20 }],
+  ]);
+});
+
+test("clearCells 去重后只发一次结构化清除", async () => {
   const { model, data, calls } = makeFakeEngine({ rows: 10, cols: 3 });
   await model.open("/x.csv");
   data[2] = ["a", "b", "c"];
   await model.clearCells([
     [2, 0],
     [2, 1],
-    [2, 0], // 重复
+    [2, 0],
     [2, 2],
   ]);
   assert.deepEqual(data[2], ["", "", ""]);
-  const batches = calls.filter(([c]) => c === "big_set_cells");
+  const batches = calls.filter(([c]) => c === "big_clear");
   assert.equal(batches.length, 1);
-  assert.deepEqual(batches[0][1].cells,
-    [[2, 0, ""], [2, 1, ""], [2, 2, ""]]);
-  assert.equal(calls.filter(([c]) => c === "big_set_cell").length, 0);
+  assert.deepEqual(batches[0][1].target, {
+    kind: "cells", cells: [[2, 0], [2, 1], [2, 2]],
+  });
+  assert.equal(calls.filter(([c]) => c === "big_set_cells").length, 0);
 });
 
 test("setCells 一次写入并只发一次非结构编辑通知", async () => {
@@ -719,28 +784,23 @@ test("setCells 失败不乐观改缓存并抛统一编辑错误", async () => {
   assert.equal(model._gen, gen);
 });
 
-test("clearRows 重复行也只形成一批快照输入", async () => {
-  const { model, calls } = makeFakeEngine({ rows: 3, cols: 3 });
+test("clearRows 重复行只发送结构化行目标", async () => {
+  const { model, data, calls } = makeFakeEngine({ rows: 3, cols: 3 });
   await model.open("/x.csv");
   await model.clearRows([1, 1]);
-  const batches = calls.filter(([cmd]) => cmd === "big_set_cells");
+  const batches = calls.filter(([cmd]) => cmd === "big_clear");
   assert.equal(batches.length, 1);
-  assert.deepEqual(batches[0][1].cells, [
-    [1, 0, ""], [1, 1, ""], [1, 2, ""],
-  ]);
+  assert.deepEqual(batches[0][1].target, { kind: "rows", rows: [1, 1] });
+  assert.deepEqual(data[1], ["", "", ""]);
 });
 
-test("clearColumns 列号去重并一次清空所有目标格", async () => {
+test("clearColumns 列号原样发送结构化列目标", async () => {
   const { model, data, calls } = makeFakeEngine({ rows: 3, cols: 3 });
   await model.open("/x.csv");
   await model.clearColumns([2, 0, 2]);
-  const batches = calls.filter(([cmd]) => cmd === "big_set_cells");
+  const batches = calls.filter(([cmd]) => cmd === "big_clear");
   assert.equal(batches.length, 1);
-  const expected = [];
-  for (let r = 0; r < 3; r += 1) {
-    for (const c of [2, 0]) expected.push([r, c, ""]);
-  }
-  assert.deepEqual(batches[0][1].cells, expected);
+  assert.deepEqual(batches[0][1].target, { kind: "columns", cols: [2, 0, 2] });
   for (const row of data) assert.deepEqual(row, ["", row[1], ""]);
 });
 

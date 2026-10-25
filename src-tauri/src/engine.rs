@@ -1990,6 +1990,124 @@ mod tests {
     }
 
     #[test]
+    fn p1_clear_structured_targets_roundtrip() {
+        let p = tmp_csv("p1_clear_targets", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let targets = [
+            ClearTarget::Rows { rows: vec![1] },
+            ClearTarget::Columns { cols: vec![1] },
+            ClearTarget::Rect { row: 0, col: 0, rows: 2, cols: 2 },
+        ];
+        for target in targets {
+            let before = bf.rows(0, u32::try_from(bf.meta().rows).unwrap());
+            assert!(bf.clear(target, Approval::deny()).unwrap().changed);
+            let changed = bf.rows(0, u32::try_from(bf.meta().rows).unwrap());
+            assert_ne!(changed, before);
+            assert!(bf.undo());
+            assert_eq!(bf.rows(0, u32::try_from(bf.meta().rows).unwrap()), before);
+            assert!(bf.redo());
+            assert_eq!(bf.rows(0, u32::try_from(bf.meta().rows).unwrap()), changed);
+        }
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p1_clear_over_budget_preserves_data_and_redo() {
+        let p = tmp_csv("p1_clear_fixed", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "redo-base".into(), Approval::deny()).unwrap();
+        assert!(bf.undo());
+        let before = bf.rows(0, u32::try_from(bf.meta().rows).unwrap());
+        let history = bf.history_stats();
+        assert_eq!(history.redo_count, 1);
+        bf.set_history_budget(history.bytes).unwrap();
+        let history = bf.history_stats();
+        let first = bf.clear(
+            ClearTarget::Columns { cols: vec![0, 1, 2] },
+            Approval::deny(),
+        ).unwrap();
+        assert!(!first.changed);
+        assert!(first.fixed_point.is_some());
+        assert_eq!(bf.rows(0, u32::try_from(bf.meta().rows).unwrap()), before);
+        assert_eq!(bf.history_stats(), history);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p1_clear_sparse_cells_roundtrip() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        let before = bf.rows(0, 5);
+        let outcome = bf.clear(
+            ClearTarget::Cells { cells: vec![(1, 0), (3, 2), (1, 0)] },
+            Approval::deny(),
+        ).unwrap();
+        assert!(outcome.changed);
+        assert_eq!(bf.history_stats().undo_count, 1);
+        let changed = bf.rows(0, 5);
+        assert_eq!(changed[1][0], "");
+        assert_eq!(changed[3][2], "");
+        assert_eq!(changed[1][1], before[1][1]);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 5), changed);
+    }
+
+    #[test]
+    fn p1_clear_confirmed_fixed_point_streams_and_bounds_later_undo() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.set_cell(0, 0, "redo-base".into(), Approval::deny()).unwrap();
+        assert!(bf.undo());
+        let history = bf.history_stats();
+        bf.set_history_budget(history.bytes).unwrap();
+        let request = bf.clear(
+            ClearTarget::Columns { cols: vec![0, 1, 2] },
+            Approval::deny(),
+        ).unwrap().fixed_point.unwrap();
+        let done = bf.clear(
+            ClearTarget::Columns { cols: vec![0, 1, 2] },
+            Approval::allow(request.preflight_id),
+        ).unwrap();
+        assert!(done.changed);
+        assert!(done.fixed_point.is_none());
+        assert_eq!(bf.history_stats().undo_count, 0);
+        assert_eq!(bf.history_stats().redo_count, 0);
+        assert!(bf.rows(0, 5).iter().flatten().all(String::is_empty));
+        bf.set_cell(0, 0, "after".into(), Approval::deny()).unwrap();
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 1)[0][0], "");
+        assert!(!bf.undo(), "固定点之前的整列清除不得撤销");
+    }
+
+    #[test]
+    fn p1_clear_invalid_rect_and_empty_target_are_atomic() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        bf.set_cell(0, 0, "redo-base".into(), Approval::deny()).unwrap();
+        assert!(bf.undo());
+        let before = bf.rows(0, 5);
+        let history = bf.history_stats();
+        let err = bf.clear(
+            ClearTarget::Rect { row: 4, col: 0, rows: 2, cols: 1 },
+            Approval::deny(),
+        ).unwrap_err();
+        assert!(err.contains("行号越界"));
+        assert_eq!(bf.rows(0, 5), before);
+        assert_eq!(bf.history_stats(), history);
+        let err = bf.clear(
+            ClearTarget::Rect { row: u64::MAX, col: 0, rows: 2, cols: 1 },
+            Approval::deny(),
+        ).unwrap_err();
+        assert!(err.contains("行号越界"));
+        assert_eq!(bf.history_stats(), history);
+        let noop = bf.clear(
+            ClearTarget::Rect { row: 5, col: 3, rows: 0, cols: 0 },
+            Approval::deny(),
+        ).unwrap();
+        assert!(!noop.changed);
+        assert_eq!(bf.history_stats(), history, "空矩形不得清 redo 或改代际");
+    }
+
+    #[test]
     fn p1_fixed_point_requires_confirmation_and_bounds_later_undo() {
         let p = tmp_csv("p1_fixed_point", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
@@ -4413,6 +4531,108 @@ struct CellChange {
     new: String,
 }
 
+/// 一次清除操作的结构化目标；坐标均为未筛选的显示坐标。
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ClearTarget {
+    Cells { cells: Vec<(u64, u32)> },
+    Rows { rows: Vec<u64> },
+    Columns { cols: Vec<u32> },
+    Rect { row: u64, col: u32, rows: u64, cols: u32 },
+}
+
+/// 排序去重并完成边界检查后的清除目标。
+enum NormalizedClear {
+    Cells { cells: Vec<(u64, u32)> },
+    Rows { rows: Vec<u64> },
+    Columns { cols: Vec<u32> },
+    Rect { row: u64, col: u32, rows: u64, cols: u32 },
+}
+
+impl ClearTarget {
+    /// 规范化结构目标，并在任何数据写入前完成 checked 边界检查。
+    fn normalize(self, total_rows: u64, ncols: usize) -> Result<NormalizedClear, String> {
+        match self {
+            ClearTarget::Cells { mut cells } => {
+                cells.sort_unstable();
+                cells.dedup();
+                Ok(NormalizedClear::Cells { cells })
+            }
+            ClearTarget::Rows { mut rows } => {
+                if rows.iter().any(|&row| row >= total_rows) {
+                    return Err("行号越界".into());
+                }
+                rows.sort_unstable();
+                rows.dedup();
+                Ok(NormalizedClear::Rows { rows })
+            }
+            ClearTarget::Columns { mut cols } => {
+                if cols.iter().any(|&col| col as usize >= ncols) {
+                    return Err("列号越界".into());
+                }
+                cols.sort_unstable();
+                cols.dedup();
+                Ok(NormalizedClear::Columns { cols })
+            }
+            ClearTarget::Rect { row, col, rows, cols } => {
+                let row_end = row.checked_add(rows).ok_or("行号越界")?;
+                if row_end > total_rows {
+                    return Err("行号越界".into());
+                }
+                let col_end = (col as u64).checked_add(cols as u64).ok_or("列号越界")?;
+                if col_end > ncols as u64 {
+                    return Err("列号越界".into());
+                }
+                Ok(NormalizedClear::Rect { row, col, rows, cols })
+            }
+        }
+    }
+}
+
+impl NormalizedClear {
+    /// 按结构目标逐个访问坐标，不为整行、整列或矩形构造单元格 Vec。
+    fn visit(
+        &self,
+        total_rows: u64,
+        ncols: usize,
+        mut visit: impl FnMut(u64, u32) -> Result<(), String>,
+    ) -> Result<(), String> {
+        match self {
+            NormalizedClear::Cells { cells } => {
+                for &(row, col) in cells {
+                    visit(row, col)?;
+                }
+            }
+            NormalizedClear::Rows { rows } => {
+                for &row in rows {
+                    for col in 0..ncols {
+                        let col = u32::try_from(col).map_err(|_| "列号越界")?;
+                        visit(row, col)?;
+                    }
+                }
+            }
+            NormalizedClear::Columns { cols } => {
+                for row in 0..total_rows {
+                    for &col in cols {
+                        visit(row, col)?;
+                    }
+                }
+            }
+            NormalizedClear::Rect { row, col, rows, cols } => {
+                for row_offset in 0..*rows {
+                    for col_offset in 0..*cols {
+                        let col = (*col)
+                            .checked_add(col_offset)
+                            .ok_or("列号越界")?;
+                        visit(*row + row_offset, col)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// 粘贴末尾新增行的最终内容及其实际插入块。
 #[derive(Clone, PartialEq, Debug)]
 struct PasteInsert {
@@ -6814,6 +7034,102 @@ impl BigFile {
             removed_rows,
             fixed_point: None,
             cancelled: false,
+        })
+    }
+
+    /// 按结构化目标清除内容；普通操作保留稀疏旧值，超预算确认后流式建立固定点。
+    pub fn clear(
+        &mut self,
+        target: ClearTarget,
+        approval: Approval,
+    ) -> Result<EditOutcome, String> {
+        self.require_editable()?;
+        self.refresh_indexed();
+        let total_rows = self.indexed_data_rows();
+        let target = target.normalize(total_rows, self.base_ncols)?;
+
+        // 第一遍只累计实际非空旧值的确定性成本，不创建全量 CellChange。
+        let mut estimated = Cost::new();
+        estimated.add_value::<Op>().map_err(history_cost_error)?;
+        let mut change_count = 0u64;
+        target.visit(total_rows, self.base_ncols, |vrow, col| {
+            let cell = self.resolve_batch_cell(vrow, col)?;
+            let old = self.cell_value(cell);
+            if old.is_empty() {
+                return Ok(());
+            }
+            change_count = change_count
+                .checked_add(1)
+                .ok_or_else(|| history_cost_error(HistoryError::CostOverflow))?;
+            estimated.add_value::<CellChange>().map_err(history_cost_error)?;
+            estimated.add_string(&old).map_err(history_cost_error)?;
+            // 新值为空 String，容量成本为 0。
+            Ok(())
+        })?;
+        if change_count == 0 {
+            return Ok(EditOutcome::unchanged());
+        }
+        let estimated_bytes = estimated.bytes();
+        let budget_bytes = self.history.stats().budget_bytes;
+        if estimated_bytes > budget_bytes {
+            // 用估算成本做固定点预检；确认后无需保存任何旧值。
+            let entry = HistoryEntry::new(
+                Op::SetCells { changes: Vec::new() },
+                estimated_bytes,
+                Vec::new(),
+                1,
+            );
+            return match self.preflight_history_entry(entry, "清除区域", approval)? {
+                HistoryDecision::Confirm(outcome) => Ok(outcome),
+                HistoryDecision::FixedPoint(prepared) => {
+                    self.stream_clear_target(&target, total_rows)?;
+                    self.last_spec = None;
+                    self.finish_history(prepared, true, 0, 0)
+                }
+                HistoryDecision::Normal(_) => Err("清除固定点预检状态错误".into()),
+            };
+        }
+
+        // 估算在预算内时，第二遍按变化数预分配，再用实际 Vec/String 容量复核。
+        let capacity = usize::try_from(change_count)
+            .map_err(|_| history_cost_error(HistoryError::CostOverflow))?;
+        let mut changes = Vec::with_capacity(capacity);
+        target.visit(total_rows, self.base_ncols, |vrow, col| {
+            let cell = self.resolve_batch_cell(vrow, col)?;
+            let old = self.cell_value(cell);
+            if !old.is_empty() {
+                changes.push(CellChange { cell, old, new: String::new() });
+            }
+            Ok(())
+        })?;
+        debug_assert_eq!(changes.len(), capacity);
+        let (mut prepared, fixed_point) = match self.preflight_history(
+            Op::SetCells { changes },
+            "清除区域",
+            approval,
+        )? {
+            HistoryDecision::Normal(prepared) => (prepared, false),
+            HistoryDecision::FixedPoint(prepared) => (prepared, true),
+            HistoryDecision::Confirm(outcome) => return Ok(outcome),
+        };
+        self.apply(&mut prepared.entry_mut().op);
+        self.last_spec = None;
+        self.finish_history(prepared, fixed_point, 0, 0)
+    }
+
+    /// 固定点确认后流式清除非空旧值，不保留全量历史快照。
+    fn stream_clear_target(
+        &mut self,
+        target: &NormalizedClear,
+        total_rows: u64,
+    ) -> Result<(), String> {
+        let ncols = self.base_ncols;
+        target.visit(total_rows, ncols, |vrow, col| {
+            let cell = self.resolve_batch_cell(vrow, col)?;
+            if !self.cell_value(cell).is_empty() {
+                self.write_cell(cell, "");
+            }
+            Ok(())
         })
     }
 
