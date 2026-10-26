@@ -20,6 +20,7 @@ mod baseline;
 mod clipboard;
 mod engine;
 mod history;
+pub mod open_request;
 mod order;
 mod schema;
 mod spool;
