@@ -2652,7 +2652,7 @@ git commit -m "feat: 将排序与排序保存纳入统一历史" -m "Co-Authored
 - Consumes: Task 6 Schema、Task 7 RowSnapshot、Task 8 RowId、Task 10 的零内容 revision。
 - Produces: `Op::HeaderMode`、`HeaderModeChange`、`HeaderTop`、`BigFile.index_epoch`；`set_headerless(on,approval) -> EditOutcome`。
 
-- [ ] **Step 1: 写完整索引和渐进索引往返 RED**
+- [x] **Step 1: 写完整索引和渐进索引往返 RED**
 
 ```rust
 #[test]
@@ -2758,7 +2758,7 @@ fn p4_header_over_budget_cancel_preserves_filter_redo_and_dirty() {
 }
 ```
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
 ```bash
 cd "D:/SVN_Cursor/simpleTable-public/src-tauri"
@@ -2767,7 +2767,7 @@ cargo test -p simpletable --lib engine::tests::p4_header -- --nocapture
 
 预期：旧方法无 approval 参数并直接清双栈，新测试编译失败或 undo=false。
 
-- [ ] **Step 3: 用稳定顶部行实现 HeaderModeChange**
+- [x] **Step 3: 用稳定顶部行实现 HeaderModeChange**
 
 ```rust
 #[derive(Clone)]
@@ -2797,13 +2797,13 @@ BigFile 在 open/create 时分配 `index_epoch`，只有更换 backing generatio
 
 HeaderMode 的 `revision_delta=0`；outcome 用 inserted_rows/removed_rows 各 0 或 1 触发行数通知，但不增加内容 revision。`schema_change` 保存自动生成列名、原表头和目标表头；`top.snapshot` 保存恢复数据行所需内容。成本包括两个共享 Schema、RowSnapshot 和结构开销，顶部行超预算走同一固定点预检。每次正向、逆向应用只清当前 filter/last_spec，不把旧筛选放进历史。
 
-- [ ] **Step 4: 命令、保存转换与前端视图通知**
+- [x] **Step 4: 命令、保存转换与前端视图通知**
 
 `big_set_headerless(on,approval)` 返回 EditOutcome。BigModel 用 `_invokeEdit("big_set_headerless",{on})` 和 `_afterEdit(outcome,"view")`；app 不因 view 标脏，undo/redo 仍从引擎 modified 更新真实脏点。排序和 pending 守卫先于任何预检，on 等于当前值返回 unchanged，不清 redo。
 
 BaselineTransform 对 HeaderTop.row、RowSnapshot 和前后 Schema 一并重绑定。普通保存不能留下指向旧顶部 Ins/Source 的 HeaderMode；无法证明时走 Task 8 的保存固定点原因，不静默清栈。
 
-- [ ] **Step 5: 全量 GREEN、真机并提交**
+- [x] **Step 5: 全量 GREEN、真机并提交**
 
 ```bash
 cd "D:/SVN_Cursor/simpleTable-public/src-tauri"
@@ -2834,7 +2834,7 @@ git commit -m "feat: 将首行模式切换纳入撤销历史" -m "Co-Authored-By
 - Consumes: Task 7 临时空间检查、Task 5 的剪切等待。
 - Produces: `LARGE_COPY_BYTES=8*1024*1024`、`ClipboardStore`、`CopyOutcome`、`ClipboardMeta`、`big_copy`、`big_clipboard_meta/clear`、`BigModel.clipboardMeta()/clipboardClear()`。
 
-- [ ] **Step 1: 写阈值、所有权和前端不取全文 RED**
+- [x] **Step 1: 写阈值、所有权和前端不取全文 RED**
 
 ```rust
 #[test]
@@ -2964,7 +2964,7 @@ test("剪切复制失败返回 false 且不清除", async () => {
 });
 ```
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
 ```bash
 cd "D:/SVN_Cursor/simpleTable-public/src-tauri"
@@ -2976,7 +2976,7 @@ node --test --test-name-pattern="大复制|应用内|剪切" tests_js/grid.test.
 
 预期：ClipboardStore/新返回类型不存在，旧 Grid 大复制仍把完整 text 交给系统剪贴板。
 
-- [ ] **Step 3: 实现进程级剪贴板和 CopyBuilder**
+- [x] **Step 3: 实现进程级剪贴板和 CopyBuilder**
 
 ```rust
 pub const LARGE_COPY_BYTES: u64 = 8 * 1024 * 1024;
@@ -3022,7 +3022,7 @@ pub struct ClipboardStore {
 
 新文件写完并 flush 后才替换 current；旧 token 立即失效，旧文件在该 Arc 的最后一个读取者释放时删除。`get(token)` clone Arc 后释放 Mutex，替换或关签不会使进行中的内部粘贴读到半文件。`clear_current()` 只使 current token 失效并保留可复用 root，供小复制和 big_clipboard_clear 使用；`cleanup()` 才取走 current 并清理自己拥有的 root，供测试结束和进程退出使用。两者都不扫描或删除其他实例目录。
 
-- [ ] **Step 4: 注册进程所有者并改 Grid 复制**
+- [x] **Step 4: 注册进程所有者并改 Grid 复制**
 
 Tauri setup 在 BigShared 后 `app.manage(ClipboardStore::create_unique()?)`。`big_copy(session,r0,r1,c0,c1)` 从进程 State 取 ClipboardStore 并调用 BigFile.copy_tsv；`big_clipboard_meta()` 只返回当前 metadata，`big_clipboard_clear()` 调 clear_current 使 token 失效但保留 store root。quit_app 先调用统一的 `cleanup_process_state(&app)`，再 `app.exit(0)`；RunEvent 和 smoke 直接退出由 Task 14 补齐。
 
@@ -3030,7 +3030,7 @@ Grid 对单个完整矩形直接根据 `sel.blocks` 计算范围，不因 select
 
 `copySelection()` 所有分支都返回 Promise<boolean>；`BigModel.copyRows` 直接返回 CopyOutcome，`clipboardMeta()` 读取当前 App 元数据，`clipboardClear()` 只清进程 current。系统写入或引擎失败时 catch 显示错误并返回 false。键盘 Ctrl+C/Ctrl+X/Delete 统一改为 `this._runClipboard(this.copySelection())` 等形式，`_runClipboard` 只负责 `Promise.resolve(p).catch(statusMsg)`，不吞掉 cut 内部的“复制失败不得清除”判断。
 
-- [ ] **Step 5: GREEN、双真机并提交**
+- [x] **Step 5: GREEN、双真机并提交**
 
 ```bash
 cd "D:/SVN_Cursor/simpleTable-public/src-tauri"
@@ -3063,7 +3063,7 @@ git commit -m "feat: 实现应用内流式大复制" -m "Co-Authored-By: Kimi <n
 - Consumes: Task 2 成本、Task 7 spool、Task 9 Paste schema_change。
 - Produces: `PASTE_CHUNK_BYTES=512*1024`、`LARGE_TEXT_BYTES=8*1024*1024`、`PasteDestination`、`PasteImport`、`big_paste_import_begin/chunk/finish/cancel`。
 
-- [ ] **Step 1: 写 UTF-8 边界和 IPC 上限 RED**
+- [x] **Step 1: 写 UTF-8 边界和 IPC 上限 RED**
 
 ```javascript
 import test from "node:test";
@@ -3212,7 +3212,7 @@ test("外部大粘贴确认复用 importId 重试且不重传", async () => {
 });
 ```
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
 ```bash
 cd "D:/SVN_Cursor/simpleTable-public"
@@ -3225,7 +3225,7 @@ cargo test -p simpletable --lib engine::tests::p5_ -- --nocapture
 
 预期：分块 helper 和导入命令尚不存在；不能先改生产实现再运行本步骤。
 
-- [ ] **Step 3: 实现无全文再编码的 JS 分块**
+- [x] **Step 3: 实现无全文再编码的 JS 分块**
 
 ```javascript
 export const LARGE_TEXT_BYTES = 8 * 1024 * 1024;
@@ -3286,7 +3286,7 @@ export function isSingleValueText(text) {
 
 `utf8Chunks` 每次只对当前 slice 调 TextEncoder，不 `encode(text)` 全文；`bytesToHex` 最长 1,048,576 字符。`isSingleValueText` 不创建 trim/replace 后的大字符串。
 
-- [ ] **Step 4: 实现 PasteImport 与目标模式**
+- [x] **Step 4: 实现 PasteImport 与目标模式**
 
 ```rust
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -3312,13 +3312,13 @@ pub struct PasteImport {
 
 finish 对 TSV 用流式 RecordReader 两遍扫描：第一遍得到行数、最大宽度、目标地址、扩行/扩列和精确历史成本；只有成本可保留时第二遍逐记录构建稀疏 CellChange/插入块，不产生完整二维输入。SingleCell 在引擎流式做 CRLF/CR→LF 和末尾换行剥离；Fill 只保留一个共享新值，再按结构化 target 计算变化，禁止为每格 clone 大字符串。所有目标先校验，排序态扩行/扩列仍拒绝。
 
-- [ ] **Step 5: Grid 接线、确认重试和取消清理**
+- [x] **Step 5: Grid 接线、确认重试和取消清理**
 
 BigModel.pasteExternalText(text,destination) 先 begin，再逐 chunk 调 invoke；最后一个块带 `last=true`。finish 走与 `_invokeEdit` 相同的固定点确认，但重试继续使用同一 importId 和 destination，不重传文本。固定点取消时显式调用 cancel 并返回 unchanged/cancelled；chunk、finish、确认过期或确认对话框抛错都在 finally 中 cancel 尚未消费的 import。成功或固定点提交由引擎消费 import，JS 不重复删除。
 
 Grid 在 `readText()` 后先计算体量，不对大文本做 replace 全文副本。小文本维持原分支；大文本只构造 PasteDestination：单值多选区 Fill、外部无 Tab 单格 SingleCell、其余 Rect。forceSplit=true 时一律使用 Rect，覆盖 SingleCell/Fill 判据。大体量一律走导入，不调用 `parseCsv`、不构造 rows、不调用一次 `big_paste` 整包。SingleCell/Fill 的固定点确认后直接写共享新值并清历史；Rect 的固定点由 Task 14 generation 执行。保留 `readText()` 会产生一份完整 JS 字符串的注释和 README 限制说明。
 
-- [ ] **Step 6: GREEN、双真机并提交**
+- [x] **Step 6: GREEN、双真机并提交**
 
 ```bash
 cd "D:/SVN_Cursor/simpleTable-public/src-tauri"
@@ -3351,7 +3351,7 @@ git commit -m "feat: 分块导入外部大粘贴" -m "Co-Authored-By: Kimi <nore
 - Consumes: Task 12 ClipboardEntry Arc、Task 13 PasteImport/Destination、Task 8 backing_path。
 - Produces: `PreparedGeneration`、`backing_encoding/output_encoding`、`cleanup_process_state`、报告 `CLEANUP_PATH=` 探针。
 
-- [ ] **Step 1: 写内部直接粘贴和固定点原子性 RED**
+- [x] **Step 1: 写内部直接粘贴和固定点原子性 RED**
 
 ```rust
 #[test]
@@ -3484,7 +3484,7 @@ fn large_tsv_128_kib() -> Vec<u8> {
 }
 ```
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
 ```bash
 cd "D:/SVN_Cursor/simpleTable-public/src-tauri"
@@ -3493,7 +3493,7 @@ cargo test -p simpletable --lib engine::tests::p5_ -- --nocapture
 
 预期：内部 paste_clipboard、PreparedGeneration 和 backing/output 编码分离尚不存在。
 
-- [ ] **Step 3: 流式合并并只切换会话 backing**
+- [x] **Step 3: 流式合并并只切换会话 backing**
 
 ```rust
 pub struct PreparedGeneration {
@@ -3513,7 +3513,7 @@ BigFile 增加 `backing_encoding` 和 `output_encoding`：初始两者均为源�
 
 失败时只删除本次 PreparedGeneration，活动 backing 不变。导入文件由 Arc/PasteImport 所有权收尾；提交前不得清 redo 或旧历史。
 
-- [ ] **Step 4: 内部粘贴先于 readText，关签与退出清理**
+- [x] **Step 4: 内部粘贴先于 readText，关签与退出清理**
 
 Grid.pasteClipboard 开始先 `await model.clipboardMeta()`；有 token 就直接 `model.pasteClipboardToken(token,destination)`，不调用 navigator.readText。目标模式仍按当前选区决定：矩形粘贴到 current，单值 Fill 只有 metadata rows=1、cols=1 且非 forceSplit 时适用。无 token 才走 Task 13 外部文本。token 在读取后失效时显示错误，不回退粘贴一份旧 JS 文本。
 
@@ -3532,7 +3532,7 @@ fn cleanup_process_state(app: &tauri::AppHandle) {
 
 `quit_app` 先 cleanup 再 exit；`.run(|app,event| if matches!(event,RunEvent::Exit) {cleanup})` 覆盖事件循环退出；`finish_smoke(app,report,code)` 写报告后 cleanup，再 process::exit。big_close 仍只 drop 对应会话，绝不清 ClipboardStore。清理函数可重复调用，第二次不得报错或删除新实例目录。
 
-- [ ] **Step 5: 真机报告验证进程退出后临时目录消失**
+- [x] **Step 5: 真机报告验证进程退出后临时目录消失**
 
 smoke 在创建一个大复制和一个会话 spool 后，把二者 owned root 以每行 `CLEANUP_PATH=<绝对路径>` 附加到报告；close tab 断言文档 root 已消失，再故意保留进程级大剪贴板到 finish_smoke，验证直接 process::exit 前也 cleanup。报告仍保留原“合计 N 项，失败 0 项”。
 
@@ -3549,7 +3549,7 @@ for (const path of cleanupPaths) {
 
 不删除旧报告，不由脚本代替产品清理；若产品未清理，断言直接失败。
 
-- [ ] **Step 6: 全量 GREEN 并提交**
+- [x] **Step 6: 全量 GREEN 并提交**
 
 ```bash
 cd "D:/SVN_Cursor/simpleTable-public/src-tauri"
@@ -3573,14 +3573,14 @@ git commit -m "feat: 完成内部大粘贴与临时文件清理" -m "Co-Authored
 - Test: Rust memory/accounting、Node 全量、`frontend/js/smoke.js`
 - Modify: `README.md`、`TODO.md`、`task_plan.md`、`findings.md`、`progress.md`
 - Modify: `.github/workflows/` 中实际存在旧测试数目的文件
-- Modify local only: `progress.md` 先记录实测，再随文档提交
+- Modify local only: `progress.md` 等台账先记录实测；若被 `.gitignore` 排除则仅留本地，不强制提交
 - No product data: 不读取、修改或提交 `price_j8888.csv`；四个既有未跟踪杂项不动
 
 **Interfaces:**
 - Consumes: 全部前序接口。
 - Produces: 活动覆盖层和行块接入 Task 8 已有 `SharedText/ValueRef` 的共享形式、内存/耗时实测记录、最终测试账目；不改变已定义 IPC 字段。
 
-- [ ] **Step 1: 写共享分配、账目稳定和内存回归 RED**
+- [x] **Step 1: 写共享分配、账目稳定和内存回归 RED**
 
 ```rust
 #[test]
@@ -3651,7 +3651,7 @@ fn p6_insert_block_and_empty_values_share_allocations() {
 }
 ```
 
-- [ ] **Step 2: 运行 RED 并审计真实克隆点**
+- [x] **Step 2: 运行 RED 并审计真实克隆点**
 
 ```bash
 cd "D:/SVN_Cursor/simpleTable-public/src-tauri"
@@ -3661,7 +3661,7 @@ grep -n -E '\.clone\(\)|to_string\(\)|Vec<Vec<String>>' src/engine.rs src/baseli
 
 预期：当前覆盖层/插入块或保存 rebuild 仍有深拷贝，指针和账目稳定断言失败。grep 输出逐项分类为“执行必需单行/列级小对象/应避免的历史深拷贝”，不只删 clone 表象。
 
-- [ ] **Step 3: 实现共享值、行块和淘汰后列回收**
+- [x] **Step 3: 实现共享值、行块和淘汰后列回收**
 
 ```rust
 pub struct RowBlock {
@@ -3679,7 +3679,7 @@ Segments.blocks 改为持有 Arc<RowBlock>，InsertRows/Paste 历史与活动块
 
 `_fillSelection` 的结构化 Fill 已在 Task 13 共用一个新值 Arc；普通小粘贴继续稀疏记录。不得把范围填充改回前端 rows×cols 数组，也不得宣称排序键或 readText 全文已消除。
 
-- [ ] **Step 4: 全量自动化与忽略基准的明确运行**
+- [x] **Step 4: 全量自动化与忽略基准的明确运行**
 
 ```bash
 cd "D:/SVN_Cursor/simpleTable-public/src-tauri"
@@ -3705,7 +3705,7 @@ cold 只表示本次环境首次打开并如实记录是否重启过系统，hot
 
 预期：常规 Rust 只保留 bench_gen_big_csv、bench_big_filter、bench_history_large 三个明确 ignored；完整测试无失败；Node/双 exe 以实际新数量为准。
 
-- [ ] **Step 5: 文档、CI 账目与发布审计**
+- [x] **Step 5: 文档、CI 账目与发布审计**
 
 README 用中文更新：64 MiB 默认与 1–1,024 MiB 设置、每页签独立、最旧淘汰、固定点提示、列/排序/表头历史、保存例外、大复制仅限本应用当前进程、不承诺跨进程或重启恢复、外部 readText 固有限制、临时文件正常清理、重启不恢复历史。写入实际 Node/Rust/debug/release 数量和基准表，不把计划数字写成结果。
 
@@ -3720,14 +3720,14 @@ git -c core.quotepath=false status --porcelain=v1 -z
 
 预期：tracked diff 只含本设计目标文件；`smoke_debug.txt`、`src-tauri/smoke-debug.txt`、`src-tauri/smoke-release.txt`、`捕获.JPG` 仍只是未跟踪杂项，不删除、不 stage；业务 CSV 不在变更集合。前端最后变更后 verify-local 已重新编译双 exe并验证时间戳。
 
-- [ ] **Step 6: 分两次本地提交并复核，不做远程操作**
+- [x] **Step 6: 分两次本地提交并复核，不做远程操作**
 
 ```bash
 cd "D:/SVN_Cursor/simpleTable-public"
-git add src-tauri/src/history.rs src-tauri/src/engine.rs src-tauri/src/schema.rs src-tauri/src/order.rs src-tauri/src/baseline.rs src-tauri/src/lib.rs frontend/js/smoke.js
+git add src-tauri/src/history.rs src-tauri/src/engine.rs src-tauri/src/schema.rs src-tauri/src/lib.rs src-tauri/src/spool.rs
 git diff --cached --check
 git commit -m "perf: 共享历史值与插入块降低内存" -m "Co-Authored-By: Kimi <noreply@moonshot.cn>" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
-git add README.md TODO.md task_plan.md findings.md progress.md .github/workflows scripts/verify-local.mjs
+git add README.md docs/superpowers/plans/2026-10-24-unified-undo-memory.md docs/superpowers/specs/2026-10-24-unified-undo-memory-design.md
 git diff --cached --check
 git commit -m "docs: 完成统一撤销内存预算验收" -m "Co-Authored-By: Kimi <noreply@moonshot.cn>" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 git show --stat --oneline HEAD
@@ -3740,9 +3740,9 @@ git status --short
 
 ## Final Self-Review Checklist for the Executor
 
-- [ ] 每一行为都保留预期 RED 命令和实际失败输出；若测试因写错而 error，先修测试再重新亲见正确 RED。
-- [ ] 每任务结束后 history_stats.bytes 不超过预算；取消/失败同时核对数据、redo、dirty、backing_path，而非只看 canUndo。
-- [ ] 前端最后一次变更后必须重新运行 verify-local，不能用之前编译的 exe 代替。
-- [ ] 普通保存、排序保存、删除列保存分别验证取消和确认；普通保存可转换时不得清栈。
-- [ ] 外部 readText 的完整字符串、固定点 generation 的执行磁盘/内存、进程 RSS 与 64 MiB 历史账目不混为一谈。
-- [ ] 所有提交都是本地提交，四个既有未跟踪杂项和业务 CSV 不进提交，不执行远程操作。
+- [x] 每一行为都保留预期 RED 命令和实际失败输出；若测试因写错而 error，先修测试再重新亲见正确 RED。
+- [x] 每任务结束后 history_stats.bytes 不超过预算；取消/失败同时核对数据、redo、dirty、backing_path，而非只看 canUndo。
+- [x] 前端最后一次变更后必须重新运行 verify-local，不能用之前编译的 exe 代替。
+- [x] 普通保存、排序保存、删除列保存分别验证取消和确认；普通保存可转换时不得清栈。
+- [x] 外部 readText 的完整字符串、固定点 generation 的执行磁盘/内存、进程 RSS 与 64 MiB 历史账目不混为一谈。
+- [x] 所有提交都是本地提交，四个既有未跟踪杂项和业务 CSV 不进提交，不执行远程操作。
