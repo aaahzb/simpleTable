@@ -129,6 +129,32 @@ impl DocumentRegistry {
         Ok(())
     }
 
+    /// 窗口是否已不拥有任何文档。
+    pub fn owner_is_empty(&self, owner: &str) -> bool {
+        !self.sessions.values().any(|entry| entry.owner == owner)
+    }
+
+    /// 关闭一个 owner 的全部文档；迁移中的文档阻止整窗关闭。
+    pub fn close_owner(&mut self, owner: &str) -> Result<Vec<(u64, BigEntry)>, String> {
+        if self.sessions.values().any(|entry| {
+            entry.owner == owner && !matches!(entry.state, DocState::Idle)
+        }) {
+            return Err(format!("窗口 {owner} 存在正在迁移或关闭的文档"));
+        }
+        let sessions: Vec<u64> = self.sessions.iter()
+            .filter(|(_, entry)| entry.owner == owner)
+            .map(|(session, _)| *session)
+            .collect();
+        let mut closed = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            if let Some(mut entry) = self.sessions.remove(&session) {
+                entry.state = DocState::Closing;
+                closed.push((session, entry));
+            }
+        }
+        Ok(closed)
+    }
+
     /// 进程退出时取走全部文档句柄，供锁外取消与等待。
     pub fn drain(&mut self) -> Vec<BigEntry> {
         self.sessions.drain().map(|(_, entry)| entry).collect()

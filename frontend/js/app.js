@@ -17,6 +17,7 @@ import {
 } from "./dialogs.js";
 import { createUndoBudgetPrefs } from "./prefs.js";
 import { createOpenRequestPump } from "./openrequests.js";
+import { createWindowCloseCoordinator } from "./windowlifecycle.js";
 
 /** @type {any} Tauri v2 全局对象（withGlobalTauri） */
 const tauri = window.__TAURI__;
@@ -1916,14 +1917,15 @@ tauri.event.listen("tauri://drag-drop", async (e) => {
 });
 
 // ---- 关闭前确认 ----
+const windowCloseCoordinator = createWindowCloseCoordinator({
+  tabs: () => tabs,
+  activateTab,
+  confirmDiscard,
+  closeWindow: () => invoke("close_window"),
+});
 tauri.event.listen("close-request", async () => {
   syncActiveTab();
-  for (const t of tabs) {
-    if (!t.dirty) continue;
-    activateTab(t.id);
-    if (!(await confirmDiscard())) return; // 用户取消：留在该档，中止退出
-  }
-  invoke("quit_app");
+  await windowCloseCoordinator.requestClose();
 });
 
 // ============ 排序（F5） ============

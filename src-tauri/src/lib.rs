@@ -22,6 +22,7 @@ mod engine;
 pub mod document_registry;
 mod history;
 pub mod open_request;
+pub mod window_registry;
 mod order;
 mod schema;
 mod spool;
@@ -51,8 +52,9 @@ fn get_version() -> String {
 /// # Returns
 /// 启动参数含 `--smoke` 时为 true。
 #[tauri::command]
-fn is_smoke() -> bool {
-    std::env::var_os("SIMPLE_TABLE_SMOKE").is_some()
+fn is_smoke(app: tauri::AppHandle, window: tauri::Window) -> bool {
+    is_diagnostic_main(&app, window.label())
+        && std::env::var_os("SIMPLE_TABLE_SMOKE").is_some()
 }
 
 /// 冒烟自检是否强制走大文件模式（SIMPLE_TABLE_FORCE_BIG 置位或运行期开启）。
@@ -90,7 +92,16 @@ fn smoke_report_path() -> std::path::PathBuf {
 /// # Returns
 /// 不返回（进程退出）。
 #[tauri::command]
-fn finish_smoke(app: tauri::AppHandle, report: String, code: i32) {
+fn finish_smoke(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    report: String,
+    code: i32,
+) -> Result<(), String> {
+    if !is_diagnostic_main(&app, window.label())
+        || std::env::var_os("SIMPLE_TABLE_SMOKE").is_none() {
+        return Err("只有 Diagnostic main 可以结束冒烟".into());
+    }
     let path = smoke_report_path();
     let cleanup_path = app.state::<ClipboardStore>().root().to_path_buf();
     let report = format!("{report}\nCLEANUP_PATH={}", cleanup_path.display());
@@ -288,6 +299,7 @@ fn io_err(path: &str, e: &std::io::Error) -> String {
 struct RuntimeState {
     docs: document_registry::DocumentRegistry,
     opens: open_request::OpenRequestQueue,
+    windows: window_registry::WindowRegistry,
 }
 
 type SharedRuntime = Arc<Mutex<RuntimeState>>;
@@ -301,13 +313,28 @@ fn with_runtime<T>(
     Ok(f(&mut guard))
 }
 
-/// 窗口注册表接入前，唯一可接收文档的窗口固定为 main。
-fn recent_window_label(_app: &tauri::AppHandle) -> String {
+fn recent_ready_window_label(app: &tauri::AppHandle) -> Option<String> {
+    let state = app.state::<SharedRuntime>();
+    let runtime = state.lock().ok()?;
+    runtime.windows.recent_ready()
+}
+
+fn recent_window_label(app: &tauri::AppHandle) -> String {
+    let state = app.state::<SharedRuntime>();
+    if let Ok(runtime) = state.lock() {
+        if let Some(label) = runtime.windows.recent_ready()
+            .or_else(|| runtime.windows.recent_registered()) {
+            return label;
+        }
+    }
     "main".to_string()
 }
 
 fn focus_recent_window(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window(&recent_window_label(app)) {
+    let Some(label) = recent_ready_window_label(app) else {
+        return;
+    };
+    if let Some(window) = app.get_webview_window(&label) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
@@ -403,7 +430,12 @@ fn open_requests_ready(
     app: tauri::AppHandle,
     window: tauri::Window,
 ) -> Result<Option<open_request::OpenBatch>, String> {
-    let batch = with_runtime(&app, |runtime| runtime.opens.mark_ready(window.label()))?;
+    let batch = with_runtime(&app, |runtime| {
+        if !runtime.windows.mark_ready(window.label()) {
+            return Err(format!("窗口未注册：{}", window.label()));
+        }
+        Ok(runtime.opens.mark_ready(window.label()))
+    })??;
     dispatch_open_batches(&app, batch.into_iter().collect());
     // 实际批次统一经已注册的 open-paths 监听发送，避免非 Unicode 路径进入 IPC。
     Ok(None)
@@ -1199,7 +1231,10 @@ fn big_col_apply(
 /// 窗口停在指定渲染场景待命（进程不退出），供外部截屏工具读像素、
 /// 验证 WebView2 真实绘制结果（DOM 探针看不到绘制级缺陷）。
 #[tauri::command]
-fn is_park() -> Option<String> {
+fn is_park(app: tauri::AppHandle, window: tauri::Window) -> Option<String> {
+    if !is_diagnostic_main(&app, window.label()) {
+        return None;
+    }
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         if a == "--park" {
@@ -1207,6 +1242,148 @@ fn is_park() -> Option<String> {
         }
     }
     None
+}
+
+fn is_diagnostic_main(app: &tauri::AppHandle, label: &str) -> bool {
+    if label != "main" {
+        return false;
+    }
+    let state = app.state::<SharedRuntime>();
+    state.lock().ok().is_some_and(|runtime| {
+        runtime.windows.role(label) == Some(window_registry::WindowRole::Diagnostic)
+    })
+}
+
+fn install_window_events(app: &tauri::AppHandle, window: &tauri::WebviewWindow) {
+    let app = app.clone();
+    let label = window.label().to_string();
+    window.on_window_event(move |event| match event {
+        tauri::WindowEvent::CloseRequested { api, .. } => {
+            api.prevent_close();
+            let _ = app.emit_to(
+                label.as_str(),
+                "close-request",
+                serde_json::json!({ "label": label.as_str() }),
+            );
+        }
+        tauri::WindowEvent::Focused(true) => {
+            let state = app.state::<SharedRuntime>();
+            if let Ok(mut runtime) = state.lock() {
+                runtime.windows.touch(&label);
+            };
+        }
+        _ => {}
+    });
+}
+
+fn discard_unready_window(app: &tauri::AppHandle, label: &str) {
+    match with_runtime(app, |runtime| {
+        runtime.windows.unregister(label);
+        let recent = runtime.windows.recent_ready()
+            .or_else(|| runtime.windows.recent_registered())
+            .unwrap_or_else(|| "main".to_string());
+        runtime.opens.remove_window(label, &recent)
+    }) {
+        Ok(batches) => dispatch_open_batches(app, batches),
+        Err(error) => eprintln!("回收未就绪窗口失败：{error}"),
+    }
+}
+
+#[tauri::command]
+async fn create_document_window(app: tauri::AppHandle) -> Result<String, String> {
+    let (label, receiver) = {
+        let state = app.state::<SharedRuntime>();
+        let mut runtime = state.lock().map_err(|e| e.to_string())?;
+        let label = runtime.windows.allocate_document_label();
+        runtime.windows.register(&label, window_registry::WindowRole::Document);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        runtime.windows.wait_ready(&label, sender);
+        (label, receiver)
+    };
+    let window = match tauri::WebviewWindowBuilder::new(
+        &app,
+        &label,
+        tauri::WebviewUrl::App("index.html".into()),
+    )
+    .title("simpleTable")
+    .inner_size(1100.0, 720.0)
+    .visible(false)
+    .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled)
+    .build() {
+        Ok(window) => window,
+        Err(error) => {
+            discard_unready_window(&app, &label);
+            return Err(format!("创建文档窗口失败：{error}"));
+        }
+    };
+    install_window_events(&app, &window);
+    match tokio::time::timeout(std::time::Duration::from_secs(10), receiver).await {
+        Ok(Ok(())) => Ok(label),
+        Ok(Err(_)) => {
+            discard_unready_window(&app, &label);
+            let _ = window.destroy();
+            Err("文档窗口 ready 通道已取消".into())
+        }
+        Err(_) => {
+            discard_unready_window(&app, &label);
+            let _ = window.destroy();
+            Err("等待文档窗口 ready 超时（10 秒）".into())
+        }
+    }
+}
+
+fn close_window_internal(
+    app: &tauri::AppHandle,
+    window: &tauri::Window,
+    require_empty: bool,
+) -> Result<(), String> {
+    let label = window.label().to_string();
+    let (entries, batches, last) = {
+        let state = app.state::<SharedRuntime>();
+        let mut runtime = state.lock().map_err(|e| e.to_string())?;
+        if require_empty && !runtime.docs.owner_is_empty(&label) {
+            return Err("窗口仍拥有文档，不能按空窗口关闭".into());
+        }
+        runtime.windows.begin_close(&label)?;
+        let entries = match runtime.docs.close_owner(&label) {
+            Ok(entries) => entries,
+            Err(error) => {
+                runtime.windows.cancel_close(&label);
+                return Err(error);
+            }
+        };
+        for (session, _) in &entries {
+            runtime.opens.remove_session(*session);
+        }
+        runtime.windows.unregister(&label);
+        let recent = runtime.windows.recent_ready()
+            .or_else(|| runtime.windows.recent_registered())
+            .unwrap_or_else(|| "main".to_string());
+        let batches = runtime.opens.remove_window(&label, &recent);
+        let last = runtime.windows.is_empty();
+        (entries, batches, last)
+    };
+    for (_, entry) in entries {
+        entry.bump_gate();
+        entry.load_cancel.store(true, Ordering::Relaxed);
+        drop(entry.file.lock());
+    }
+    dispatch_open_batches(app, batches);
+    let destroyed = window.destroy().map_err(|e| e.to_string());
+    if last {
+        app.exit(0);
+    }
+    destroyed
+}
+
+#[tauri::command]
+fn close_window(app: tauri::AppHandle, window: tauri::Window) -> Result<(), String> {
+    close_window_internal(&app, &window, false)
+}
+
+#[tauri::command]
+fn close_empty_window(app: tauri::AppHandle, window: tauri::Window) -> Result<(), String> {
+    close_window_internal(&app, &window, true)
 }
 
 /// 截屏诊断辅助：探测路径是否存在（--park 模式与外部截屏工具握手用）。
@@ -1244,15 +1421,17 @@ pub fn run() {
     builder
         .setup(|app| {
             app.manage(ClipboardStore::create_unique()?);
-            // 关闭请求转发给前端做"未保存确认"，确认后由 quit_app 命令真正退出
+            {
+                let state = app.state::<SharedRuntime>();
+                let role = if diagnostic_mode() {
+                    window_registry::WindowRole::Diagnostic
+                } else {
+                    window_registry::WindowRole::Primary
+                };
+                state.lock().map_err(|e| e.to_string())?.windows.register("main", role);
+            }
             if let Some(window) = app.get_webview_window("main") {
-                let handle = window.clone();
-                window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = handle.emit("close-request", ());
-                    }
-                });
+                install_window_events(app.handle(), &window);
             }
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let paths = open_request::normalize_args(std::env::args_os().collect(), &cwd);
@@ -1281,7 +1460,9 @@ pub fn run() {
             pick_open_path,
             pick_save_path,
             set_title,
-            quit_app,
+            create_document_window,
+            close_window,
+            close_empty_window,
             file_size,
             big_open,
             big_new,
@@ -1434,7 +1615,7 @@ fn big_paste_import_cancel(
     with_big(&state, &window, session, lease, Access::Write, |bf| bf.cancel_paste_import(&import_id))
 }
 
-/// 前端确认关闭（或保存完毕）后调用：立即退出进程。
+/// 最后一个窗口退出进程后清理所有文档和进程级临时目录。
 fn cleanup_process_state(app: &tauri::AppHandle) {
     let entries = match app.state::<SharedRuntime>().lock() {
         Ok(mut guard) => guard.docs.drain(),
@@ -1447,10 +1628,4 @@ fn cleanup_process_state(app: &tauri::AppHandle) {
     }
     // 可在 quit、RunEvent::Exit 和 smoke 出口重复调用；目录仅属于本进程。
     app.state::<ClipboardStore>().cleanup();
-}
-
-#[tauri::command]
-fn quit_app(app: tauri::AppHandle) {
-    cleanup_process_state(&app);
-    app.exit(0);
 }

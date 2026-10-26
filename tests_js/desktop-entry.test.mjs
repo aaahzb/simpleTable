@@ -10,6 +10,17 @@ test("macOS declares CSV Editor file association", () => {
   }]);
 });
 
+test("default capability covers main and document windows", () => {
+  const capability = JSON.parse(readFileSync(new URL("../src-tauri/capabilities/default.json", import.meta.url), "utf8"));
+  assert.deepEqual(capability.windows, ["main", "doc-*"]);
+});
+
+test("window close is scoped instead of quitting the process", () => {
+  const app = readFileSync(new URL("../frontend/js/app.js", import.meta.url), "utf8");
+  assert.match(app, /createWindowCloseCoordinator/);
+  assert.equal(app.includes('invoke("quit_app"'), false);
+});
+
 test("single-instance stays pinned to 2.3.4", () => {
   const manifest = readFileSync(new URL("../src-tauri/Cargo.toml", import.meta.url), "utf8");
   const lock = readFileSync(new URL("../src-tauri/Cargo.lock", import.meta.url), "utf8");
