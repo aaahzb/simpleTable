@@ -14,6 +14,7 @@
  *   大选区复制/矩形选区大小设防（防 30M 行选整列卡死）
  */
 
+import { LARGE_TEXT_BYTES, isSingleValueText, utf8ByteLength } from "./clipboard.js";
 import { parseCsv, serializeRecords } from "./csv.js";
 
 export const ZOOM_MIN = 0.5;
@@ -1680,6 +1681,23 @@ export class Grid {
     // 一对多填充（Excel）：剪贴板是单格单值（无 Tab/换行的单行，内外部来源皆然）
     // 且选区超过一格 → 全选区填充。必须先于"纯文本整段进当前格"分支判定，
     // 否则外部单值文本会被整段吞进当前格。forceSplit（按行拆分粘贴）不填充。
+    // readText 已产生完整 JS 字符串；大文本只做有上限的体量探测，避免 replace/parseCsv 再复制全文。
+    if (utf8ByteLength(text, LARGE_TEXT_BYTES + 1) > LARGE_TEXT_BYTES) {
+      let destination = { kind: "rect", row: r0, col: c0 };
+      if (!forceSplit && this.selectedSet.size > 1 && isSingleValueText(text)) {
+        const rect = this._singleSelectionRect();
+        destination = {
+          kind: "fill",
+          target: rect
+            ? { kind: "rect", row: rect.row, col: rect.col, rows: rect.rows, cols: rect.cols }
+            : { kind: "cells", cells: this.selectedCells() },
+        };
+      } else if (!forceSplit && !text.includes("\t")) {
+        destination = { kind: "singleCell", row: r0, col: c0 };
+      }
+      await this._pasteExternalLarge(text, destination);
+      return;
+    }
     const single = text.replace(/[\r\n]+$/, "");
     if (!forceSplit && single && this.selectedSet.size > 1
         && !single.includes("\t") && !single.includes("\n")) {
@@ -1716,6 +1734,26 @@ export class Grid {
    * @param {string} value - 填充值。
    * @returns {Promise<void>}
    */
+  /** 大文本只提交目的地；解析、扩行和历史成本全部留在引擎流式路径。 */
+  async _pasteExternalLarge(text, destination) {
+    try {
+      const outcome = await this.model.pasteExternalText(text, destination);
+      if (outcome?.cancelled) {
+        this.hooks.statusMsg("已取消粘贴", 2500);
+        return;
+      }
+      if (destination.kind === "fill") {
+        this.hooks.statusMsg(`已填充 ${this.selectedSet.size} 个单元格`, 2000);
+      } else if (destination.kind === "singleCell") {
+        this.hooks.statusMsg("已粘贴到当前单元格", 2000);
+      } else {
+        this.hooks.statusMsg("已粘贴大文本", 2000);
+      }
+    } catch (err) {
+      this.hooks.statusMsg(String(err?.message ?? err), 3000);
+    }
+  }
+
   async _fillSelection(value) {
     const cells = this.selectedCells();
     if (!cells.length) return;

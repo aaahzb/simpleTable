@@ -1817,3 +1817,65 @@ test("modified() 读取引擎脏点且空模型安全", () => {
   model._meta.modified = false;
   assert.equal(model.modified(), false);
 });
+
+function makeImportModel(confirm, finish) {
+  const calls = [];
+  let refreshes = 0;
+  let dataEvents = 0;
+  let finishes = 0;
+  const model = new BigModel({
+    invoke: async (cmd, args = {}) => {
+      calls.push([cmd, args]);
+      if (cmd === "big_paste_import_begin") return { importId: "i1" };
+      if (cmd === "big_paste_import_chunk") return { bytes: 3 };
+      if (cmd === "big_paste_import_finish") return finish(++finishes);
+      if (cmd === "big_paste_import_cancel") return null;
+      throw new Error("unexpected " + cmd);
+    },
+    listen: async () => () => {},
+    confirmFixedPoint: confirm,
+  });
+  model._meta = { rows: 1, cols: 1 };
+  model._refreshMeta = async () => { refreshes += 1; };
+  model._emitData = () => { dataEvents += 1; };
+  model._emitUndo = () => {};
+  return { model, calls, counts: () => ({ refreshes, dataEvents }) };
+}
+
+const importFixed = {
+  kind: "stepOverBudget", operation: "外部粘贴", requiredBytes: 9_000_000,
+  budgetBytes: 4096, preflightId: 7,
+};
+const importRequest = { changed: false, insertedRows: 0, removedRows: 0,
+  fixedPoint: importFixed, cancelled: false };
+
+test("外部大粘贴固定点取消会 cancel 且不刷新", async () => {
+  const { model, calls, counts } = makeImportModel(async () => false, () => importRequest);
+  const out = await model.pasteExternalText("A\tB", { kind: "rect", row: 0, col: 0 });
+  assert.equal(out.cancelled, true);
+  assert.equal(out.changed, false);
+  assert.deepEqual(calls.map(([cmd]) => cmd), [
+    "big_paste_import_begin", "big_paste_import_chunk",
+    "big_paste_import_finish", "big_paste_import_cancel",
+  ]);
+  assert.deepEqual(counts(), { refreshes: 0, dataEvents: 0 });
+});
+
+test("外部大粘贴确认复用 importId 重试且不重传", async () => {
+  const done = { changed: true, insertedRows: 0, removedRows: 0,
+    fixedPoint: null, cancelled: false };
+  const { model, calls, counts } = makeImportModel(async () => true,
+    (attempt) => attempt === 1 ? importRequest : done);
+  const out = await model.pasteExternalText("A\tB", { kind: "rect", row: 0, col: 0 });
+  assert.equal(out.changed, true);
+  assert.deepEqual(calls.map(([cmd]) => cmd), [
+    "big_paste_import_begin", "big_paste_import_chunk",
+    "big_paste_import_finish", "big_paste_import_finish",
+  ]);
+  const finishes = calls.filter(([cmd]) => cmd === "big_paste_import_finish");
+  assert.equal(finishes[0][1].importId, "i1");
+  assert.equal(finishes[1][1].importId, "i1");
+  assert.deepEqual(finishes[1][1].approval, { allowFixedPoint: true, preflightId: 7 });
+  assert.equal(calls.filter(([cmd]) => cmd === "big_paste_import_chunk")[0][1].last, true);
+  assert.deepEqual(counts(), { refreshes: 1, dataEvents: 1 });
+});

@@ -3706,6 +3706,58 @@ x,y
     assert(backLines[2][1] === "直写", `再保存内容应含第二笔编辑：${backLines[2]}`);
   });
 
+  check("大外部 SingleCell 分块导入并一步撤销/重做", async () => {
+    await loadBasic();
+    const value = "x".repeat(8 * 1024 * 1024 + 1);
+    const original = tableSnapshot();
+    grid.select([0, 0]);
+    stubClipboard(value + "\r\n");
+    await grid.pasteClipboard();
+    await waitFor(() => model.rawData(0, 0) === value, "大外部单值应流式写入");
+    assert(await model.undo() === true, "大外部单值应有一步撤销");
+    await waitFor(() => tableEquals(original), "大外部单值撤销应恢复原表");
+    assert(await model.redo() === true, "大外部单值应有一步重做");
+    await waitFor(() => model.rawData(0, 0) === value, "大外部单值重做应恢复值");
+  });
+
+  check("大外部 Rect 分块导入扩行扩列并一步撤销/重做", async () => {
+    await loadBasic();
+    const value = "界".repeat(3 * 1024 * 1024);
+    const original = tableSnapshot();
+    grid.select([2, 2]);
+    stubClipboard(value + "\tY\r\nP\tQ");
+    await grid.pasteClipboard();
+    await waitFor(() => model.rowCount() === 4 && model.columnCount() === 4 &&
+      model.rawData(2, 2) === value && model.rawData(3, 2) === "P" &&
+      model.rawData(3, 3) === "Q", "大外部矩形应流式扩行扩列");
+    assert(await model.undo() === true, "大外部矩形应有一步撤销");
+    await waitFor(() => model.rowCount() === 3 && model.columnCount() === 3 &&
+      tableEquals(original), "大外部矩形撤销应恢复结构和内容");
+    assert(await model.redo() === true, "大外部矩形应有一步重做");
+    await waitFor(() => model.rowCount() === 4 && model.columnCount() === 4 &&
+      model.rawData(2, 2) === value && model.rawData(3, 2) === "P" &&
+      model.rawData(3, 3) === "Q", "大外部矩形重做应恢复结构和内容");
+  });
+
+  check("大外部 Fill 分块导入共享新值并一步撤销/重做", async () => {
+    await loadBasic();
+    const value = "填".repeat(3 * 1024 * 1024);
+    const original = tableSnapshot();
+    grid.select([0, 1]);
+    grid._extendTo([1, 2]);
+    stubClipboard(value);
+    await grid.pasteClipboard();
+    await waitFor(() => model.rawData(0, 1) === value && model.rawData(0, 2) === value &&
+      model.rawData(1, 1) === value && model.rawData(1, 2) === value,
+    "大外部填充应共享写入整个选区");
+    assert(await model.undo() === true, "大外部填充应有一步撤销");
+    await waitFor(() => tableEquals(original), "大外部填充撤销应恢复整片");
+    assert(await model.redo() === true, "大外部填充应有一步重做");
+    await waitFor(() => model.rawData(0, 1) === value && model.rawData(0, 2) === value &&
+      model.rawData(1, 1) === value && model.rawData(1, 2) === value,
+    "大外部填充重做应恢复整片");
+  });
+
   // ---- 执行（看门狗：整体超时强制收尾，防挂死） ----
   const watchdog = setTimeout(async () => {
     lines.push("", `[watchdog] 超时未完成，已通过 ${lines.length} 项`);

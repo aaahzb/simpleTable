@@ -30,7 +30,7 @@ use crate::history::{
 };
 use crate::order::{project_filter, Perm, RowOrder};
 use crate::schema::{ColumnId, ColumnStorage, Schema};
-use crate::spool::{history_text_bytes, RowSnapshot, SessionSpool};
+use crate::spool::{history_text_bytes, PasteImport, RowSnapshot, SessionSpool};
 use memchr::{memchr, memchr_iter};
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
@@ -194,6 +194,96 @@ fn chunk_transitions(bytes: &[u8]) -> (bool, bool) {
     let mut from_true = QuoteMachine::new(true);
     from_true.feed(bytes);
     (from_false.in_quotes, from_true.in_quotes)
+}
+
+/// 以固定缓冲区顺序读取 CSV/TSV 记录，记录内容可按记录分配而不装载整文件。
+pub struct RecordReader {
+    file: std::fs::File,
+    delimiter: u8,
+    buffer: Vec<u8>,
+    buffer_pos: usize,
+    buffer_len: usize,
+    offset: u64,
+}
+
+impl RecordReader {
+    pub fn open(path: &Path, delimiter: u8) -> Result<Self, String> {
+        let file = std::fs::File::open(path).map_err(|e| format!("打开导入文件失败：{e}"))?;
+        Ok(Self {
+            file,
+            delimiter,
+            buffer: vec![0; 64 * 1024],
+            buffer_pos: 0,
+            buffer_len: 0,
+            offset: 0,
+        })
+    }
+
+    fn fill_buffer(&mut self) -> Result<bool, String> {
+        self.buffer_len = std::io::Read::read(&mut self.file, &mut self.buffer)
+            .map_err(|e| format!("读取导入文件失败：{e}"))?;
+        self.buffer_pos = 0;
+        Ok(self.buffer_len > 0)
+    }
+
+    fn peek_byte(&mut self) -> Result<Option<u8>, String> {
+        if self.buffer_pos == self.buffer_len && !self.fill_buffer()? {
+            return Ok(None);
+        }
+        Ok(Some(self.buffer[self.buffer_pos]))
+    }
+
+    fn read_byte(&mut self) -> Result<Option<u8>, String> {
+        if self.buffer_pos == self.buffer_len && !self.fill_buffer()? {
+            return Ok(None);
+        }
+        let byte = self.buffer[self.buffer_pos];
+        self.buffer_pos += 1;
+        self.offset = self.offset.checked_add(1).ok_or("导入文件偏移溢出")?;
+        Ok(Some(byte))
+    }
+
+    pub fn position(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn seek(&mut self, offset: u64) -> Result<(), String> {
+        std::io::Seek::seek(&mut self.file, std::io::SeekFrom::Start(offset))
+            .map_err(|e| format!("定位导入文件失败：{e}"))?;
+        self.buffer_pos = 0;
+        self.buffer_len = 0;
+        self.offset = offset;
+        Ok(())
+    }
+
+    pub fn next_record(&mut self) -> Result<Option<Vec<String>>, String> {
+        let mut record = Vec::new();
+        let mut in_quotes = false;
+        let mut saw_bytes = false;
+        loop {
+            let Some(byte) = self.read_byte()? else { break };
+            saw_bytes = true;
+            record.push(byte);
+            if byte == b'"' {
+                in_quotes = !in_quotes;
+            }
+            if !in_quotes && (byte == b'\r' || byte == b'\n') {
+                if byte == b'\r' && self.peek_byte()? == Some(b'\n') {
+                    let lf = self.read_byte()?.ok_or("读取 CRLF 失败")?;
+                    record.push(lf);
+                }
+                let text = String::from_utf8(record)
+                    .map_err(|_| "粘贴内容不是有效 UTF-8".to_string())?;
+                return Ok(Some(parse_record(&text, self.delimiter)));
+            }
+        }
+        if !saw_bytes {
+            return Ok(None);
+        }
+        let text = String::from_utf8(record)
+            .map_err(|_| "粘贴内容不是有效 UTF-8".to_string())?;
+        Ok(Some(parse_record(&text, self.delimiter)))
+    }
 }
 
 /// 解析单条记录：slice 可能含引号内嵌换行/结尾换行符，取首条记录即止。
@@ -2243,6 +2333,191 @@ a,b
         assert_eq!(bytes, LARGE_COPY_BYTES);
         assert_eq!(text.len(), LARGE_COPY_BYTES as usize);
         store.cleanup();
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p5_record_reader_matches_parse_csv_tsv_semantics() {
+        let p = tmp_csv("p5_tsv_reader", b"a\t\"b\"\"q\"\r\n\"x\r\ny\"\tz");
+        let mut reader = RecordReader::open(&p, b'\t').unwrap();
+        assert_eq!(reader.next_record().unwrap(),
+            Some(vec!["a".to_string(), "b\"q".to_string()]));
+        assert_eq!(reader.next_record().unwrap(),
+            Some(vec!["x\r\ny".to_string(), "z".to_string()]));
+        assert!(reader.next_record().unwrap().is_none());
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p5_bad_import_chunk_and_post_last_preserve_document() {
+        let p = tmp_csv("p5_bad_import", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "redo-base".into(), Approval::deny()).unwrap();
+        assert!(bf.undo());
+        let before = bf.rows(0, u32::try_from(bf.meta().rows).unwrap());
+        let headers = bf.meta().headers;
+        let history = bf.history_stats();
+        let revision = bf.revision;
+        let backing = bf.backing_path.to_path_buf();
+        let mut bad = crate::spool::PasteImport::begin(&bf.spool, "bad-hex".into()).unwrap();
+        let bad_path = bad.path.clone();
+        assert_eq!(bad.append_hex(&bf.spool, "41", false).unwrap(), 1);
+        assert!(bad.append_hex(&bf.spool, "0g", false).is_err());
+        bad.cancel().unwrap();
+        assert!(!bad_path.exists());
+        let mut closed = crate::spool::PasteImport::begin(&bf.spool, "post-last".into()).unwrap();
+        let closed_path = closed.path.clone();
+        assert_eq!(closed.append_hex(&bf.spool, "41", true).unwrap(), 1);
+        assert!(closed.append_hex(&bf.spool, "42", false).is_err());
+        closed.cancel().unwrap();
+        assert!(!closed_path.exists());
+        assert_eq!(bf.rows(0, u32::try_from(bf.meta().rows).unwrap()), before);
+        assert_eq!(bf.meta().headers, headers);
+        assert_eq!(bf.history_stats(), history);
+        assert_eq!(history.redo_count, 1);
+        assert_eq!(bf.revision, revision);
+        assert_eq!(bf.backing_path, backing);
+        fs::remove_file(&p).ok();
+    }
+
+    fn import_hex(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
+    }
+
+    fn begin_import_bytes(bf: &mut BigFile, bytes: &[u8]) -> String {
+        let id = bf.begin_paste_import().unwrap();
+        let hex = import_hex(bytes);
+        assert_eq!(bf.append_paste_import(&id, &hex, true).unwrap(), bytes.len() as u64);
+        id
+    }
+
+    #[test]
+    fn p5_external_rect_import_roundtrip_with_expansion() {
+        let p = tmp_csv("p5_external_rect", &people_csv());
+        let original = fs::read(&p).unwrap();
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 5);
+        let id = begin_import_bytes(&mut bf, b"X\tY\r\nP\tQ");
+        let outcome = bf.finish_paste_import(
+            &id,
+            PasteDestination::Rect { row: 4, col: 2 },
+            Approval::deny(),
+        ).unwrap();
+        assert!(outcome.changed);
+        assert_eq!(outcome.inserted_rows, 1);
+        assert_eq!(bf.meta().rows, 6);
+        assert_eq!(bf.meta().headers, vec!["name", "age", "city", "列4"]);
+        let changed = bf.rows(0, 6);
+        assert_eq!(changed[4], vec!["Eve", "22", "X", "Y"]);
+        assert_eq!(changed[5], vec!["", "", "P", "Q"]);
+        assert_eq!(fs::read(&p).unwrap(), original, "导入不得提前写用户 CSV");
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 5), before);
+        assert_eq!(bf.meta().cols, 3);
+        assert!(!bf.undo(), "矩形导入只能占一步历史");
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 6), changed);
+        assert_eq!(bf.meta().headers, vec!["name", "age", "city", "列4"]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p5_external_single_cell_normalizes_newlines_and_roundtrips() {
+        let p = tmp_csv("p5_external_single", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 1);
+        let id = begin_import_bytes(&mut bf, b"a\r\nb\rc\n\n");
+        let outcome = bf.finish_paste_import(
+            &id,
+            PasteDestination::SingleCell { row: 0, col: 0 },
+            Approval::deny(),
+        ).unwrap();
+        assert!(outcome.changed);
+        assert_eq!(bf.rows(0, 1)[0][0], "a\nb\nc");
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 1), before);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 1)[0][0], "a\nb\nc");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p5_external_fill_fixed_point_shares_value_and_fences_history() {
+        let p = tmp_csv("p5_external_fill_fixed", &people_csv());
+        let original = fs::read(&p).unwrap();
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_history_budget(4_096).unwrap();
+        let before = bf.rows(0, 5);
+        let before_history = bf.history_stats();
+        let value = "x".repeat(128 * 1024);
+        let id = begin_import_bytes(&mut bf, value.as_bytes());
+        let destination = PasteDestination::Fill {
+            target: ClearTarget::Rect { row: 0, col: 0, rows: 1, cols: 2 },
+        };
+        let first = bf.finish_paste_import(&id, destination.clone(), Approval::deny()).unwrap();
+        let request = first.fixed_point.expect("共享大值仍应请求固定点");
+        assert!(!first.changed);
+        assert_eq!(bf.rows(0, 5), before);
+        assert_eq!(bf.history_stats(), before_history);
+        let done = bf.finish_paste_import(
+            &id,
+            destination,
+            Approval::allow(request.preflight_id),
+        ).unwrap();
+        assert!(done.changed);
+        assert_eq!(bf.rows(0, 1)[0][0], value);
+        assert_eq!(bf.rows(0, 1)[0][1], value);
+        assert_eq!(bf.rows(0, 1)[0][2], "Beijing");
+        assert_eq!(bf.history_stats().undo_count, 0);
+        assert_eq!(bf.history_stats().redo_count, 0);
+        assert_eq!(fs::read(&p).unwrap(), original, "固定点不得提前保存用户 CSV");
+        assert!(!bf.undo(), "固定点本身不可撤销");
+        bf.set_cell(0, 2, "after-fixed".into(), Approval::deny()).unwrap();
+        assert!(bf.undo(), "固定点之后的新操作必须可撤销");
+        assert_eq!(bf.rows(0, 1)[0][2], "Beijing");
+        assert!(!bf.undo(), "不得越过固定点");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p5_import_finish_errors_and_expired_retry_preserve_document() {
+        let p = tmp_csv("p5_import_finish_errors", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 5);
+        let before_history = bf.history_stats();
+        let bad_id = begin_import_bytes(&mut bf, &[0xf0, 0x9f, 0x98]);
+        let bad_path = bf.imports.get(&bad_id).unwrap().path.clone();
+        assert!(bf.finish_paste_import(
+            &bad_id,
+            PasteDestination::Rect { row: 0, col: 0 },
+            Approval::deny(),
+        ).is_err());
+        assert_eq!(bf.rows(0, 5), before);
+        assert_eq!(bf.history_stats(), before_history);
+        assert!(bad_path.exists(), "失败导入须等待统一 cancel");
+        bf.cancel_paste_import(&bad_id).unwrap();
+        assert!(!bad_path.exists());
+
+        bf.set_history_budget(4_096).unwrap();
+        let id = begin_import_bytes(&mut bf, &vec![b'x'; 128 * 1024]);
+        let destination = PasteDestination::SingleCell { row: 0, col: 0 };
+        let first = bf.finish_paste_import(&id, destination.clone(), Approval::deny()).unwrap();
+        let request = first.fixed_point.unwrap();
+        bf.set_cell(0, 1, "generation-change".into(), Approval::deny()).unwrap();
+        let before_retry = bf.rows(0, 5);
+        let retry_history = bf.history_stats();
+        assert!(bf.finish_paste_import(
+            &id,
+            destination,
+            Approval::allow(request.preflight_id),
+        ).is_err());
+        assert_eq!(bf.rows(0, 5), before_retry);
+        assert_eq!(bf.history_stats(), retry_history);
+        bf.cancel_paste_import(&id).unwrap();
         fs::remove_file(&p).ok();
     }
 
@@ -5609,6 +5884,15 @@ struct CellChange {
 }
 
 /// 一次清除操作的结构化目标；坐标均为未筛选的显示坐标。
+/// 外部文本导入的目标；坐标沿用当前显示视图，Fill 使用结构化选区。
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PasteDestination {
+    Rect { row: u64, col: u32 },
+    SingleCell { row: u64, col: u32 },
+    Fill { target: ClearTarget },
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ClearTarget {
@@ -7032,6 +7316,8 @@ pub struct BigFile {
     history: HistoryLedger<Op>,
     /// 删除快照和后续固定点 generation 的会话独占临时目录。
     spool: SessionSpool,
+    imports: HashMap<String, PasteImport>,
+    next_import_id: u64,
     history_generation: u64,
     /// backing 与索引替换代际；Source 历史值只能读取同一代。
     index_epoch: u64,
@@ -7185,6 +7471,8 @@ impl BigFile {
             filter_stats: FilterStats::default(),
             history: HistoryLedger::new(DEFAULT_HISTORY_BUDGET_BYTES),
             spool,
+            imports: HashMap::new(),
+            next_import_id: 0,
             history_generation: 0,
             index_epoch: 0,
             fixed_point: false,
@@ -7376,6 +7664,8 @@ impl BigFile {
             filter_stats: FilterStats::default(),
             history: HistoryLedger::new(DEFAULT_HISTORY_BUDGET_BYTES),
             spool,
+            imports: HashMap::new(),
+            next_import_id: 0,
             history_generation: 0,
             index_epoch: 0,
             fixed_point: false,
@@ -8626,6 +8916,419 @@ impl BigFile {
         self.apply(&mut prepared.entry_mut().op);
         self.last_spec = None;
         self.finish_history(prepared, fixed_point, 0, 0)
+    }
+
+    /// 在目标会话 spool 中建立一个唯一的外部粘贴导入。
+    pub fn begin_paste_import(&mut self) -> Result<String, String> {
+        let next_id = self.next_import_id.checked_add(1).ok_or("导入编号溢出")?;
+        let id = format!("paste-{}-{}", std::process::id(), self.next_import_id);
+        let import = PasteImport::begin(&self.spool, id.clone())?;
+        self.next_import_id = next_id;
+        self.imports.insert(id.clone(), import);
+        Ok(id)
+    }
+
+    /// 追加一个已上传分块；文件写入和容量检查由 PasteImport 完成。
+    pub fn append_paste_import(&mut self, id: &str, hex: &str, last: bool)
+        -> Result<u64, String> {
+        let spool = &self.spool;
+        let import = self.imports.get_mut(id).ok_or("导入不存在或已结束")?;
+        import.append_hex(spool, hex, last)
+    }
+
+    /// 取消并消费本次导入；重复取消是幂等的。
+    pub fn cancel_paste_import(&mut self, id: &str) -> Result<(), String> {
+        let Some(import) = self.imports.remove(id) else { return Ok(()) };
+        import.cancel()
+    }
+
+    /// 完成导入。固定点预检请求保留 import，成功或失败后的统一取消才消费它。
+    pub fn finish_paste_import(
+        &mut self,
+        id: &str,
+        destination: PasteDestination,
+        approval: Approval,
+    ) -> Result<EditOutcome, String> {
+        if approval.allow_fixed_point
+            && approval.preflight_id != Some(self.history_generation)
+        {
+            return Err("固定点预检已过期，请重试".into());
+        }
+        let mut import = self.imports.remove(id).ok_or("导入不存在或已结束")?;
+        let result = self.finish_paste_import_loaded(&mut import, destination, approval);
+        match result {
+            Ok(outcome) if outcome.fixed_point.is_some() => {
+                self.imports.insert(id.to_string(), import);
+                Ok(outcome)
+            }
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                self.imports.insert(id.to_string(), import);
+                Err(error)
+            }
+        }
+    }
+
+    fn finish_paste_import_loaded(
+        &mut self,
+        import: &mut PasteImport,
+        destination: PasteDestination,
+        approval: Approval,
+    ) -> Result<EditOutcome, String> {
+        self.require_editable()?;
+        self.refresh_indexed();
+        if !import.finished_upload {
+            return Err("导入尚未上传完成".into());
+        }
+        match destination {
+            PasteDestination::Rect { row, col } => {
+                self.paste_import_rect(import, row, col, approval)
+            }
+            PasteDestination::SingleCell { row, col } => {
+                self.resolve_batch_cell(row, col)?;
+                let value = Self::read_import_single_value(&import.path)?;
+                self.set_cell(row, col, value, approval)
+            }
+            PasteDestination::Fill { target } => {
+                self.paste_import_fill(import, target, approval)
+            }
+        }
+    }
+
+    /// 流式读取一个外部单值，按字节处理 CRLF/CR，避免先复制整份原文。
+    fn read_import_single_value(path: &Path) -> Result<String, String> {
+        let mut file = fs::File::open(path).map_err(|e| format!("打开导入文件失败：{e}"))?;
+        let mut buffer = [0u8; 64 * 1024];
+        let mut output = Vec::new();
+        let mut pending_cr = false;
+        loop {
+            let read = std::io::Read::read(&mut file, &mut buffer)
+                .map_err(|e| format!("读取导入文件失败：{e}"))?;
+            if read == 0 { break; }
+            for &byte in &buffer[..read] {
+                if pending_cr {
+                    output.push(b'\n');
+                    pending_cr = false;
+                    if byte == b'\n' { continue; }
+                }
+                if byte == b'\r' {
+                    pending_cr = true;
+                } else {
+                    output.push(byte);
+                }
+            }
+        }
+        if pending_cr { output.push(b'\n'); }
+        while output.last() == Some(&b'\n') { output.pop(); }
+        String::from_utf8(output).map_err(|_| "粘贴内容不是有效 UTF-8".to_string())
+    }
+
+    fn import_add_history_text(cost: &mut Cost, len: usize) -> Result<(), String> {
+        let bytes = history_text_bytes(len as u64).map_err(history_cost_error)?;
+        cost.add(bytes).map_err(history_cost_error)
+    }
+
+    /// Fill 普通路径共享一个新值；固定点路径只流式写入，不保存旧值。
+    fn paste_import_fill(
+        &mut self,
+        import: &mut PasteImport,
+        target: ClearTarget,
+        approval: Approval,
+    ) -> Result<EditOutcome, String> {
+        let total_rows = self.indexed_data_rows();
+        let ncols = self.schema.visible().len();
+        let target = target.normalize(total_rows, ncols)?;
+        let value = Self::read_import_single_value(&import.path)?;
+        let new_value = ValueRef::text(value);
+        let new_text: &str = match &new_value {
+            ValueRef::Text(text) => text.text.as_ref(),
+            ValueRef::Source { .. } => return Err("填充值类型错误".into()),
+        };
+        let mut estimated = Cost::new();
+        estimated.add_value::<Op>().map_err(history_cost_error)?;
+        let mut change_count = 0u64;
+        let mut empty_shared = false;
+        target.visit(total_rows, ncols, |vrow, col| {
+            let cell = self.resolve_batch_cell(vrow, col)?;
+            let old = self.cell_value(cell);
+            if old == new_text { return Ok(()); }
+            change_count = change_count.checked_add(1)
+                .ok_or_else(|| history_cost_error(HistoryError::CostOverflow))?;
+            if old.is_empty() || new_text.is_empty() { empty_shared = true; }
+            if !old.is_empty() { Self::import_add_history_text(&mut estimated, old.len())?; }
+            Ok(())
+        })?;
+        if change_count == 0 { return Ok(EditOutcome::unchanged()); }
+        let change_bytes = change_count
+            .checked_mul(std::mem::size_of::<CellChange>() as u64)
+            .ok_or_else(|| history_cost_error(HistoryError::CostOverflow))?;
+        estimated.add(change_bytes).map_err(history_cost_error)?;
+        if !new_text.is_empty() {
+            Self::import_add_history_text(&mut estimated, new_text.len())?;
+        }
+        if empty_shared {
+            Self::import_add_history_text(&mut estimated, 0)?;
+        }
+        let estimated_bytes = estimated.bytes();
+        if estimated_bytes > self.history.stats().budget_bytes {
+            let entry = HistoryEntry::new(
+                Op::SetCells { changes: Vec::new() }, estimated_bytes, Vec::new(), 1);
+            return match self.preflight_history_entry(entry, "外部填充", approval)? {
+                HistoryDecision::Confirm(outcome) => Ok(outcome),
+                HistoryDecision::FixedPoint(prepared) => {
+                    self.stream_fill_target(&target, total_rows, new_text)?;
+                    self.last_spec = None;
+                    self.finish_history(prepared, true, 0, 0)
+                }
+                HistoryDecision::Normal(_) => Err("填充固定点预检状态错误".into()),
+            };
+        }
+        let capacity = usize::try_from(change_count)
+            .map_err(|_| history_cost_error(HistoryError::CostOverflow))?;
+        let mut changes = Vec::with_capacity(capacity);
+        target.visit(total_rows, ncols, |vrow, col| {
+            let cell = self.resolve_batch_cell(vrow, col)?;
+            let old = self.cell_value(cell);
+            if old != new_text {
+                let old = self.history_value(cell, old);
+                changes.push(CellChange { cell, old, new: new_value.clone() });
+            }
+            Ok(())
+        })?;
+        debug_assert_eq!(changes.len(), capacity);
+        let (mut prepared, fixed_point) = match self.preflight_history(
+            Op::SetCells { changes }, "外部填充", approval)? {
+            HistoryDecision::Normal(prepared) => (prepared, false),
+            HistoryDecision::FixedPoint(prepared) => (prepared, true),
+            HistoryDecision::Confirm(outcome) => return Ok(outcome),
+        };
+        self.apply(&mut prepared.entry_mut().op);
+        self.last_spec = None;
+        self.finish_history(prepared, fixed_point, 0, 0)
+    }
+
+    fn stream_fill_target(
+        &mut self,
+        target: &NormalizedClear,
+        total_rows: u64,
+        value: &str,
+    ) -> Result<(), String> {
+        let ncols = self.schema.visible().len();
+        target.visit(total_rows, ncols, |vrow, col| {
+            let cell = self.resolve_batch_cell(vrow, col)?;
+            if self.cell_value(cell) != value { self.write_cell(cell, value); }
+            Ok(())
+        })
+    }
+
+    /// 外部矩形导入：首遍只读记录并累计精确历史成本，次遍才构造稀疏操作。
+    fn paste_import_rect(
+        &mut self,
+        import: &mut PasteImport,
+        vrow: u64,
+        col: u32,
+        approval: Approval,
+    ) -> Result<EditOutcome, String> {
+        let total_rows = if self.partial.is_some() { self.indexed_data_rows() } else { self.seg.vrow_count() };
+        if vrow > total_rows { return Err("粘贴起始行越界".into()); }
+        let original_ncols = self.schema.visible().len();
+        let paste_start = usize::try_from(col).map_err(|_| "粘贴列号溢出")?;
+        if paste_start > original_ncols { return Err("粘贴起始列越界".into()); }
+        let mut candidate = (*self.schema).clone();
+        let mut target_ncols = original_ncols;
+        let mut reader = RecordReader::open(&import.path, b'\t')?;
+        import.row_index.clear();
+        let mut row_count = 0u64;
+        let mut max_width = 0usize;
+        let mut change_count = 0u64;
+        let mut inserted_rows = 0u64;
+        let mut empty_shared = false;
+        let mut estimated = Cost::new();
+        estimated.add_value::<Op>().map_err(history_cost_error)?;
+        loop {
+            let offset = reader.position();
+            let Some(record) = reader.next_record()? else { break };
+            import.row_index.push(offset);
+            let row_index = row_count;
+            row_count = row_count.checked_add(1).ok_or("粘贴行数溢出")?;
+            max_width = max_width.max(record.len());
+            let required_cols = paste_start.checked_add(max_width).ok_or("粘贴列数溢出")?;
+            while target_ncols < required_cols {
+                let mut name_number = target_ncols.checked_add(1).ok_or("列名序号溢出")?;
+                let name = loop {
+                    let candidate_name = format!("列{name_number}");
+                    let exists = candidate.visible().iter().any(|id| {
+                        candidate.resolve(*id).is_some_and(|column| column.header == candidate_name)
+                    });
+                    if !exists { break candidate_name; }
+                    name_number = name_number.checked_add(1).ok_or("列名序号溢出")?;
+                };
+                let pos = u32::try_from(target_ncols).map_err(|_| "粘贴列数溢出")?;
+                candidate.insert(pos, name)?;
+                target_ncols = target_ncols.checked_add(1).ok_or("粘贴列数溢出")?;
+            }
+            if row_index < total_rows - vrow {
+                let target_row = vrow.checked_add(row_index).ok_or("粘贴行号溢出")?;
+                for (j, value) in record.iter().enumerate() {
+                    let target_col = paste_start.checked_add(j).ok_or("粘贴列号溢出")?;
+                    let target_col_u32 = u32::try_from(target_col).map_err(|_| "粘贴列号溢出")?;
+                    let old = if target_col < original_ncols {
+                        let cell = self.resolve_batch_cell(target_row, target_col_u32)?;
+                        self.cell_value(cell)
+                    } else {
+                        String::new()
+                    };
+                    if old == value.as_str() { continue; }
+                    change_count = change_count.checked_add(1).ok_or("粘贴变化数溢出")?;
+                    if old.is_empty() || value.is_empty() { empty_shared = true; }
+                    if !old.is_empty() { Self::import_add_history_text(&mut estimated, old.len())?; }
+                    if !value.is_empty() { Self::import_add_history_text(&mut estimated, value.len())?; }
+                }
+            } else {
+                if self.is_sorted() {
+                    return Err("排序模式下暂不支持扩行粘贴，请先取消排序".into());
+                }
+                if self.is_indexing() {
+                    return Err("索引期间暂不支持扩行粘贴，请等待索引完成".into());
+                }
+                inserted_rows = inserted_rows.checked_add(1).ok_or("插入行数溢出")?;
+                let mut stored_len = 0usize;
+                for (j, value) in record.iter().enumerate() {
+                    if value.is_empty() { continue; }
+                    let logical_col = paste_start.checked_add(j).ok_or("粘贴列号溢出")?;
+                    let view_col = u32::try_from(logical_col).map_err(|_| "粘贴列号溢出")?;
+                    let column_id = candidate.view_id(view_col).ok_or("粘贴列号越界")?;
+                    let storage = candidate.storage(column_id).ok_or("粘贴列存储不存在")?;
+                    let slot = self.inserted_slot(storage).ok_or("插入行存储槽不存在")?;
+                    stored_len = stored_len.max(slot.checked_add(1).ok_or("插入行槽号溢出")?);
+                    estimated.add(value.len() as u64).map_err(history_cost_error)?;
+                }
+                let row_bytes = (stored_len as u64)
+                    .checked_mul(std::mem::size_of::<String>() as u64)
+                    .ok_or_else(|| history_cost_error(HistoryError::CostOverflow))?;
+                estimated.add(row_bytes).map_err(history_cost_error)?;
+            }
+        }
+        if row_count == 0 { return Ok(EditOutcome::unchanged()); }
+        if self.is_sorted() && target_ncols > original_ncols {
+            return Err("排序模式下暂不支持扩列粘贴，请先取消排序".into());
+        }
+        let existing_count = row_count.min(total_rows - vrow);
+        debug_assert_eq!(inserted_rows, row_count - existing_count);
+        let after = if target_ncols > original_ncols {
+            Arc::new(candidate)
+        } else {
+            Arc::clone(&self.schema)
+        };
+        let schema_change = if target_ncols > original_ncols {
+            Some(SchemaChange { before: Arc::clone(&self.schema), after: Arc::clone(&after) })
+        } else {
+            None
+        };
+        let change_bytes = change_count
+            .checked_mul(std::mem::size_of::<CellChange>() as u64)
+            .ok_or_else(|| history_cost_error(HistoryError::CostOverflow))?;
+        estimated.add(change_bytes).map_err(history_cost_error)?;
+        let inserted_bytes = inserted_rows
+            .checked_mul(std::mem::size_of::<Vec<String>>() as u64)
+            .ok_or_else(|| history_cost_error(HistoryError::CostOverflow))?;
+        estimated.add(inserted_bytes).map_err(history_cost_error)?;
+        if let Some(change) = &schema_change {
+            estimated.add(change.before.history_bytes()).map_err(history_cost_error)?;
+            estimated.add(change.after.history_bytes()).map_err(history_cost_error)?;
+        }
+        if empty_shared { Self::import_add_history_text(&mut estimated, 0)?; }
+        let estimated_bytes = estimated.bytes();
+        if estimated_bytes > self.history.stats().budget_bytes {
+            let entry = HistoryEntry::new(
+                Op::Paste { changes: Vec::new(), inserted: None, schema_change: None },
+                estimated_bytes, Vec::new(), 1);
+            return match self.preflight_history_entry(entry, "外部粘贴", approval)? {
+                HistoryDecision::Confirm(outcome) => Ok(outcome),
+                HistoryDecision::FixedPoint(_) => {
+                    Err("超大矩形粘贴需要预生成 backing，当前操作未执行".into())
+                }
+                HistoryDecision::Normal(_) => Err("粘贴固定点预检状态错误".into()),
+            };
+        }
+        let change_capacity = usize::try_from(change_count)
+            .map_err(|_| history_cost_error(HistoryError::CostOverflow))?;
+        let insert_capacity = usize::try_from(inserted_rows)
+            .map_err(|_| history_cost_error(HistoryError::CostOverflow))?;
+        let mut changes = Vec::with_capacity(change_capacity);
+        let mut inserted = Vec::with_capacity(insert_capacity);
+        reader.seek(0)?;
+        let mut input_index = 0u64;
+        while let Some(record) = reader.next_record()? {
+            let row_index = input_index;
+            input_index = input_index.checked_add(1).ok_or("粘贴行数溢出")?;
+            if row_index < existing_count {
+                let target_row = vrow.checked_add(row_index).ok_or("粘贴行号溢出")?;
+                for (j, value) in record.into_iter().enumerate() {
+                    let target_col = paste_start.checked_add(j).ok_or("粘贴列号溢出")?;
+                    let target_col_u32 = u32::try_from(target_col).map_err(|_| "粘贴列号溢出")?;
+                    let cell = self.resolve_batch_cell_in_schema(target_row, target_col_u32, &after)?;
+                    let old = self.cell_value(cell);
+                    if old != value {
+                        let old = self.history_value(cell, old);
+                        changes.push(CellChange { cell, old, new: ValueRef::text(value) });
+                    }
+                }
+            } else {
+                inserted.push(self.import_storage_row(&after, paste_start, record)?);
+            }
+        }
+        debug_assert_eq!(input_index, row_count);
+        debug_assert_eq!(changes.len(), change_capacity);
+        debug_assert_eq!(inserted.len(), insert_capacity);
+        if changes.is_empty() && inserted.is_empty() && schema_change.is_none() {
+            return Ok(EditOutcome::unchanged());
+        }
+        let inserted = if inserted.is_empty() {
+            None
+        } else {
+            Some(PasteInsert { vpos: total_rows, block: 0, rows: inserted })
+        };
+        let (mut prepared, fixed_point) = match self.preflight_history(
+            Op::Paste { changes, inserted, schema_change }, "外部粘贴", approval)? {
+            HistoryDecision::Normal(prepared) => (prepared, false),
+            HistoryDecision::FixedPoint(prepared) => (prepared, true),
+            HistoryDecision::Confirm(outcome) => return Ok(outcome),
+        };
+        self.apply(&mut prepared.entry_mut().op);
+        self.last_spec = None;
+        self.finish_history(prepared, fixed_point, inserted_rows, 0)
+    }
+
+    /// 将一条插入记录直接转成物理槽，预分配精确容量以便成本可复核。
+    fn import_storage_row(
+        &self,
+        schema: &Schema,
+        paste_start: usize,
+        record: Vec<String>,
+    ) -> Result<Vec<String>, String> {
+        let mut stored_len = 0usize;
+        for (j, value) in record.iter().enumerate() {
+            if value.is_empty() { continue; }
+            let logical_col = paste_start.checked_add(j).ok_or("粘贴列号溢出")?;
+            let view_col = u32::try_from(logical_col).map_err(|_| "粘贴列号溢出")?;
+            let column_id = schema.view_id(view_col).ok_or("粘贴列号越界")?;
+            let storage = schema.storage(column_id).ok_or("粘贴列存储不存在")?;
+            let slot = self.inserted_slot(storage).ok_or("插入行存储槽不存在")?;
+            stored_len = stored_len.max(slot.checked_add(1).ok_or("插入行槽号溢出")?);
+        }
+        let mut stored = Vec::with_capacity(stored_len);
+        stored.resize(stored_len, String::new());
+        for (j, value) in record.into_iter().enumerate() {
+            if value.is_empty() { continue; }
+            let logical_col = paste_start.checked_add(j).ok_or("粘贴列号溢出")?;
+            let view_col = u32::try_from(logical_col).map_err(|_| "粘贴列号溢出")?;
+            let column_id = schema.view_id(view_col).ok_or("粘贴列号越界")?;
+            let storage = schema.storage(column_id).ok_or("粘贴列存储不存在")?;
+            let slot = self.inserted_slot(storage).ok_or("插入行存储槽不存在")?;
+            stored[slot] = value.into_boxed_str().into_string();
+        }
+        Ok(stored)
     }
 
     /// 粘贴不规则行块；扩列、既有格与末尾扩行只占一步历史。

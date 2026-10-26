@@ -482,3 +482,67 @@ test("剪切复制失败返回 false 且不清除", async () => {
   assert.equal(clears, 0);
   assert.deepEqual(writes, []);
 });
+
+function makeLargePasteGrid() {
+  const calls = [];
+  const g = Object.create(Grid.prototype);
+  g.sel = { current: [2, 1] };
+  g.selectedSet = new Set([0, 1]);
+  g.lastCopiedText = null;
+  g.hooks = { statusMsg: () => {} };
+  g.model = {
+    pasteExternalText: async (text, destination) => {
+      calls.push([text, destination]);
+      return { changed: true, insertedRows: 0, removedRows: 0, cancelled: false };
+    },
+    setData: async () => { throw new Error("大文本不得走 setData"); },
+    pasteRows: async () => { throw new Error("大文本不得走 pasteRows"); },
+    setCells: async () => { throw new Error("大文本不得走 setCells"); },
+  };
+  g._singleSelectionRect = () => ({ row: 2, col: 1, rows: 1, cols: 2 });
+  g.selectedCells = () => [[2, 1], [2, 2]];
+  g.select = () => {};
+  g._extendTo = () => {};
+  return { g, calls };
+}
+
+function makeLargeText() {
+  return "x".repeat(8 * 1024 * 1024 + 1);
+}
+
+test("大外部无 Tab 文本走 SingleCell 流式导入", async () => {
+  const { g, calls } = makeLargePasteGrid();
+  g.selectedSet = new Set([0]);
+  const restore = stubNavigatorClipboard(makeLargeText());
+  try { await g.pasteClipboard(); } finally { restore(); }
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0].length, 8 * 1024 * 1024 + 1);
+  assert.deepEqual(calls[0][1], { kind: "singleCell", row: 2, col: 1 });
+});
+
+test("大外部含 Tab 文本走 Rect 流式导入", async () => {
+  const { g, calls } = makeLargePasteGrid();
+  const restore = stubNavigatorClipboard(makeLargeText() + "\tZ");
+  try { await g.pasteClipboard(); } finally { restore(); }
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0][1], { kind: "rect", row: 2, col: 1 });
+});
+
+test("大外部单值多选区走结构化 Fill 流式导入", async () => {
+  const { g, calls } = makeLargePasteGrid();
+  const restore = stubNavigatorClipboard(makeLargeText());
+  try { await g.pasteClipboard(); } finally { restore(); }
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0][1], {
+    kind: "fill",
+    target: { kind: "rect", row: 2, col: 1, rows: 1, cols: 2 },
+  });
+});
+
+test("forceSplit 大文本始终走 Rect 而不是 Fill 或 SingleCell", async () => {
+  const { g, calls } = makeLargePasteGrid();
+  const restore = stubNavigatorClipboard(makeLargeText());
+  try { await g.pasteClipboard(true); } finally { restore(); }
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0][1], { kind: "rect", row: 2, col: 1 });
+});

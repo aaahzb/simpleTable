@@ -11,6 +11,7 @@
  */
 
 import { DEFAULT_UNDO_BUDGET_MIB, normalizeUndoBudgetMiB, undoBudgetBytes } from "./prefs.js";
+import { bytesToHex, utf8Chunks } from "./clipboard.js";
 
 /** 之后新建会话使用的默认历史预算；已有会话只能由显式设置修改。 */
 let defaultUndoBudgetMiB = DEFAULT_UNDO_BUDGET_MIB;
@@ -1036,6 +1037,49 @@ export class BigModel {
    * @returns {Promise<object>} 引擎 EditOutcome（含 changed/insertedRows/cancelled）。
    * @throws {Error} 筛选态、位置/列非法、快照超限或会话失败。
    */
+  /**
+   * 将外部文本按 UTF-8 分块上传，再由引擎流式完成粘贴。
+   * 固定点重试只复用 importId，不重复上传文本；未消费的导入统一取消。
+   *
+   * @param {string} text - 外部剪贴板文本。
+   * @param {object} destination - PasteDestination。
+   * @returns {Promise<object>} EditOutcome。
+   */
+  async pasteExternalText(text, destination) {
+    let importId = null;
+    let consumed = false;
+    try {
+      const begin = await this._invoke("big_paste_import_begin");
+      importId = begin.importId;
+      let sent = false;
+      for (const chunk of utf8Chunks(text)) {
+        sent = true;
+        await this._invoke("big_paste_import_chunk", {
+          importId,
+          hex: bytesToHex(chunk.bytes),
+          last: chunk.end === text.length,
+        });
+      }
+      if (!sent) {
+        await this._invoke("big_paste_import_chunk", { importId, hex: "", last: true });
+      }
+      const outcome = await this._invokeEdit("big_paste_import_finish", {
+        importId, destination,
+      });
+      if (outcome.cancelled) return outcome;
+      consumed = true;
+      return await this._afterEdit(outcome, "edit");
+    } finally {
+      if (!consumed && importId !== null) {
+        try {
+          await this._invoke("big_paste_import_cancel", { importId });
+        } catch {
+          // 保留原始粘贴错误；清理失败由会话 spool 的最终清理兜底。
+        }
+      }
+    }
+  }
+
   async pasteRows(row, col, rows) {
     if (this._filterOn) {
       throw new Error("筛选结果中不可编辑：请先清除筛选");

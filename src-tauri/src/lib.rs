@@ -964,6 +964,10 @@ pub fn run() {
             big_set_cells,
             big_clear,
             big_paste,
+            big_paste_import_begin,
+            big_paste_import_chunk,
+            big_paste_import_finish,
+            big_paste_import_cancel,
             big_insert_rows,
             big_remove_rows,
             big_undo,
@@ -988,6 +992,64 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building simpleTable")
         .run(|_app, _event| {});
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PasteImportBegin {
+    import_id: String,
+}
+
+#[derive(Serialize)]
+struct PasteImportChunk {
+    bytes: u64,
+}
+
+/// 开始一个会话级外部文本导入。
+#[tauri::command]
+fn big_paste_import_begin(
+    state: tauri::State<BigShared>,
+    session: u64,
+) -> Result<PasteImportBegin, String> {
+    with_big(&state, session, |bf| {
+        bf.begin_paste_import().map(|import_id| PasteImportBegin { import_id })
+    })
+}
+
+/// 上传一个 UTF-8 字节的十六进制分块。
+#[tauri::command]
+fn big_paste_import_chunk(
+    state: tauri::State<BigShared>,
+    session: u64,
+    import_id: String,
+    hex: String,
+    last: bool,
+) -> Result<PasteImportChunk, String> {
+    with_big(&state, session, |bf| {
+        bf.append_paste_import(&import_id, &hex, last).map(|bytes| PasteImportChunk { bytes })
+    })
+}
+
+/// 流式完成外部文本导入，固定点预检沿用统一编辑协议。
+#[tauri::command]
+fn big_paste_import_finish(
+    state: tauri::State<BigShared>,
+    session: u64,
+    import_id: String,
+    destination: engine::PasteDestination,
+    approval: Approval,
+) -> Result<EditOutcome, String> {
+    with_big(&state, session, |bf| bf.finish_paste_import(&import_id, destination, approval))
+}
+
+/// 取消并清理一个尚未消费的导入。
+#[tauri::command]
+fn big_paste_import_cancel(
+    state: tauri::State<BigShared>,
+    session: u64,
+    import_id: String,
+) -> Result<(), String> {
+    with_big(&state, session, |bf| bf.cancel_paste_import(&import_id))
 }
 
 /// 前端确认关闭（或保存完毕）后调用：立即退出进程。

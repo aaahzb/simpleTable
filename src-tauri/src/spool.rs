@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const MEM_SNAPSHOT_MAX_BYTES: u64 = 1024 * 1024;
 pub const SPOOL_RESERVE_BYTES: u64 = 8 * 1024 * 1024;
+pub const PASTE_CHUNK_BYTES: usize = 512 * 1024;
 
 /// 当前文档会话独占的临时目录及文件编号。
 pub struct SessionSpool {
@@ -64,6 +65,85 @@ impl Drop for SessionSpool {
         if self.owned {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+}
+
+
+/// 一个外部文本导入的独占临时文件及其上传状态。
+pub struct PasteImport {
+    pub id: String,
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub finished_upload: bool,
+    pub row_index: Vec<u64>,
+}
+
+impl PasteImport {
+    /// 在目标会话的 spool 中创建一个唯一导入文件。
+    pub fn begin(spool: &SessionSpool, id: String) -> Result<Self, String> {
+        if id.is_empty() {
+            return Err("导入 ID 不能为空".into());
+        }
+        let path = spool.new_file("paste")?;
+        Ok(Self { id, path, bytes: 0, finished_upload: false, row_index: Vec::new() })
+    }
+
+    /// 校验并追加一个 hex 分块；所有可预见错误都发生在写入前。
+    pub fn append_hex(&mut self, spool: &SessionSpool, hex: &str, last: bool)
+        -> Result<u64, String> {
+        if self.finished_upload {
+            return Err("导入已结束，不能继续追加分块".into());
+        }
+        if hex.len() % 2 != 0 {
+            return Err("粘贴分块 hex 长度必须为偶数".into());
+        }
+        let decoded_len = hex.len() / 2;
+        if decoded_len > PASTE_CHUNK_BYTES {
+            return Err("粘贴分块超过 512 KiB".into());
+        }
+        let mut decoded = Vec::with_capacity(decoded_len);
+        for pair in hex.as_bytes().chunks_exact(2) {
+            let hi = hex_digit(pair[0]).ok_or("粘贴分块包含非法十六进制字符")?;
+            let lo = hex_digit(pair[1]).ok_or("粘贴分块包含非法十六进制字符")?;
+            decoded.push((hi << 4) | lo);
+        }
+        let decoded_u64 = u64::try_from(decoded_len).map_err(|_| "粘贴分块长度溢出")?;
+        let total = self.bytes.checked_add(decoded_u64).ok_or("粘贴字节数溢出")?;
+        spool.ensure_capacity(decoded_u64)?;
+        let mut file = OpenOptions::new().append(true).open(&self.path)
+            .map_err(|e| format!("打开粘贴导入文件失败：{e}"))?;
+        file.write_all(&decoded).map_err(|e| format!("写入粘贴导入文件失败：{e}"))?;
+        file.flush().map_err(|e| format!("冲刷粘贴导入文件失败：{e}"))?;
+        self.bytes = total;
+        if last {
+            self.finished_upload = true;
+        }
+        Ok(self.bytes)
+    }
+
+    /// 消费导入并只删除自己拥有的临时文件。
+    pub fn cancel(self) -> Result<(), String> {
+        let path = self.path.clone();
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("删除粘贴导入文件失败：{e}")),
+        }
+    }
+}
+
+impl Drop for PasteImport {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -267,6 +347,24 @@ pub fn history_text_bytes(utf8_len: u64) -> Result<u64, HistoryError> {
 mod tests {
     use super::{RowSnapshot, SessionSpool, MEM_SNAPSHOT_MAX_BYTES, history_text_bytes};
     use crate::history::HistoryError;
+
+    #[test]
+    fn paste_import_rejects_bad_hex_and_oversized_chunk() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "simpletable-paste-test-{}-{nonce}", std::process::id()));
+        let spool = SessionSpool::create(&root).unwrap();
+        let mut import = super::PasteImport::begin(&spool, "chunk".into()).unwrap();
+        assert_eq!(import.append_hex(&spool, "41", false).unwrap(), 1);
+        assert!(import.append_hex(&spool, "0g", false).is_err());
+        let oversized = "41".repeat(super::PASTE_CHUNK_BYTES as usize + 1);
+        assert!(import.append_hex(&spool, &oversized, false).is_err());
+        assert_eq!(import.bytes, 1);
+        let path = import.path.clone();
+        import.cancel().unwrap();
+        assert!(!path.exists());
+    }
 
     #[test]
     fn spool_snapshot_roundtrip_and_drop_cleans_only_owned_dir() {
