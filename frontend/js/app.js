@@ -16,6 +16,7 @@ import {
   shortcutsDialog, sortDialog, undoBudgetDialog,
 } from "./dialogs.js";
 import { createUndoBudgetPrefs } from "./prefs.js";
+import { createOpenRequestPump } from "./openrequests.js";
 
 /** @type {any} Tauri v2 全局对象（withGlobalTauri） */
 const tauri = window.__TAURI__;
@@ -1682,10 +1683,51 @@ async function newFile() {
   await activateTab(t.id);
 }
 
-/** 打开 CSV：文件对话框选择（作为新页签；已有路径则激活） */
+/** 所有用户入口统一提交进程级打开队列，由 owner 窗口串行消费。 */
+async function submitOpenPaths(paths) {
+  const csvs = paths.filter((p) => p.toLowerCase().endsWith(".csv"));
+  if (!csvs.length) return false;
+  try {
+    await invoke("open_requests_submit", { paths: csvs });
+    return true;
+  } catch (err) {
+    await errorDialog("打开失败", String(err?.message ?? err));
+    return false;
+  }
+}
+
+/** 消费一个 Open：模型和标签都建立后 commit；失败由 pump 释放预留。 */
+async function openQueuedPath(p, { requestId } = {}) {
+  const before = new Set(tabs.map((t) => t.id));
+  try {
+    if (!(await openPathsAsTabs([p]))) throw new Error(`无法打开 ${p}`);
+    const tab = tabs.find((t) => t.path === p && t.model?.sessionId);
+    if (!tab) throw new Error(`文件已读取，但标签未能建立：${p}`);
+    await invoke("open_requests_commit", {
+      requestId, path: p, session: tab.model.sessionId, lease: tab.model.lease ?? 0,
+    });
+    return true;
+  } catch (error) {
+    // 模型已建但渲染/提交失败时，big_close 随 closeTab 回滚会话。
+    for (const tab of tabs.filter((t) => !before.has(t.id))) {
+      try { await closeTab(tab.id); } catch { /* 保留原始打开错误 */ }
+    }
+    throw error;
+  }
+}
+
+/** Activate 只聚焦原窗口的原标签，绝不重新读盘或新建会话。 */
+async function activateQueuedPath(p, session) {
+  const tab = tabs.find((t) => t.model?.sessionId === session)
+    ?? tabs.find((t) => t.path === p);
+  if (!tab) throw new Error(`已打开文件的原标签不可用：${p}`);
+  return activateTab(tab.id);
+}
+
+/** 打开 CSV：文件对话框选择，经统一队列作为新页签或激活原签。 */
 async function openFile() {
   const p = await invoke("pick_open_path");
-  if (p) await openPath(p);
+  if (p) await submitOpenPaths([p]);
 }
 
 /**
@@ -1870,7 +1912,7 @@ window.addEventListener("focus", async () => {
 tauri.event.listen("tauri://drag-drop", async (e) => {
   const paths = e.payload?.paths ?? [];
   const csvs = paths.filter((x) => x.toLowerCase().endsWith(".csv"));
-  if (csvs.length) await openPathsAsTabs(csvs);
+  if (csvs.length) await submitOpenPaths(csvs);
 });
 
 // ---- 关闭前确认 ----
@@ -2289,9 +2331,16 @@ const gridLive = new Proxy(/** @type {any} */ ({}), {
   refreshHeaderlessUi();
   // 初始标题保持 "simpleTable"（对齐 Qt：首次标脏/文件操作后才刷新标题）
 
-  // 命令行/文件关联传入的 CSV：启动即打开
-  const startupPath = await invoke("get_startup_path");
-  if (startupPath) await openPath(startupPath);
+  // 启动参数、第二实例和 macOS Opened 均由后端队列分发；监听先于 ready。
+  const openPump = createOpenRequestPump({
+    invoke,
+    listen: (event, handler) => tauri.event.listen(event, handler),
+    openPath: openQueuedPath,
+    activatePath: activateQueuedPath,
+    reportError: (error) => statusMsg(`打开失败：${error?.message ?? error}`, 5000),
+  });
+  await openPump.start();
+  await openPump.idle();
 
   if (await invoke("is_smoke")) {
     // 未捕获异常兜底：任何前端错误都要写报告退出，不能让冒烟无声挂死

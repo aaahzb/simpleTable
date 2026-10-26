@@ -37,6 +37,16 @@
     ],
     "macOS": {
       "signingIdentity": "-"
-    }
+    },
+    "fileAssociations": [
+      {
+        "ext": ["csv"],
+        "name": "CSV Document",
+        "description": "CSV document",
+        "role": "Editor",
+        "contentTypes": ["public.comma-separated-values-text"],
+        "mimeType": "text/csv"
+      }
+    ]
   }
 }

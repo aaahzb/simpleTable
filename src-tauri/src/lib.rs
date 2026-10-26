@@ -4,7 +4,7 @@
 //! 前端经 `window.__TAURI__.core.invoke` 调用本模块命令；文件内容一律
 //! 以字符串形式跨边界传输，编码处理全部收敛在本层（对齐 csv_io.py）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
@@ -279,9 +279,179 @@ fn io_err(path: &str, e: &std::io::Error) -> String {
     format!("{path}: {reason}")
 }
 
-/// 启动参数状态：命令行携带的待打开 CSV（文件关联/双击打开用）。
-struct StartupArgs {
-    open_path: Option<String>,
+/// 进程级运行状态；打开队列先于任何窗口 ready 建立，后续任务在此并入文档和窗口表。
+#[derive(Default)]
+struct RuntimeState {
+    opens: open_request::OpenRequestQueue,
+}
+
+type SharedRuntime = Arc<Mutex<RuntimeState>>;
+
+fn with_runtime<T>(
+    app: &tauri::AppHandle,
+    f: impl FnOnce(&mut RuntimeState) -> T,
+) -> Result<T, String> {
+    let state = app.state::<SharedRuntime>();
+    let mut guard = state.lock().map_err(|e| e.to_string())?;
+    Ok(f(&mut guard))
+}
+
+/// 窗口注册表接入前，唯一可接收文档的窗口固定为 main。
+fn recent_window_label(_app: &tauri::AppHandle) -> String {
+    "main".to_string()
+}
+
+fn focus_recent_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(&recent_window_label(app)) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn diagnostic_mode() -> bool {
+    std::env::args_os().any(|arg| arg == "--smoke" || arg == "--park")
+}
+
+/// 定向投递打开批次；不可 Unicode 路径和发送失败都必须释放预留并继续排队。
+fn dispatch_open_batches(app: &tauri::AppHandle, initial: Vec<open_request::OpenBatch>) {
+    let mut scheduled: VecDeque<open_request::OpenBatch> = initial.into();
+    while let Some(batch) = scheduled.pop_front() {
+        let deliverable = batch.items.iter().filter(|item| match item {
+            open_request::OpenItem::Open { path, .. }
+            | open_request::OpenItem::Activate { path, .. } => path.to_str().is_some(),
+        }).cloned().collect::<Vec<_>>();
+        let emitted = if deliverable.is_empty() {
+            false
+        } else {
+            let delivery = open_request::OpenBatch {
+                batch_id: batch.batch_id,
+                target: batch.target.clone(),
+                items: deliverable,
+            };
+            match app.emit_to(batch.target.as_str(), "open-paths", delivery) {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!("打开批次投递失败（{}）：{error}", batch.target);
+                    false
+                }
+            }
+        };
+        let recent = recent_window_label(app);
+        let follow_up = with_runtime(app, |runtime| {
+            let mut follow_up = Vec::new();
+            for item in &batch.items {
+                let open_request::OpenItem::Open { request_id, path } = item else {
+                    continue;
+                };
+                if emitted && path.to_str().is_some() {
+                    continue;
+                }
+                if path.to_str().is_none() {
+                    eprintln!("路径不是有效 Unicode，无法安全分发：{path:?}");
+                }
+                match runtime.opens.fail_open(*request_id, path, &recent) {
+                    Ok(batches) => follow_up.extend(batches),
+                    Err(error) => eprintln!("释放打开预留失败：{error}"),
+                }
+            }
+            if !emitted {
+                match runtime.opens.ack(&batch.target, batch.batch_id) {
+                    Ok(next) => follow_up.extend(next),
+                    Err(error) => eprintln!("回收打开批次失败：{error}"),
+                }
+            }
+            follow_up
+        });
+        match follow_up {
+            Ok(batches) => scheduled.extend(batches),
+            Err(error) => {
+                eprintln!("打开队列状态不可用：{error}");
+                return;
+            }
+        }
+    }
+}
+
+fn enqueue_open_paths(app: &tauri::AppHandle, paths: Vec<std::path::PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    let recent = recent_window_label(app);
+    match with_runtime(app, |runtime| runtime.opens.enqueue(paths, &recent)) {
+        Ok(batches) => dispatch_open_batches(app, batches),
+        Err(error) => eprintln!("加入打开队列失败：{error}"),
+    }
+}
+
+#[tauri::command]
+fn open_requests_submit(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    enqueue_open_paths(&app, paths.into_iter().map(std::path::PathBuf::from).collect());
+    Ok(())
+}
+
+#[tauri::command]
+fn open_requests_ready(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+) -> Result<Option<open_request::OpenBatch>, String> {
+    let batch = with_runtime(&app, |runtime| runtime.opens.mark_ready(window.label()))?;
+    dispatch_open_batches(&app, batch.into_iter().collect());
+    // 实际批次统一经已注册的 open-paths 监听发送，避免非 Unicode 路径进入 IPC。
+    Ok(None)
+}
+
+#[tauri::command]
+fn open_requests_ack(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    batch_id: u64,
+) -> Result<Option<open_request::OpenBatch>, String> {
+    let next = with_runtime(&app, |runtime| runtime.opens.ack(window.label(), batch_id))??;
+    dispatch_open_batches(&app, next.into_iter().collect());
+    // 下一批经同一 open-paths 监听进入前端现有 Promise 链。
+    Ok(None)
+}
+
+#[tauri::command]
+fn open_requests_commit(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    big: tauri::State<'_, BigShared>,
+    request_id: u64,
+    path: String,
+    session: u64,
+    lease: u64,
+) -> Result<(), String> {
+    let _entry = big_entry(big.inner(), session)?;
+    let _ = lease;
+    let batches = with_runtime(&app, |runtime| {
+        runtime.opens.complete_open(
+            request_id,
+            std::path::Path::new(&path),
+            session,
+            window.label(),
+        )
+    })??;
+    dispatch_open_batches(&app, batches);
+    Ok(())
+}
+
+#[tauri::command]
+fn open_requests_fail(
+    app: tauri::AppHandle,
+    request_id: u64,
+    path: String,
+) -> Result<(), String> {
+    let recent = recent_window_label(&app);
+    let batches = with_runtime(&app, |runtime| {
+        runtime.opens.fail_open(request_id, std::path::Path::new(&path), &recent)
+    })??;
+    dispatch_open_batches(&app, batches);
+    Ok(())
 }
 
 /// 单个大文件会话：文件本体 + 独立筛选代数。
@@ -873,18 +1043,6 @@ fn big_col_apply(
     with_big(&state, session, |bf| bf.apply_col_ops(approval))
 }
 
-/// 取命令行第一个 .csv 路径（启动时由前端拉取并打开）。
-///
-/// # Parameters
-/// - `state`: 托管的启动参数。
-///
-/// # Returns
-/// 路径字符串；无则 null。
-#[tauri::command]
-fn get_startup_path(state: tauri::State<StartupArgs>) -> Option<String> {
-    state.open_path.clone()
-}
-
 /// 截屏诊断模式：启动参数 `--park <mode>` 时返回 mode 字符串，否则 None。
 ///
 /// 窗口停在指定渲染场景待命（进程不退出），供外部截屏工具读像素、
@@ -917,13 +1075,23 @@ fn path_exists(path: String) -> bool {
 /// # Returns
 /// 不返回（事件循环退出时进程结束）。
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
+        .manage(SharedRuntime::default());
+    #[cfg(windows)]
+    let builder = if diagnostic_mode() {
+        builder
+    } else {
+        builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            let paths = open_request::normalize_args(
+                args.into_iter().map(std::ffi::OsString::from).collect(),
+                std::path::Path::new(&cwd),
+            );
+            focus_recent_window(app);
+            enqueue_open_paths(app, paths);
+        }))
+    };
+    builder
         .setup(|app| {
-            // 命令行 .csv 参数（资源管理器"打开方式"/双击关联场景）
-            let open_path = std::env::args()
-                .skip(1)
-                .find(|a| a.to_lowercase().ends_with(".csv"));
-            app.manage(StartupArgs { open_path });
             app.manage(BigShared::new(Mutex::new(HashMap::new())));
             app.manage(ClipboardStore::create_unique()?);
             // 关闭请求转发给前端做"未保存确认"，确认后由 quit_app 命令真正退出
@@ -936,11 +1104,18 @@ pub fn run() {
                     }
                 });
             }
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let paths = open_request::normalize_args(std::env::args_os().collect(), &cwd);
+            enqueue_open_paths(app.handle(), paths);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_version,
-            get_startup_path,
+            open_requests_submit,
+            open_requests_ready,
+            open_requests_ack,
+            open_requests_commit,
+            open_requests_fail,
             is_smoke,
             is_park,
             path_exists,
@@ -1003,8 +1178,25 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building simpleTable")
         .run(|app, event| {
-            if matches!(event, tauri::RunEvent::Exit) {
-                cleanup_process_state(app);
+            match event {
+                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+                tauri::RunEvent::Opened { urls } => {
+                    let mut paths = Vec::new();
+                    for url in urls {
+                        match open_request::file_url_to_path(url.as_str()) {
+                            Ok(path) if path.extension().and_then(|ext| ext.to_str())
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("csv")) => {
+                                paths.push(path);
+                            }
+                            Ok(_) => eprintln!("忽略非 CSV 的 Opened URL：{url}"),
+                            Err(error) => eprintln!("忽略无效 Opened URL：{error}"),
+                        }
+                    }
+                    focus_recent_window(app);
+                    enqueue_open_paths(app, paths);
+                }
+                tauri::RunEvent::Exit => cleanup_process_state(app),
+                _ => {}
             }
         });
 }
