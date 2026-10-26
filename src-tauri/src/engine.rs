@@ -5705,6 +5705,16 @@ keep,old,target
 
     // ---- Part 24：内存字节源建表（统一大引擎，新建表格不写盘） ----
 
+    #[test]
+    fn meta_reports_filtered_state() {
+        let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
+        assert!(!bf.meta().filtered);
+        bf.run_filter(&spec_one(0, "Alice")).unwrap();
+        assert!(bf.meta().filtered);
+        bf.clear_filter();
+        assert!(!bf.meta().filtered);
+    }
+
     /// from_bytes：内存字节直接建会话——无路径、Ram 后备、同步索引，
     /// meta/读路径与磁盘打开完全一致。
     #[test]
@@ -6763,6 +6773,8 @@ pub struct BigMeta {
     pub has_path: bool,
     /// 当前是否处于排序视图（显示行按 `order` 映射）。
     pub sorted: bool,
+    /// 当前是否有筛选命中集。
+    pub filtered: bool,
     /// 是否存在上次保存后的内容修改（排序本身不算修改）。
     pub modified: bool,
     /// 已建立索引的字节数 / 文件总字节数。
@@ -8602,6 +8614,7 @@ impl BigFile {
             ram_backed: self.is_ram_backed(),
             has_path: self.has_path(),
             sorted: self.is_sorted(),
+            filtered: self.has_filter(),
             modified: self.modified(),
             indexed_bytes,
             total_bytes: self.total_bytes,

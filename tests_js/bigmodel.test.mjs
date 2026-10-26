@@ -5,290 +5,10 @@ import { test } from "node:test";
 
 import { BigModel, BIG_PAGE, BIG_THRESHOLD } from "../frontend/js/bigmodel.js";
 import { findVerticalEdge } from "../frontend/js/nav.js";
+import { makeFakeEngine, makeSharedBackend } from "./helpers/shared_bigmodel_fake.mjs";
 
 function editOutcome({ changed = false, insertedRows = 0, removedRows = 0 } = {}) {
   return { changed, insertedRows, removedRows, fixedPoint: null, cancelled: false };
-}
-
-/** 造一个内存版"引擎"：N 行 M 列的顺序数据 + 记录 invoke 调用。 */
-function makeFakeEngine({ rows = 1000, cols = 3, data: initial = null } = {}) {
-  let data = initial
-    ? initial.map((r) => r.slice())
-    : Array.from({ length: rows }, (_, r) =>
-      Array.from({ length: cols }, (_, c) => `r${r}c${c}`),
-    );
-  const calls = [];
-  let headerless = false;
-  let ramBacked = false;
-  let hasPath = false; // big_open 置 true、big_new 置 false
-  let sorted = false;
-  let ncols = cols; // big_new 后随文本重估列数
-  let baseHeaders = Array.from({ length: cols }, (_, c) => `h${c}`);
-  const generic = () => Array.from({ length: ncols }, (_, c) => `列${c + 1}`);
-  const meta = () => ({
-    rows: data.length,
-    cols: ncols,
-    headers: headerless ? generic() : baseHeaders.slice(),
-    encoding: "utf-8",
-    pending_cols: false,
-    can_undo: false,
-    can_redo: false, modified: false,
-    headerless,
-    // 渐进索引字段：普通夹具视为"已索引完成"
-    indexing: false,
-    ram_backed: ramBacked,
-    has_path: hasPath,
-    sorted,
-    indexed_bytes: 1024,
-    total_bytes: 1024,
-    open_ms: 3,
-    index_ms: 3,
-    elapsed_ms: 3,
-  });
-  let filter = null; // 命中视图行号数组
-  const model = new BigModel({
-    invoke: async (cmd, args = {}) => {
-      calls.push([cmd, args]);
-      switch (cmd) {
-        case "big_open":
-          headerless = !!args.headerless;
-          hasPath = true;
-          return meta();
-        case "big_new": {
-          // 对齐引擎 from_bytes：按行切分、跳过空白行；空文本同语义拒绝
-          const recs = String(args.text).split(/\r\n|\n/)
-            .filter((l) => l.length > 0)
-            .map((l) => l.split(",").map((c) => (c === '""' ? "" : c)));
-          if (!recs.length) throw new Error("空文件");
-          headerless = !!args.headerless;
-          if (headerless) {
-            data = recs;
-          } else {
-            baseHeaders = recs[0].slice();
-            data = recs.slice(1);
-          }
-          ncols = recs[0].length;
-          ramBacked = true;
-          hasPath = false;
-          filter = null;
-          return meta();
-        }
-        case "big_set_headerless": {
-          const on = !!args.on;
-          const changed = on !== headerless;
-          let insertedRows = 0;
-          let removedRows = 0;
-          if (changed) {
-            if (on) {
-              data.unshift(baseHeaders.slice());
-              insertedRows = 1;
-            } else {
-              if (!data.length) throw new Error("没有数据行可作为列名");
-              baseHeaders = data.shift().slice();
-              removedRows = 1;
-            }
-            headerless = on;
-            filter = null;
-          }
-          return editOutcome({ changed, insertedRows, removedRows });
-        }
-        case "big_set_undo_budget":
-        case "big_meta":
-          return meta();
-        case "big_rows": {
-          const from = Number(args.from);
-          return data.slice(from, from + Number(args.count)).map((row) => [...row]);
-        }
-        case "big_clear": {
-          const target = args.target;
-          let cells = [];
-          if (target.kind === "cells") {
-            cells = target.cells;
-          } else if (target.kind === "rows") {
-            for (const r of new Set(target.rows)) {
-              for (let c = 0; c < ncols; c += 1) cells.push([r, c]);
-            }
-          } else if (target.kind === "columns") {
-            for (let r = 0; r < data.length; r += 1) {
-              for (const c of new Set(target.cols)) cells.push([r, c]);
-            }
-          } else if (target.kind === "rect") {
-            for (let r = target.row; r < target.row + target.rows; r += 1) {
-              for (let c = target.col; c < target.col + target.cols; c += 1) {
-                cells.push([r, c]);
-              }
-            }
-          }
-          let changed = false;
-          for (const [rawR, rawC] of cells) {
-            const r = Number(rawR);
-            const c = Number(rawC);
-            if (!data[r] || c >= ncols) throw new Error("目标单元格越界");
-            if ((data[r][c] ?? "") !== "") {
-              data[r][c] = "";
-              changed = true;
-            }
-          }
-          return editOutcome({ changed });
-        }
-        case "big_set_cells": {
-          const cells = args.cells.map(([r, c, value]) => [Number(r), Number(c), value]);
-          for (const [r, c] of cells) {
-            if (!data[r] || c >= ncols) throw new Error("目标单元格越界");
-          }
-          let changed = false;
-          for (const [r, c, value] of cells) {
-            if ((data[r][c] ?? "") !== value) {
-              data[r][c] = value;
-              changed = true;
-            }
-          }
-          return editOutcome({ changed });
-        }
-        case "big_paste": {
-          const start = Number(args.vrow);
-          const col = Number(args.col);
-          const input = args.rows.map((row) => row.slice());
-          const width = Math.max(0, ...input.map((row) => row.length));
-          if (start > data.length || col + width > ncols) throw new Error("粘贴位置越界");
-          const existing = Math.min(input.length, data.length - start);
-          let changed = false;
-          for (let i = 0; i < existing; i += 1) {
-            for (let c = 0; c < input[i].length; c += 1) {
-              if ((data[start + i][col + c] ?? "") !== input[i][c]) {
-                data[start + i][col + c] = input[i][c];
-                changed = true;
-              }
-            }
-          }
-          const appended = input.slice(existing).map((row) =>
-            Array.from({ length: ncols }, (_, c) => row[c] ?? ""));
-          if (appended.length) {
-            data.push(...appended);
-            changed = true;
-          }
-          return editOutcome({ changed, insertedRows: appended.length });
-        }
-        case "big_set_cell": {
-          const r = Number(args.vrow);
-          const c = Number(args.col);
-          if (r >= data.length) throw new Error("行号越界");
-          const changed = (data[r][c] ?? "") !== args.value;
-          data[r][c] = args.value;
-          return editOutcome({ changed });
-        }
-        case "big_insert_rows": {
-          const at = Math.min(Number(args.vpos), data.length);
-          const n = args.rows ? args.rows.length : Number(args.count);
-          const blank = Array.from({ length: ncols }, () => "");
-          for (let i = 0; i < n; i += 1) data.splice(at + i, 0, args.rows ? [...args.rows[i]] : [...blank]);
-          return editOutcome({ changed: n > 0, insertedRows: n });
-        }
-        case "big_remove_rows": {
-          for (const v of [...args.vrows].sort((a, b) => b - a)) data.splice(Number(v), 1);
-          return editOutcome({ changed: args.vrows.length > 0, removedRows: args.vrows.length });
-        }
-        case "big_undo":
-        case "big_redo":
-          return true;
-        case "big_filter": {
-          const kw = String(args.spec?.cols?.[0]?.[1] ?? "");
-          filter = [];
-          for (let r = 0; r < data.length; r += 1) {
-            if (data[r].some((c) => c.toLowerCase().includes(kw))) filter.push(r);
-          }
-          return filter.length;
-        }
-        case "big_filter_page": {
-          const from = Number(args.from);
-          const hits = (filter ?? []).slice(from, from + Number(args.count));
-          // 对齐引擎 FilterPage：行内容与各命中行的原始行号（0 基）成对下发
-          return { rows: hits.map((r) => data[r]), vrows: hits };
-        }
-        case "big_filter_hit_view_row": {
-          const hit = (filter ?? [])[Number(args.idx)];
-          return hit === undefined ? null : hit;
-        }
-        case "big_find_edge": {
-          const list = args.filtered ? (filter ?? []) : data.map((_, i) => i);
-          if (!list.length) return null;
-          const col = Number(args.col);
-          const nonEmpty = (i) => String(data[list[i]]?.[col] ?? "") !== "";
-          const edge = findVerticalEdge(nonEmpty, Number(args.from), list.length, !!args.down);
-          return edge < 0 ? null : list[edge];
-        }
-        case "big_clear_filter":
-          filter = null;
-          return null;
-        case "big_col_push":
-          return null;
-        case "big_col_pop":
-        case "big_col_clear":
-          return null;
-        case "big_col_apply":
-          return editOutcome({ changed: true });
-        case "big_save":
-        case "big_save_as":
-          // 真实引擎保存/另存为后重开文件：筛选结果被丢弃、排序视图已物理落盘
-          filter = null;
-          sorted = false;
-          return { saved: true, fixedPoint: null, cancelled: false };
-        case "big_sort_estimate":
-          return {
-            file_bytes: 1024,
-            row_count: data.length,
-            new_bytes: 4096,
-            peak_bytes: 8192,
-            available_bytes: 1 << 30,
-          };
-        case "big_sort_load":
-          ramBacked = true;
-          return true;
-        case "big_sort_cancel":
-          return null;
-        case "big_sort_apply": {
-          const levels = args.levels || [];
-          const val = (r, l) => {
-            const text = String(data[r][Number(l.col)] ?? "");
-            if (!l.numeric) return text;
-            const n = Number(text.trim());
-            return text.trim() === "" || !Number.isFinite(n) ? null : n;
-          };
-          const idx = data.map((_, i) => i);
-          idx.sort((a, b) => {
-            for (const l of levels) {
-              const x = val(a, l);
-              const y = val(b, l);
-              if (l.numeric) {
-                if (x === null && y !== null) return 1;
-                if (y === null && x !== null) return -1;
-                if (x === null) continue;
-                if (x !== y) return l.asc ? x - y : y - x;
-              } else if (x !== y) {
-                return l.asc ? (x < y ? -1 : 1) : (x > y ? -1 : 1);
-              }
-            }
-            return a - b;
-          });
-          data.splice(0, data.length, ...idx.map((i) => data[i]));
-          sorted = true;
-          return editOutcome({ changed: true });
-        }
-        case "big_sort_exit":
-          sorted = false;
-          if (args.releaseRam !== false) ramBacked = false;
-          return editOutcome({ changed: true });
-        case "big_close":
-          return null;
-        case "big_stale":
-          return false;
-        default:
-          throw new Error(`unexpected cmd ${cmd}`);
-      }
-    },
-    listen: async () => () => {},
-  });
-  return { model, data, calls };
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -331,7 +51,7 @@ function makeIndexingEngine({ rows = 100, cols = 2, openRows = 20, steps = [], p
       calls.push([cmd, args]);
       switch (cmd) {
         case "big_open":
-          return { ...meta };
+          return { session: 1, lease: 1, meta: { ...meta } };
         case "big_set_undo_budget":
           return { ...meta };
         case "big_meta":
@@ -389,27 +109,52 @@ test("阈值常量为 50MiB", () => {
   assert.equal(BIG_THRESHOLD, 50 * 1024 * 1024);
 });
 
-test("每个模型持有独立会话号，所有 big_* 调用都携带它", async () => {
-  const a = makeFakeEngine({ rows: 3, cols: 1 });
-  const b = makeFakeEngine({ rows: 4, cols: 1 });
-  await a.model.open("/a.csv");
-  await b.model.open("/b.csv");
-  const sidA = a.calls[0][1].session;
-  const sidB = b.calls[0][1].session;
+test("open/new 由共享 backend 分配唯一 BigSession，后续命令携带 session+lease", async () => {
+  const backend = makeSharedBackend({ rows: 3, cols: 1 });
+  const a = backend.model();
+  const b = backend.model();
+  await a.open("/a.csv");
+  const sidA = a.sessionId;
+  const leaseA = a.lease;
   assert.equal(typeof sidA, "number");
-  assert.equal(typeof sidB, "number");
-  assert.notEqual(sidA, sidB, "两个模型不应共享会话号");
+  assert.equal(typeof leaseA, "number");
 
-  // 任意后续命令（取数/筛选/保存/关闭）都必须带上本模型会话号
-  a.model.prefetchRange(0, 0);
+  const afterOpen = backend.calls.length;
+  a.prefetchRange(0, 0);
   await tick();
-  await a.model.runFilter([[0, "r"]], [], "");
-  await a.model.close();
-  const later = a.calls.slice(1);
+  await a.runFilter([[0, "r"]], [], "");
+  await a.close();
+  const later = backend.calls.slice(afterOpen);
   assert.ok(later.length >= 3);
   for (const [cmd, args] of later) {
-    assert.equal(args.session, sidA, `${cmd} 应携带会话号`);
+    assert.equal(args.session, sidA, cmd + " 应携带 Rust session");
+    assert.equal(args.lease, leaseA, cmd + " 应携带当前 lease");
   }
+
+  const created = await b.create("h\nx");
+  assert.equal(created.rows, 1);
+  assert.notEqual(sidA, b.sessionId);
+  for (const [cmd, args] of backend.calls) {
+    if (cmd === "big_open" || cmd === "big_new") {
+      assert.equal(Object.hasOwn(args, "session"), false);
+      assert.equal(Object.hasOwn(args, "lease"), false);
+    }
+  }
+});
+
+test("旧 owner 或 lease 不能 close/edit 文档", async () => {
+  const backend = makeSharedBackend({ rows: 2, cols: 1 });
+  const model = backend.model();
+  await model.open("/a.csv");
+  const session = model.sessionId;
+  const lease = model.lease;
+  const stale = { session, lease, vrow: 0, col: 0, value: "bad" };
+  await assert.rejects(backend.invokeFor("doc-1")("big_close", stale), /owner/);
+  await assert.rejects(backend.invokeFor("doc-1")("big_set_cell", stale), /owner/);
+  backend.sessions.get(session).lease += 1;
+  await assert.rejects(backend.invokeFor("main")("big_close", stale), /lease/);
+  await assert.rejects(backend.invokeFor("main")("big_set_cell", stale), /lease/);
+  assert.equal(backend.snapshot(session).data[0][0], "r0c0");
 });
 
 test("displayData 未命中缓存返回空串并调度拉页，落定后读到值", async () => {
@@ -597,6 +342,8 @@ function makeFixedPointSaveModel(confirm, first, retry) {
     listen: async () => () => {},
     confirmFixedPoint: confirm,
   });
+  model._sid = 1;
+  model._lease = 1;
   model._filterOn = true;
   model._filterCount = 1;
   model._refreshMeta = async () => { refreshes += 1; };
@@ -770,6 +517,8 @@ function makeFixedPointColumnModel(confirm, first, retry) {
     listen: async () => () => {},
     confirmFixedPoint: confirm,
   });
+  model._sid = 1;
+  model._lease = 1;
   model._refreshMeta = async () => { refreshes += 1; };
   model._emitData = () => { dataEvents += 1; };
   return { model, calls, counts: () => ({ refreshes, dataEvents }) };
@@ -823,6 +572,8 @@ function makeModelWithMeta({ rows, cols }) {
     },
     listen: async () => () => {},
   });
+  model._sid = 1;
+  model._lease = 1;
   model._meta = { rows, cols };
   model._refreshMeta = async () => {};
   model._emitData = () => {};
@@ -1013,6 +764,7 @@ function makeDeferredFilterModel() {
     invoke: (cmd) => {
       switch (cmd) {
         case "big_open":
+          return Promise.resolve({ session: 1, lease: 1, meta });
         case "big_set_undo_budget":
         case "big_meta":
           return Promise.resolve(meta);
@@ -1180,7 +932,7 @@ test("open 把 headerless 传给 big_open，缺省为 false", async () => {
   assert.equal(calls[0][0], "big_open");
   assert.equal(calls[0][1].path, "/x.csv");
   assert.equal(calls[0][1].headerless, false);
-  assert.equal(typeof calls[0][1].session, "number");
+  assert.equal(Object.hasOwn(calls[0][1], "session"), false);
   assert.equal(model.isHeaderless(), false);
 });
 
@@ -1194,8 +946,10 @@ test("open 无列名：isHeaderless=true、表头为 列1..N、首行计入数�
 
 test("meta 缺 headerless 字段时按 false 兼容", async () => {
   const model = new BigModel({
-    invoke: async (cmd) =>
-      cmd === "big_open" ? { rows: 0, cols: 0, headers: [], indexing: false } : null,
+    invoke: async (cmd) => {
+      const meta = { rows: 0, cols: 0, headers: [], indexing: false };
+      return cmd === "big_open" ? { session: 1, lease: 1, meta } : meta;
+    },
     listen: async () => () => {},
   });
   await model.open("/x.csv");
@@ -1274,6 +1028,8 @@ test("setHeaderless approval：changed 后刷新 meta 并以 view 通知", async
     },
     listen: async () => () => {},
   });
+  model._sid = 1;
+  model._lease = 1;
   model._meta = { rows: 2, cols: 2, headers: ["a", "b"], headerless: false,
     modified: false, can_undo: false, can_redo: true };
   model._filterOn = true;
@@ -1306,6 +1062,8 @@ test("setHeaderless fixedPoint 取消保留筛选、redo 和通知现场", async
     listen: async () => () => {},
     confirmFixedPoint: async () => false,
   });
+  model._sid = 1;
+  model._lease = 1;
   model._meta = { rows: 2, cols: 2, headers: ["a", "b"], headerless: false,
     modified: true, can_undo: true, can_redo: true };
   model._filterOn = true;
@@ -1349,6 +1107,8 @@ test("setHeaderless fixedPoint 确认只带原 preflightId 重试", async () => 
     listen: async () => () => {},
     confirmFixedPoint: async () => true,
   });
+  model._sid = 1;
+  model._lease = 1;
   model._meta = { rows: 2, cols: 2, headers: ["a", "b"], headerless: false,
     modified: false, can_undo: true, can_redo: false };
   const outcome = await model.setHeaderless(true);
@@ -1411,6 +1171,8 @@ test("sort fixedPoint 取消不重试、不刷新并返回 cancelled", async () 
     listen: async () => () => {},
     confirmFixedPoint: async () => false,
   });
+  model._sid = 1;
+  model._lease = 1;
   model._refreshMeta = async () => { refreshes += 1; };
   model._emitData = () => { dataEvents += 1; };
   const outcome = await model.sort([{ col: 0, numeric: false, asc: true }]);
@@ -1440,21 +1202,31 @@ test("exitSort 走 approval，默认释放内存并以 origin='view' 通知", as
   assert.deepEqual(events.at(-1), [true, "view"]);
 });
 
-test("onSortProgress 只派发本会话进度事件", async () => {
+test("onProgress/onSortProgress 只派发当前 session+lease 的对象载荷", async () => {
   const handlers = [];
+  const session = { session: 77, lease: 4, meta: { rows: 1, cols: 1, headers: ["h"], indexing: false } };
   const model = new BigModel({
-    invoke: async () => null,
+    invoke: async () => session,
     listen: async (event, cb) => {
       handlers.push([event, cb]);
       return () => {};
     },
   });
-  const got = [];
-  await model.onSortProgress((done, total) => got.push([done, total]));
-  assert.equal(handlers[0][0], "big-sort-progress");
-  handlers[0][1]({ payload: [1, 2, 999] }); // 其他会话
-  handlers[0][1]({ payload: [3, 4, model.sessionId] }); // 本会话
-  assert.deepEqual(got, [[3, 4]]);
+  await model.open("/x.csv");
+  const progress = [];
+  const sortProgress = [];
+  await model.onProgress((...args) => progress.push(args));
+  await model.onSortProgress((...args) => sortProgress.push(args));
+  const onProgress = handlers.find(([event]) => event === "big-progress")[1];
+  const onSort = handlers.find(([event]) => event === "big-sort-progress")[1];
+  onProgress({ payload: { session: 77, lease: 3, done: 1, total: 2, phase: 0, rows: 1 } });
+  onProgress({ payload: { session: 78, lease: 4, done: 2, total: 3, phase: 0, rows: 1 } });
+  onProgress({ payload: { session: 77, lease: 4, done: 3, total: 4, phase: 1, rows: 1 } });
+  onSort({ payload: { session: 77, lease: 3, done: 1, total: 2 } });
+  onSort({ payload: { session: 78, lease: 4, done: 2, total: 3 } });
+  onSort({ payload: { session: 77, lease: 4, done: 3, total: 4 } });
+  assert.deepEqual(progress, [[3, 4, 1, 1]]);
+  assert.deepEqual(sortProgress, [[3, 4]]);
 });
 
 test("无列名模式拒绝重命名列且不调用引擎", async () => {
@@ -1532,6 +1304,7 @@ function makeDeferredEngine({ rows = 100 * BIG_PAGE, cols = 2 } = {}) {
     invoke: (cmd, args = {}) => {
       switch (cmd) {
         case "big_open":
+          return Promise.resolve({ session: 1, lease: 1, meta: { ...meta } });
         case "big_set_undo_budget":
         case "big_meta":
           return Promise.resolve({ ...meta });
@@ -1629,13 +1402,13 @@ test("快速拖动：被丢弃的排队页回滚视口后仍能重新拉取", as
     `回到第 10 页应重新拉取，实际在飞 ${pending.map((p) => p.page)}`);
 });
 
-test("create：内存文本建会话（big_new 携带 text/headerless/session）", async () => {
+test("create：内存文本建会话（big_new 携带 text/headerless，session 由 Rust 分配）", async () => {
   const { model, calls } = makeFakeEngine();
   const meta = await model.create("name,age\r\nAlice,30\r\nbob,25\r\n", { headerless: false });
   assert.equal(calls[0][0], "big_new");
   assert.equal(calls[0][1].text, "name,age\r\nAlice,30\r\nbob,25\r\n");
   assert.equal(calls[0][1].headerless, false);
-  assert.equal(typeof calls[0][1].session, "number");
+  assert.equal(Object.hasOwn(calls[0][1], "session"), false);
   assert.equal(meta.rows, 2);
   assert.equal(meta.ram_backed, true);
   assert.equal(meta.has_path, false);
@@ -1716,6 +1489,8 @@ function makeFixedPointModel(confirm, retry) {
     listen: async () => () => {},
     confirmFixedPoint: confirm,
   });
+  model._sid = 1;
+  model._lease = 1;
   model._refreshMeta = async () => { refreshes += 1; };
   model._emitData = () => { dataEvents += 1; };
   model._emitUndo = () => {};
@@ -1765,6 +1540,8 @@ test("undo budget 按 MiB 转为字节下发并刷新元数据", async () => {
     },
     listen: async () => () => {},
   });
+  model._sid = 1;
+  model._lease = 1;
   model._meta = { rows: 0, cols: 0, modified: true };
   model._emitUndo = () => { undoEvents += 1; };
   await model.setUndoBudget(128);
@@ -1835,6 +1612,8 @@ function makeImportModel(confirm, finish) {
     listen: async () => () => {},
     confirmFixedPoint: confirm,
   });
+  model._sid = 1;
+  model._lease = 1;
   model._meta = { rows: 1, cols: 1 };
   model._refreshMeta = async () => { refreshes += 1; };
   model._emitData = () => { dataEvents += 1; };
@@ -1904,6 +1683,8 @@ test("内部 token 粘贴直接调用引擎并重试固定点", async () => {
     listen: async () => () => {},
     confirmFixedPoint: async () => true,
   });
+  model._sid = 1;
+  model._lease = 1;
   model._meta = { rows: 1, cols: 1 };
   model._refreshMeta = async () => { refreshes += 1; };
   model._emitData = () => { dataEvents += 1; };

@@ -2099,13 +2099,13 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const last = events[events.length - 1];
     assert(last[0] === last[1] && last[1] === est.file_bytes,
       `收尾进度应到满：${last} / ${est.file_bytes}`);
-    const meta = await invoke("big_meta", { session: bm.sessionId });
+    const meta = await invoke("big_meta", { session: bm.sessionId, lease: bm.lease });
     assert(meta.ram_backed === true, "meta 应报告内存后备");
-    const rows = await invoke("big_rows", { from: 0, count: 1, session: bm.sessionId });
+    const rows = await invoke("big_rows", { from: 0, count: 1, session: bm.sessionId, lease: bm.lease });
     assert(rows[0][0] === "大理", `内存后备下首行应正确：${rows[0]}`);
     // 已载入时再点取消应幂等，且视图仍可读（排序模式不因取消退出）
     await bm.cancelSortLoad();
-    const tail = await invoke("big_rows", { from: 4999, count: 1, session: bm.sessionId });
+    const tail = await invoke("big_rows", { from: 4999, count: 1, session: bm.sessionId, lease: bm.lease });
     assert(tail[0][0] === "大理", `取消后末行应可读：${tail[0]}`);
   });
 
@@ -2130,11 +2130,11 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     grid.filters.set(0, "大理"); // 与真实交互同路径：条件进 grid，点执行筛选
     await window.__app.runBigFilter();
     assert(bm.filterActive() === true, "筛选应处于激活态");
-    assert(await invoke("big_filter_count", { session: bm.sessionId }) === 5000,
+    assert(await invoke("big_filter_count", { session: bm.sessionId, lease: bm.lease }) === 5000,
       "引擎侧命中数不一致");
     grid.filters.set(0, "不存在xyz");
     await window.__app.runBigFilter();
-    assert(await invoke("big_filter_count", { session: bm.sessionId }) === 0, "零命中应返回 0");
+    assert(await invoke("big_filter_count", { session: bm.sessionId, lease: bm.lease }) === 0, "零命中应返回 0");
     grid.clearFilters(); // 条件清空 → 视图自动回全量（fire-and-forget）
     await sleep(150);
     assert(bm.filterActive() === false, "清除筛选后应回全量");
@@ -2149,7 +2149,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await waitFor(() => bm.filterActive() && bm.rowCount() === 5000, "键入即筛落定");
     assert(document.querySelector(".modal-mask") === null,
       "键入即筛不应弹模态（扫描在引擎线程，UI 不冻结）");
-    assert(await invoke("big_filter_count", { session: bm.sessionId }) === 5000,
+    assert(await invoke("big_filter_count", { session: bm.sessionId, lease: bm.lease }) === 5000,
       "引擎侧命中数不一致");
   });
 
@@ -2224,7 +2224,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const bm = bigM();
     grid.filters.set(0, "大理");
     await window.__app.runBigFilter();
-    const page = await invoke("big_filter_page", { from: 0, count: 5, session: bm.sessionId });
+    const page = await invoke("big_filter_page", { from: 0, count: 5, session: bm.sessionId, lease: bm.lease });
     assert(page.rows.length === 5, `筛选页行数 ${page.rows.length}`);
     assert(page.rows[4][0] === "大理" && page.rows[4][1] === "3", `筛选页内容 ${page.rows[4]}`);
     // FilterPage 协议：vrows 与 rows 等长，未排序时即原始行号（严格递增）
@@ -2241,19 +2241,19 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     grid.filters.set(0, "大理");
     grid.filterModes.set(0, 1); // 严格·不分大小写
     await window.__app.runBigFilter();
-    assert(await invoke("big_filter_count", { session: bm.sessionId }) === 5000,
+    assert(await invoke("big_filter_count", { session: bm.sessionId, lease: bm.lease }) === 5000,
       "严格CI 整字段等于应中全部 5000 行");
     grid.filters.set(0, "大"); // 子串 ≠ 整字段
     await window.__app.runBigFilter();
-    assert(await invoke("big_filter_count", { session: bm.sessionId }) === 0,
+    assert(await invoke("big_filter_count", { session: bm.sessionId, lease: bm.lease }) === 0,
       "严格CI 下子串不应命中");
     grid.filterModes.set(0, 2); // 严格·区分大小写
     await window.__app.runBigFilter();
-    assert(await invoke("big_filter_count", { session: bm.sessionId }) === 0,
+    assert(await invoke("big_filter_count", { session: bm.sessionId, lease: bm.lease }) === 0,
       "严格CS 下子串同样不应命中");
     grid.filterModes.delete(0); // 回包含
     await window.__app.runBigFilter();
-    assert(await invoke("big_filter_count", { session: bm.sessionId }) === 5000,
+    assert(await invoke("big_filter_count", { session: bm.sessionId, lease: bm.lease }) === 5000,
       "回包含后子串应恢复 5000 行");
     grid.clearFilters();
     await sleep(150);
@@ -2303,7 +2303,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const path = window.__app.getPath();
     const diskBefore = (await invoke("read_csv_file", { path })).text;
     const pendingRows = await invoke("big_rows", {
-      from: 0, count: 2, session: bm.sessionId,
+      from: 0, count: 2, session: bm.sessionId, lease: bm.lease,
     });
     await window.__app.applyColOps();
     assert(bm.colOpsPending() === false, "执行后不应再有 pending");
@@ -2312,7 +2312,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert((await invoke("read_csv_file", { path })).text === diskBefore,
       "大档列执行不得提前物理重写");
     const appliedRows = await invoke("big_rows", {
-      from: 0, count: 2, session: bm.sessionId,
+      from: 0, count: 2, session: bm.sessionId, lease: bm.lease,
     });
     assert(JSON.stringify(appliedRows) === JSON.stringify(pendingRows),
       "执行后视图行应与 pending 预览一致");
@@ -2326,7 +2326,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(await bm.redo() === true, "大档列执行应可重做");
     await waitFor(() => bm.columnCount() === 4, "重做应恢复四列");
     const redoneRows = await invoke("big_rows", {
-      from: 0, count: 2, session: bm.sessionId,
+      from: 0, count: 2, session: bm.sessionId, lease: bm.lease,
     });
     assert(JSON.stringify(redoneRows) === JSON.stringify(pendingRows),
       "重做后应恢复 pending 的列和内容");
@@ -3041,7 +3041,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     // 首行参与筛选：只有首行（原表头）含「目的地」
     grid.filters.set(0, "目的地");
     await window.__app.runBigFilter();
-    assert(await invoke("big_filter_count", { session: model.sessionId }) === 1,
+    assert(await invoke("big_filter_count", { session: model.sessionId, lease: model.lease }) === 1,
       "应仅命中首行");
     assert(model.rowCount() === 1, `筛选后行数 ${model.rowCount()}`);
     grid.clearFilters();
@@ -3769,7 +3769,7 @@ x,y
     const target = `${TMP}/internal-token.csv`;
     await writeText(target, "a,b\r\n1,2\r\n");
     assert(await window.__app.openPathsAsTabs([target]) === true, "探针文件应进入页签");
-    const spoolPath = await invoke("smoke_spool_path", { session: model.sessionId });
+    const spoolPath = await invoke("smoke_spool_path", { session: model.sessionId, lease: model.lease });
     lines.push("CLEANUP_PATH=" + spoolPath);
     assert(await invoke("path_exists", { path: spoolPath }), "文档 spool 应在会话期间存在");
     grid.select([0, 0]);

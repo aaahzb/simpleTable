@@ -43,8 +43,6 @@ export const BIG_THRESHOLD = 50 * 1024 * 1024;
 /** 乐观编辑失败时抛出的统一错误前缀（app 层捕获转状态栏）。 */
 const BIG_EDIT_ERR = "大文件编辑失败";
 
-/** 进程内会话号分配器：每个 BigModel 独占一个引擎会话（多页签互不干扰）。 */
-let nextSessionId = 1;
 
 /**
  * 大文件模型。
@@ -63,9 +61,10 @@ export class BigModel {
     };
     /** @type {Function} 原始 Tauri 调用（_invoke 负责附加会话号） */
     this._rawInvoke = tauri.invoke;
-    /** @type {number} 本模型独占的引擎会话号 */
-    this._sid = nextSessionId;
-    nextSessionId += 1;
+    /** @type {number | null} Rust 在 open/create 成功后分配的会话号 */
+    this._sid = null;
+    /** @type {number | null} 当前 owner 的文档租约 */
+    this._lease = null;
     /** @type {Function} */
     this._listen = tauri.listen;
     /** @type {Function} 超大操作确认；未注入时安全取消。 */
@@ -117,10 +116,15 @@ export class BigModel {
   /**
    * 本模型独占的引擎会话号（调试/诊断用；命令调用请走 _invoke）。
    *
-   * @returns {number} 会话号。
+   * @returns {number | null} 会话号；尚未建立会话时为 null。
    */
   get sessionId() {
     return this._sid;
+  }
+
+  /** @returns {number | null} 当前文档租约。 */
+  get lease() {
+    return this._lease;
   }
 
   /**
@@ -134,7 +138,10 @@ export class BigModel {
    * @returns {Promise<any>} 命令返回值。
    */
   _invoke(cmd, args = {}) {
-    return this._rawInvoke(cmd, { session: this._sid, ...args });
+    if (typeof this._sid !== "number" || typeof this._lease !== "number") {
+      throw new Error("大文件会话尚未建立");
+    }
+    return this._rawInvoke(cmd, { session: this._sid, lease: this._lease, ...args });
   }
 
   /**
@@ -219,10 +226,28 @@ export class BigModel {
    */
   async open(path, { headerless = false } = {}) {
     this._stopIndexPolling();
+    const started = performance.now();
+    let opened;
+    try {
+      opened = await this._rawInvoke("big_open", {
+        path,
+        headerless: !!headerless,
+        replaceSession: this._sid,
+        replaceLease: this._lease,
+      });
+      if (typeof opened?.session !== "number" || typeof opened?.lease !== "number" || !opened.meta) {
+        throw new Error("big_open 未返回有效 BigSession");
+      }
+    } catch (error) {
+      this._startIndexPolling();
+      throw error;
+    }
     this._session += 1;
-    this._openT0 = performance.now();
+    this._openT0 = started;
     this._firstPaintMs = 0;
-    this._meta = await this._invoke("big_open", { path, headerless: !!headerless });
+    this._sid = opened.session;
+    this._lease = opened.lease;
+    this._meta = opened.meta;
     await this._applyDefaultUndoBudget();
     this._invalidate();
     this._emitReset();
@@ -242,10 +267,28 @@ export class BigModel {
    */
   async create(text, { headerless = false } = {}) {
     this._stopIndexPolling();
+    const started = performance.now();
+    let created;
+    try {
+      created = await this._rawInvoke("big_new", {
+        text,
+        headerless: !!headerless,
+        replaceSession: this._sid,
+        replaceLease: this._lease,
+      });
+      if (typeof created?.session !== "number" || typeof created?.lease !== "number" || !created.meta) {
+        throw new Error("big_new 未返回有效 BigSession");
+      }
+    } catch (error) {
+      this._startIndexPolling();
+      throw error;
+    }
     this._session += 1;
-    this._openT0 = performance.now();
+    this._openT0 = started;
     this._firstPaintMs = 0;
-    this._meta = await this._invoke("big_new", { text, headerless: !!headerless });
+    this._sid = created.session;
+    this._lease = created.lease;
+    this._meta = created.meta;
     await this._applyDefaultUndoBudget();
     this._invalidate();
     this._emitReset();
@@ -307,7 +350,9 @@ export class BigModel {
   async close() {
     this._stopIndexPolling();
     this._session += 1;
-    await this._invoke("big_close");
+    if (this._sid !== null) await this._invoke("big_close");
+    this._sid = null;
+    this._lease = null;
     this._meta = null;
     this._openT0 = null;
     this._firstPaintMs = 0;
@@ -507,20 +552,22 @@ export class BigModel {
    * @returns {Promise<Function>} 取消监听函数。
    */
   async onProgress(cb) {
-    return this._listen("big-progress", (e) =>
-      cb(e.payload[0], e.payload[1], e.payload[2], e.payload[3]));
+    return this._listen("big-progress", (e) => {
+      const { session, lease, done, total, phase, rows } = e.payload;
+      if (session === this._sid && lease === this._lease) cb(done, total, phase, rows);
+    });
   }
 
   /**
-   * 订阅排序模式载入进度（事件带会话号，只接收本模型的）。
+   * 订阅排序模式载入进度（事件带会话号和租约，只接收本模型当前租约）。
    *
    * @param {(done: number, total: number) => void} cb - 回调（字节）。
    * @returns {Promise<Function>} 取消监听函数。
    */
   async onSortProgress(cb) {
     return this._listen("big-sort-progress", (e) => {
-      const [done, total, sid] = e.payload;
-      if (sid === this._sid) cb(done, total);
+      const { session, lease, done, total } = e.payload;
+      if (session === this._sid && lease === this._lease) cb(done, total);
     });
   }
 
