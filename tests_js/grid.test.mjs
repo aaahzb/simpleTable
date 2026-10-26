@@ -411,3 +411,74 @@ test("扩列 fixedPoint 取消时不扩展选区并提示取消", async () => {
   assert.deepEqual(selections, []);
   assert.equal(messages.at(-1), "已取消粘贴");
 });
+
+/** 记录系统剪贴板写入，并恢复原始描述符。 */
+function stubClipboardWriter(writes) {
+  const old = Object.getOwnPropertyDescriptor(globalThis.navigator, "clipboard");
+  Object.defineProperty(globalThis.navigator, "clipboard", {
+    value: { writeText: async (text) => { writes.push(text); } }, configurable: true,
+  });
+  return () => {
+    if (old) Object.defineProperty(globalThis.navigator, "clipboard", old);
+    else delete globalThis.navigator.clipboard;
+  };
+}
+
+test("大复制完整矩形只拿 token，不写系统剪贴板", async () => {
+  const writes = [];
+  const calls = [];
+  const model = {
+    copyRows: async (...args) => {
+      calls.push(args);
+      return { kind: "app", meta: { token: "7", rows: 4, cols: 3,
+        bytes: 9_000_000, version: 1 } };
+    },
+    clipboardClear: async () => { throw new Error("App 结果不得清 current"); },
+  };
+  const { g, messages } = makeEditGrid(model);
+  g.sel = { current: [1, 0], blocks: [[4, 2, 1, 0]] };
+  g.selectedSet = { size: 200_001 };
+  g.selectedCells = () => { throw new Error("完整矩形不得展开"); };
+  g.lastCopiedText = null;
+  const restore = stubClipboardWriter(writes);
+  try { assert.equal(await g.copySelection(), true); } finally { restore(); }
+  assert.deepEqual(calls, [[1, 5, 0, 3]]);
+  assert.deepEqual(writes, []);
+  assert.equal(g.lastCopiedText, null);
+  assert.ok(messages.some((x) => x.includes("已复制大区域，仅可在本应用内粘贴")));
+});
+
+test("小复制 Text 写系统后才清旧应用内 token", async () => {
+  const writes = [];
+  const events = [];
+  const model = {
+    copyRows: async () => ({ kind: "text", text: "A", bytes: 1 }),
+    clipboardClear: async () => { events.push("clear"); },
+  };
+  const { g } = makeEditGrid(model);
+  g.sel = { current: [0, 0], blocks: [[0, 0, 0, 0]] };
+  g.selectedSet = new Set([0]);
+  g.lastCopiedText = null;
+  const restore = stubClipboardWriter(writes);
+  try { assert.equal(await g.copySelection(), true); } finally { restore(); }
+  assert.deepEqual(writes, ["A"]);
+  assert.deepEqual(events, ["clear"]);
+  assert.equal(g.lastCopiedText, "A");
+});
+
+test("剪切复制失败返回 false 且不清除", async () => {
+  const writes = [];
+  let clears = 0;
+  const model = {
+    copyRows: async () => { throw new Error("copy failed"); },
+    clearRect: async () => { clears += 1; return { changed: true }; },
+    clearCells: async () => { clears += 1; return { changed: true }; },
+  };
+  const { g } = makeEditGrid(model);
+  g.sel = { current: [0, 0], blocks: [[0, 0, 0, 0]] };
+  g.selectedSet = new Set([0]);
+  const restore = stubClipboardWriter(writes);
+  try { assert.equal(await g.cutSelection(), false); } finally { restore(); }
+  assert.equal(clears, 0);
+  assert.deepEqual(writes, []);
+});

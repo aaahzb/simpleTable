@@ -790,7 +790,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     grid.clearSelection();
     grid.select([0, 0]);
     grid._extendTo([1, 1]);
-    grid.copySelection();
+    assert(await grid.copySelection(), "复制应成功");
     const expect = '大理\t3\r\n丽江\t10\r\n';
     assert(grid.lastCopiedText === expect, `复制内容: ${JSON.stringify(grid.lastCopiedText)}`);
   });
@@ -799,7 +799,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await model.setData(0, 0, 'a\tb\nc');
     await waitFor(() => model.rawData(0, 0) === 'a\tb\nc', "写入落定");
     grid.select([0, 0]);
-    grid.copySelection();
+    assert(await grid.copySelection(), "复制应成功");
     assert(grid.lastCopiedText === '"a\tb\nc"\r\n', `引号包裹: ${JSON.stringify(grid.lastCopiedText)}`);
   });
 
@@ -2278,7 +2278,9 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
   });
 
   check("大模式：大选区复制委派引擎（TSV）", async () => {
-    const tsv = await bigM().copyRows(0, 2, 0, 3); // 半开区间：2 行 × 3 列
+    const outcome = await bigM().copyRows(0, 2, 0, 3); // 半开区间：2 行 × 3 列
+    assert(outcome.kind === "text", "小结果必须返回 Text");
+    const tsv = outcome.text;
     const lines = tsv.split("\r\n").filter((l) => l.length > 0); // 末行带行尾
     assert(lines.length === 2, `TSV 行数 ${lines.length}：${tsv.slice(0, 40)}`);
     assert(lines[0].split("\t").length === 3, `TSV 列数 ${lines[0].split("\t").length}`);

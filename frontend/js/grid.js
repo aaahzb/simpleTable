@@ -1567,26 +1567,44 @@ export class Grid {
   }
 
   /**
-   * 复制选区为 TSV；只有系统剪贴板写入成功才报告可复制。
+   * 复制选区：小结果写系统剪贴板，大结果只保留应用内 token。
    *
    * @returns {Promise<boolean>} 写入成功为 true，失败或空选区为 false。
    */
   async copySelection() {
     if (!this.selectedSet.size) return false;
-    const rows = this.selectedRows();
-    const cols = this.selectedCols();
-    const cc = this.model.columnCount();
-    const fullRect = this.selectedSet.size === rows.length * cols.length;
     try {
+      let rect = this._singleSelectionRect();
+      let rows = null;
+      let cols = null;
+      if (!rect) {
+        rows = this.selectedRows();
+        cols = this.selectedCols();
+        if (this.selectedSet.size === rows.length * cols.length) {
+          rect = {
+            row: rows[0], col: cols[0],
+            rows: rows[rows.length - 1] - rows[0] + 1,
+            cols: cols[cols.length - 1] - cols[0] + 1,
+          };
+        }
+      }
       let text;
-      if (fullRect && this.selectedSet.size > 20000) {
-        text = await this.model.copyRows(rows[0], rows[rows.length - 1] + 1,
-          cols[0], cols[cols.length - 1] + 1);
+      if (rect) {
+        const outcome = await this.model.copyRows(
+          rect.row, rect.row + rect.rows, rect.col, rect.col + rect.cols);
+        if (outcome?.kind === "app") {
+          this.lastCopiedText = null;
+          this.hooks.statusMsg("已复制大区域，仅可在本应用内粘贴", 3000);
+          return true;
+        }
+        if (outcome?.kind !== "text") throw new Error("复制结果格式无效");
+        text = outcome.text;
       } else {
-        if (!fullRect && this.selectedSet.size > 20000) {
+        if (this.selectedSet.size > 20000) {
           this.hooks.statusMsg("大文件模式：大型选区仅支持完整矩形复制", 3000);
           return false;
         }
+        const cc = this.model.columnCount();
         const data = [];
         for (const r of rows) {
           const line = [];
@@ -1597,9 +1615,12 @@ export class Grid {
         }
         text = serializeRecords(data, "\t");
       }
-      this.lastCopiedText = text;
       await navigator.clipboard.writeText(text);
-      this.hooks.statusMsg("已复制 " + this.selectedSet.size + " 个单元格", 2000);
+      // 只有系统剪贴板写入成功后，才使旧的应用内 token 失效。
+      await this.model.clipboardClear();
+      this.lastCopiedText = text;
+      const count = rect ? rect.rows * rect.cols : this.selectedSet.size;
+      this.hooks.statusMsg("已复制 " + count + " 个单元格", 2000);
       return true;
     } catch (err) {
       this.hooks.statusMsg(String(err?.message ?? err), 3000);

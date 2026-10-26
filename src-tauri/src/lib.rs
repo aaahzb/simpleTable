@@ -17,6 +17,7 @@ use serde::Serialize;
 use tauri::{Emitter, Manager};
 
 mod baseline;
+mod clipboard;
 mod engine;
 // Task 2 先建立独立账本；接口在 Task 3–14 接入，Task 15 移除本豁免。
 #[allow(dead_code)]
@@ -26,6 +27,7 @@ mod schema;
 // Task 7 先以缺失类型测试驱动实现；Task 15 复查临时豁免。
 #[allow(dead_code)]
 mod spool;
+use clipboard::{ClipboardMeta, ClipboardStore, CopyOutcome};
 use engine::{BigFile, BigMeta, ClearTarget, ColOp, FilterPage, FilterSpec, SortEstimate, SortLevel};
 use history::{Approval, EditOutcome};
 
@@ -731,17 +733,28 @@ fn big_set_headerless(
     with_big(&state, session, |bf| bf.set_headerless(on, approval))
 }
 
-/// 大选区复制（TSV，\r\n 行尾）。
+/// 完整矩形复制：小结果返回 Text，大结果返回应用内 token。
 #[tauri::command]
 fn big_copy(
     state: tauri::State<BigShared>,
+    clipboard: tauri::State<ClipboardStore>,
     session: u64,
     r0: u64,
     r1: u64,
     c0: u32,
     c1: u32,
-) -> Result<String, String> {
-    with_big(&state, session, |bf| bf.copy_tsv(r0, r1, c0, c1))
+) -> Result<CopyOutcome, String> {
+    with_big(&state, session, |bf| bf.copy_tsv(r0, r1, c0, c1, clipboard.inner()))
+}
+
+#[tauri::command]
+fn big_clipboard_meta(state: tauri::State<ClipboardStore>) -> Option<ClipboardMeta> {
+    state.current_meta()
+}
+
+#[tauri::command]
+fn big_clipboard_clear(state: tauri::State<ClipboardStore>) {
+    state.clear_current();
 }
 
 /// 保存（流式重写 + 原子换名），进度经 "big-progress" 事件推送。
@@ -903,6 +916,7 @@ pub fn run() {
                 .find(|a| a.to_lowercase().ends_with(".csv"));
             app.manage(StartupArgs { open_path });
             app.manage(BigShared::new(Mutex::new(HashMap::new())));
+            app.manage(ClipboardStore::create_unique()?);
             // 关闭请求转发给前端做"未保存确认"，确认后由 quit_app 命令真正退出
             if let Some(window) = app.get_webview_window("main") {
                 let handle = window.clone();
@@ -962,6 +976,8 @@ pub fn run() {
             big_clear_filter,
             big_set_headerless,
             big_copy,
+            big_clipboard_meta,
+            big_clipboard_clear,
             big_save,
             big_save_as,
             big_col_push,
@@ -975,7 +991,12 @@ pub fn run() {
 }
 
 /// 前端确认关闭（或保存完毕）后调用：立即退出进程。
+fn cleanup_process_state(app: &tauri::AppHandle) {
+    app.state::<ClipboardStore>().cleanup();
+}
+
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
+    cleanup_process_state(&app);
     app.exit(0);
 }

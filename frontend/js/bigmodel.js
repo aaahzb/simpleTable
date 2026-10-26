@@ -1491,10 +1491,20 @@ export class BigModel {
    * @param {number} r1 - 结束视图行（不含）。
    * @param {number} c0 - 起始视图列（含）。
    * @param {number} c1 - 结束视图列（不含）。
-   * @returns {Promise<string>} TSV 文本（\r\n 行尾）。
+   * @returns {Promise<{kind: string, text?: string, bytes?: number, meta?: object}>} CopyOutcome。
    */
   async copyRows(r0, r1, c0, c1) {
     return this._invoke("big_copy", { r0, r1, c0, c1 });
+  }
+
+  /** @returns {Promise<object|null>} 当前进程内大复制元数据。 */
+  async clipboardMeta() {
+    return this._invoke("big_clipboard_meta");
+  }
+
+  /** @returns {Promise<void>} 使当前应用内复制 token 失效。 */
+  async clipboardClear() {
+    return this._invoke("big_clipboard_clear");
   }
 
   // ---- 明确不支持（大模式 v1 边界，app 层已禁用入口） ----

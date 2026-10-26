@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::baseline::{BaselineTransform, RowId};
+use crate::clipboard::CopyBuilder;
 use crate::history::{
     Approval, BudgetChange, Cost, EditOutcome, FixedPointKind, FixedPointRequest,
     HistoryEntry, HistoryError, HistoryLedger, HistoryStats, Prepared, PreparedHistory,
@@ -643,6 +644,7 @@ fn usable_record_count(n: usize, line_started_open: bool, done: bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clipboard::{ClipboardStore, CopyOutcome, LARGE_COPY_BYTES};
 
     /// 进度节流：大间隔时首次放行、紧接着的突发调用全部被压住，
     /// 零间隔（不节流路径）行为不受影响。
@@ -2191,8 +2193,56 @@ a,b
         let p = tmp_csv("tsv", bytes);
         let bf = BigFile::open(&p).unwrap();
         // TSV 语义：仅 TAB/引号/换行触发引号（逗号不触发，对齐前端 serializeRecords）
-        let tsv = bf.copy_tsv(0, 2, 0, 2).unwrap();
+        let tsv = copy_text(&bf, 0, 2, 0, 2);
         assert_eq!(tsv, "x,y\t\"l1\nl2\"\r\nplain\tok\r\n");
+        fs::remove_file(&p).ok();
+    }
+
+    fn wide_9_mib_csv() -> Vec<u8> {
+        format!("value\n{}\n", "x".repeat(9 * 1024 * 1024)).into_bytes()
+    }
+
+    fn copy_text(bf: &BigFile, r0: u64, r1: u64, c0: u32, c1: u32) -> String {
+        let store = ClipboardStore::create_unique().unwrap();
+        let outcome = bf.copy_tsv(r0, r1, c0, c1, &store).unwrap();
+        let text = match outcome {
+            CopyOutcome::Text { text, .. } => text,
+            CopyOutcome::App { .. } => panic!("小复制不应产生应用内 token"),
+        };
+        store.cleanup();
+        text
+    }
+
+    #[test]
+    fn copy_over_8_mib_returns_token_not_tsv() {
+        let p = tmp_csv("p5_large_copy", &wide_9_mib_csv());
+        let bf = BigFile::open(&p).unwrap();
+        let store = ClipboardStore::create_unique().unwrap();
+        let outcome = bf.copy_tsv(0, bf.meta().rows, 0, bf.meta().cols, &store).unwrap();
+        let CopyOutcome::App { meta } = outcome else { panic!("必须应用内复制") };
+        assert!(meta.bytes > LARGE_COPY_BYTES);
+        assert_eq!(meta.version, 1);
+        let entry = store.get(&meta.token).unwrap();
+        assert_eq!(entry.bytes, meta.bytes);
+        assert!(entry.path.exists());
+        drop(bf);
+        assert!(store.get(&meta.token).unwrap().path.exists());
+        store.cleanup();
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn copy_at_8_mib_stays_text() {
+        let bytes = format!("value\n{}\n", "x".repeat(LARGE_COPY_BYTES as usize - 2))
+            .into_bytes();
+        let p = tmp_csv("p5_copy_equal_limit", &bytes);
+        let bf = BigFile::open(&p).unwrap();
+        let store = ClipboardStore::create_unique().unwrap();
+        let outcome = bf.copy_tsv(0, 1, 0, 1, &store).unwrap();
+        let CopyOutcome::Text { text, bytes } = outcome else { panic!("等值必须仍为 Text") };
+        assert_eq!(bytes, LARGE_COPY_BYTES);
+        assert_eq!(text.len(), LARGE_COPY_BYTES as usize);
+        store.cleanup();
         fs::remove_file(&p).ok();
     }
 
@@ -4077,7 +4127,7 @@ keep,old,target
         assert!(m.headerless);
         assert_eq!(m.rows, 4);
         assert_eq!(bf.rows(0, 1)[0], vec!["a", "b"]);
-        assert_eq!(bf.copy_tsv(0, 1, 0, 2).unwrap(), "a\tb\r\n");
+        assert_eq!(copy_text(&bf, 0, 1, 0, 2), "a\tb\r\n");
         // 索引期关闭开关：只翻 offset，首行变表头
         bf.set_headerless(false, Approval::deny()).unwrap();
         assert_eq!(bf.meta().rows, 3);
@@ -4708,7 +4758,7 @@ keep,old,target
         let mut bf = load_ram(&p);
         bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: false }], Approval::deny())
             .unwrap(); // e,d,c,b,a
-        assert_eq!(bf.copy_tsv(0, 2, 0, 2).unwrap(), "e\tx\r\nd\t2\r\n");
+        assert_eq!(copy_text(&bf, 0, 2, 0, 2), "e\tx\r\nd\t2\r\n");
         bf.set_cell(0, 0, "E2".into(), Approval::deny()).unwrap();
         assert_eq!(bf.rows(0, 1)[0], vec!["E2", "x", "foo"]);
         bf.undo();
@@ -9762,7 +9812,14 @@ impl BigFile {
     // ---- 复制（大选区走引擎） ----
 
     /// 选区转 TSV（含引号转义，\r\n 行尾，对齐 csv.js serializeRecords）。
-    pub fn copy_tsv(&self, r0: u64, r1: u64, c0: u32, c1: u32) -> Result<String, String> {
+    pub fn copy_tsv(
+        &self,
+        r0: u64,
+        r1: u64,
+        c0: u32,
+        c1: u32,
+        store: &crate::clipboard::ClipboardStore,
+    ) -> Result<crate::clipboard::CopyOutcome, String> {
         let total = if self.partial.is_some() {
             self.indexed_data_rows()
         } else {
@@ -9771,28 +9828,24 @@ impl BigFile {
         if r1 < r0 || r1 > total {
             return Err("复制范围越界".into());
         }
-        let mut out = String::new();
+        let rows = r1 - r0;
+        let cols = c1.saturating_sub(c0);
+        let mut builder = CopyBuilder::new(store);
         if self.partial.is_some() {
             // 渐进索引期无插删行：vrow + 模式偏移 = 物理记录号
             for v in r0..r1 {
                 let fields = self.src_fields(v as u32 + self.record_offset());
-                let row: Vec<String> = (c0..c1)
-                    .map(|c| fields.get(c as usize).cloned().unwrap_or_default())
-                    .collect();
-                out.push_str(&serialize_record(&row, b'\t'));
+                builder.write_record(&fields, c0, c1)?;
             }
-            return Ok(out);
+            return builder.finish(rows, cols);
         }
         let cum = self.seg_cum_lens();
         for v in r0..r1 {
             if let Some(fields) = self.row_at_fast(&cum, v) {
-                let row: Vec<String> = (c0..c1)
-                    .map(|c| fields.get(c as usize).cloned().unwrap_or_default())
-                    .collect();
-                out.push_str(&serialize_record(&row, b'\t'));
+                builder.write_record(&fields, c0, c1)?;
             }
         }
-        Ok(out)
+        builder.finish(rows, cols)
     }
 
     // ---- 列操作 ----
