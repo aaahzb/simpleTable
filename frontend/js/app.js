@@ -18,6 +18,7 @@ import {
 import { createUndoBudgetPrefs } from "./prefs.js";
 import { createOpenRequestPump } from "./openrequests.js";
 import { createWindowCloseCoordinator } from "./windowlifecycle.js";
+import { createTransferCoordinator } from "./transfer.js";
 
 /** @type {any} Tauri v2 全局对象（withGlobalTauri） */
 const tauri = window.__TAURI__;
@@ -753,7 +754,6 @@ async function openPathsAsTabs(paths) {
 async function closeTab(id) {
   const t = tabs.find((x) => x.id === id);
   if (!t) return true;
-  const wasSide = splitOn ? t.side : "A";
   // 脏确认：活动签走 live 路径；后台脏签按标题确认，选「保存」才激活走既有保存流
   if (id === activeId) {
     if (!(await confirmDiscard())) return false;
@@ -766,26 +766,40 @@ async function closeTab(id) {
       if (dirty) return false; // 保存失败/取消另存为：中止关签
     }
   }
-  const closingActive = id === activeId; // 「保存」路径可能刚激活了目标签
+  return detachTab(id, { closeEngine: true });
+}
+
+/**
+ * 摘除页签并补齐邻签/分屏布局；迁移路径保留同一 Rust 会话，绝不 big_close。
+ *
+ * @param {number} id - 页签 id。
+ * @param {{closeEngine?: boolean}} [opts] - 普通关签为 true，迁移摘除为 false。
+ * @returns {Promise<boolean>} 页签存在时已摘除，不存在时返回 true。
+ */
+async function detachTab(id, { closeEngine = false } = {}) {
+  const t = tabs.find((x) => x.id === id);
+  if (!t) return true;
+  const wasSide = splitOn ? t.side : "A";
+  const closingActive = id === activeId;
   const group = groupTabs(wasSide);
   const neighbor = group[group.indexOf(t) + 1] ?? group[group.indexOf(t) - 1] ?? null;
-  // 只关闭本页签的引擎会话，其他页签不受影响
-  try { await t.model?.close?.(); } catch { /* 会话已关闭 */ }
+  if (closeEngine) {
+    try { await t.model?.close?.(); } catch { /* 会话已关闭 */ }
+  }
   tabs.splice(tabs.indexOf(t), 1);
   if (!tabs.length) {
     resetToEmpty();
     return true;
   }
   if (splitOn && groupTabs("B").length === 0) {
-    closeSplit(); // 右组关空：自动收屏（焦点在 B 时左组当前签接管）
+    closeSplit();
     return true;
   }
   if (splitOn && groupTabs("A").length === 0) {
-    promoteGroupB(); // 左组关空：右组整体升格补位
+    promoteGroupB();
     return true;
   }
   if (closingActive || (splitOn && sideTab[wasSide] === id)) {
-    // （组）当前签被关：同组右邻（无则左邻）补位
     if (!splitOn || wasSide === focusedSide) {
       activeId = null; // 强制 activateTab 走完整换绑
       await activateTab(neighbor.id);
@@ -795,6 +809,68 @@ async function closeTab(id) {
   }
   renderTabbar();
   return true;
+}
+
+/** 只回写迁移快照中的筛选控件；引擎已有命中集，绝不重新执行 big_filter。 */
+function restoreAdoptedFilter(t, filter) {
+  if (!filter) return;
+  const g = gridOfSide(splitOn ? t.side : "A");
+  g.filters.clear();
+  g.filterModes.clear();
+  for (const item of filter.cols ?? []) {
+    if (!Array.isArray(item) || item.length < 2) continue;
+    const col = Number(item[0]);
+    const keyword = String(item[1] ?? "");
+    const mode = Number(item[2] ?? 0);
+    if (!Number.isInteger(col) || !keyword) continue;
+    g.filters.set(col, keyword);
+    if (mode) g.filterModes.set(col, mode);
+  }
+  g.multi.cols = new Set(
+    (filter.multiCols ?? []).map(Number).filter((col) => Number.isInteger(col)),
+  );
+  g.multi.text = String(filter.multiText ?? "");
+  g.multi.on = !!g.multi.text || g.multi.cols.size > 0;
+  // 仅按快照重建输入框/严格模式/多选框，不触发筛选或清筛 IPC。
+  g._renderHeader();
+  tb.multiFilter.classList.toggle("on", g.multi.on);
+  multiWrap.classList.toggle("hidden", !g.multi.on);
+  multiInput.value = g.multi.text;
+}
+
+/** accept 后在目标窗口插入同一 session；不得 open/new 或重设撤销预算。 */
+async function adoptToTab(adopted) {
+  const bm = makeDocumentModel();
+  bindModelEvents(bm);
+  const snapshot = adopted.snapshot ?? {};
+  const t = {
+    id: tabSeq++,
+    title: snapshot.title ?? tabTitleOf(adopted.path),
+    path: adopted.path ?? null,
+    model: bm,
+    dirty: adopted.meta?.modified === true,
+    headerless: adopted.meta?.headerless === true,
+    side: "A",
+  };
+  await bm.adopt(adopted);
+  t.dirty = bm.meta()?.modified === true;
+  t.headerless = bm.isHeaderless();
+  if (activeId === null && model.sessionId !== null) ensureTabbed();
+  const side = adopted.side === "B" && splitOn ? "B" : "A";
+  insertTabIntoGroup(t, side, adopted.index);
+  if (!(await activateTab(t.id))) throw new Error("迁移标签未能激活");
+  restoreAdoptedFilter(t, snapshot.filter);
+  renderTabbar();
+  updateStatusText();
+  return bm;
+}
+
+/** complete/cancel 后仅摘除标签；同一 BigFile 由新 owner 或源窗口继续持有。 */
+async function removeTransferredTab(session) {
+  const t = tabs.find((item) => item.model?.sessionId === session);
+  if (t) await detachTab(t.id, { closeEngine: false });
+  else if (activeId === null && model.sessionId === session) resetToEmpty();
+  return tabs.length;
 }
 
 /** 全部页签关闭后回空表（对齐启动态） */
@@ -2313,6 +2389,24 @@ document.addEventListener("keydown", (e) => {
   });
 })();
 
+const transferCoordinator = createTransferCoordinator({
+  invoke,
+  listen: (event, handler) => tauri.event.listen(event, handler),
+  createWindow: () => invoke("create_document_window"),
+  closeEmptyWindow: () => invoke("close_empty_window"),
+  modelForSession: (session) => tabs.find((t) => t.model?.sessionId === session)?.model
+    ?? (model.sessionId === session ? model : null),
+  adoptToTab,
+  removeSourceTab: removeTransferredTab,
+  removeAdoptedTab: removeTransferredTab,
+  onChanged: () => {
+    renderTabbar();
+    updateStatusText();
+    refreshBigUi();
+  },
+  onError: (error) => statusMsg("迁移失败：" + String(error?.message ?? error), 5000),
+});
+
 // ============ 启动 ============
 
 // 冒烟/截屏诊断经此代理访问网格：函数调用绑定到当前焦点侧实例，
@@ -2341,6 +2435,7 @@ const gridLive = new Proxy(/** @type {any} */ ({}), {
     activatePath: activateQueuedPath,
     reportError: (error) => statusMsg(`打开失败：${error?.message ?? error}`, 5000),
   });
+  await transferCoordinator.ready;
   await openPump.start();
   await openPump.idle();
 
@@ -2411,6 +2506,7 @@ window.__app = {
     current: splitOn && sideTab[t.side] === t.id,
   })),
   activateTab, closeTab, openPathsAsTabs, moveTab,
+  transferTabToWindow: transferCoordinator.transferTabToWindow,
   // 分屏视图：状态快照 / 建立 / 关闭
   split: () => ({
     on: splitOn,

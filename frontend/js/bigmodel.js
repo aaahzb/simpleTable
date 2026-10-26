@@ -43,6 +43,20 @@ export const BIG_THRESHOLD = 50 * 1024 * 1024;
 /** 乐观编辑失败时抛出的统一错误前缀（app 层捕获转状态栏）。 */
 const BIG_EDIT_ERR = "大文件编辑失败";
 
+/** accepted 阶段只允许读取；写入必须等 complete 解除只读。 */
+const TRANSFER_READ_COMMANDS = new Set([
+  "big_meta", "big_rows", "big_filter_page", "big_filter_count",
+  "big_filter_hit_view_row", "big_find_edge", "big_stale",
+  "big_sort_estimate", "big_copy", "big_clipboard_meta",
+]);
+
+/** 这些命令在途时不进入 sealing，避免保存/重写与迁移屏障交叉。 */
+const TRANSFER_BLOCK_COMMANDS = new Set([
+  "big_save", "big_save_as", "big_sort_load", "big_sort_apply", "big_sort_exit",
+  "big_col_apply", "big_paste_import_begin", "big_paste_import_chunk",
+  "big_paste_import_finish", "big_paste_clipboard",
+]);
+
 
 /**
  * 大文件模型。
@@ -111,6 +125,18 @@ export class BigModel {
     this._undoCbs = new Set();
     /** @type {Set<Function>} */
     this._resetCbs = new Set();
+    /** @type {Map<symbol, {cmd: string, promise: Promise<any>}>} 在途 IPC；迁移屏障等待其落定 */
+    this._operations = new Map();
+    /** @type {"idle" | "sealing" | "accepted"} 文档迁移状态 */
+    this._transferState = "idle";
+    /** 固定点确认等待期间禁止开始迁移 */
+    this._confirmingFixedPoint = false;
+    /** @type {{cols: Array, multiCols: number[], multiText: string} | null} 最近一次筛选控件快照 */
+    this._filterView = null;
+    /** @type {string | null} 当前文档路径（adopt 不重新读盘） */
+    this._path = null;
+    /** @type {string} 标签标题快照 */
+    this._title = "未命名";
   }
 
   /**
@@ -141,7 +167,18 @@ export class BigModel {
     if (typeof this._sid !== "number" || typeof this._lease !== "number") {
       throw new Error("大文件会话尚未建立");
     }
-    return this._rawInvoke(cmd, { session: this._sid, lease: this._lease, ...args });
+    if (this._transferState === "sealing") {
+      return Promise.reject(new Error("文档正在迁移，请稍后重试"));
+    }
+    if (this._transferState === "accepted" && !TRANSFER_READ_COMMANDS.has(cmd)) {
+      return Promise.reject(new Error("迁移接管中，文档当前只读"));
+    }
+    const key = Symbol(cmd);
+    const promise = Promise.resolve(this._rawInvoke(cmd, {
+      session: this._sid, lease: this._lease, ...args,
+    }));
+    this._operations.set(key, { cmd, promise });
+    return promise.finally(() => this._operations.delete(key));
   }
 
   /**
@@ -158,7 +195,13 @@ export class BigModel {
       approval: { allowFixedPoint: false, preflightId: null },
     });
     if (!first.fixedPoint) return first;
-    const confirmed = await this._confirmFixedPoint(first.fixedPoint);
+    this._confirmingFixedPoint = true;
+    let confirmed;
+    try {
+      confirmed = await this._confirmFixedPoint(first.fixedPoint);
+    } finally {
+      this._confirmingFixedPoint = false;
+    }
     if (!confirmed) {
       return { changed: false, insertedRows: 0, removedRows: 0,
         fixedPoint: null, cancelled: true };
@@ -248,6 +291,9 @@ export class BigModel {
     this._sid = opened.session;
     this._lease = opened.lease;
     this._meta = opened.meta;
+    this._path = path;
+    this._title = path?.split(/[\\/]/).pop() ?? "未命名";
+    this._filterView = null;
     await this._applyDefaultUndoBudget();
     this._invalidate();
     this._emitReset();
@@ -289,6 +335,9 @@ export class BigModel {
     this._sid = created.session;
     this._lease = created.lease;
     this._meta = created.meta;
+    this._path = null;
+    this._title = "未命名";
+    this._filterView = null;
     await this._applyDefaultUndoBudget();
     this._invalidate();
     this._emitReset();
@@ -297,6 +346,115 @@ export class BigModel {
     this._emitProgress();
     this._startIndexPolling();
     return this._meta;
+  }
+
+  /**
+   * 进入迁移屏障：拒绝保存/重写等在途操作，等待其余 IPC 落定并保存视图快照。
+   *
+   * @returns {Promise<object>} 随 ticket 传给目标窗口的快照。
+   * @throws {Error} 无会话、正在迁移或关键操作尚未完成。
+   */
+  async prepareTransfer() {
+    if (this._sid === null || this._transferState !== "idle") {
+      throw new Error("文档正在迁移，请稍后重试");
+    }
+    const blocked = [...this._operations.values()].some(({ cmd }) => TRANSFER_BLOCK_COMMANDS.has(cmd));
+    if (this._confirmingFixedPoint || blocked) {
+      throw new Error("当前操作尚未完成，请稍后重试");
+    }
+    this._transferState = "sealing";
+    try {
+      const pending = [...this._operations.values()].map(({ promise }) => promise);
+      const settled = await Promise.allSettled(pending);
+      const failed = settled.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
+    } catch (error) {
+      this.rollbackTransfer(this._lease);
+      throw error;
+    }
+    const filter = this._filterOn ? {
+      cols: (this._filterView?.cols ?? []).map((item) => item.slice()),
+      multiCols: [...(this._filterView?.multiCols ?? [])],
+      multiText: this._filterView?.multiText ?? "",
+    } : null;
+    return {
+      filter,
+      headerless: this.isHeaderless(),
+      path: this._path,
+      title: this._title,
+      dirty: this.modified(),
+      view: null,
+    };
+  }
+
+  /**
+   * 接管 Rust 已 accept 的同一 BigFile；不 open/new，也不重设撤销预算。
+   *
+   * @param {object} adopted - Rust AdoptedSession。
+   * @returns {Promise<object>} 同一引擎会话的 BigMeta。
+   */
+  async adopt(adopted) {
+    if (typeof adopted?.session !== "number" || typeof adopted?.lease !== "number" || !adopted.meta) {
+      throw new Error("accept_transfer 未返回有效 AdoptedSession");
+    }
+    this._stopIndexPolling();
+    this._session += 1;
+    this._sid = adopted.session;
+    this._lease = adopted.lease;
+    this._meta = adopted.meta;
+    this._path = adopted.path ?? null;
+    this._title = adopted.snapshot?.title ?? this._path?.split(/[\\/]/).pop() ?? "未命名";
+    this._openT0 = null;
+    this._firstPaintMs = 0;
+    this._transferState = "accepted";
+    this._filterOn = adopted.meta.filtered === true;
+    this._filterView = adopted.snapshot?.filter ?? null;
+    this._filterCount = 0;
+    this._filterGen += 1;
+    this._invalidate();
+    if (this._filterOn) {
+      this._filterCount = Number(await this._invoke("big_filter_count") ?? 0);
+    }
+    this._emitReset();
+    this._emitData(true, "fetch");
+    this._emitUndo();
+    this._emitProgress();
+    this._startIndexPolling();
+    return this._meta;
+  }
+
+  /**
+   * complete/recovered 后解除 accepted 只读；session 和 lease 不变。
+   *
+   * @param {number} lease - Rust 最终确认的租约。
+   * @returns {void}
+   */
+  finishTransfer(lease) {
+    if (typeof lease !== "number") throw new Error("迁移完成未返回有效 lease");
+    this._lease = lease;
+    this._transferState = "idle";
+    this._emitData(true, "fetch");
+    this._emitUndo();
+    this._emitProgress();
+    this._startIndexPolling();
+  }
+
+  /**
+   * cancel/timeout 后恢复源租约，使旧页响应失效并重新允许源窗口操作。
+   *
+   * @param {number} restoredLease - Rust 提升后的源租约。
+   * @returns {void}
+   */
+  rollbackTransfer(restoredLease) {
+    if (typeof restoredLease !== "number") throw new Error("迁移回滚未返回有效 lease");
+    this._lease = restoredLease;
+    this._transferState = "idle";
+    this._session += 1;
+    this._invalidate();
+    this._emitData(true, "fetch");
+    this._emitUndo();
+    this._emitProgress();
+    this._startIndexPolling();
   }
 
   /**
@@ -1382,6 +1540,11 @@ export class BigModel {
     if (n === null || n === undefined || gen !== this._filterGen) return null;
     this._filterOn = true;
     this._filterCount = n;
+    this._filterView = {
+      cols: cols.map((item) => item.slice()),
+      multiCols: [...multiCols],
+      multiText,
+    };
     this._invalidate();
     // origin "fetch"：筛选只切视图不改正文——不得标脏
     this._emitData(true, "fetch");
@@ -1410,6 +1573,7 @@ export class BigModel {
     if (gen !== this._filterGen) return { applied: false, target: null }; // 同上
     this._filterOn = false;
     this._filterCount = 0;
+    this._filterView = null;
     this._invalidate();
     // 同 runFilter：视图恢复，不标脏
     this._emitData(true, "fetch");

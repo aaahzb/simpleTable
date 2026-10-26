@@ -27,6 +27,7 @@ function createEngine({ rows = 1000, cols = 3, data: initial = null } = {}, call
     pending_cols: false,
     can_undo: false,
     can_redo: false, modified: false,
+    filtered: filter !== null,
     headerless,
     // 渐进索引字段：普通夹具视为"已索引完成"
     indexing: false,
@@ -41,7 +42,6 @@ function createEngine({ rows = 1000, cols = 3, data: initial = null } = {}, call
   });
   let filter = null; // 命中视图行号数组
   const invoke = async (cmd, args = {}) => {
-      calls.push([cmd, args]);
       switch (cmd) {
         case "big_open":
           headerless = !!args.headerless;
@@ -192,6 +192,8 @@ function createEngine({ rows = 1000, cols = 3, data: initial = null } = {}, call
           }
           return filter.length;
         }
+        case "big_filter_count":
+          return filter?.length ?? 0;
         case "big_filter_page": {
           const from = Number(args.from);
           const hits = (filter ?? []).slice(from, from + Number(args.count));
@@ -279,60 +281,303 @@ function createEngine({ rows = 1000, cols = 3, data: initial = null } = {}, call
           throw new Error(`unexpected cmd ${cmd}`);
       }
   };
-  return { invoke, meta, getData: () => data };
+  const capture = () => ({
+    data: data.map((row) => row.slice()),
+    headerless, ramBacked, hasPath, sorted, ncols,
+    baseHeaders: baseHeaders.slice(),
+    filter: filter ? filter.slice() : null,
+  });
+  const restore = (state) => {
+    data = state.data.map((row) => row.slice());
+    headerless = state.headerless;
+    ramBacked = state.ramBacked;
+    hasPath = state.hasPath;
+    sorted = state.sorted;
+    ncols = state.ncols;
+    baseHeaders = state.baseHeaders.slice();
+    filter = state.filter ? state.filter.slice() : null;
+  };
+  return { invoke, meta, getData: () => data, capture, restore };
 }
 
 
-/** 共享进程会话表；每个 model 使用独立数据，owner 由 invokeFor 注入。 */
+/** 共享进程会话表、owner/lease、迁移票据与定向事件。 */
 export function makeSharedBackend(options = {}) {
   const calls = [];
   const sessions = new Map();
   const engines = new WeakMap();
+  const transfers = new Map();
+  const listeners = new Map();
+  const tabCounts = new Map();
   let nextSession = 1;
+  let nextTicket = 1;
+  let now = 0;
 
-  function authorize(entry, owner, lease) {
+  const writeCommands = new Set([
+    "big_set_undo_budget", "big_set_headerless", "big_set_cell", "big_set_cells",
+    "big_paste", "big_paste_import_begin", "big_paste_import_chunk",
+    "big_paste_import_finish", "big_paste_clipboard", "big_clear",
+    "big_insert_rows", "big_remove_rows", "big_undo", "big_redo",
+    "big_filter", "big_clear_filter", "big_col_push", "big_col_pop",
+    "big_col_clear", "big_col_apply", "big_save", "big_save_as",
+    "big_sort_load", "big_sort_cancel", "big_sort_apply", "big_sort_exit",
+  ]);
+  const historyCommands = new Set([
+    "big_set_headerless", "big_set_cell", "big_set_cells", "big_paste",
+    "big_paste_import_finish", "big_paste_clipboard", "big_clear",
+    "big_insert_rows", "big_remove_rows", "big_col_apply",
+    "big_sort_apply", "big_sort_exit",
+  ]);
+  const dirtyCommands = new Set([
+    "big_set_cell", "big_set_cells", "big_paste", "big_paste_import_finish",
+    "big_paste_clipboard", "big_clear", "big_insert_rows", "big_remove_rows",
+    "big_col_apply",
+  ]);
+
+  function authorize(entry, owner, lease, access = "read") {
     if (!entry) throw new Error("大文件会话未打开");
     if (entry.owner !== owner) throw new Error("窗口不是文档 owner");
     if (entry.lease !== lease) throw new Error("文档 lease 已过期");
+    if (entry.state === "sealed") throw new Error("文档正在迁移");
+    if (access === "write" && entry.state !== "idle") {
+      throw new Error("迁移目标当前只读");
+    }
     return entry;
+  }
+
+  function decoratedMeta(entry) {
+    return {
+      ...entry.engine.meta(),
+      can_undo: entry.undoStack.length > 0,
+      can_redo: entry.redoStack.length > 0,
+      modified: entry.dirty,
+    };
+  }
+
+  function bumpTab(owner, delta) {
+    tabCounts.set(owner, Math.max(0, (tabCounts.get(owner) ?? 0) + delta));
+  }
+
+  function listenFor(owner, event, callback) {
+    if (!listeners.has(event)) listeners.set(event, new Set());
+    const listener = { owner, callback };
+    listeners.get(event).add(listener);
+    return Promise.resolve(() => listeners.get(event)?.delete(listener));
+  }
+
+  async function emit(event, payload, targets = null) {
+    const allowed = targets === null ? null : new Set(
+      Array.isArray(targets) ? targets : [targets],
+    );
+    const pending = [];
+    for (const listener of listeners.get(event) ?? []) {
+      if (allowed && !allowed.has(listener.owner)) continue;
+      pending.push(Promise.resolve().then(() => listener.callback({ payload })));
+    }
+    await Promise.all(pending);
+  }
+
+  function seal(session, source, lease, target, snapshot = {}, side = "A", index = 0) {
+    const entry = authorize(sessions.get(Number(session)), source, lease, "write");
+    const ticket = nextTicket;
+    nextTicket += 1;
+    entry.state = "sealed";
+    transfers.set(ticket, {
+      ticket, session: entry.session, source, target, side, index, snapshot,
+      meta: decoratedMeta(entry), path: entry.path, deadline: now + 15000,
+      adopted: false,
+    });
+    return ticket;
+  }
+
+  function accept(ticket, target) {
+    const transfer = transfers.get(Number(ticket));
+    if (!transfer || transfer.target !== target) throw new Error("迁移 ticket 不存在或目标不符");
+    const entry = sessions.get(transfer.session);
+    if (!entry || entry.state !== "sealed") throw new Error("文档不在 sealed 状态");
+    entry.owner = target;
+    entry.lease += 1;
+    entry.state = "accepted";
+    return {
+      ticket: transfer.ticket,
+      session: transfer.session,
+      lease: entry.lease,
+      meta: decoratedMeta(entry),
+      path: transfer.path,
+      side: transfer.side,
+      index: transfer.index,
+      snapshot: transfer.snapshot,
+    };
+  }
+
+  function markAdopted(ticket, target) {
+    const transfer = transfers.get(Number(ticket));
+    const entry = transfer && sessions.get(transfer.session);
+    if (!transfer || !entry || transfer.target !== target || entry.state !== "accepted") {
+      throw new Error("迁移不在 accepted 状态");
+    }
+    transfer.adopted = true;
+    return { ticket: transfer.ticket, session: transfer.session, lease: entry.lease, sourceLive: true };
+  }
+
+  function complete(ticket, source) {
+    const transfer = transfers.get(Number(ticket));
+    const entry = transfer && sessions.get(transfer.session);
+    if (!transfer || !entry || transfer.source !== source || !transfer.adopted) {
+      throw new Error("目标尚未 adopt，不能 complete");
+    }
+    entry.state = "idle";
+    transfers.delete(transfer.ticket);
+    return { ticket: transfer.ticket, session: transfer.session, owner: entry.owner, lease: entry.lease };
+  }
+
+  function rollbackTransfer(transfer) {
+    const entry = sessions.get(transfer.session);
+    if (!entry) throw new Error("大文件会话未打开");
+    entry.owner = transfer.source;
+    entry.lease += 1;
+    entry.state = "idle";
+    transfers.delete(transfer.ticket);
+    return { ticket: transfer.ticket, session: transfer.session, owner: entry.owner, lease: entry.lease };
+  }
+
+  function cancel(ticket, actor) {
+    const transfer = transfers.get(Number(ticket));
+    if (!transfer || ![transfer.source, transfer.target].includes(actor)) {
+      throw new Error("迁移 ticket 不存在或已结束");
+    }
+    return rollbackTransfer(transfer);
+  }
+
+  function recover(ticket, target) {
+    const transfer = transfers.get(Number(ticket));
+    const entry = transfer && sessions.get(transfer.session);
+    if (!transfer || !entry || transfer.target !== target || entry.state !== "sealed") {
+      throw new Error("源销毁恢复要求 sealed 状态");
+    }
+    entry.owner = target;
+    entry.lease += 1;
+    entry.state = "idle";
+    transfers.delete(transfer.ticket);
+    return {
+      ticket: transfer.ticket, session: transfer.session, lease: entry.lease,
+      meta: decoratedMeta(entry), path: transfer.path,
+      side: transfer.side, index: transfer.index, snapshot: transfer.snapshot,
+    };
+  }
+
+  async function advanceTime(ms) {
+    now += Number(ms);
+    const updates = [];
+    for (const transfer of [...transfers.values()]) {
+      if (transfer.deadline > now) continue;
+      const update = rollbackTransfer(transfer);
+      updates.push(update);
+      await emit("transfer-cancelled", update, [transfer.source, transfer.target]);
+    }
+    return updates;
   }
 
   function invokeFor(owner, initialEngine = null) {
     return async (cmd, args = {}) => {
+      calls.push([cmd, args]);
+      if (cmd === "seal_document") {
+        const ticket = seal(
+          args.session, owner, args.lease, args.target,
+          args.snapshot ?? {}, args.side ?? "A", args.index ?? 0,
+        );
+        queueMicrotask(() => {
+          void emit("transfer-request", { ticket, source: owner }, args.target);
+        });
+        return ticket;
+      }
+      if (cmd === "accept_transfer") return accept(args.ticket, owner);
+      if (cmd === "transfer_adopted") {
+        const notice = markAdopted(args.ticket, owner);
+        const transfer = transfers.get(Number(args.ticket));
+        await emit("transfer-accepted", notice, transfer.source);
+        return notice;
+      }
+      if (cmd === "complete_transfer") {
+        const update = complete(args.ticket, owner);
+        await emit("transfer-completed", update, update.owner);
+        return update;
+      }
+      if (cmd === "cancel_transfer") {
+        const transfer = transfers.get(Number(args.ticket));
+        const update = cancel(args.ticket, owner);
+        await emit("transfer-cancelled", update, [transfer.source, transfer.target]);
+        return update;
+      }
       if (cmd === "big_open" || cmd === "big_new") {
         if (Object.hasOwn(args, "session") || Object.hasOwn(args, "lease")) {
-          throw new Error(`${cmd} 不接受 JS session/lease`);
+          throw new Error(cmd + " 不接受 JS session/lease");
         }
         const replaceSession = args.replaceSession;
         let replaced = null;
         if (replaceSession !== null && replaceSession !== undefined) {
           replaced = authorize(
-            sessions.get(Number(replaceSession)),
-            owner,
-            args.replaceLease,
+            sessions.get(Number(replaceSession)), owner, args.replaceLease, "write",
           );
         }
         const engine = initialEngine ?? createEngine(options, calls);
-        const meta = await engine.invoke(cmd, args);
+        await engine.invoke(cmd, args);
         const session = nextSession;
         nextSession += 1;
-        const entry = { engine, owner, lease: 1, history: [] };
-        if (replaced) sessions.delete(replaceSession);
+        const entry = {
+          session, engine, owner, lease: 1, state: "idle",
+          path: cmd === "big_open" ? args.path : null,
+          undoStack: [], redoStack: [], dirty: false,
+        };
+        if (replaced) {
+          sessions.delete(replaceSession);
+          bumpTab(replaced.owner, -1);
+        }
         sessions.set(session, entry);
-        return { session, lease: 1, meta };
+        bumpTab(owner, 1);
+        return { session, lease: 1, meta: decoratedMeta(entry) };
       }
-      const entry = authorize(sessions.get(Number(args.session)), owner, args.lease);
-      const result = await entry.engine.invoke(cmd, args);
-      if (cmd === "big_close") sessions.delete(args.session);
+      const entry = authorize(
+        sessions.get(Number(args.session)), owner, args.lease,
+        writeCommands.has(cmd) ? "write" : "read",
+      );
+      let result;
+      if (cmd === "big_undo" || cmd === "big_redo") {
+        const from = cmd === "big_undo" ? entry.undoStack : entry.redoStack;
+        const to = cmd === "big_undo" ? entry.redoStack : entry.undoStack;
+        const action = from.pop();
+        if (!action) return false;
+        entry.engine.restore(cmd === "big_undo" ? action.before : action.after);
+        entry.dirty = cmd === "big_undo" ? action.beforeDirty : action.afterDirty;
+        to.push(action);
+        return true;
+      }
+      const before = historyCommands.has(cmd) ? entry.engine.capture() : null;
+      const beforeDirty = entry.dirty;
+      result = await entry.engine.invoke(cmd, args);
+      if (before && result?.changed) {
+        const after = entry.engine.capture();
+        if (dirtyCommands.has(cmd)) entry.dirty = true;
+        entry.undoStack.push({ before, after, beforeDirty, afterDirty: entry.dirty });
+        entry.redoStack = [];
+      }
+      if (cmd === "big_save" || cmd === "big_save_as") entry.dirty = false;
+      if (cmd === "big_close") {
+        sessions.delete(args.session);
+        bumpTab(entry.owner, -1);
+      }
+      if (cmd === "big_meta" || cmd === "big_set_undo_budget") {
+        return decoratedMeta(entry);
+      }
       return result;
     };
   }
 
-  function model() {
+  function model(owner = "main") {
     const engine = createEngine(options, calls);
     const instance = new BigModel({
-      invoke: invokeFor("main", engine),
-      listen: async () => () => {},
+      invoke: invokeFor(owner, engine),
+      listen: (event, callback) => listenFor(owner, event, callback),
     });
     engines.set(instance, engine);
     return instance;
@@ -342,11 +587,12 @@ export function makeSharedBackend(options = {}) {
     const entry = sessions.get(Number(session));
     if (!entry) return null;
     return {
+      session: entry.session,
       data: entry.engine.getData(),
       owner: entry.owner,
       lease: entry.lease,
-      meta: entry.engine.meta(),
-      history: entry.history,
+      meta: decoratedMeta(entry),
+      history: entry.undoStack,
     };
   }
 
@@ -355,7 +601,17 @@ export function makeSharedBackend(options = {}) {
     sessions,
     model,
     invokeFor,
+    listenFor,
+    emit,
     snapshot,
+    seal,
+    accept,
+    markAdopted,
+    complete,
+    cancel,
+    recover,
+    advanceTime,
+    tabCount(owner) { return tabCounts.get(owner) ?? 0; },
     dataFor(instance) {
       return instance && engines.get(instance)?.getData?.();
     },
