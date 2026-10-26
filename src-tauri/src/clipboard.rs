@@ -72,6 +72,9 @@ fn ensure_capacity(root: &Path, required: u64) -> Result<(), String> {
 }
 
 impl ClipboardStore {
+    /// 仅供退出冒烟报告探针使用；清理仍由 ClipboardStore 自己执行。
+    pub fn root(&self) -> &Path { &self.root }
+
     /// 创建本进程独占的临时目录，并验证空间与写权限。
     pub fn create_unique() -> Result<Self, String> {
         let temp = std::env::temp_dir();

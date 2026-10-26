@@ -1080,6 +1080,23 @@ export class BigModel {
     }
   }
 
+  /**
+   * 直接粘贴当前进程的大复制 token，固定点重试复用同一 token。
+   *
+   * @param {string} token - 应用内剪贴板 token。
+   * @param {object} destination - PasteDestination。
+   * @returns {Promise<object>} EditOutcome。
+   */
+  async pasteClipboardToken(token, destination) {
+    let outcome;
+    try {
+      outcome = await this._invokeEdit("big_paste_clipboard", { token, destination });
+    } catch (err) {
+      throw new Error(BIG_EDIT_ERR + "：" + err);
+    }
+    return this._afterEdit(outcome);
+  }
+
   async pasteRows(row, col, rows) {
     if (this._filterOn) {
       throw new Error("筛选结果中不可编辑：请先清除筛选");

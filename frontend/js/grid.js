@@ -1667,6 +1667,40 @@ export class Grid {
    * @param {boolean} forceSplit - 无条件按区域解析（右键"按行拆分粘贴"）。
    */
   async pasteClipboard(forceSplit = false) {
+    const cur = this.sel.current;
+    if (!cur) return;
+    const [r0, c0] = cur;
+    // 应用内 token 优先于系统文本；失效 token 直接报错，不回退旧文本。
+    let tokenMeta = null;
+    try {
+      tokenMeta = await this.model.clipboardMeta();
+    } catch {
+      tokenMeta = null;
+    }
+    if (tokenMeta?.token) {
+      let destination = { kind: "rect", row: r0, col: c0 };
+      if (!forceSplit && tokenMeta.rows === 1 && tokenMeta.cols === 1
+          && this.selectedSet.size > 1) {
+        const rect = this._singleSelectionRect();
+        destination = {
+          kind: "fill",
+          target: rect
+            ? { kind: "rect", row: rect.row, col: rect.col, rows: rect.rows, cols: rect.cols }
+            : { kind: "cells", cells: this.selectedCells() },
+        };
+      }
+      try {
+        const outcome = await this.model.pasteClipboardToken(tokenMeta.token, destination);
+        if (outcome?.cancelled) {
+          this.hooks.statusMsg("已取消粘贴", 2500);
+          return;
+        }
+        this.hooks.statusMsg(destination.kind === "fill" ? "已填充选区" : "已粘贴", 2000);
+      } catch (err) {
+        this.hooks.statusMsg(String(err?.message ?? err), 3000);
+      }
+      return;
+    }
     let text;
     try {
       text = await navigator.clipboard.readText();
@@ -1675,9 +1709,6 @@ export class Grid {
       return;
     }
     if (!text) return;
-    const cur = this.sel.current;
-    if (!cur) return;
-    const [r0, c0] = cur;
     // 一对多填充（Excel）：剪贴板是单格单值（无 Tab/换行的单行，内外部来源皆然）
     // 且选区超过一格 → 全选区填充。必须先于"纯文本整段进当前格"分支判定，
     // 否则外部单值文本会被整段吞进当前格。forceSplit（按行拆分粘贴）不填充。

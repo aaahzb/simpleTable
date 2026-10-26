@@ -485,11 +485,12 @@ test("剪切复制失败返回 false 且不清除", async () => {
 
 function makeLargePasteGrid() {
   const calls = [];
+  const messages = [];
   const g = Object.create(Grid.prototype);
   g.sel = { current: [2, 1] };
   g.selectedSet = new Set([0, 1]);
   g.lastCopiedText = null;
-  g.hooks = { statusMsg: () => {} };
+  g.hooks = { statusMsg: (msg) => messages.push(msg) };
   g.model = {
     pasteExternalText: async (text, destination) => {
       calls.push([text, destination]);
@@ -503,7 +504,7 @@ function makeLargePasteGrid() {
   g.selectedCells = () => [[2, 1], [2, 2]];
   g.select = () => {};
   g._extendTo = () => {};
-  return { g, calls };
+  return { g, calls, messages };
 }
 
 function makeLargeText() {
@@ -545,4 +546,50 @@ test("forceSplit 大文本始终走 Rect 而不是 Fill 或 SingleCell", async (
   try { await g.pasteClipboard(true); } finally { restore(); }
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0][1], { kind: "rect", row: 2, col: 1 });
+});
+
+test("内部 token 粘贴先于 readText 并按矩形目的地直贴", async () => {
+  const { g, calls } = makeLargePasteGrid();
+  let reads = 0;
+  g.model.clipboardMeta = async () => ({ token: "t1", rows: 2, cols: 2, bytes: 20 });
+  g.model.pasteClipboardToken = async (token, destination) => {
+    calls.push([token, destination]);
+    return { changed: true, insertedRows: 0, removedRows: 0, cancelled: false };
+  };
+  const restore = stubNavigatorClipboard("old system text");
+  const oldRead = navigator.clipboard.readText;
+  navigator.clipboard.readText = async () => { reads += 1; return oldRead(); };
+  try { await g.pasteClipboard(); } finally { restore(); }
+  assert.equal(reads, 0);
+  assert.deepEqual(calls, [["t1", { kind: "rect", row: 2, col: 1 }]]);
+});
+
+test("内部单值 token 多选区走 Fill 而不读取系统文本", async () => {
+  const { g, calls } = makeLargePasteGrid();
+  let reads = 0;
+  g.model.clipboardMeta = async () => ({ token: "t2", rows: 1, cols: 1, bytes: 1 });
+  g.model.pasteClipboardToken = async (token, destination) => {
+    calls.push([token, destination]);
+    return { changed: true, insertedRows: 0, removedRows: 0, cancelled: false };
+  };
+  const restore = stubNavigatorClipboard("old system text");
+  navigator.clipboard.readText = async () => { reads += 1; return "old system text"; };
+  try { await g.pasteClipboard(); } finally { restore(); }
+  assert.equal(reads, 0);
+  assert.deepEqual(calls, [["t2", { kind: "fill", target: {
+    kind: "rect", row: 2, col: 1, rows: 1, cols: 2,
+  } }]]);
+});
+
+test("失效内部 token 报错且不回退旧系统文本", async () => {
+  const { g, calls, messages } = makeLargePasteGrid();
+  let reads = 0;
+  g.model.clipboardMeta = async () => ({ token: "expired", rows: 1, cols: 1, bytes: 1 });
+  g.model.pasteClipboardToken = async () => { throw new Error("token 已失效"); };
+  const restore = stubNavigatorClipboard("old system text");
+  navigator.clipboard.readText = async () => { reads += 1; return "old system text"; };
+  try { await g.pasteClipboard(); } finally { restore(); }
+  assert.equal(reads, 0);
+  assert.equal(calls.length, 0);
+  assert.ok(messages.some((text) => text.includes("token 已失效")));
 });

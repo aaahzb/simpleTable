@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::baseline::{BaselineTransform, RowId};
-use crate::clipboard::CopyBuilder;
+use crate::clipboard::{ClipboardEntry, ClipboardStore, CopyBuilder};
 use crate::history::{
     Approval, BudgetChange, Cost, EditOutcome, FixedPointKind, FixedPointRequest,
     HistoryEntry, HistoryError, HistoryLedger, HistoryStats, Prepared, PreparedHistory,
@@ -2521,6 +2521,121 @@ a,b
         fs::remove_file(&p).ok();
     }
 
+
+    fn large_tsv_128_kib() -> Vec<u8> {
+        vec![b'x'; 128 * 1024]
+    }
+
+    #[test]
+    fn p5_internal_fixed_point_paste_preserves_user_file_and_history_on_cancel() {
+        let p = tmp_csv("p5_internal_fixed", &people_csv());
+        let original = fs::read(&p).unwrap();
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_history_budget(4_096).unwrap();
+        bf.set_cell(0, 0, "redo-base".into(), Approval::deny()).unwrap();
+        assert!(bf.undo());
+        let before = bf.rows(0, u32::try_from(bf.meta().rows).unwrap());
+        let before_history = bf.history_stats();
+        let store = ClipboardStore::create_unique().unwrap();
+        let token = store.put_test_bytes(&large_tsv_128_kib()).unwrap();
+        let destination = PasteDestination::Rect { row: 0, col: 0 };
+        let first = bf.paste_clipboard(&store, &token, destination.clone(), Approval::deny()).unwrap();
+        assert!(first.fixed_point.is_some());
+        assert_eq!(bf.rows(0, u32::try_from(bf.meta().rows).unwrap()), before);
+        assert_eq!(bf.history_stats().bytes, before_history.bytes);
+        assert_eq!(bf.history_stats().redo_count, before_history.redo_count);
+        let request = first.fixed_point.unwrap();
+        let done = bf.paste_clipboard(&store, &token, destination,
+            Approval::allow(request.preflight_id)).unwrap();
+        assert!(done.changed);
+        assert_eq!(bf.history_stats().undo_count, 0);
+        assert_eq!(bf.history_stats().redo_count, 0);
+        assert!(bf.modified());
+        assert_eq!(fs::read(&p).unwrap(), original);
+        assert_ne!(bf.backing_path(), p);
+        assert!(bf.backing_path().exists());
+        assert!(!bf.undo());
+        let fixed = bf.rows(0, u32::try_from(bf.meta().rows).unwrap());
+        bf.set_cell(0, 1, "after-fixed".into(), Approval::deny()).unwrap();
+        assert!(bf.undo(), "固定点之后的新操作必须可撤销");
+        assert_eq!(bf.rows(0, u32::try_from(bf.meta().rows).unwrap()), fixed);
+        assert!(!bf.undo(), "不得越过固定点");
+        store.cleanup();
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p5_invalid_or_truncated_clipboard_keeps_generation_and_history() {
+        let p = tmp_csv("p5_bad_clipboard", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "redo-base".into(), Approval::deny()).unwrap();
+        assert!(bf.undo());
+        let before = bf.rows(0, u32::try_from(bf.meta().rows).unwrap());
+        let history = bf.history_stats();
+        let backing = bf.backing_path().to_path_buf();
+        let store = ClipboardStore::create_unique().unwrap();
+        let destination = PasteDestination::Rect { row: 0, col: 0 };
+        assert!(bf.paste_clipboard(&store, "missing", destination.clone(), Approval::deny()).is_err());
+        let token = store.put_test_bytes(&[0xf0, 0x9f, 0x98]).unwrap();
+        assert!(bf.paste_clipboard(&store, &token, destination, Approval::deny()).is_err());
+        assert_eq!(bf.rows(0, u32::try_from(bf.meta().rows).unwrap()), before);
+        assert_eq!(bf.history_stats(), history);
+        assert_eq!(bf.backing_path(), backing);
+        store.cleanup();
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p5_generation_reopen_failure_is_atomic() {
+        let p = tmp_csv("p5_generation_bad", &people_csv());
+        let original = fs::read(&p).unwrap();
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "redo-base".into(), Approval::deny()).unwrap();
+        assert!(bf.undo());
+        let before = bf.rows(0, u32::try_from(bf.meta().rows).unwrap());
+        let history = bf.history_stats();
+        let revision = bf.revision;
+        let backing = bf.backing_path().to_path_buf();
+        let store = ClipboardStore::create_unique().unwrap();
+        let token = store.put_test_bytes(&large_tsv_128_kib()).unwrap();
+        let destination = PasteDestination::Rect { row: 0, col: 0 };
+        let prepared = bf.prepare_paste_generation(store.get(&token).unwrap(), &destination).unwrap();
+        let generation = prepared.backing_path.clone();
+        fs::write(&generation, [0xf0, 0x9f, 0x98]).unwrap();
+        assert!(bf.commit_prepared_generation(prepared).is_err());
+        assert!(!generation.exists(), "失败的本次 generation 必须自清理");
+        assert_eq!(bf.rows(0, u32::try_from(bf.meta().rows).unwrap()), before);
+        assert_eq!(bf.history_stats(), history);
+        assert_eq!(bf.revision, revision);
+        assert_eq!(bf.backing_path(), backing);
+        assert_eq!(fs::read(&p).unwrap(), original);
+        store.cleanup();
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p5_sorted_fixed_point_paste_keeps_permutation() {
+        let p = tmp_csv("p5_sorted_fixed_paste", &sort_fixture());
+        let original = fs::read(&p).unwrap();
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }], Approval::deny()).unwrap();
+        let old = bf.history_stats();
+        bf.set_history_budget(old.bytes).unwrap();
+        let store = ClipboardStore::create_unique().unwrap();
+        let token = store.put_test_bytes(&large_tsv_128_kib()).unwrap();
+        let destination = PasteDestination::SingleCell { row: 0, col: 0 };
+        let first = bf.paste_clipboard(&store, &token, destination.clone(), Approval::deny()).unwrap();
+        let request = first.fixed_point.unwrap();
+        let before_order = (0..bf.meta().rows).map(|r| bf.order.display_to_orig(r)).collect::<Vec<_>>();
+        let done = bf.paste_clipboard(&store, &token, destination, Approval::allow(request.preflight_id)).unwrap();
+        assert!(done.changed);
+        let after_order = (0..bf.meta().rows).map(|r| bf.order.display_to_orig(r)).collect::<Vec<_>>();
+        assert_eq!(after_order, before_order);
+        assert!(bf.meta().sorted);
+        assert_eq!(fs::read(&p).unwrap(), original);
+        store.cleanup();
+        fs::remove_file(&p).ok();
+    }
     #[test]
     fn p1_clear_structured_targets_roundtrip() {
         let p = tmp_csv("p1_clear_targets", &people_csv());
@@ -5854,6 +5969,42 @@ struct PreparedReopen {
     n_data: u32,
 }
 
+/// 已完整写入但尚未提交的活动后备；只拥有本次会话的临时路径。
+pub struct PreparedGeneration {
+    pub backing_path: PathBuf,
+    pub rows: u64,
+    pub cols: u32,
+    pub bytes: u64,
+    pub schema: Arc<Schema>,
+    pub order: RowOrder,
+    pub headerless: bool,
+}
+
+enum GenerationKind {
+    Rect {
+        path: PathBuf,
+        offsets: Vec<u64>,
+        row: u64,
+        col: u32,
+        input_rows: u64,
+        existing_rows: u64,
+    },
+    SingleCell { row: u64, col: u32, value: String },
+    Fill { target: NormalizedClear, value: String },
+}
+
+struct GenerationSpec {
+    rows: u64,
+    cols: u32,
+    schema: Arc<Schema>,
+    order: RowOrder,
+    headerless: bool,
+    original_rows: u64,
+    original_cols: usize,
+    input_bytes: u64,
+    kind: GenerationKind,
+}
+
 /// 单次删除的执行前段状态，仅在批量删除中途失败时用于回滚。
 struct DeleteRollback {
     index: usize,
@@ -7279,7 +7430,8 @@ pub struct BigFile {
     backing_path: PathBuf,
     /// 字节后备：常规为文件映射，排序模式载入后为私有内存缓冲。
     backing: Backing,
-    enc: Encoding,
+    backing_encoding: Encoding,
+    output_encoding: Encoding,
     /// 已完成的全量索引；渐进索引期间为空（数据在 `partial` 里）。
     idx: RawIndex,
     /// 渐进索引状态；全量完成后由 `refresh_indexed` 并入 `idx` 并清空。
@@ -7449,7 +7601,8 @@ impl BigFile {
             backing_path: path.clone(),
             path,
             backing,
-            enc,
+            backing_encoding: enc,
+            output_encoding: enc,
             idx,
             partial: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -7642,7 +7795,8 @@ impl BigFile {
             path: path.to_path_buf(),
             backing_path: path.to_path_buf(),
             backing: Backing::Mmap(mmap),
-            enc,
+            backing_encoding: enc,
+            output_encoding: enc,
             idx,
             partial,
             cancel,
@@ -8006,7 +8160,7 @@ impl BigFile {
         let avg_row = if rows > 0 { file_bytes / rows } else { 0 };
         // 文本键按整行字节上界估算；GBK 解码成 UTF-8 最多约 1.5×。
         let per_level = avg_row
-            .saturating_mul(if self.enc == Encoding::Gbk { 2 } else { 1 })
+            .saturating_mul(if self.backing_encoding == Encoding::Gbk { 2 } else { 1 })
             .max(8);
         let keys = rows.saturating_mul(per_level).saturating_mul(levels);
         let scratch = rows.saturating_mul(16);
@@ -8117,7 +8271,7 @@ impl BigFile {
             cols: self.view_ncols(),
             headers: self.view_headers(),
             headerless: self.headerless,
-            encoding: match self.enc {
+            encoding: match self.output_encoding {
                 Encoding::Utf8 => "utf-8".into(),
                 Encoding::Gbk => "gbk".into(),
             },
@@ -8300,7 +8454,7 @@ impl BigFile {
         let Some((s, e)) = self.src_span(rec) else {
             return vec![String::new(); self.base_ncols];
         };
-        let mut fields = parse_record(&decode_slice(self.enc, &self.bytes()[s..e]), b',');
+        let mut fields = parse_record(&decode_slice(self.backing_encoding, &self.bytes()[s..e]), b',');
         if fields.len() < self.base_ncols {
             fields.resize(self.base_ncols, String::new());
         } else if fields.len() > self.base_ncols {
@@ -8452,8 +8606,8 @@ impl BigFile {
             return false;
         };
         let bytes = &self.bytes()[s..e];
-        if self.enc == Encoding::Gbk {
-            let text = decode_slice(self.enc, bytes);
+        if self.backing_encoding == Encoding::Gbk {
+            let text = decode_slice(self.backing_encoding, bytes);
             field_nonempty(text.as_bytes(), b',', col as usize)
         } else {
             field_nonempty(bytes, b',', col as usize)
@@ -8665,6 +8819,11 @@ impl BigFile {
         }
         Ok(changes)
     }
+
+    pub fn backing_path(&self) -> &Path { &self.backing_path }
+
+    /// 仅供冒烟诊断读取本会话独占临时目录。
+    pub fn spool_root(&self) -> &Path { self.spool.root() }
 
     pub fn modified(&self) -> bool {
         self.savepoint_detached || self.revision != 0
@@ -8942,6 +9101,38 @@ impl BigFile {
         import.cancel()
     }
 
+    /// 使用进程内大复制 token；token 文件由 ClipboardStore 持有，不能按导入 Drop 删除。
+    pub fn paste_clipboard(
+        &mut self,
+        store: &ClipboardStore,
+        token: &str,
+        destination: PasteDestination,
+        approval: Approval,
+    ) -> Result<EditOutcome, String> {
+        if approval.allow_fixed_point
+            && approval.preflight_id != Some(self.history_generation)
+        {
+            return Err("固定点预检已过期，请重试".into());
+        }
+        self.require_editable()?;
+        self.refresh_indexed();
+        let entry = store.get(token).ok_or("内部粘贴 token 已失效")?;
+        match destination {
+            PasteDestination::Rect { row, col } => {
+                let mut row_index = Vec::new();
+                self.paste_import_rect_path(&entry.path, &mut row_index, row, col, approval)
+            }
+            PasteDestination::SingleCell { row, col } => {
+                self.resolve_batch_cell(row, col)?;
+                let value = Self::read_import_single_value(&entry.path)?;
+                self.set_cell(row, col, value, approval)
+            }
+            PasteDestination::Fill { target } => {
+                self.paste_import_fill_path(&entry.path, target, approval)
+            }
+        }
+    }
+
     /// 完成导入。固定点预检请求保留 import，成功或失败后的统一取消才消费它。
     pub fn finish_paste_import(
         &mut self,
@@ -9029,16 +9220,16 @@ impl BigFile {
     }
 
     /// Fill 普通路径共享一个新值；固定点路径只流式写入，不保存旧值。
-    fn paste_import_fill(
+    fn paste_import_fill_path(
         &mut self,
-        import: &mut PasteImport,
+        path: &Path,
         target: ClearTarget,
         approval: Approval,
     ) -> Result<EditOutcome, String> {
         let total_rows = self.indexed_data_rows();
         let ncols = self.schema.visible().len();
         let target = target.normalize(total_rows, ncols)?;
-        let value = Self::read_import_single_value(&import.path)?;
+        let value = Self::read_import_single_value(&path)?;
         let new_value = ValueRef::text(value);
         let new_text: &str = match &new_value {
             ValueRef::Text(text) => text.text.as_ref(),
@@ -9107,6 +9298,15 @@ impl BigFile {
         self.finish_history(prepared, fixed_point, 0, 0)
     }
 
+    fn paste_import_fill(
+        &mut self,
+        import: &mut PasteImport,
+        target: ClearTarget,
+        approval: Approval,
+    ) -> Result<EditOutcome, String> {
+        self.paste_import_fill_path(&import.path, target, approval)
+    }
+
     fn stream_fill_target(
         &mut self,
         target: &NormalizedClear,
@@ -9122,9 +9322,402 @@ impl BigFile {
     }
 
     /// 外部矩形导入：首遍只读记录并累计精确历史成本，次遍才构造稀疏操作。
-    fn paste_import_rect(
+    /// 为固定点粘贴准备完整 UTF-8 generation；活动数据、历史和用户路径均不变。
+    pub fn prepare_paste_generation(
+        &self,
+        entry: Arc<ClipboardEntry>,
+        destination: &PasteDestination,
+    ) -> Result<PreparedGeneration, String> {
+        self.prepare_paste_generation_path(&entry.path, destination)
+    }
+
+    fn prepare_paste_generation_path(
+        &self,
+        path: &Path,
+        destination: &PasteDestination,
+    ) -> Result<PreparedGeneration, String> {
+        self.require_editable()?;
+        if self.is_indexing() {
+            return Err("文件仍在索引中，请稍候再粘贴".into());
+        }
+        self.revision.checked_add(1).ok_or("修订号溢出")?;
+        self.next_history_generation()?;
+        self.index_epoch.checked_add(1).ok_or("索引代际溢出")?;
+        let spec = match destination {
+            PasteDestination::Rect { row, col } => {
+                self.rect_generation_spec(path, *row, *col)?
+            }
+            PasteDestination::SingleCell { row, col } => {
+                self.single_generation_spec(path, *row, *col)?
+            }
+            PasteDestination::Fill { target } => {
+                self.fill_generation_spec(path, target.clone())?
+            }
+        };
+        self.write_generation(spec)
+    }
+
+    fn generation_schema(&self, headers: Vec<String>) -> Result<Arc<Schema>, String> {
+        Ok(Arc::new(Schema::from_headers(headers)?))
+    }
+
+    fn generation_headers(&self, schema: &Schema, cols: usize) -> Vec<String> {
+        if self.headerless {
+            return generic_headers(cols);
+        }
+        schema.visible().iter().map(|id| {
+            schema.resolve(*id).map(|column| column.header.clone()).unwrap_or_default()
+        }).collect()
+    }
+
+    fn rect_generation_spec(
+        &self,
+        path: &Path,
+        vrow: u64,
+        col: u32,
+    ) -> Result<GenerationSpec, String> {
+        let total_rows = self.indexed_data_rows();
+        if vrow > total_rows { return Err("粘贴起始行越界".into()); }
+        let original_cols = self.schema.visible().len();
+        let paste_start = usize::try_from(col).map_err(|_| "粘贴列号溢出")?;
+        if paste_start > original_cols { return Err("粘贴起始列越界".into()); }
+        let mut candidate = (*self.schema).clone();
+        let mut target_cols = original_cols;
+        let mut reader = RecordReader::open(path, b'\t')?;
+        let mut offsets = Vec::new();
+        let mut input_rows = 0u64;
+        loop {
+            let offset = reader.position();
+            let Some(record) = reader.next_record()? else { break };
+            offsets.push(offset);
+            input_rows = input_rows.checked_add(1).ok_or("粘贴行数溢出")?;
+            let required_cols = paste_start.checked_add(record.len()).ok_or("粘贴列数溢出")?;
+            while target_cols < required_cols {
+                let mut name_number = target_cols.checked_add(1).ok_or("列名序号溢出")?;
+                let name = loop {
+                    let candidate_name = format!("列{name_number}");
+                    let exists = candidate.visible().iter().any(|id| {
+                        candidate.resolve(*id).is_some_and(|column| column.header == candidate_name)
+                    });
+                    if !exists { break candidate_name; }
+                    name_number = name_number.checked_add(1).ok_or("列名序号溢出")?;
+                };
+                let pos = u32::try_from(target_cols).map_err(|_| "粘贴列数溢出")?;
+                candidate.insert(pos, name)?;
+                target_cols = target_cols.checked_add(1).ok_or("粘贴列数溢出")?;
+            }
+        }
+        if input_rows == 0 { return Err("粘贴内容为空".into()); }
+        let existing_rows = input_rows.min(total_rows - vrow);
+        let appended_rows = input_rows - existing_rows;
+        if appended_rows > 0 && self.is_sorted() {
+            return Err("排序模式下暂不支持扩行粘贴，请先取消排序".into());
+        }
+        if appended_rows > 0 && self.is_indexing() {
+            return Err("索引期间暂不支持扩行粘贴，请等待索引完成".into());
+        }
+        if target_cols > original_cols && self.is_sorted() {
+            return Err("排序模式下暂不支持扩列粘贴，请先取消排序".into());
+        }
+        let rows = total_rows.checked_add(appended_rows).ok_or("粘贴行数溢出")?;
+        let cols = u32::try_from(target_cols).map_err(|_| "粘贴列数溢出")?;
+        let schema = self.generation_schema(self.generation_headers(&candidate, target_cols))?;
+        let input_bytes = fs::metadata(path).map_err(|e| format!("读取粘贴文件大小失败：{e}"))?.len();
+        Ok(GenerationSpec {
+            rows, cols, schema, order: self.order.clone(), headerless: self.headerless,
+            original_rows: total_rows, original_cols, input_bytes,
+            kind: GenerationKind::Rect {
+                path: path.to_path_buf(), offsets, row: vrow, col,
+                input_rows, existing_rows,
+            },
+        })
+    }
+
+    fn single_generation_spec(
+        &self,
+        path: &Path,
+        row: u64,
+        col: u32,
+    ) -> Result<GenerationSpec, String> {
+        self.resolve_batch_cell(row, col)?;
+        let value = Self::read_import_single_value(path)?;
+        let original_rows = self.indexed_data_rows();
+        let original_cols = self.schema.visible().len();
+        let schema = self.generation_schema(self.view_headers())?;
+        Ok(GenerationSpec {
+            rows: original_rows,
+            cols: u32::try_from(original_cols).map_err(|_| "列数溢出")?,
+            schema, order: self.order.clone(), headerless: self.headerless,
+            original_rows, original_cols, input_bytes: value.len() as u64,
+            kind: GenerationKind::SingleCell { row, col, value },
+        })
+    }
+
+    fn fill_generation_spec(
+        &self,
+        path: &Path,
+        target: ClearTarget,
+    ) -> Result<GenerationSpec, String> {
+        let original_rows = self.indexed_data_rows();
+        let original_cols = self.schema.visible().len();
+        let target = target.normalize(original_rows, original_cols)?;
+        target.visit(original_rows, original_cols, |row, col| {
+            self.resolve_batch_cell(row, col).map(|_| ())
+        })?;
+        let value = Self::read_import_single_value(path)?;
+        let schema = self.generation_schema(self.view_headers())?;
+        Ok(GenerationSpec {
+            rows: original_rows,
+            cols: u32::try_from(original_cols).map_err(|_| "列数溢出")?,
+            schema, order: self.order.clone(), headerless: self.headerless,
+            original_rows, original_cols, input_bytes: value.len() as u64,
+            kind: GenerationKind::Fill { target, value },
+        })
+    }
+
+    fn write_generation(&self, spec: GenerationSpec) -> Result<PreparedGeneration, String> {
+        let input_size = match &spec.kind {
+            GenerationKind::Rect { input_rows, .. } => *input_rows,
+            _ => 0,
+        };
+        let index_bytes = input_size.checked_mul(8).ok_or("generation 索引大小溢出")?;
+        let mut required = (self.bytes().len() as u64)
+            .checked_add(spec.input_bytes).ok_or("generation 空间需求溢出")?
+            .checked_add(index_bytes).ok_or("generation 空间需求溢出")?
+            .checked_add(64 * 1024).ok_or("generation 空间需求溢出")?;
+        for value in self.overlay.values() {
+            required = required.checked_add(value.len() as u64).ok_or("generation 空间需求溢出")?;
+        }
+        for block in &self.seg.blocks {
+            if let Some(rows) = block {
+                for row in rows {
+                    for value in row {
+                        required = required.checked_add(value.len() as u64)
+                            .ok_or("generation 空间需求溢出")?;
+                    }
+                }
+            }
+        }
+        self.spool.ensure_capacity(required)?;
+        let path = self.spool.new_file("generation")?;
+        let result = (|| {
+            let file = fs::File::create(&path).map_err(|e| format!("创建 generation 失败：{e}"))?;
+            let mut writer = BufWriter::with_capacity(64 * 1024, file);
+            let mut written = 0u64;
+            let headers = self.generation_headers(&spec.schema, spec.cols as usize);
+            if !spec.headerless {
+                Self::write_generation_record(&mut writer, &headers, &mut written)?;
+            }
+            let mut reader = match &spec.kind {
+                GenerationKind::Rect { path, .. } => Some(RecordReader::open(path, b'\t')?),
+                _ => None,
+            };
+            let rank = match &spec.order {
+                RowOrder::Identity => None,
+                RowOrder::Perm(perm) => {
+                    let mut rank = vec![u64::MAX; usize::try_from(spec.original_rows)
+                        .map_err(|_| "行数溢出")?];
+                    for (display, &orig) in perm.as_slice().iter().enumerate() {
+                        if let Some(slot) = rank.get_mut(orig as usize) {
+                            *slot = display as u64;
+                        }
+                    }
+                    Some(rank)
+                }
+            };
+            for orig in 0..spec.original_rows {
+                let mut fields = self.identity_row_at(orig).ok_or("generation 行映射失败")?;
+                fields.resize(spec.cols as usize, String::new());
+                let display = match &rank {
+                    Some(rank) => rank[orig as usize],
+                    None => orig,
+                };
+                match &spec.kind {
+                    GenerationKind::Rect { offsets, row, col, existing_rows, .. } => {
+                        let end = row.checked_add(*existing_rows).ok_or("粘贴行号溢出")?;
+                        if display >= *row && display < end {
+                            let input_index = display - *row;
+                            let record = Self::read_generation_record(
+                                reader.as_mut().unwrap(), offsets, input_index)?;
+                            for (j, value) in record.into_iter().enumerate() {
+                                let target = usize::try_from(*col).map_err(|_| "粘贴列号溢出")?
+                                    .checked_add(j).ok_or("粘贴列号溢出")?;
+                                if target < fields.len() { fields[target] = value; }
+                            }
+                        }
+                    }
+                    GenerationKind::SingleCell { row, col, value } => {
+                        if display == *row {
+                            fields[*col as usize] = value.clone();
+                        }
+                    }
+                    GenerationKind::Fill { target, value } => {
+                        for col in 0..spec.original_cols {
+                            let col_u32 = u32::try_from(col).map_err(|_| "列号溢出")?;
+                            if Self::generation_target_contains(target, display, col_u32) {
+                                fields[col] = value.clone();
+                            }
+                        }
+                    }
+                }
+                Self::write_generation_record(&mut writer, &fields, &mut written)?;
+            }
+            if let GenerationKind::Rect { offsets, existing_rows, input_rows, col, .. } = &spec.kind {
+                for input_index in *existing_rows..*input_rows {
+                    let record = Self::read_generation_record(
+                        reader.as_mut().unwrap(), offsets, input_index)?;
+                    let mut fields = vec![String::new(); spec.cols as usize];
+                    for (j, value) in record.into_iter().enumerate() {
+                        let target = usize::try_from(*col).map_err(|_| "粘贴列号溢出")?
+                            .checked_add(j).ok_or("粘贴列号溢出")?;
+                        if target < fields.len() { fields[target] = value; }
+                    }
+                    Self::write_generation_record(&mut writer, &fields, &mut written)?;
+                }
+            }
+            writer.flush().map_err(|e| format!("冲刷 generation 失败：{e}"))?;
+            drop(writer);
+            let bytes = fs::metadata(&path).map_err(|e| format!("读取 generation 失败：{e}"))?.len();
+            if bytes != written { return Err("generation 字节数校验失败".into()); }
+            Ok(PreparedGeneration {
+                backing_path: path.clone(), rows: spec.rows, cols: spec.cols,
+                bytes, schema: spec.schema, order: spec.order, headerless: spec.headerless,
+            })
+        })();
+        if result.is_err() { let _ = fs::remove_file(&path); }
+        result
+    }
+
+    fn write_generation_record(
+        writer: &mut impl Write,
+        fields: &[String],
+        written: &mut u64,
+    ) -> Result<(), String> {
+        let bytes = encode_record(fields, b',', Encoding::Utf8);
+        writer.write_all(&bytes).map_err(|e| format!("写入 generation 失败：{e}"))?;
+        *written = written.checked_add(bytes.len() as u64).ok_or("generation 字节数溢出")?;
+        Ok(())
+    }
+
+    fn read_generation_record(
+        reader: &mut RecordReader,
+        offsets: &[u64],
+        index: u64,
+    ) -> Result<Vec<String>, String> {
+        let offset = *offsets.get(usize::try_from(index).map_err(|_| "粘贴行号溢出")?)
+            .ok_or("粘贴行索引越界")?;
+        reader.seek(offset)?;
+        reader.next_record()?.ok_or("粘贴记录截断".into())
+    }
+
+    fn identity_row_at(&self, orig: u64) -> Option<Vec<String>> {
+        if self.partial.is_some() {
+            if orig >= self.indexed_data_rows() { return None; }
+            let rec = u32::try_from(orig).ok()?.checked_add(self.record_offset())?;
+            return Some(self.src_fields(rec));
+        }
+        match self.seg.resolve(orig)? {
+            ResolvedRow::Src(rec) => Some(self.src_fields(rec)),
+            ResolvedRow::Ins { block, row } => Some(self.ins_fields(block, row)),
+        }
+    }
+
+    fn generation_target_contains(target: &NormalizedClear, row: u64, col: u32) -> bool {
+        match target {
+            NormalizedClear::Cells { cells } => cells.binary_search(&(row, col)).is_ok(),
+            NormalizedClear::Rows { rows } => rows.binary_search(&row).is_ok(),
+            NormalizedClear::Columns { cols } => cols.binary_search(&col).is_ok(),
+            NormalizedClear::Rect { row: start, col: first, rows, cols } => {
+                row >= *start && row < start.saturating_add(*rows)
+                    && col >= *first && col < first.saturating_add(*cols)
+            }
+        }
+    }
+
+    /// 重开并完整校验 generation 后才交换活动 backing；失败只清理本次临时文件。
+    pub fn commit_prepared_generation(
         &mut self,
-        import: &mut PasteImport,
+        prepared: PreparedGeneration,
+    ) -> Result<EditOutcome, String> {
+        let path = prepared.backing_path.clone();
+        let result = (|| {
+            let next_revision = self.revision.checked_add(1).ok_or("修订号溢出")?;
+            let next_generation = self.next_history_generation()?;
+            let next_epoch = self.index_epoch.checked_add(1).ok_or("索引代际溢出")?;
+            if prepared.headerless != self.headerless || prepared.order != self.order {
+                return Err("generation 提交范围已过期".into());
+            }
+            if prepared.schema.visible().len() != prepared.cols as usize {
+                return Err("generation 列宽校验失败".into());
+            }
+            let file = fs::File::open(&path).map_err(|e| format!("重开 generation 失败：{e}"))?;
+            let metadata = file.metadata().map_err(|e| e.to_string())?;
+            if metadata.len() != prepared.bytes { return Err("generation 长度已改变".into()); }
+            let mmap = Arc::new(unsafe {
+                memmap2::MmapOptions::new().map(&file).map_err(|e| e.to_string())?
+            });
+            let bytes: &[u8] = &mmap;
+            std::str::from_utf8(bytes).map_err(|_| "generation 不是有效 UTF-8".to_string())?;
+            let idx = build_index(bytes);
+            let offset = if prepared.headerless { 0u32 } else { 1u32 };
+            let expected_records = prepared.rows.checked_add(offset as u64)
+                .ok_or("generation 行数溢出")?;
+            if idx.n_records() as u64 != expected_records {
+                return Err("generation 行数校验失败".into());
+            }
+            for record in 0..idx.n_records() {
+                let (start, end) = idx.record_span(bytes.len(), record);
+                let text = std::str::from_utf8(&bytes[start..end])
+                    .map_err(|_| "generation 不是有效 UTF-8".to_string())?;
+                let fields = parse_record(text, b',');
+                if record == 0 && !prepared.headerless {
+                    let headers = self.generation_headers(&prepared.schema, prepared.cols as usize);
+                    if fields != headers { return Err("generation 表头校验失败".into()); }
+                } else if fields.len() != prepared.cols as usize {
+                    return Err("generation 列数校验失败".into());
+                }
+            }
+            let inserted_rows = prepared.rows.checked_sub(self.seg.vrow_count())
+                .ok_or("generation 提交范围已过期")?;
+            let n_data = u32::try_from(prepared.rows).map_err(|_| "generation 行数溢出")?;
+            let modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let headers = self.generation_headers(&prepared.schema, prepared.cols as usize);
+            self.backing = Backing::Mmap(mmap);
+            self.backing_path = path.clone();
+            self.backing_encoding = Encoding::Utf8;
+            self.idx = idx;
+            self.partial = None;
+            self.index_sync = true;
+            self.index_ms = 0;
+            self.total_bytes = prepared.bytes;
+            self.base_size = prepared.bytes;
+            self.base_mtime = modified;
+            self.seg = Segments::new(offset, n_data);
+            self.overlay.clear();
+            self.schema = prepared.schema;
+            self.base_ncols = prepared.cols as usize;
+            self.base_headers = headers;
+            self.order = prepared.order;
+            self.stable_hits = None;
+            self.display_hits = None;
+            self.last_spec = None;
+            self.history.clear();
+            self.fixed_point = true;
+            if self.revision != 0 { self.savepoint_detached = true; }
+            self.revision = next_revision;
+            self.history_generation = next_generation;
+            self.index_epoch = next_epoch;
+            Ok(EditOutcome { changed: true, inserted_rows, removed_rows: 0,
+                fixed_point: None, cancelled: false })
+        })();
+        if result.is_err() { let _ = fs::remove_file(&path); }
+        result
+    }
+
+    fn paste_import_rect_path(
+        &mut self,
+        path: &Path,
+        row_index: &mut Vec<u64>,
         vrow: u64,
         col: u32,
         approval: Approval,
@@ -9136,8 +9729,8 @@ impl BigFile {
         if paste_start > original_ncols { return Err("粘贴起始列越界".into()); }
         let mut candidate = (*self.schema).clone();
         let mut target_ncols = original_ncols;
-        let mut reader = RecordReader::open(&import.path, b'\t')?;
-        import.row_index.clear();
+        let mut reader = RecordReader::open(&path, b'\t')?;
+        row_index.clear();
         let mut row_count = 0u64;
         let mut max_width = 0usize;
         let mut change_count = 0u64;
@@ -9148,7 +9741,7 @@ impl BigFile {
         loop {
             let offset = reader.position();
             let Some(record) = reader.next_record()? else { break };
-            import.row_index.push(offset);
+            row_index.push(offset);
             let row_index = row_count;
             row_count = row_count.checked_add(1).ok_or("粘贴行数溢出")?;
             max_width = max_width.max(record.len());
@@ -9246,7 +9839,9 @@ impl BigFile {
             return match self.preflight_history_entry(entry, "外部粘贴", approval)? {
                 HistoryDecision::Confirm(outcome) => Ok(outcome),
                 HistoryDecision::FixedPoint(_) => {
-                    Err("超大矩形粘贴需要预生成 backing，当前操作未执行".into())
+                    let prepared = self.prepare_paste_generation_path(
+                        path, &PasteDestination::Rect { row: vrow, col })?;
+                    self.commit_prepared_generation(prepared)
                 }
                 HistoryDecision::Normal(_) => Err("粘贴固定点预检状态错误".into()),
             };
@@ -9298,6 +9893,17 @@ impl BigFile {
         self.apply(&mut prepared.entry_mut().op);
         self.last_spec = None;
         self.finish_history(prepared, fixed_point, inserted_rows, 0)
+    }
+
+    fn paste_import_rect(
+        &mut self,
+        import: &mut PasteImport,
+        vrow: u64,
+        col: u32,
+        approval: Approval,
+    ) -> Result<EditOutcome, String> {
+        let path = import.path.clone();
+        self.paste_import_rect_path(&path, &mut import.row_index, vrow, col, approval)
     }
 
     /// 将一条插入记录直接转成物理槽，预分配精确容量以便成本可复核。
@@ -10438,7 +11044,7 @@ impl BigFile {
         end: u64,
     ) -> Option<ChunkOut> {
         let mut hits = Vec::new();
-        let mut scan = FieldScan::new_resolved(resolved, self.enc, &self.overlay, self.base_ncols);
+        let mut scan = FieldScan::new_resolved(resolved, self.backing_encoding, &self.overlay, self.base_ncols);
         for i in start..end {
             if let Some((g, id)) = gate {
                 if i & 0xFFF == 0 && g.load(Ordering::Relaxed) != id {
@@ -11106,7 +11712,7 @@ impl BigFile {
         let Some(ColumnStorage::Source(slot)) = self.schema.storage(*col) else {
             return Err("Source 历史值列已不是物理源列".into());
         };
-        let decoded = decode_slice(self.enc, raw);
+        let decoded = decode_slice(self.backing_encoding, raw);
         let fields = parse_record(&decoded, b',');
         let value = fields.get(slot as usize).cloned().unwrap_or_default();
         if value.len() as u64 != *utf8_len {
@@ -11252,7 +11858,7 @@ impl BigFile {
         }
         // 表头模式先写列名；无列名模式段表第一行就是数据第一行。
         if !self.headerless {
-            w.write_all(&encode_record(&saved_headers, b',', self.enc))
+            w.write_all(&encode_record(&saved_headers, b',', self.output_encoding))
                 .map_err(|e| e.to_string())?;
         }
         let total = self.seg.vrow_count();
@@ -11276,7 +11882,7 @@ impl BigFile {
                     Some(ResolvedRow::Src(rec)) => {
                         if source_layout_changed || edited.contains(&rec) {
                             let f = self.src_fields(rec);
-                            w.write_all(&encode_record(&f, b',', self.enc))
+                            w.write_all(&encode_record(&f, b',', self.output_encoding))
                                 .map_err(|e| e.to_string())?;
                         } else {
                             let (s, e) = self.src_span(rec).unwrap_or((0, 0));
@@ -11289,7 +11895,7 @@ impl BigFile {
                     }
                     Some(ResolvedRow::Ins { block, row }) => {
                         let f = self.ins_fields(block, row);
-                        w.write_all(&encode_record(&f, b',', self.enc))
+                        w.write_all(&encode_record(&f, b',', self.output_encoding))
                             .map_err(|e| e.to_string())?;
                     }
                     None => {}
@@ -11342,7 +11948,7 @@ impl BigFile {
                                 self.write_raw_range(&mut w, rs, rec)?;
                             }
                             let f = self.src_fields(rec);
-                            w.write_all(&encode_record(&f, b',', self.enc))
+                            w.write_all(&encode_record(&f, b',', self.output_encoding))
                                 .map_err(|e| e.to_string())?;
                         } else if run.is_none() {
                             run = Some(rec);
@@ -11363,7 +11969,7 @@ impl BigFile {
                         for (row_index, _) in rows.iter().enumerate() {
                             let row = u32::try_from(row_index).map_err(|_| "插入行号越界")?;
                             let f = self.ins_fields(block, row);
-                            w.write_all(&encode_record(&f, b',', self.enc))
+                            w.write_all(&encode_record(&f, b',', self.output_encoding))
                                 .map_err(|e| e.to_string())?;
                             done += 1;
                             if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
@@ -11552,6 +12158,7 @@ impl BigFile {
         self.index_sync = true;
         self.total_bytes = prepared.total_bytes;
         self.backing_path = self.path.clone();
+        self.backing_encoding = self.output_encoding;
         self.seg = Segments::new(prepared.offset, prepared.n_data);
         self.overlay.clear();
         self.stable_hits = None;

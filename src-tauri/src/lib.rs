@@ -91,13 +91,16 @@ fn smoke_report_path() -> std::path::PathBuf {
 /// # Returns
 /// 不返回（进程退出）。
 #[tauri::command]
-fn finish_smoke(report: String, code: i32) {
+fn finish_smoke(app: tauri::AppHandle, report: String, code: i32) {
     let path = smoke_report_path();
+    let cleanup_path = app.state::<ClipboardStore>().root().to_path_buf();
+    let report = format!("{report}\nCLEANUP_PATH={}", cleanup_path.display());
     if let Err(e) = fs::write(&path, report) {
         // 写失败必须出声（CI 依赖该文件），否则无声挂死难排查
         eprintln!("[smoke] 报告写入失败 {path:?}: {e}");
     }
     eprintln!("[smoke] 报告已写入 {path:?}，退出码 {code}");
+    cleanup_process_state(&app);
     std::process::exit(code);
 }
 
@@ -167,6 +170,15 @@ fn smoke_write_repeat(path: String, line: String, times: u32, append: bool) -> R
 #[tauri::command]
 fn smoke_tmp_dir() -> String {
     std::env::temp_dir().to_string_lossy().into_owned()
+}
+
+/// 冒烟诊断：返回指定文档会话的 owned spool 根目录。
+#[tauri::command]
+fn smoke_spool_path(
+    state: tauri::State<BigShared>,
+    session: u64,
+) -> Result<String, String> {
+    with_big(&state, session, |bf| Ok(bf.spool_root().to_string_lossy().into_owned()))
 }
 
 /// 读取 CSV 文件并按 utf-8-sig → utf-8 → gbk 顺序识别编码（对齐 csv_io.py）。
@@ -941,6 +953,7 @@ pub fn run() {
             smoke_write_bytes,
             smoke_write_repeat,
             smoke_tmp_dir,
+            smoke_spool_path,
             read_csv_file,
             write_csv_file,
             pick_open_path,
@@ -968,6 +981,7 @@ pub fn run() {
             big_paste_import_chunk,
             big_paste_import_finish,
             big_paste_import_cancel,
+            big_paste_clipboard,
             big_insert_rows,
             big_remove_rows,
             big_undo,
@@ -991,7 +1005,11 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building simpleTable")
-        .run(|_app, _event| {});
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                cleanup_process_state(app);
+            }
+        });
 }
 
 #[derive(Serialize)]
@@ -1042,6 +1060,21 @@ fn big_paste_import_finish(
     with_big(&state, session, |bf| bf.finish_paste_import(&import_id, destination, approval))
 }
 
+/// 使用当前进程的大复制 token 粘贴；失效 token 不回退系统剪贴板。
+#[tauri::command]
+fn big_paste_clipboard(
+    state: tauri::State<BigShared>,
+    clipboard: tauri::State<ClipboardStore>,
+    session: u64,
+    token: String,
+    destination: engine::PasteDestination,
+    approval: Approval,
+) -> Result<EditOutcome, String> {
+    with_big(&state, session, |bf| {
+        bf.paste_clipboard(clipboard.inner(), &token, destination, approval)
+    })
+}
+
 /// 取消并清理一个尚未消费的导入。
 #[tauri::command]
 fn big_paste_import_cancel(
@@ -1054,6 +1087,16 @@ fn big_paste_import_cancel(
 
 /// 前端确认关闭（或保存完毕）后调用：立即退出进程。
 fn cleanup_process_state(app: &tauri::AppHandle) {
+    let entries = match app.state::<BigShared>().lock() {
+        Ok(mut guard) => guard.drain().map(|(_, entry)| entry).collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+    for entry in entries {
+        entry.bump_gate();
+        entry.load_cancel.store(true, Ordering::Relaxed);
+        drop(entry.file.lock());
+    }
+    // 可在 quit、RunEvent::Exit 和 smoke 出口重复调用；目录仅属于本进程。
     app.state::<ClipboardStore>().cleanup();
 }
 

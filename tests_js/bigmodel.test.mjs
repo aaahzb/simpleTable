@@ -1879,3 +1879,44 @@ test("外部大粘贴确认复用 importId 重试且不重传", async () => {
   assert.equal(calls.filter(([cmd]) => cmd === "big_paste_import_chunk")[0][1].last, true);
   assert.deepEqual(counts(), { refreshes: 1, dataEvents: 1 });
 });
+
+test("内部 token 粘贴直接调用引擎并重试固定点", async () => {
+  const calls = [];
+  let refreshes = 0;
+  let dataEvents = 0;
+  let attempts = 0;
+  const request = {
+    changed: false, insertedRows: 0, removedRows: 0, cancelled: false,
+    fixedPoint: { kind: "stepOverBudget", operation: "内部粘贴",
+      requiredBytes: 9000000, budgetBytes: 4096, preflightId: 11 },
+  };
+  const done = { changed: true, insertedRows: 0, removedRows: 0,
+    fixedPoint: null, cancelled: false };
+  const model = new BigModel({
+    invoke: async (cmd, args = {}) => {
+      calls.push([cmd, args]);
+      if (cmd === "big_paste_clipboard") {
+        attempts += 1;
+        return attempts === 1 ? request : done;
+      }
+      throw new Error("unexpected " + cmd);
+    },
+    listen: async () => () => {},
+    confirmFixedPoint: async () => true,
+  });
+  model._meta = { rows: 1, cols: 1 };
+  model._refreshMeta = async () => { refreshes += 1; };
+  model._emitData = () => { dataEvents += 1; };
+  model._emitUndo = () => {};
+  const destination = { kind: "rect", row: 0, col: 0 };
+  const out = await model.pasteClipboardToken("token-1", destination);
+  assert.equal(out.changed, true);
+  assert.deepEqual(calls.map(([cmd]) => cmd), ["big_paste_clipboard", "big_paste_clipboard"]);
+  assert.equal(calls[0][1].token, "token-1");
+  assert.deepEqual(calls[0][1].destination, destination);
+  assert.deepEqual(calls[0][1].approval, { allowFixedPoint: false, preflightId: null });
+  assert.equal(typeof calls[0][1].session, "number");
+  assert.deepEqual(calls[1][1].approval, { allowFixedPoint: true, preflightId: 11 });
+  assert.equal(refreshes, 1);
+  assert.equal(dataEvents, 1);
+});

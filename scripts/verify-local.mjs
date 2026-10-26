@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -54,6 +55,12 @@ try {
     if (!fs.existsSync(report)) throw new Error(`${kind} smoke report missing: ${report}`);
     const text = fs.readFileSync(report, "utf8");
     process.stdout.write(`\n${kind} report: ${report}\n${text}\n`);
+    const cleanupPaths = [...text.matchAll(/^CLEANUP_PATH=(.+)$/gm)]
+      .map((m) => m[1].trim());
+    assert.ok(cleanupPaths.length >= 1, "冒烟未报告清理探针");
+    for (const cleanupPath of cleanupPaths) {
+      assert.equal(fs.existsSync(cleanupPath), false, `退出后临时目录仍存在：${cleanupPath}`);
+    }
     if (status !== 0) throw new Error(`${kind} smoke exited ${status}`);
     if (!/合计\s+\d+\s+项，失败\s+0\s+项/.test(text)) {
       throw new Error(`${kind} smoke summary is not zero-failure`);

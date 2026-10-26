@@ -3758,6 +3758,37 @@ x,y
     "大外部填充重做应恢复整片");
   });
 
+  check("内部大复制 token 粘贴与关签/退出清理探针", async () => {
+    const value = "x".repeat(8 * 1024 * 1024 + 1);
+    await window.__app.smokeLoadSmall(["a"], [[value]]);
+    grid.select([0, 0]);
+    assert(await grid.copySelection() === true, "大复制应生成应用内 token");
+    const copied = await model.clipboardMeta();
+    assert(copied?.token && copied.rows === 1 && copied.cols === 1 && copied.bytes > 8 * 1024 * 1024,
+      "大复制必须产生单值应用内 token");
+    const target = `${TMP}/internal-token.csv`;
+    await writeText(target, "a,b\r\n1,2\r\n");
+    assert(await window.__app.openPathsAsTabs([target]) === true, "探针文件应进入页签");
+    const spoolPath = await invoke("smoke_spool_path", { session: model.sessionId });
+    lines.push("CLEANUP_PATH=" + spoolPath);
+    assert(await invoke("path_exists", { path: spoolPath }), "文档 spool 应在会话期间存在");
+    grid.select([0, 0]);
+    await grid.pasteClipboard();
+    await waitFor(() => model.rawData(0, 0) === value, "内部 token 应直接粘贴大值");
+    assert(await model.undo() === true, "内部 token 粘贴应可撤销");
+    await waitFor(() => model.rawData(0, 0) === "1", "内部 token 撤销应恢复原值");
+    assert(await model.redo() === true, "内部 token 粘贴应可重做");
+    await waitFor(() => model.rawData(0, 0) === value, "内部 token 重做应恢复大值");
+    const tab = window.__app.tabs().find((t) => t.active);
+    assert(tab, "关签探针需要活动页签");
+    const closePending = window.__app.closeTab(tab.id);
+    await sleep(100);
+    clickDiscardDialog("放弃");
+    assert(await closePending === true, "探针页签应允许放弃关闭");
+    assert(await invoke("path_exists", { path: spoolPath }) === false,
+      "关签后文档 spool 必须删除");
+  });
+
   // ---- 执行（看门狗：整体超时强制收尾，防挂死） ----
   const watchdog = setTimeout(async () => {
     lines.push("", `[watchdog] 超时未完成，已通过 ${lines.length} 项`);
