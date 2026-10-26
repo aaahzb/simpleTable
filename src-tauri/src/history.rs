@@ -55,6 +55,7 @@ pub struct Approval {
     pub preflight_id: Option<u64>,
 }
 
+#[cfg(test)]
 impl Approval {
     pub fn deny() -> Self { Self::default() }
     pub fn allow(preflight_id: u64) -> Self {
@@ -122,7 +123,6 @@ impl<T> Prepared<T> {
     pub fn entry_mut(&mut self) -> &mut HistoryEntry<T> { &mut self.entry }
     pub fn entry_bytes(&self) -> u64 { self.entry_bytes }
     pub fn requires_fixed_point(&self) -> bool { self.entry_bytes > self.budget_bytes }
-    pub fn into_entry(self) -> HistoryEntry<T> { self.entry }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -204,7 +204,9 @@ impl<T> HistoryLedger<T> {
     pub fn commit_rebuild(&mut self, prepared: PreparedHistory<T>) {
         *self = prepared.ledger;
     }
+    #[cfg(test)]
     pub fn undo_op(&self) -> Option<&T> { self.undo.back().map(|e| &e.op) }
+    #[cfg(test)]
     pub fn redo_op(&self) -> Option<&T> { self.redo.back().map(|e| &e.op) }
     /// 重做换块后只重绑稳定格地址，不移动条目也不改变账本。
     pub fn redo_ops_mut(&mut self) -> impl Iterator<Item = &mut T> {

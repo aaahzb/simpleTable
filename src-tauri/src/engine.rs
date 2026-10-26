@@ -21,7 +21,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::baseline::{BaselineTransform, RowId};
-use crate::clipboard::{ClipboardEntry, ClipboardStore, CopyBuilder};
+use crate::clipboard::{ClipboardStore, CopyBuilder};
+#[cfg(test)]
+use crate::clipboard::ClipboardEntry;
 use crate::history::{
     Approval, BudgetChange, Cost, EditOutcome, FixedPointKind, FixedPointRequest,
     HistoryEntry, HistoryError, HistoryLedger, HistoryStats, Prepared, PreparedHistory,
@@ -1391,7 +1393,7 @@ mod tests {
             Op::InsertRows { block, .. } => *block,
             other => panic!("应为插行记录：{other:?}"),
         };
-        bf.seg.blocks[block as usize].as_mut().unwrap()[0][0] = "MISMATCH".into();
+        Arc::make_mut(bf.seg.blocks[block as usize].as_mut().unwrap()).rows[0][0] = SharedText::from_string("MISMATCH".into());
         assert!(!bf.undo(), "内容不匹配必须拒绝逆操作");
         assert_eq!(bf.meta().rows, 6);
         // 故障注入直接修改实时块；失败的撤销必须保留这个现场。
@@ -1648,7 +1650,7 @@ a,b
             panic!("应解析为插入行");
         };
         let physical_len = |bf: &BigFile| {
-            bf.seg.blocks[block as usize].as_ref().unwrap()[row as usize].len()
+            bf.seg.blocks[block as usize].as_ref().unwrap().rows[row as usize].len()
         };
         assert_eq!(physical_len(&bf), 0, "空白行不得预占所有物理槽");
         bf.set_cell(1, 2, "b2".into(), Approval::deny()).unwrap();
@@ -1905,7 +1907,7 @@ a,b
             Op::Paste { inserted: Some(ins), .. } => ins.block,
             other => panic!("应为含插入块的 Paste：{other:?}"),
         };
-        bf.seg.blocks[block as usize].as_mut().unwrap()[0][0] = "TAMPER".into();
+        Arc::make_mut(bf.seg.blocks[block as usize].as_mut().unwrap()).rows[0][0] = SharedText::from_string("TAMPER".into());
         assert!(!bf.undo());
         assert_eq!(bf.meta().rows, 6);
         assert_eq!(bf.rows(4, 1)[0][0], "Eve2", "不得只恢复既有格");
@@ -1940,7 +1942,7 @@ a,b
         };
 
         // 空块占用但无对应段不会改变可见行，却会让后续插入行恢复失败。
-        bf.seg.blocks[block as usize] = Some(Vec::new());
+        bf.seg.blocks[block as usize] = Some(Arc::new(RowBlock { rows: Vec::new() }));
         assert!(!bf.undo());
         assert_eq!(bf.rows(0, 6), before_rows, "不得只恢复前面的源行");
         assert_eq!(bf.history_stats(), before_stats);
@@ -2637,6 +2639,117 @@ a,b
         fs::remove_file(&p).ok();
     }
     #[test]
+    fn p6_value_and_block_are_shared_not_deep_copied() {
+        let p = tmp_csv("p6_shared_values", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let value = "new-value".repeat(1000);
+        bf.set_cell(0, 0, value, Approval::deny()).unwrap();
+        let active = bf.test_active_value_ptr(RowId::Source(1), ColumnId(0));
+        let historical = bf.test_history_value_ptr();
+        assert_eq!(active, historical);
+        let bytes = bf.history_stats().bytes;
+        assert!(bf.undo());
+        assert_eq!(bf.history_stats().bytes, bytes);
+        assert!(bf.redo());
+        assert_eq!(bf.history_stats().bytes, bytes);
+        assert_eq!(bf.test_active_value_ptr(RowId::Source(1), ColumnId(0)), historical);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p6_evicted_hidden_inserted_column_releases_overlay_and_blocks() {
+        let p = tmp_csv("p6_reclaim_inserted", &people_csv());
+        let original = fs::read(&p).unwrap();
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.push_col_op(ColOp::Insert { pos: 3, name: "extra".into() }).unwrap();
+        bf.apply_col_ops(Approval::deny()).unwrap();
+        let inserted = bf.schema.visible()[3];
+        bf.set_cell(0, 3, "source-secret".into(), Approval::deny()).unwrap();
+        let rows = bf.meta().rows;
+        bf.insert_rows(rows, Some(vec![vec![
+            "left".into(), "middle".into(), "right".into(), "row-secret".into(),
+        ]]), 1, Approval::deny()).unwrap();
+        let block = match bf.history.undo_op() {
+            Some(Op::InsertRows { block, .. }) => *block,
+            _ => panic!("插入行必须产生块历史"),
+        };
+        bf.push_col_op(ColOp::Delete { col: 3 }).unwrap();
+        bf.apply_col_ops(Approval::deny()).unwrap();
+        assert!(bf.undo());
+        assert_eq!(bf.cell_value(CellId { row: RowId::Source(1), col: inserted }), "source-secret");
+        assert_eq!(bf.cell_value(CellId {
+            row: RowId::Inserted { block, row: 0 }, col: inserted,
+        }), "row-secret");
+        assert!(bf.redo());
+        let visible_before = bf.rows(0, bf.meta().rows as u32);
+        let source_weak = Arc::downgrade(bf.overlay.get(&(1, inserted)).unwrap());
+        let slot = bf.inserted_slot(ColumnStorage::Inserted(0)).unwrap();
+        let block_weak = {
+            let rows = bf.seg.blocks[block as usize].as_ref().unwrap();
+            Arc::downgrade(&rows.rows[0][slot])
+        };
+        assert!(source_weak.upgrade().is_some());
+        assert!(block_weak.upgrade().is_some());
+        let change = bf.set_history_budget(1).unwrap();
+        assert!(change.fixed_point);
+        assert_eq!(bf.history_stats().undo_count, 0);
+        assert_eq!(bf.history_stats().redo_count, 0);
+        assert!(source_weak.upgrade().is_none(), "淘汰后必须释放隐藏列 overlay 文本");
+        assert!(block_weak.upgrade().is_none(), "淘汰后必须释放隐藏列插入块文本");
+        assert_eq!(bf.schema.storage(inserted), None);
+        assert!(bf.overlay.get(&(1, inserted)).is_none());
+        assert!(bf.seg.blocks[block as usize].as_ref().unwrap().rows[0].len() <= slot);
+        assert_eq!(bf.rows(0, bf.meta().rows as u32), visible_before);
+        assert_eq!(fs::read(&p).unwrap(), original);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p6_history_never_exceeds_budget_after_interleaved_operations() {
+        let p = tmp_csv("p6_history_budget", &sort_fixture());
+        let mut bf = load_ram(&p);
+        bf.set_history_budget(64 * 1024).unwrap();
+        for i in 0..100 {
+            bf.set_cell(0, 0, format!("{i}:{}", "x".repeat(2048)), Approval::deny()).unwrap();
+            if i % 7 == 0 { assert!(bf.undo()); }
+            if i % 11 == 0 && bf.history_stats().redo_count > 0 { assert!(bf.redo()); }
+            assert!(bf.history_stats().bytes <= bf.history_stats().budget_bytes);
+        }
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p6_save_rebinds_source_without_changing_history_bytes() {
+        let p = tmp_csv("p6_source_rebind", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "changed".into(), Approval::deny()).unwrap();
+        assert!(bf.test_history_source_is_borrowed());
+        let bytes = bf.history_stats().bytes;
+        assert!(bf.save(Approval::deny(), |_, _, _, _| {}).unwrap().saved);
+        assert!(!bf.test_history_source_is_borrowed());
+        assert_eq!(bf.history_stats().bytes, bytes);
+        assert!(bf.meta().can_undo);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn p6_insert_block_and_empty_values_share_allocations() {
+        let p = tmp_csv("p6_block_sharing", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.paste_rows(bf.meta().rows, 0, vec![vec!["X".into(), "Y".into(), "Z".into()]],
+            Approval::deny()).unwrap();
+        let (active, historical) = bf.test_last_insert_block_ptrs();
+        assert_ne!(active, 0);
+        assert_eq!(active, historical);
+        bf.set_cell(0, 0, String::new(), Approval::deny()).unwrap();
+        bf.set_cell(1, 0, String::new(), Approval::deny()).unwrap();
+        let first = bf.test_active_value_ptr(RowId::Source(1), ColumnId(0));
+        let second = bf.test_active_value_ptr(RowId::Source(2), ColumnId(0));
+        assert_eq!(first, second);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
     fn p1_clear_structured_targets_roundtrip() {
         let p = tmp_csv("p1_clear_targets", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
@@ -3108,7 +3221,7 @@ a,b
             }).unwrap(),
             other => panic!("应为删除行记录：{other:?}"),
         };
-        bf.seg.blocks[block as usize] = Some(Vec::new());
+        bf.seg.blocks[block as usize] = Some(Arc::new(RowBlock { rows: Vec::new() }));
         assert!(!bf.undo());
         assert_eq!(bf.rows(0, 3), deleted_state);
         assert_eq!(bf.history_stats(), before_stats);
@@ -3723,7 +3836,7 @@ keep,old,target
 
     /// 直调 FieldScan 扫一条记录（特征化/对拍共用；ncols 给足 32 覆盖超界列）。
     fn scan_one(spec: &FilterSpec, enc: Encoding, rec: &[u8]) -> bool {
-        let overlay: HashMap<(u32, ColumnId), String> = HashMap::new();
+        let overlay: HashMap<(u32, ColumnId), Arc<SharedText>> = HashMap::new();
         let mut fs = FieldScan::new(spec, enc, &overlay, 32);
         fs.record_matches(0, rec)
     }
@@ -3823,8 +3936,8 @@ keep,old,target
         assert!(scan_one(&spec_one(1, "值"), Encoding::Gbk, &gbk));
         assert!(!scan_one(&spec_one(1, "名"), Encoding::Gbk, &gbk));
         // 覆盖层优先于原始字节（同列同 rec）
-        let mut ov: HashMap<(u32, ColumnId), String> = HashMap::new();
-        ov.insert((0, ColumnId(0)), "zzz".to_string());
+        let mut ov: HashMap<(u32, ColumnId), Arc<SharedText>> = HashMap::new();
+        ov.insert((0, ColumnId(0)), SharedText::from_string("zzz".to_string()));
         let mut fs = FieldScan::new(&spec_one(0, "zzz"), u, &ov, 32);
         assert!(fs.record_matches(0, b"a,b\r\n"));
         let mut fs = FieldScan::new(&spec_one(0, "a"), u, &ov, 32);
@@ -3912,7 +4025,7 @@ keep,old,target
         // GBK 非 ASCII 记录路由标量（严格 mode 同样成立）
         let gbk_rec = encoding_rs::GBK.encode("北京,ab
 ").0.into_owned();
-        let ov: HashMap<(u32, ColumnId), String> = HashMap::new();
+        let ov: HashMap<(u32, ColumnId), Arc<SharedText>> = HashMap::new();
         let fs = FieldScan::new(&spec_mode(0, "北京", 1), g, &ov, 32);
         assert!(!fs.route_fast(&gbk_rec), "GBK 非 ASCII → 标量（严格模式同）");
         // 标量路径：CJK 严格相等（无大小写折叠问题）
@@ -3987,7 +4100,7 @@ keep,old,target
 
     /// 同一记录分别走强分发 / 强制快路径 / 强制标量，三者必须逐位一致。
     fn scan_three(spec: &FilterSpec, enc: Encoding, rec: &[u8]) -> (bool, bool, bool) {
-        let overlay: HashMap<(u32, ColumnId), String> = HashMap::new();
+        let overlay: HashMap<(u32, ColumnId), Arc<SharedText>> = HashMap::new();
         let mut a = FieldScan::new(spec, enc, &overlay, 32);
         let mut b = FieldScan::new(spec, enc, &overlay, 32);
         let mut c = FieldScan::new(spec, enc, &overlay, 32);
@@ -4011,7 +4124,7 @@ keep,old,target
     /// 路由断言：GBK 非 ASCII 记录走标量；GBK 纯 ASCII 与 UTF-8 走快路径。
     #[test]
     fn field_scan_gbk_non_ascii_routes_to_scalar() {
-        let overlay: HashMap<(u32, ColumnId), String> = HashMap::new();
+        let overlay: HashMap<(u32, ColumnId), Arc<SharedText>> = HashMap::new();
         let gbk = encoding_rs::GBK.encode("名字,值\r\n").0.into_owned();
         let fs = FieldScan::new(&spec_one(0, "名字"), Encoding::Gbk, &overlay, 32);
         assert!(!fs.route_fast(&gbk), "GBK 非 ASCII → 标量慢路径");
@@ -5426,6 +5539,170 @@ keep,old,target
         bench_timed(&mut bf, &spec_mode(1, "user-377", 2), "首筛严格CS user-377");
     }
 
+    #[cfg(windows)]
+    fn bench_peak_working_set() -> Option<u64> {
+        let command = format!("(Get-Process -Id {}).PeakWorkingSet64", std::process::id());
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &command])
+            .output().ok()?;
+        if !output.status.success() { return None; }
+        String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    }
+
+    #[cfg(not(windows))]
+    fn bench_peak_working_set() -> Option<u64> { None }
+
+    fn bench_dir_bytes(path: &Path) -> u64 {
+        let Ok(entries) = fs::read_dir(path) else { return 0 };
+        let mut total = 0u64;
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(kind) = entry.file_type() else { continue };
+            let bytes = if kind.is_dir() {
+                bench_dir_bytes(&entry.path())
+            } else if kind.is_file() {
+                entry.metadata().map_or(0, |meta| meta.len())
+            } else {
+                0
+            };
+            total = total.saturating_add(bytes);
+        }
+        total
+    }
+
+    fn bench_history_line(
+        cache_label: &str,
+        stage: &str,
+        elapsed: std::time::Duration,
+        history_bytes: u64,
+        budget_bytes: u64,
+        spool_bytes: u64,
+    ) {
+        let peak = bench_peak_working_set()
+            .map_or_else(|| "unmeasured".to_string(), |value| value.to_string());
+        println!(
+            "BENCH label={cache_label}.{stage} elapsed_ms={} history_bytes={} budget_bytes={} spool_bytes={} peak_working_set={peak}",
+            elapsed.as_millis(), history_bytes, budget_bytes, spool_bytes,
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_history_large() {
+        let path = std::path::PathBuf::from(
+            std::env::var("SIMPLETABLE_BENCH_CSV").expect("必须设置 SIMPLETABLE_BENCH_CSV"),
+        );
+        assert_eq!(
+            path.as_path(),
+            Path::new("E:/simpletable_hdd_test/bench_22gb.csv"),
+            "基准只能读取指定合成夹具",
+        );
+        let cache_label = std::env::var("BENCH_CACHE_LABEL")
+            .unwrap_or_else(|_| "unlabeled".into());
+        let original_metadata = fs::metadata(&path).unwrap();
+        let original_len = original_metadata.len();
+        let original_mtime = original_metadata.modified().unwrap();
+        let report = |stage: &str, elapsed: std::time::Duration, bf: &BigFile| {
+            let stats = bf.history_stats();
+            bench_history_line(
+                &cache_label,
+                stage,
+                elapsed,
+                stats.bytes,
+                stats.budget_bytes,
+                bench_dir_bytes(bf.spool_root()),
+            );
+        };
+
+        let started = std::time::Instant::now();
+        let mut bf = BigFile::open_progressive_with_mode(&path, false).unwrap();
+        report("open", started.elapsed(), &bf);
+        bf.set_history_budget(256 * 1024 * 1024).unwrap();
+
+        let started = std::time::Instant::now();
+        while bf.is_indexing() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(600), "渐进索引超时");
+            bf.refresh_indexed();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        bf.refresh_indexed();
+        assert!(!bf.is_indexing());
+        report("index", started.elapsed(), &bf);
+
+        let started = std::time::Instant::now();
+        let hits = bf.run_filter(&spec_one(1, "user-377")).unwrap();
+        assert!(hits > 0);
+        report("filter", started.elapsed(), &bf);
+
+        let started = std::time::Instant::now();
+        let cancel = AtomicBool::new(false);
+        assert!(bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap());
+        report("ram_load", started.elapsed(), &bf);
+
+        let started = std::time::Instant::now();
+        let sorted = bf.sort_by_levels(
+            &[SortLevel { col: 1, numeric: false, asc: true }],
+            Approval::deny(),
+        ).unwrap();
+        assert!(sorted.changed);
+        assert!(bf.undo());
+        report("sort_undo", started.elapsed(), &bf);
+
+        bf.clear_filter();
+        let started = std::time::Instant::now();
+        let edited = bf.set_cell(0, 0, "bench-small-edit".into(), Approval::deny()).unwrap();
+        assert!(edited.changed);
+        report("small_edit", started.elapsed(), &bf);
+
+        bf.set_history_budget(1024 * 1024).unwrap();
+        let store = ClipboardStore::create_unique().unwrap();
+        let token = store.put_test_bytes(&vec![b'Z'; 2 * 1024 * 1024]).unwrap();
+        // Rect 固定点走 generation；SingleCell 仍走普通编辑路径。
+        let destination = PasteDestination::Rect { row: 0, col: 0 };
+        let before = bf.rows(0, 1);
+        let history = bf.history_stats();
+        let started = std::time::Instant::now();
+        let first = bf.paste_clipboard(&store, &token, destination.clone(), Approval::deny()).unwrap();
+        let request = first.fixed_point.clone().expect("大粘贴必须先请求固定点");
+        assert!(!first.changed);
+        assert_eq!(bf.rows(0, 1), before);
+        assert_eq!(bf.history_stats(), history);
+        report("fixed_point_preflight", started.elapsed(), &bf);
+
+        let started = std::time::Instant::now();
+        let done = bf.paste_clipboard(
+            &store,
+            &token,
+            destination,
+            Approval::allow(request.preflight_id),
+        ).unwrap();
+        assert!(done.changed);
+        assert!(done.fixed_point.is_none());
+        assert_eq!(bf.history_stats().undo_count, 0);
+        assert_eq!(bf.history_stats().redo_count, 0);
+        assert_eq!(bf.rows(0, 1)[0][0].len(), 2 * 1024 * 1024);
+        assert_eq!(fs::metadata(&path).unwrap().len(), original_len);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), original_mtime);
+        assert_ne!(bf.backing_path(), path.as_path());
+        assert!(bench_dir_bytes(bf.spool_root()) > 0);
+        report("fixed_point_commit", started.elapsed(), &bf);
+
+        store.cleanup();
+        let budget_bytes = bf.history_stats().budget_bytes;
+        let spool_root = bf.spool_root().to_path_buf();
+        let started = std::time::Instant::now();
+        drop(bf);
+        assert!(!spool_root.exists(), "关签后必须清理 owned spool");
+        bench_history_line(
+            &cache_label,
+            "close",
+            started.elapsed(),
+            0,
+            budget_bytes,
+            bench_dir_bytes(&spool_root),
+        );
+    }
+
+
     // ---- Part 24：内存字节源建表（统一大引擎，新建表格不写盘） ----
 
     /// from_bytes：内存字节直接建会话——无路径、Ram 后备、同步索引，
@@ -5658,7 +5935,7 @@ pub enum ResolvedRow {
 struct Segments {
     segs: Vec<Seg>,
     /// 插入块数据；与 Ins 段一一对应（None = 块已整块删除/替换）。
-    blocks: Vec<Option<Vec<Vec<String>>>>,
+    blocks: Vec<Option<Arc<RowBlock>>>,
     /// 已删除的源记录号。
     tombstones: BTreeSet<u32>,
 }
@@ -5729,10 +6006,11 @@ impl Segments {
             }
             SegKind::Ins { block } => {
                 // 一一对应不变式：块也切成两块，旧块作废
-                let rows = self.blocks[block as usize].take().unwrap_or_default();
-                let (a, b) = (rows[..off as usize].to_vec(), rows[off as usize..].to_vec());
-                self.blocks.push(Some(a));
-                self.blocks.push(Some(b));
+                let rows = self.blocks[block as usize].take()
+                    .unwrap_or_else(|| Arc::new(RowBlock { rows: Vec::new() }));
+                let (a, b) = (rows.rows[..off as usize].to_vec(), rows.rows[off as usize..].to_vec());
+                self.blocks.push(Some(Arc::new(RowBlock { rows: a })));
+                self.blocks.push(Some(Arc::new(RowBlock { rows: b })));
                 let nb1 = (self.blocks.len() - 2) as u32;
                 let nb2 = (self.blocks.len() - 1) as u32;
                 self.segs[i] = Seg { kind: SegKind::Ins { block: nb1 }, len: off };
@@ -5746,9 +6024,9 @@ impl Segments {
     }
 
     /// 在 vpos 处插入一个新块（返回块号）。
-    fn insert_block(&mut self, vpos: u64, rows: Vec<Vec<String>>) -> u32 {
+    fn insert_block(&mut self, vpos: u64, rows: Arc<RowBlock>) -> u32 {
         let at = self.split_at(vpos);
-        let len = rows.len() as u32;
+        let len = rows.rows.len() as u32;
         self.blocks.push(Some(rows));
         let block = (self.blocks.len() - 1) as u32;
         self.segs.insert(at, Seg { kind: SegKind::Ins { block }, len });
@@ -5756,7 +6034,7 @@ impl Segments {
     }
 
     /// 删除单个 vrow（源记录进位图并分裂段；插入块行直接摘除）。
-    fn delete_one(&mut self, vrow: u64) -> Option<Vec<String>> {
+    fn delete_one(&mut self, vrow: u64) -> Option<Vec<Arc<SharedText>>> {
         let (i, off) = self.locate(vrow)?;
         let s = self.segs[i];
         match s.kind {
@@ -5780,12 +6058,12 @@ impl Segments {
                 Some(Vec::new())
             }
             SegKind::Ins { block } => {
-                let rows = self.blocks.get_mut(block as usize)?.as_mut()?;
-                if off as usize >= rows.len() {
+                let rows = Arc::make_mut(self.blocks.get_mut(block as usize)?.as_mut()?);
+                if off as usize >= rows.rows.len() {
                     return None;
                 }
-                let cells = rows.remove(off as usize);
-                if rows.is_empty() {
+                let cells = rows.rows.remove(off as usize);
+                if rows.rows.is_empty() {
                     self.blocks[block as usize] = None;
                     self.segs.remove(i);
                 } else {
@@ -5812,8 +6090,8 @@ impl Segments {
                 }
                 SegKind::Ins { block } => {
                     let slot = self.blocks.get_mut(block as usize).expect("删除块必须存在");
-                    let rows = slot.get_or_insert_with(Vec::new);
-                    rows.insert(rollback.off as usize, rollback.cells);
+                    let rows = slot.get_or_insert_with(|| Arc::new(RowBlock { rows: Vec::new() }));
+                    Arc::make_mut(rows).rows.insert(rollback.off as usize, rollback.cells);
                     if rollback.removed_seg {
                         self.segs.insert(rollback.index, rollback.seg);
                     } else {
@@ -5836,7 +6114,7 @@ impl Segments {
             if !simulated.contains_key(&block) {
                 let Some(slot) = self.blocks.get(block as usize) else { return false };
                 let occupied = slot.is_some();
-                let rows_len = slot.as_ref().map_or(0, Vec::len);
+                let rows_len = slot.as_ref().map_or(0, |block| block.rows.len());
                 let seg_len = self.segs.iter().find(|seg| {
                     matches!(seg.kind, SegKind::Ins { block: id } if id == block)
                 }).map(|seg| seg.len);
@@ -5883,6 +6161,7 @@ impl Segments {
         row: u32,
         cells: Vec<String>,
     ) -> bool {
+        let cells = cells.into_iter().map(SharedText::from_string).collect::<Vec<_>>();
         let Some(slot) = self.blocks.get(block as usize) else { return false };
         let occupied = slot.is_some();
         let seg_index = self.segs.iter().position(|seg| {
@@ -5890,15 +6169,15 @@ impl Segments {
         });
         match (occupied, seg_index) {
             (true, Some(i)) => {
-                let rows = self.blocks[block as usize].as_mut().unwrap();
+                let rows = Arc::make_mut(self.blocks[block as usize].as_mut().unwrap());
                 let next_len = self.segs[i].len.checked_add(1);
-                if row as usize > rows.len()
-                    || self.segs[i].len as usize != rows.len()
+                if row as usize > rows.rows.len()
+                    || self.segs[i].len as usize != rows.rows.len()
                     || next_len.is_none()
                 {
                     return false;
                 }
-                rows.insert(row as usize, cells);
+                rows.rows.insert(row as usize, cells);
                 self.segs[i].len = next_len.unwrap();
                 true
             }
@@ -5908,7 +6187,7 @@ impl Segments {
                     return false;
                 }
                 let at = self.split_at(vpos);
-                self.blocks[block as usize] = Some(vec![cells]);
+                self.blocks[block as usize] = Some(Arc::new(RowBlock { rows: vec![cells] }));
                 self.segs.insert(
                     at,
                     Seg { kind: SegKind::Ins { block }, len: 1 },
@@ -5954,7 +6233,7 @@ enum DeletedRow {
 /// 保存前完成历史重建和块槽预留，替换目标后只做无失败移动。
 struct PreparedSaveHistory {
     history: PreparedHistory<Op>,
-    blocks: Vec<Option<Vec<Vec<String>>>>,
+    blocks: Vec<Option<Arc<RowBlock>>>,
     schema: Arc<Schema>,
 }
 
@@ -6012,7 +6291,7 @@ struct DeleteRollback {
     seg: Seg,
     removed_seg: bool,
     tombstone_was_present: bool,
-    cells: Vec<String>,
+    cells: Vec<Arc<SharedText>>,
 }
 
 // ============================================================
@@ -6151,6 +6430,64 @@ struct SharedText {
     text: Box<str>,
 }
 
+impl SharedText {
+    fn from_string(value: String) -> Arc<Self> {
+        if value.is_empty() {
+            static EMPTY: OnceLock<Arc<SharedText>> = OnceLock::new();
+            let text = EMPTY.get_or_init(|| {
+                Arc::new(SharedText { text: String::new().into_boxed_str() })
+            });
+            return Arc::clone(text);
+        }
+        Arc::new(SharedText { text: value.into_boxed_str() })
+    }
+}
+
+/// 插入行的共享存储；历史与活动段只 clone 外层 Arc，文本也按 Arc 共享。
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowBlock {
+    rows: Vec<Vec<Arc<SharedText>>>,
+}
+
+impl RowBlock {
+    fn from_strings(rows: Vec<Vec<String>>) -> Self {
+        Self {
+            rows: rows.into_iter().map(|row| {
+                row.into_iter().map(SharedText::from_string).collect()
+            }).collect(),
+        }
+    }
+
+    fn row_to_strings(row: &[Arc<SharedText>]) -> Vec<String> {
+        row.iter().map(|value| value.text.to_string()).collect()
+    }
+
+    fn shared_bytes(&self) -> Result<u64, HistoryError> {
+        let mut cost = Cost::new();
+        cost.add((2 * std::mem::size_of::<usize>()) as u64)?;
+        cost.add_value::<RowBlock>()?;
+        cost.add_vec(&self.rows)?;
+        for row in &self.rows {
+            cost.add_vec(row)?;
+        }
+        Ok(cost.bytes())
+    }
+
+    fn add_shared_charge(
+        rows: &Arc<RowBlock>,
+        charges: &mut Vec<SharedCharge>,
+    ) -> Result<(), HistoryError> {
+        charges.push(SharedCharge::of(rows, rows.shared_bytes()?));
+        for row in &rows.rows {
+            for value in row {
+                let bytes = history_text_bytes(value.text.len() as u64)?;
+                charges.push(SharedCharge::of(value, bytes));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// 历史值直接引用当前 backing 的源记录，或共享独立文本。
 #[derive(Clone, PartialEq, Debug)]
 enum ValueRef {
@@ -6167,14 +6504,7 @@ enum ValueRef {
 
 impl ValueRef {
     fn text(value: String) -> Self {
-        if value.is_empty() {
-            static EMPTY: OnceLock<Arc<SharedText>> = OnceLock::new();
-            let text = EMPTY.get_or_init(|| {
-                Arc::new(SharedText { text: String::new().into_boxed_str() })
-            });
-            return Self::Text(Arc::clone(text));
-        }
-        Self::Text(Arc::new(SharedText { text: value.into_boxed_str() }))
+        Self::Text(SharedText::from_string(value))
     }
 
     fn add_own_cost(&self, cost: &mut Cost) -> Result<(), HistoryError> {
@@ -6199,7 +6529,7 @@ impl ValueRef {
 struct PasteInsert {
     vpos: u64,
     block: u32,
-    rows: Vec<Vec<String>>,
+    rows: Arc<RowBlock>,
 }
 
 /// 一次可撤销列结构变化；前后 Schema 通过 Arc 共享列级存储。
@@ -6255,7 +6585,7 @@ enum Op {
         inserted: Option<PasteInsert>,
         schema_change: Option<SchemaChange>,
     },
-    InsertRows { vpos: u64, block: u32, rows: Vec<Vec<String>> },
+    InsertRows { vpos: u64, block: u32, rows: Arc<RowBlock> },
     Sort { before: RowOrder, after: RowOrder, levels: Vec<StableSortLevel> },
     /// items 按 vpos 升序（重做按身份重新定位）。
     RemoveRows { items: Vec<DeletedRow> },
@@ -6266,17 +6596,6 @@ fn history_cost_error(error: HistoryError) -> String {
 }
 
 impl Op {
-    fn rows_cost(cost: &mut Cost, rows: &Vec<Vec<String>>) -> Result<(), HistoryError> {
-        cost.add_vec(rows)?;
-        for row in rows {
-            cost.add_vec(row)?;
-            for value in row {
-                cost.add_string(value)?;
-            }
-        }
-        Ok(())
-    }
-
     /// 单步完整保留成本：Vec 容量和 String 实际容量均计入。
     fn history_cost(&self) -> Result<u64, HistoryError> {
         let mut cost = Cost::new();
@@ -6295,17 +6614,14 @@ impl Op {
             }
             Op::Columns { .. } | Op::HeaderMode(_) => {}
             Op::Sort { levels, .. } => { cost.add_vec(levels)?; }
-            Op::Paste { changes, inserted, .. } => {
+            Op::Paste { changes, .. } => {
                 cost.add_vec(changes)?;
                 for change in changes {
                     change.old.add_own_cost(&mut cost)?;
                     change.new.add_own_cost(&mut cost)?;
                 }
-                if let Some(inserted) = inserted {
-                    Self::rows_cost(&mut cost, &inserted.rows)?;
-                }
             }
-            Op::InsertRows { rows, .. } => Self::rows_cost(&mut cost, rows)?,
+            Op::InsertRows { .. } => {},
             Op::RemoveRows { items } => {
                 cost.add_vec(items)?;
             }
@@ -6334,10 +6650,13 @@ impl Op {
                     shared.push(top.snapshot.shared_charge());
                 }
             }
-            Op::Paste { changes, schema_change, .. } => {
+            Op::Paste { changes, inserted, schema_change } => {
                 for change in changes {
                     change.old.add_shared_charge(&mut shared)?;
                     change.new.add_shared_charge(&mut shared)?;
+                }
+                if let Some(inserted) = inserted {
+                    RowBlock::add_shared_charge(&inserted.rows, &mut shared)?;
                 }
                 if let Some(change) = schema_change {
                     change.add_shared_charge(&mut shared);
@@ -6353,7 +6672,7 @@ impl Op {
                     shared.push(snapshot.shared_charge());
                 }
             }
-            Op::InsertRows { .. } => {}
+            Op::InsertRows { rows, .. } => RowBlock::add_shared_charge(rows, &mut shared)?,
             Op::Sort { before, after, .. } => {
                 shared.extend(before.shared_charge());
                 shared.extend(after.shared_charge());
@@ -6565,7 +6884,7 @@ impl RowSource<'_> {
 /// 字节级字段扫描器：引号感知解析，逐字段匹配（不建任何投影缓存）。
 struct FieldScan<'a> {
     enc: Encoding,
-    overlay: &'a HashMap<(u32, ColumnId), String>,
+    overlay: &'a HashMap<(u32, ColumnId), Arc<SharedText>>,
     needles: Vec<Needle>,
     needle_by_col: HashMap<u32, Vec<usize>>,
     /// 列 → 位标记：1 = 参与匹配。
@@ -6597,7 +6916,7 @@ impl<'a> FieldScan<'a> {
     fn new(
         spec: &FilterSpec,
         enc: Encoding,
-        overlay: &'a HashMap<(u32, ColumnId), String>,
+        overlay: &'a HashMap<(u32, ColumnId), Arc<SharedText>>,
         ncols: usize,
     ) -> Self {
         let resolved = ResolvedFilterSpec::identity_for_test(spec, ncols as u32);
@@ -6607,7 +6926,7 @@ impl<'a> FieldScan<'a> {
     fn new_resolved(
         spec: &ResolvedFilterSpec,
         enc: Encoding,
-        overlay: &'a HashMap<(u32, ColumnId), String>,
+        overlay: &'a HashMap<(u32, ColumnId), Arc<SharedText>>,
         ncols: usize,
     ) -> Self {
         let mut needles = Vec::new();
@@ -6693,7 +7012,7 @@ impl<'a> FieldScan<'a> {
                 let value = needle
                     .column
                     .and_then(|id| self.overlay.get(&(rec, id)))
-                    .map(String::as_str)
+                    .map(|value| value.text.as_ref())
                     .unwrap_or("");
                 Self::value_hit(needle, value)
             };
@@ -6726,7 +7045,7 @@ impl<'a> FieldScan<'a> {
                     let needle = &self.needles[index];
                     let overlay = needle.column.and_then(|id| self.overlay.get(&(rec, id)));
                     let hit = match overlay {
-                        Some(value) => Self::value_hit(needle, value),
+                        Some(value) => Self::value_hit(needle, value.text.as_ref()),
                         None => match needle.mode {
                             2 if needle.ascii => self.raw_buf.as_slice() == needle.text.as_bytes(),
                             2 => decode_slice(self.enc, &self.raw_buf) == needle.text,
@@ -7456,7 +7775,7 @@ pub struct BigFile {
     pending_schema: Option<Arc<Schema>>,
     seg: Segments,
     /// 源记录编辑层：(稳定记录号, 稳定列身份) → 新值。
-    overlay: HashMap<(u32, ColumnId), String>,
+    overlay: HashMap<(u32, ColumnId), Arc<SharedText>>,
     pending_cols: Vec<ColOp>,
     /// 稳定原始 vrow 命中；筛选扫描与收窄只使用该身份。
     stable_hits: Option<Vec<u32>>,
@@ -7513,6 +7832,7 @@ impl BigFile {
     ///
     /// # Errors
     /// 文件不可读/为空/无记录时返回错误字符串。
+    #[cfg(test)]
     pub fn open_with(path: &Path, headerless: bool) -> Result<Self, String> {
         let t0 = Instant::now();
         let file = fs::File::open(path)
@@ -8477,7 +8797,7 @@ impl BigFile {
                     _ => String::new(),
                 };
                 if let Some(edited) = self.overlay.get(&(rec, *id)) {
-                    value.clone_from(edited);
+                    value = edited.text.to_string();
                 }
                 value
             })
@@ -8491,7 +8811,7 @@ impl BigFile {
             .blocks
             .get(block as usize)
             .and_then(|block| block.as_ref())
-            .and_then(|rows| rows.get(row as usize));
+            .and_then(|rows| rows.rows.get(row as usize));
         self.schema
             .visible()
             .iter()
@@ -8500,7 +8820,7 @@ impl BigFile {
                     .storage(*id)
                     .and_then(|storage| self.inserted_slot(storage))
                     .and_then(|slot| cells.and_then(|cells| cells.get(slot)))
-                    .cloned()
+                    .map(|value| value.text.to_string())
                     .unwrap_or_default()
             })
             .collect()
@@ -8569,7 +8889,7 @@ impl BigFile {
         match resolved {
             ResolvedRow::Src(rec) => {
                 if let Some(value) = self.overlay.get(&(rec, id)) {
-                    return !value.is_empty();
+                    return !value.text.is_empty();
                 }
                 match storage {
                     ColumnStorage::Source(slot) => self.record_field_nonempty(rec, slot),
@@ -8583,10 +8903,10 @@ impl BigFile {
                         .blocks
                         .get(block as usize)
                         .and_then(|block| block.as_ref())
-                        .and_then(|rows| rows.get(row as usize))
+                        .and_then(|rows| rows.rows.get(row as usize))
                         .and_then(|cells| cells.get(slot))
                 })
-                .is_some_and(|value| !value.is_empty()),
+                .is_some_and(|value| !value.text.is_empty()),
         }
     }
 
@@ -8674,7 +8994,7 @@ impl BigFile {
             RowId::Source(rec) => {
                 let col = cell.col;
                 if let Some(value) = self.overlay.get(&(rec, col)) {
-                    return value.clone();
+                    return value.text.to_string();
                 }
                 match self.schema.storage(col) {
                     Some(ColumnStorage::Source(slot)) => self
@@ -8698,12 +9018,58 @@ impl BigFile {
                     .blocks
                     .get(block as usize)
                     .and_then(|block| block.as_ref())
-                    .and_then(|rows| rows.get(row as usize))
+                    .and_then(|rows| rows.rows.get(row as usize))
                     .and_then(|cells| cells.get(slot))
-                    .cloned()
+                    .map(|value| value.text.to_string())
                     .unwrap_or_default()
             }
         }
+    }
+
+    #[cfg(test)]
+    fn test_active_value_ptr(&self, row: RowId, col: ColumnId) -> usize {
+        match row {
+            RowId::Source(rec) => self.overlay.get(&(rec, col))
+                .map_or(0, |value| value.text.as_ptr() as usize),
+            RowId::Inserted { block, row } => {
+                let Some(slot) = self.schema.storage(col)
+                    .and_then(|storage| self.inserted_slot(storage))
+                else { return 0 };
+                self.seg.blocks.get(block as usize)
+                    .and_then(|block| block.as_ref())
+                    .and_then(|rows| rows.rows.get(row as usize))
+                    .and_then(|cells| cells.get(slot))
+                    .map_or(0, |value| value.text.as_ptr() as usize)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn test_history_value_ptr(&self) -> usize {
+        match self.history.undo_op() {
+            Some(Op::SetCell { new: ValueRef::Text(text), .. }) => text.text.as_ptr() as usize,
+            _ => 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn test_history_source_is_borrowed(&self) -> bool {
+        matches!(self.history.undo_op(), Some(Op::SetCell {
+            old: ValueRef::Source { .. }, ..
+        }))
+    }
+
+    #[cfg(test)]
+    fn test_last_insert_block_ptrs(&self) -> (usize, usize) {
+        let (block, rows) = match self.history.undo_op() {
+            Some(Op::InsertRows { block, rows, .. }) => (*block, rows),
+            Some(Op::Paste { inserted: Some(inserted), .. }) => (inserted.block, &inserted.rows),
+            _ => return (0, 0),
+        };
+        let active = self.seg.blocks.get(block as usize)
+            .and_then(|block| block.as_ref())
+            .map_or(0, |rows| Arc::as_ptr(rows) as usize);
+        (active, Arc::as_ptr(rows) as usize)
     }
 
     /// 将批前文本转换为稳定历史值；未覆盖源格只记录 backing 范围。
@@ -8820,6 +9186,7 @@ impl BigFile {
         Ok(changes)
     }
 
+    #[cfg(test)]
     pub fn backing_path(&self) -> &Path { &self.backing_path }
 
     /// 仅供冒烟诊断读取本会话独占临时目录。
@@ -8843,6 +9210,9 @@ impl BigFile {
             }
         }
         self.history_generation = next_generation;
+        if change.evicted > 0 {
+            self.reclaim_unreferenced_columns();
+        }
         Ok(change)
     }
 
@@ -8865,8 +9235,123 @@ impl BigFile {
         }
     }
 
+    fn collect_schema_columns(schema: &Schema, referenced: &mut BTreeSet<ColumnId>) {
+        for (id, _) in schema.columns() {
+            referenced.insert(id);
+        }
+    }
+
+    /// 活动可见列及双栈操作仍可见的列身份；隐藏身份不能仅靠活动 Schema 保留。
+    fn referenced_column_ids(&self) -> BTreeSet<ColumnId> {
+        let mut referenced = BTreeSet::new();
+        referenced.extend(self.schema.visible().iter().copied());
+        if let Some(schema) = &self.pending_schema {
+            referenced.extend(schema.visible().iter().copied());
+        }
+        for entry in self.history.iter_undo().chain(self.history.iter_redo()) {
+            match &entry.op {
+                Op::SetCell { cell, .. } => { referenced.insert(cell.col); }
+                Op::SetCells { changes } => {
+                    for change in changes { referenced.insert(change.cell.col); }
+                }
+                Op::Columns { change } => {
+                    Self::collect_schema_columns(&change.before, &mut referenced);
+                    Self::collect_schema_columns(&change.after, &mut referenced);
+                }
+                Op::HeaderMode(change) => {
+                    Self::collect_schema_columns(&change.schema_change.before, &mut referenced);
+                    Self::collect_schema_columns(&change.schema_change.after, &mut referenced);
+                }
+                Op::Paste { changes, schema_change, .. } => {
+                    for change in changes { referenced.insert(change.cell.col); }
+                    if let Some(change) = schema_change {
+                        Self::collect_schema_columns(&change.before, &mut referenced);
+                        Self::collect_schema_columns(&change.after, &mut referenced);
+                    }
+                }
+                Op::Sort { levels, .. } => {
+                    for level in levels { referenced.insert(level.col); }
+                }
+                Op::InsertRows { .. } | Op::RemoveRows { .. } => {}
+            }
+        }
+        referenced
+    }
+
+    /// 仅回收隐藏且双栈不再引用的 Inserted 数据；Source 字节和可见槽保持不变。
+    fn reclaim_unreferenced_columns(&mut self) {
+        let mut referenced = self.referenced_column_ids();
+        let mut candidates = Vec::new();
+        for (id, column) in self.schema.columns() {
+            if self.schema.visible().contains(&id) || referenced.contains(&id) {
+                continue;
+            }
+            if let ColumnStorage::Inserted(slot) = column.storage {
+                if let Some(physical) = self.inserted_slot(ColumnStorage::Inserted(slot)) {
+                    candidates.push((id, physical));
+                }
+            }
+        }
+        let mut active_reclaim = false;
+        for (id, physical) in candidates {
+            // 历史仍共享同一行块时，块内数据仍是历史引用；等最后引用淘汰后再收。
+            let block_referenced = self.seg.blocks.iter().flatten().any(|block| {
+                Arc::strong_count(block) > 1
+                    && block.rows.iter().any(|row| row.len() > physical)
+            });
+            if block_referenced {
+                referenced.insert(id);
+            } else {
+                active_reclaim = true;
+            }
+        }
+        let removed = if active_reclaim {
+            Arc::make_mut(&mut self.schema).reclaim_hidden_inserted(&referenced)
+        } else {
+            Vec::new()
+        };
+        let pending_reclaim = self.pending_schema.as_ref().is_some_and(|schema| {
+            schema.columns().any(|(id, column)| {
+                !schema.visible().contains(&id)
+                    && !referenced.contains(&id)
+                    && matches!(column.storage, ColumnStorage::Inserted(_))
+            })
+        });
+        if pending_reclaim {
+            let pending = self.pending_schema.as_mut().unwrap();
+            let _ = Arc::make_mut(pending).reclaim_hidden_inserted(&referenced);
+        }
+        if removed.is_empty() {
+            return;
+        }
+        let removed_ids: BTreeSet<_> = removed.iter().map(|(id, _)| *id).collect();
+        let removed_slots: BTreeSet<_> = removed.iter().filter_map(|(_, slot)| {
+            self.inserted_slot(ColumnStorage::Inserted(*slot))
+        }).collect();
+        self.overlay.retain(|(_, id), _| !removed_ids.contains(id));
+        for block in &mut self.seg.blocks {
+            let Some(block) = block else { continue };
+            let Some(block) = Arc::get_mut(block) else { continue };
+            for row in &mut block.rows {
+                let old_len = row.len();
+                for slot in &removed_slots {
+                    if *slot < row.len() {
+                        row[*slot] = SharedText::from_string(String::new());
+                    }
+                }
+                while row.last().is_some_and(|value| value.text.is_empty()) {
+                    row.pop();
+                }
+                if row.len() != old_len {
+                    row.shrink_to_fit();
+                }
+            }
+        }
+    }
+
     fn clear_history_at_fixed_point(&mut self, next_generation: u64) {
         self.history.clear();
+        self.reclaim_unreferenced_columns();
         self.fixed_point = true;
         if self.revision != 0 {
             self.savepoint_detached = true;
@@ -8939,7 +9424,10 @@ impl BigFile {
             if self.revision < 0 {
                 self.savepoint_detached = true;
             }
-            self.history.commit_prepared(prepared);
+            let stats = self.history.commit_prepared(prepared);
+            if stats.evicted_undo > 0 || stats.cleared_redo > 0 {
+                self.reclaim_unreferenced_columns();
+            }
             self.history_generation = next_generation;
         }
         self.revision = next_revision;
@@ -9323,6 +9811,7 @@ impl BigFile {
 
     /// 外部矩形导入：首遍只读记录并累计精确历史成本，次遍才构造稀疏操作。
     /// 为固定点粘贴准备完整 UTF-8 generation；活动数据、历史和用户路径均不变。
+    #[cfg(test)]
     pub fn prepare_paste_generation(
         &self,
         entry: Arc<ClipboardEntry>,
@@ -9486,13 +9975,13 @@ impl BigFile {
             .checked_add(index_bytes).ok_or("generation 空间需求溢出")?
             .checked_add(64 * 1024).ok_or("generation 空间需求溢出")?;
         for value in self.overlay.values() {
-            required = required.checked_add(value.len() as u64).ok_or("generation 空间需求溢出")?;
+            required = required.checked_add(value.text.len() as u64).ok_or("generation 空间需求溢出")?;
         }
         for block in &self.seg.blocks {
             if let Some(rows) = block {
-                for row in rows {
+                for row in &rows.rows {
                     for value in row {
-                        required = required.checked_add(value.len() as u64)
+                        required = required.checked_add(value.text.len() as u64)
                             .ok_or("generation 空间需求溢出")?;
                     }
                 }
@@ -9702,6 +10191,7 @@ impl BigFile {
             self.display_hits = None;
             self.last_spec = None;
             self.history.clear();
+            self.reclaim_unreferenced_columns();
             self.fixed_point = true;
             if self.revision != 0 { self.savepoint_detached = true; }
             self.revision = next_revision;
@@ -9882,7 +10372,8 @@ impl BigFile {
         let inserted = if inserted.is_empty() {
             None
         } else {
-            Some(PasteInsert { vpos: total_rows, block: 0, rows: inserted })
+            Some(PasteInsert { vpos: total_rows, block: 0,
+                rows: Arc::new(RowBlock::from_strings(inserted)) })
         };
         let (mut prepared, fixed_point) = match self.preflight_history(
             Op::Paste { changes, inserted, schema_change }, "外部粘贴", approval)? {
@@ -10039,7 +10530,8 @@ impl BigFile {
         let inserted = if inserted.is_empty() {
             None
         } else {
-            Some(PasteInsert { vpos: total, block: 0, rows: inserted })
+            Some(PasteInsert { vpos: total, block: 0,
+                rows: Arc::new(RowBlock::from_strings(inserted)) })
         };
         let (mut prepared, fixed_point) = match self.preflight_history(
             Op::Paste { changes, inserted, schema_change },
@@ -10137,8 +10629,8 @@ impl BigFile {
                 row
             })
             .collect();
-        let rows = self.logical_rows_to_storage(rows)?;
-        let inserted_rows = rows.len() as u64;
+        let rows = Arc::new(RowBlock::from_strings(self.logical_rows_to_storage(rows)?));
+        let inserted_rows = rows.rows.len() as u64;
         let (mut prepared, fixed_point) = match self.preflight_history(
             Op::InsertRows { vpos, block: 0, rows },
             "插入行",
@@ -10165,8 +10657,8 @@ impl BigFile {
                 ResolvedRow::Ins { block, row } => self.seg.blocks
                     .get(block as usize)
                     .and_then(Option::as_ref)
-                    .and_then(|rows| rows.get(row as usize))
-                    .cloned()
+                    .and_then(|rows| rows.rows.get(row as usize))
+                    .map(|cells| RowBlock::row_to_strings(cells))
                     .ok_or("行号越界")?,
             };
             resolved.push((vpos, identity));
@@ -10235,7 +10727,7 @@ impl BigFile {
                     SegKind::Ins { block } => self.seg.blocks
                         .get(block as usize)
                         .and_then(Option::as_ref)
-                        .is_some_and(|rows| rows.len() == 1),
+                        .is_some_and(|rows| rows.rows.len() == 1),
                     SegKind::Src { .. } => false,
                 };
                 let tombstone_was_present = match original_seg.kind {
@@ -10342,7 +10834,7 @@ impl BigFile {
                     }
                     self.seg.tombstones.remove(&rec);
                     for (id, value) in headerless_schema.visible().iter().zip(cells) {
-                        self.overlay.insert((rec, *id), value);
+                        self.overlay.insert((rec, *id), SharedText::from_string(value));
                     }
                     self.seg.compact();
                 }
@@ -10359,7 +10851,7 @@ impl BigFile {
                     let Some(stored) = stored.pop() else { return false };
                     let index = block as usize;
                     if index == self.seg.blocks.len() {
-                        let inserted = self.seg.insert_block(0, vec![stored]);
+                        let inserted = self.seg.insert_block(0, Arc::new(RowBlock::from_strings(vec![stored])));
                         debug_assert_eq!(inserted, block, "预分配顶部块号必须稳定");
                     } else if index < self.seg.blocks.len() {
                         if !self.seg.restore_inserted(0, block, 0, stored) {
@@ -10395,7 +10887,7 @@ impl BigFile {
                         return false;
                     };
                     let Some(stored) = stored.pop() else { return false };
-                    if !self.remove_inserted_block_for_undo(0, block, &[stored]) {
+                    if !self.remove_inserted_block_for_undo(0, block, &RowBlock::from_strings(vec![stored])) {
                         return false;
                     }
                 }
@@ -10438,7 +10930,7 @@ impl BigFile {
                     self.schema = Arc::clone(&change.after);
                 }
                 if let Some(inserted) = inserted {
-                    inserted.block = self.seg.insert_block(inserted.vpos, inserted.rows.clone());
+                    inserted.block = self.seg.insert_block(inserted.vpos, Arc::clone(&inserted.rows));
                 }
                 for change in changes {
                     self.write_value(change.cell, &change.new);
@@ -10451,7 +10943,7 @@ impl BigFile {
                 true
             }
             Op::InsertRows { vpos, block, rows } => {
-                *block = self.seg.insert_block(*vpos, rows.clone());
+                *block = self.seg.insert_block(*vpos, Arc::clone(rows));
                 true
             }
             Op::RemoveRows { items } => {
@@ -10476,7 +10968,7 @@ impl BigFile {
     /// 从共享文本或其原始 backing 记录读取历史值，再写入稳定格地址。
     fn write_value(&mut self, cell: CellId, value: &ValueRef) {
         match value {
-            ValueRef::Text(text) => self.write_cell(cell, &text.text),
+            ValueRef::Text(text) => self.write_shared_cell(cell, Arc::clone(text)),
             ValueRef::Source { .. } => {
                 if let Ok(value) = self.source_value_text(value) {
                     self.write_cell(cell, &value);
@@ -10485,31 +10977,34 @@ impl BigFile {
         }
     }
 
-    fn write_cell(&mut self, cell: CellId, value: &str) {
+    fn write_shared_cell(&mut self, cell: CellId, value: Arc<SharedText>) {
         match cell.row {
             RowId::Source(rec) => {
-                let col = cell.col;
-                self.overlay.insert((rec, col), value.to_string());
+                self.overlay.insert((rec, cell.col), value);
             }
             RowId::Inserted { block, row } => {
-                let col = cell.col;
                 let Some(slot) = self
                     .schema
-                    .storage(col)
+                    .storage(cell.col)
                     .and_then(|storage| self.inserted_slot(storage))
                 else {
                     return;
                 };
                 if let Some(Some(rows)) = self.seg.blocks.get_mut(block as usize) {
-                    if let Some(cells) = rows.get_mut(row as usize) {
+                    let rows = Arc::make_mut(rows);
+                    if let Some(cells) = rows.rows.get_mut(row as usize) {
                         if slot >= cells.len() {
-                            cells.resize(slot + 1, String::new());
+                            cells.resize(slot + 1, SharedText::from_string(String::new()));
                         }
-                        cells[slot] = value.to_string();
+                        cells[slot] = value;
                     }
                 }
             }
         }
+    }
+
+    fn write_cell(&mut self, cell: CellId, value: &str) {
+        self.write_shared_cell(cell, SharedText::from_string(value.to_string()));
     }
 
     /// 撤销；逆操作失败时把同一条目放回原栈，数据与代际不变。
@@ -10669,18 +11164,18 @@ impl BigFile {
         &mut self,
         vpos: u64,
         block: u32,
-        rows: &[Vec<String>],
+        rows: &RowBlock,
     ) -> bool {
         if let Some((i, off)) = self.seg.locate(vpos) {
             if let SegKind::Ins { block: current } = self.seg.segs[i].kind {
-                let covers = off == 0 && self.seg.segs[i].len == rows.len() as u32;
+                let covers = off == 0 && self.seg.segs[i].len == rows.rows.len() as u32;
                 if covers && current != block {
                     return false;
                 }
                 let same = covers
                     && self.seg.blocks.get(current as usize)
                         .and_then(Option::as_ref)
-                        .is_some_and(|current_rows| current_rows.as_slice() == rows);
+                        .is_some_and(|current_rows| current_rows.rows.as_slice() == rows.rows.as_slice());
                 if same {
                     self.seg.segs.remove(i);
                     self.seg.blocks[current as usize] = None;
@@ -10692,7 +11187,7 @@ impl BigFile {
         // 保存把插入行物化为 Source。先验证整段身份和最终内容，再倒序删除，
         // 使任何可预见失败都发生在首次写入之前。
         let mut materialized = Vec::new();
-        for (offset, expected) in rows.iter().enumerate() {
+        for (offset, expected) in rows.rows.iter().enumerate() {
             let Ok(offset_u64) = u64::try_from(offset) else { return false };
             let Some(vrow) = vpos.checked_add(offset_u64) else { return false };
             let Some(resolved) = self.seg.resolve(vrow) else { return false };
@@ -10710,15 +11205,15 @@ impl BigFile {
                         if slot >= fields.len() {
                             fields.resize(slot + 1, String::new());
                         }
-                        fields[slot].clone_from(value);
+                        fields[slot] = value.text.to_string();
                     }
                     fields
                 }
                 ResolvedRow::Ins { block, row } => {
                     let Some(fields) = self.seg.blocks.get(block as usize)
                         .and_then(Option::as_ref)
-                        .and_then(|block_rows| block_rows.get(row as usize))
-                        .cloned()
+                        .and_then(|block_rows| block_rows.rows.get(row as usize))
+                        .map(|cells| RowBlock::row_to_strings(cells))
                     else {
                         return false;
                     };
@@ -10729,7 +11224,7 @@ impl BigFile {
             let width = actual.len().max(expected.len());
             let same = (0..width).all(|slot| {
                 actual.get(slot).map(String::as_str).unwrap_or("")
-                    == expected.get(slot).map(String::as_str).unwrap_or("")
+                    == expected.get(slot).map(|value| value.text.as_ref()).unwrap_or("")
             });
             if !same {
                 return false;
@@ -10739,7 +11234,7 @@ impl BigFile {
                 materialized.push((rec, row));
             }
         }
-        for offset in (0..rows.len()).rev() {
+        for offset in (0..rows.rows.len()).rev() {
             let vrow = vpos + offset as u64;
             let removed = self.seg.delete_one(vrow);
             debug_assert!(removed.is_some(), "预检后的插行逆删除必须成功");
@@ -10829,7 +11324,7 @@ impl BigFile {
                     match item {
                         DeletedRow::Src { vpos, rec, .. } => {
                             for (id, value) in visible.iter().zip(cells) {
-                                self.overlay.insert((*rec, *id), value);
+                                self.overlay.insert((*rec, *id), SharedText::from_string(value));
                             }
                             self.seg.tombstones.remove(rec);
                             let at = self.seg.split_at(*vpos);
@@ -11387,7 +11882,7 @@ impl BigFile {
                 SegKind::Ins { block } => {
                     let rows = self.seg.blocks.get(block as usize)
                         .and_then(Option::as_ref).ok_or("插入块在保存前已失效")?;
-                    for row in 0..rows.len() {
+                    for row in 0..rows.rows.len() {
                         let row = u32::try_from(row).map_err(|_| "插入行号溢出")?;
                         if transform.inserted_rows.insert((block, row), new_rec).is_some() {
                             return Err("插入行保存映射重复".into());
@@ -11511,7 +12006,7 @@ impl BigFile {
                 })
             }).collect()
         };
-        let map_row = |row: &Vec<String>| -> Result<Vec<String>, String> {
+        let map_row = |row: &[Arc<SharedText>]| -> Result<Vec<Arc<SharedText>>, String> {
             let mut mapped = Vec::new();
             for (slot, value) in row.iter().enumerate() {
                 let column = if slot < self.base_ncols {
@@ -11528,18 +12023,20 @@ impl BigFile {
                 };
                 let new_index = usize::try_from(new_slot).map_err(|_| "保存列槽越界")?;
                 if new_index >= mapped.len() {
-                    if value.is_empty() {
+                    if value.text.is_empty() {
                         continue;
                     }
                     let end = new_index.checked_add(1).ok_or("保存列槽越界")?;
-                    mapped.resize(end, String::new());
+                    mapped.resize(end, SharedText::from_string(String::new()));
                 }
-                mapped[new_index] = value.clone();
+                mapped[new_index] = Arc::clone(value);
             }
             Ok(mapped)
         };
-        let map_rows = |rows: &Vec<Vec<String>>| -> Result<Vec<Vec<String>>, String> {
-            rows.iter().map(map_row).collect()
+        let map_rows = |rows: &RowBlock| -> Result<Arc<RowBlock>, String> {
+            let rows = rows.rows.iter().map(|row| map_row(row))
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(Arc::new(RowBlock { rows }))
         };
         let mut map_schema = |schema: &Arc<Schema>| -> Result<Arc<Schema>, String> {
             Self::map_schema_for_save(schema, transform, schema_cache)
@@ -11923,6 +12420,7 @@ impl BigFile {
             // 排序物化仍是固定点；成功保存本身重新建立干净保存点。
             self.order = RowOrder::Identity;
             self.history.clear();
+            self.reclaim_unreferenced_columns();
             self.fixed_point = true;
             self.revision = 0;
             self.savepoint_detached = false;
@@ -11966,7 +12464,7 @@ impl BigFile {
                 }
                 SegKind::Ins { block } => {
                     if let Some(Some(rows)) = self.seg.blocks.get(block as usize) {
-                        for (row_index, _) in rows.iter().enumerate() {
+                        for (row_index, _) in rows.rows.iter().enumerate() {
                             let row = u32::try_from(row_index).map_err(|_| "插入行号越界")?;
                             let f = self.ins_fields(block, row);
                             w.write_all(&encode_record(&f, b',', self.output_encoding))
@@ -11998,9 +12496,11 @@ impl BigFile {
         if let Some(prepared) = prepared_history {
             self.seg.blocks = prepared.blocks;
             self.history.commit_rebuild(prepared.history);
+            self.reclaim_unreferenced_columns();
             self.schema = prepared.schema;
         } else {
             self.history.clear();
+            self.reclaim_unreferenced_columns();
             self.fixed_point = true;
             self.schema = saved_schema;
         }

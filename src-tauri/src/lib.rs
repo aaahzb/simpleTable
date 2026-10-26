@@ -19,13 +19,9 @@ use tauri::{Emitter, Manager};
 mod baseline;
 mod clipboard;
 mod engine;
-// Task 2 先建立独立账本；接口在 Task 3–14 接入，Task 15 移除本豁免。
-#[allow(dead_code)]
 mod history;
 mod order;
 mod schema;
-// Task 7 先以缺失类型测试驱动实现；Task 15 复查临时豁免。
-#[allow(dead_code)]
 mod spool;
 use clipboard::{ClipboardMeta, ClipboardStore, CopyOutcome};
 use engine::{BigFile, BigMeta, ClearTarget, ColOp, FilterPage, FilterSpec, SortEstimate, SortLevel};

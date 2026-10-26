@@ -1,5 +1,5 @@
 use crate::history::Cost;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 会话内稳定列身份；与物理存储槽和当前可见位置无关。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -153,6 +153,31 @@ impl Schema {
         next.columns.get_mut(&id).unwrap().header = header;
         *self = Self::finish_candidate(next)?;
         Ok(())
+    }
+
+    /// 删除不可见且不再被活动或历史引用的 Inserted 身份，返回其存储槽。
+    pub fn reclaim_hidden_inserted(
+        &mut self,
+        referenced: &BTreeSet<ColumnId>,
+    ) -> Vec<(ColumnId, u32)> {
+        let mut removed = Vec::new();
+        for (id, column) in &self.columns {
+            if self.visible.contains(id) || referenced.contains(id) {
+                continue;
+            }
+            if let ColumnStorage::Inserted(slot) = column.storage {
+                removed.push((*id, slot));
+            }
+        }
+        for (id, _) in &removed {
+            self.columns.remove(id);
+        }
+        if !removed.is_empty() {
+            // 只删除节点，既有账目已成功计算，更小的总账不可能新增溢出。
+            self.history_bytes = self.compute_history_bytes()
+                .expect("删除隐藏列后历史账目不得溢出");
+        }
+        removed
     }
 
     /// 把历史 Schema 重绑定到保存后的连续 Source 基线。

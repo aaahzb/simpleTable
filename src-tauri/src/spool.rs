@@ -71,7 +71,6 @@ impl Drop for SessionSpool {
 
 /// 一个外部文本导入的独占临时文件及其上传状态。
 pub struct PasteImport {
-    pub id: String,
     pub path: PathBuf,
     pub bytes: u64,
     pub finished_upload: bool,
@@ -85,7 +84,7 @@ impl PasteImport {
             return Err("导入 ID 不能为空".into());
         }
         let path = spool.new_file("paste")?;
-        Ok(Self { id, path, bytes: 0, finished_upload: false, row_index: Vec::new() })
+        Ok(Self { path, bytes: 0, finished_upload: false, row_index: Vec::new() })
     }
 
     /// 校验并追加一个 hex 分块；所有可预见错误都发生在写入前。
@@ -240,13 +239,13 @@ impl RowSnapshot {
         I: Iterator<Item = Vec<String>>,
     {
         let mut buffered = Vec::<Vec<String>>::new();
-        let mut logical_bytes = 0u64;
+        let mut logical = Cost::new();
         let mut disk: Option<(PathBuf, File, Vec<SnapshotIndex>, u64)> = None;
         for row in rows {
             for value in &row {
-                logical_bytes = logical_bytes.checked_add(value.len() as u64)
-                    .ok_or("快照逻辑内容长度溢出")?;
+                logical.add_logical_str(value).map_err(|_| "快照逻辑内容长度溢出")?;
             }
+            let logical_bytes = logical.bytes();
             if disk.is_none() && logical_bytes <= MEM_SNAPSHOT_MAX_BYTES {
                 buffered.push(row);
                 continue;
@@ -268,6 +267,7 @@ impl RowSnapshot {
             let (_, file, index, offset) = disk.as_mut().unwrap();
             write_disk_row(file, &row, offset, index)?;
         }
+        let logical_bytes = logical.bytes();
         if let Some((path, mut file, index, _)) = disk {
             let count = u64::try_from(index.len()).map_err(|_| "快照行数超过 u64")?;
             file.seek(SeekFrom::Start(4)).and_then(|_| file.write_all(&count.to_le_bytes()))
