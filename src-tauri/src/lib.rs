@@ -4,7 +4,7 @@
 //! 前端经 `window.__TAURI__.core.invoke` 调用本模块命令；文件内容一律
 //! 以字符串形式跨边界传输，编码处理全部收敛在本层（对齐 csv_io.py）。
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
@@ -29,7 +29,10 @@ mod spool;
 use clipboard::{ClipboardMeta, ClipboardStore, CopyOutcome};
 use engine::{BigFile, BigMeta, ClearTarget, ColOp, FilterPage, FilterSpec, SortEstimate, SortLevel};
 use history::{Approval, EditOutcome};
-use document_registry::{Access, BigEntry, BigSession};
+use document_registry::{
+    Access, AdoptedNotice, AdoptedSession, BigEntry, BigSession, DestroyOutcome,
+    TransferRoute, TransferUpdate,
+};
 
 /// 读文件结果：解码后的纯文本 + 实际使用的编码名（供状态栏展示）。
 #[derive(Serialize)]
@@ -1244,6 +1247,266 @@ fn is_park(app: tauri::AppHandle, window: tauri::Window) -> Option<String> {
     None
 }
 
+fn emit_transfer_update(app: &tauri::AppHandle, event: &str, update: &TransferUpdate, targets: &[String]) {
+    for target in targets {
+        if app.get_webview_window(target).is_some() {
+            let _ = app.emit_to(target, event, update.clone());
+        }
+    }
+}
+
+fn cancel_in_runtime(
+    runtime: &mut RuntimeState,
+    ticket: u64,
+    actor: &str,
+) -> Result<(TransferUpdate, TransferRoute, Vec<open_request::OpenBatch>), String> {
+    let route = runtime.docs.route(ticket)
+        .ok_or_else(|| "迁移 ticket 不存在或已结束".to_string())?;
+    let (session, owner, lease) = runtime.docs.cancel(ticket, actor)?;
+    runtime.opens.set_session_owner(session, &owner);
+    let batches = runtime.opens.set_transferring(session, false);
+    Ok((TransferUpdate { ticket, session, owner, lease }, route, batches))
+}
+
+fn reap_expired_transfers(app: &tauri::AppHandle) {
+    let result = with_runtime(app, |runtime| {
+        let now = std::time::Instant::now();
+        let routes = runtime.docs.expired_routes(now);
+        let expired = runtime.docs.reap_expired(now);
+        debug_assert_eq!(routes.len(), expired.len());
+        let mut batches = Vec::new();
+        let mut updates = Vec::with_capacity(expired.len());
+        for (route, (session, owner, lease)) in routes.into_iter().zip(expired) {
+            runtime.opens.set_session_owner(session, &owner);
+            batches.extend(runtime.opens.set_transferring(session, false));
+            updates.push((TransferUpdate {
+                ticket: route.ticket,
+                session,
+                owner,
+                lease,
+            }, route));
+        }
+        (updates, batches)
+    });
+    let Ok((updates, batches)) = result else {
+        if let Err(error) = result {
+            eprintln!("回收到期迁移失败：{error}");
+        }
+        return;
+    };
+    dispatch_open_batches(app, batches);
+    for (update, route) in updates {
+        emit_transfer_update(app, "transfer-cancelled", &update, &[route.source, route.target]);
+    }
+}
+
+#[tauri::command]
+fn seal_document(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    session: u64,
+    lease: u64,
+    target: String,
+    side: String,
+    index: usize,
+    snapshot: serde_json::Value,
+) -> Result<u64, String> {
+    reap_expired_transfers(&app);
+    let source = window.label().to_string();
+    let ticket = with_runtime(&app, |runtime| -> Result<u64, String> {
+        if !runtime.windows.is_ready(&target) {
+            return Err(format!("目标窗口未 ready：{target}"));
+        }
+        let ticket = runtime.docs.seal(
+            session,
+            &source,
+            lease,
+            &target,
+            &side,
+            index,
+            snapshot,
+        )?;
+        let _ = runtime.opens.set_transferring(session, true);
+        Ok(ticket)
+    })??;
+    if let Err(error) = app.emit_to(
+        &target,
+        "transfer-request",
+        serde_json::json!({ "ticket": ticket, "source": source }),
+    ) {
+        if let Ok(Ok((update, route, batches))) = with_runtime(&app, |runtime| {
+            cancel_in_runtime(runtime, ticket, &source)
+        }) {
+            dispatch_open_batches(&app, batches);
+            emit_transfer_update(
+                &app,
+                "transfer-cancelled",
+                &update,
+                &[route.source, route.target],
+            );
+        }
+        return Err(format!("发送迁移请求失败，已回滚：{error}"));
+    }
+    Ok(ticket)
+}
+
+#[tauri::command]
+fn accept_transfer(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    ticket: u64,
+) -> Result<AdoptedSession, String> {
+    reap_expired_transfers(&app);
+    let target = window.label().to_string();
+    with_runtime(&app, |runtime| {
+        let adopted = runtime.docs.accept(ticket, &target)?;
+        runtime.opens.set_session_owner(adopted.session, &target);
+        Ok(adopted)
+    })?
+}
+
+#[tauri::command]
+fn transfer_adopted(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    ticket: u64,
+) -> Result<AdoptedNotice, String> {
+    reap_expired_transfers(&app);
+    let target = window.label().to_string();
+    let (notice, route, batches) = with_runtime(&app, |runtime| -> Result<(AdoptedNotice, TransferRoute, Vec<open_request::OpenBatch>), String> {
+        let route = runtime.docs.route(ticket)
+            .ok_or_else(|| "迁移 ticket 不存在或已结束".to_string())?;
+        let notice = runtime.docs.mark_adopted(ticket, &target)?;
+        let batches = if notice.source_live {
+            Vec::new()
+        } else {
+            runtime.opens.set_transferring(notice.session, false)
+        };
+        Ok((notice, route, batches))
+    })??;
+    if notice.source_live {
+        if let Err(error) = app.emit_to(&route.source, "transfer-accepted", notice.clone()) {
+            eprintln!("通知源窗口目标已 adopt 失败：{error}");
+        }
+    } else {
+        dispatch_open_batches(&app, batches);
+        let update = TransferUpdate {
+            ticket,
+            session: notice.session,
+            owner: target,
+            lease: notice.lease,
+        };
+        emit_transfer_update(&app, "transfer-completed", &update, &[update.owner.clone()]);
+    }
+    Ok(notice)
+}
+
+#[tauri::command]
+fn complete_transfer(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    ticket: u64,
+) -> Result<TransferUpdate, String> {
+    reap_expired_transfers(&app);
+    let source = window.label().to_string();
+    let (update, batches) = with_runtime(&app, |runtime| -> Result<(TransferUpdate, Vec<open_request::OpenBatch>), String> {
+        let (session, owner, lease) = runtime.docs.complete(ticket, &source)?;
+        runtime.opens.set_session_owner(session, &owner);
+        let batches = runtime.opens.set_transferring(session, false);
+        Ok((TransferUpdate { ticket, session, owner, lease }, batches))
+    })??;
+    dispatch_open_batches(&app, batches);
+    if let Err(error) = app.emit_to(&update.owner, "transfer-completed", update.clone()) {
+        eprintln!("通知目标迁移完成失败：{error}");
+    }
+    Ok(update)
+}
+
+#[tauri::command]
+fn cancel_transfer(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    ticket: u64,
+) -> Result<TransferUpdate, String> {
+    reap_expired_transfers(&app);
+    let actor = window.label().to_string();
+    let (update, route, batches) = with_runtime(&app, |runtime| {
+        cancel_in_runtime(runtime, ticket, &actor)
+    })??;
+    dispatch_open_batches(&app, batches);
+    emit_transfer_update(&app, "transfer-cancelled", &update, &[route.source, route.target]);
+    Ok(update)
+}
+
+fn handle_window_destroyed(app: &tauri::AppHandle, label: &str) {
+    let mut live: HashSet<String> = app.webview_windows().keys()
+        .filter(|candidate| candidate.as_str() != label)
+        .cloned()
+        .collect();
+    let result = with_runtime(app, |runtime| {
+        if runtime.windows.role(label).is_none() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        live.retain(|candidate| runtime.windows.role(candidate).is_some());
+        let fallback = runtime.windows.recent_ready()
+            .filter(|candidate| live.contains(candidate));
+        let outcomes = runtime.docs.destroy_window(label, &live, fallback.as_deref());
+        let mut batches = Vec::new();
+        let mut entries = Vec::new();
+        for outcome in &outcomes {
+            match outcome {
+                DestroyOutcome::Cancelled { session, owner, .. }
+                | DestroyOutcome::Completed { session, owner, .. }
+                | DestroyOutcome::Recovered { session, owner, .. } => {
+                    runtime.opens.set_session_owner(*session, owner);
+                    batches.extend(runtime.opens.set_transferring(*session, false));
+                }
+                DestroyOutcome::Dropped { session, entry: Some(entry), .. } => {
+                    runtime.opens.remove_session(*session);
+                    entries.push(entry.clone());
+                }
+                _ => {}
+            }
+        }
+        runtime.windows.unregister(label);
+        let recent = runtime.windows.recent_ready()
+            .or_else(|| runtime.windows.recent_registered())
+            .unwrap_or_else(|| "main".to_string());
+        batches.extend(runtime.opens.remove_window(label, &recent));
+        (outcomes, batches, entries)
+    });
+    let Ok((outcomes, batches, entries)) = result else {
+        if let Err(error) = result {
+            eprintln!("恢复销毁窗口失败：{error}");
+        }
+        return;
+    };
+    for entry in entries {
+        entry.bump_gate();
+        entry.load_cancel.store(true, Ordering::Relaxed);
+        drop(entry.file.lock());
+    }
+    dispatch_open_batches(app, batches);
+    for outcome in outcomes {
+        match outcome {
+            DestroyOutcome::Cancelled { ticket, session, owner, lease } => {
+                let update = TransferUpdate { ticket, session, owner, lease };
+                emit_transfer_update(app, "transfer-cancelled", &update, &[update.owner.clone()]);
+            }
+            DestroyOutcome::Completed { ticket, session, owner, lease } => {
+                let update = TransferUpdate { ticket, session, owner, lease };
+                emit_transfer_update(app, "transfer-completed", &update, &[update.owner.clone()]);
+            }
+            DestroyOutcome::Recovered { owner, adopted, .. } => {
+                if let Err(error) = app.emit_to(&owner, "document-recovered", adopted) {
+                    eprintln!("发送销毁恢复文档失败：{error}");
+                }
+            }
+            DestroyOutcome::Detached { .. } | DestroyOutcome::Dropped { .. } => {}
+        }
+    }
+}
+
 fn is_diagnostic_main(app: &tauri::AppHandle, label: &str) -> bool {
     if label != "main" {
         return false;
@@ -1271,6 +1534,9 @@ fn install_window_events(app: &tauri::AppHandle, window: &tauri::WebviewWindow) 
             if let Ok(mut runtime) = state.lock() {
                 runtime.windows.touch(&label);
             };
+        }
+        tauri::WindowEvent::Destroyed => {
+            handle_window_destroyed(&app, &label);
         }
         _ => {}
     });
@@ -1338,13 +1604,28 @@ fn close_window_internal(
     require_empty: bool,
 ) -> Result<(), String> {
     let label = window.label().to_string();
-    let (entries, batches, last) = {
+    let (entries, batches, cancellations, last) = {
         let state = app.state::<SharedRuntime>();
         let mut runtime = state.lock().map_err(|e| e.to_string())?;
+        if runtime.docs.has_outgoing(&label) {
+            return Err("窗口存在正在迁出的文档，不能关闭".into());
+        }
         if require_empty && !runtime.docs.owner_is_empty(&label) {
             return Err("窗口仍拥有文档，不能按空窗口关闭".into());
         }
         runtime.windows.begin_close(&label)?;
+        let cancellations = match runtime.docs.cancel_incoming(&label) {
+            Ok(updates) => updates,
+            Err(error) => {
+                runtime.windows.cancel_close(&label);
+                return Err(error);
+            }
+        };
+        let mut batches = Vec::new();
+        for update in &cancellations {
+            runtime.opens.set_session_owner(update.session, &update.owner);
+            batches.extend(runtime.opens.set_transferring(update.session, false));
+        }
         let entries = match runtime.docs.close_owner(&label) {
             Ok(entries) => entries,
             Err(error) => {
@@ -1359,14 +1640,22 @@ fn close_window_internal(
         let recent = runtime.windows.recent_ready()
             .or_else(|| runtime.windows.recent_registered())
             .unwrap_or_else(|| "main".to_string());
-        let batches = runtime.opens.remove_window(&label, &recent);
+        batches.extend(runtime.opens.remove_window(&label, &recent));
         let last = runtime.windows.is_empty();
-        (entries, batches, last)
+        (entries, batches, cancellations, last)
     };
     for (_, entry) in entries {
         entry.bump_gate();
         entry.load_cancel.store(true, Ordering::Relaxed);
         drop(entry.file.lock());
+    }
+    for update in &cancellations {
+        emit_transfer_update(
+            app,
+            "transfer-cancelled",
+            update,
+            &[update.owner.clone(), label.clone()],
+        );
     }
     dispatch_open_batches(app, batches);
     let destroyed = window.destroy().map_err(|e| e.to_string());
@@ -1433,6 +1722,15 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 install_window_events(app.handle(), &window);
             }
+            let reap_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    reap_expired_transfers(&reap_app);
+                }
+            });
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let paths = open_request::normalize_args(std::env::args_os().collect(), &cwd);
             enqueue_open_paths(app.handle(), paths);
@@ -1463,6 +1761,11 @@ pub fn run() {
             create_document_window,
             close_window,
             close_empty_window,
+            seal_document,
+            accept_transfer,
+            transfer_adopted,
+            complete_transfer,
+            cancel_transfer,
             file_size,
             big_open,
             big_new,

@@ -95,6 +95,10 @@ impl WindowRegistry {
             .map(|(label, _)| label.clone())
     }
 
+    pub fn is_ready(&self, label: &str) -> bool {
+        self.entries.get(label).is_some_and(|entry| entry.ready && !entry.closing)
+    }
+
     pub fn role(&self, label: &str) -> Option<WindowRole> {
         self.entries.get(label).map(|entry| entry.role)
     }
@@ -130,6 +134,18 @@ mod tests {
     use super::{WindowRegistry, WindowRole};
     use crate::document_registry::{Access, DocumentRegistry};
     use crate::engine::BigFile;
+
+    #[test]
+    fn ready_lookup_excludes_unready_and_closing_windows() {
+        let mut windows = WindowRegistry::default();
+        windows.register("main", WindowRole::Primary);
+        windows.register("doc-1", WindowRole::Document);
+        assert!(!windows.is_ready("doc-1"));
+        windows.mark_ready("doc-1");
+        assert!(windows.is_ready("doc-1"));
+        windows.begin_close("doc-1").unwrap();
+        assert!(!windows.is_ready("doc-1"));
+    }
 
     #[test]
     fn recent_ready_skips_unready_and_unregistered_windows() {
