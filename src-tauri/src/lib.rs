@@ -1396,9 +1396,18 @@ fn transfer_adopted(
             owner: target,
             lease: notice.lease,
         };
+        reveal_transfer_target(&app, &update.owner);
         emit_transfer_update(&app, "transfer-completed", &update, &[update.owner.clone()]);
     }
     Ok(notice)
+}
+
+fn reveal_transfer_target(app: &tauri::AppHandle, owner: &str) {
+    if let Some(window) = app.get_webview_window(owner) {
+        if let Err(error) = window.show().and_then(|_| window.set_focus()) {
+            eprintln!("显示迁移目标窗口失败：{error}");
+        }
+    }
 }
 
 #[tauri::command]
@@ -1416,6 +1425,7 @@ fn complete_transfer(
         Ok((TransferUpdate { ticket, session, owner, lease }, batches))
     })??;
     dispatch_open_batches(&app, batches);
+    reveal_transfer_target(&app, &update.owner);
     if let Err(error) = app.emit_to(&update.owner, "transfer-completed", update.clone()) {
         eprintln!("通知目标迁移完成失败：{error}");
     }
@@ -1498,6 +1508,7 @@ fn handle_window_destroyed(app: &tauri::AppHandle, label: &str) {
                 emit_transfer_update(app, "transfer-completed", &update, &[update.owner.clone()]);
             }
             DestroyOutcome::Recovered { owner, adopted, .. } => {
+                reveal_transfer_target(app, &owner);
                 if let Err(error) = app.emit_to(&owner, "document-recovered", adopted) {
                     eprintln!("发送销毁恢复文档失败：{error}");
                 }
@@ -1600,7 +1611,7 @@ async fn create_document_window(app: tauri::AppHandle) -> Result<String, String>
 
 fn close_window_internal(
     app: &tauri::AppHandle,
-    window: &tauri::Window,
+    window: &tauri::WebviewWindow,
     require_empty: bool,
 ) -> Result<(), String> {
     let label = window.label().to_string();
@@ -1666,13 +1677,28 @@ fn close_window_internal(
 }
 
 #[tauri::command]
-fn close_window(app: tauri::AppHandle, window: tauri::Window) -> Result<(), String> {
+fn close_window(app: tauri::AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
     close_window_internal(&app, &window, false)
 }
 
 #[tauri::command]
-fn close_empty_window(app: tauri::AppHandle, window: tauri::Window) -> Result<(), String> {
-    close_window_internal(&app, &window, true)
+fn close_empty_window(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    target_label: Option<String>,
+) -> Result<(), String> {
+    let target = if let Some(label) = target_label {
+        let is_document = with_runtime(&app, |runtime| {
+            matches!(runtime.windows.role(&label), Some(window_registry::WindowRole::Document))
+        })?;
+        if !is_document {
+            return Err("只能按标签回收空文档窗口".into());
+        }
+        app.get_webview_window(&label).ok_or_else(|| format!("目标窗口不存在：{label}"))?
+    } else {
+        window
+    };
+    close_window_internal(&app, &target, true)
 }
 
 /// 截屏诊断辅助：探测路径是否存在（--park 模式与外部截屏工具握手用）。

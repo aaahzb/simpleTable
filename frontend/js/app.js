@@ -19,6 +19,7 @@ import { createUndoBudgetPrefs } from "./prefs.js";
 import { createOpenRequestPump } from "./openrequests.js";
 import { createWindowCloseCoordinator } from "./windowlifecycle.js";
 import { createTransferCoordinator } from "./transfer.js";
+import { createTabMenuItems } from "./tabmenu.js";
 
 /** @type {any} Tauri v2 全局对象（withGlobalTauri） */
 const tauri = window.__TAURI__;
@@ -38,7 +39,7 @@ function makeDocumentModel(io) {
   // 部分 io 也要保留默认 invoke/listen，不能只传确认回调。
   return new BigModel({
     invoke,
-    listen: (ev, cb) => tauri.event.listen(ev, cb),
+    listen: (ev, cb) => tauri.window.getCurrentWindow().listen(ev, cb),
     ...io,
     confirmFixedPoint: confirmFixedPointDialog,
   });
@@ -1184,34 +1185,30 @@ function promoteGroupB() {
   closeSplit();
 }
 
-/**
- * 页签右键菜单：未分屏给「在分屏中打开」（只有一个签时禁用）；分屏态对任意签
- * 给「移到右侧/移到左侧」（与拖拽共用 moveTab 原语；A 组单签时「移到右侧」禁用，
- * 与拖空保护一致）外加「关闭分屏」。
- *
- * @param {DocTab} t - 目标页签。
- * @param {number} x - 菜单位置 x。
- * @param {number} y - 菜单位置 y。
- * @returns {void}
- */
-function showTabMenu(t, x, y) {
-  if (!splitOn) {
-    showMenu(x, y, [{
-      label: "在分屏中打开",
-      disabled: tabs.length < 2, // 单签无可对照档
-      onClick: () => openSplit(t.id),
-    }]);
-    return;
+/** 把当前标签的同一会话迁往新窗口；失败由协调器报告并保留源标签。 */
+async function openTabInNewWindow(id) {
+  const t = tabs.find((item) => item.id === id);
+  const session = t?.model?.sessionId;
+  if (typeof session !== "number") return false;
+  try {
+    return await transferCoordinator.transferTabToWindow(
+      session, null, "A", Number.MAX_SAFE_INTEGER,
+    );
+  } catch {
+    return false; // 协调器已提示；源标签和 undo/dirty 必须保留
   }
-  const toB = t.side === "A";
-  showMenu(x, y, [
-    {
-      label: toB ? "移到右侧" : "移到左侧",
-      disabled: toB && groupTabs("A").length === 1, // 左组是主组，禁止拖空（I3）
-      onClick: () => void moveTab(t.id, toB ? "B" : "A"),
-    },
-    { label: "关闭分屏", onClick: () => closeSplit() },
-  ]);
+}
+
+/** 页签右键菜单：分屏/移组命令之外，允许把同一会话移到新窗口。 */
+function showTabMenu(t, x, y) {
+  const items = createTabMenuItems({
+    splitOn,
+    tab: { ...t, transferState: t.model?._transferState ?? "idle" },
+    tabCount: tabs.length,
+    groupACount: groupTabs("A").length,
+    actions: { openSplit, moveTab, closeSplit, openTabInNewWindow },
+  });
+  showMenu(x, y, items);
 }
 
 // ============ 大文件模式 UI（按钮显隐/筛选执行/列操作 pending） ============
@@ -1986,7 +1983,7 @@ window.addEventListener("focus", async () => {
 });
 
 // ---- 拖放打开 ----
-tauri.event.listen("tauri://drag-drop", async (e) => {
+tauri.window.getCurrentWindow().listen("tauri://drag-drop", async (e) => {
   const paths = e.payload?.paths ?? [];
   const csvs = paths.filter((x) => x.toLowerCase().endsWith(".csv"));
   if (csvs.length) await submitOpenPaths(csvs);
@@ -1999,7 +1996,7 @@ const windowCloseCoordinator = createWindowCloseCoordinator({
   confirmDiscard,
   closeWindow: () => invoke("close_window"),
 });
-tauri.event.listen("close-request", async () => {
+tauri.window.getCurrentWindow().listen("close-request", async () => {
   syncActiveTab();
   await windowCloseCoordinator.requestClose();
 });
@@ -2391,9 +2388,10 @@ document.addEventListener("keydown", (e) => {
 
 const transferCoordinator = createTransferCoordinator({
   invoke,
-  listen: (event, handler) => tauri.event.listen(event, handler),
+  listen: (event, handler) => tauri.window.getCurrentWindow().listen(event, handler),
   createWindow: () => invoke("create_document_window"),
   closeEmptyWindow: () => invoke("close_empty_window"),
+  discardWindow: (label) => invoke("close_empty_window", { targetLabel: label }),
   modelForSession: (session) => tabs.find((t) => t.model?.sessionId === session)?.model
     ?? (model.sessionId === session ? model : null),
   adoptToTab,
@@ -2430,7 +2428,7 @@ const gridLive = new Proxy(/** @type {any} */ ({}), {
   // 启动参数、第二实例和 macOS Opened 均由后端队列分发；监听先于 ready。
   const openPump = createOpenRequestPump({
     invoke,
-    listen: (event, handler) => tauri.event.listen(event, handler),
+    listen: (event, handler) => tauri.window.getCurrentWindow().listen(event, handler),
     openPath: openQueuedPath,
     activatePath: activateQueuedPath,
     reportError: (error) => statusMsg(`打开失败：${error?.message ?? error}`, 5000),

@@ -3789,6 +3789,28 @@ x,y
       "关签后文档 spool 必须删除");
   });
 
+  check("新窗口：右键标签迁移并显示目标，源窗口保留其他标签", async () => {
+    await window.__app.closeSplit();
+    const fa = `${TMP}/sv/a.csv`; const fb = `${TMP}/sv/b.csv`;
+    await window.__app.openPathsAsTabs([fa, fb]);
+    const tab = window.__app.tabs().find((x) => x.path === fb);
+    const el = tabEl("b.csv");
+    assert(tab && el, "应找到待迁移 b 签");
+    el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    const item = [...document.querySelectorAll(".ctx-menu .mi")]
+      .find((x) => x.textContent === "在新窗口打开");
+    assert(item && !item.classList.contains("disabled"), "右键菜单应有可用的新窗口命令");
+    item.click();
+    await waitFor(() => !window.__app.tabs().some((x) => x.path === fb)
+      && window.__app.tabs().some((x) => x.path === fa), "complete 后源窗口只保留 a 签");
+    const windows = await window.__TAURI__.window.getAllWindows();
+    const docs = [];
+    for (const candidate of windows) {
+      if (candidate.label.startsWith("doc-") && await candidate.isVisible()) docs.push(candidate);
+    }
+    assert(docs.length === 1, "complete 后应显示一个文档窗口");
+  });
+
   // ---- 执行（看门狗：整体超时强制收尾，防挂死） ----
   const watchdog = setTimeout(async () => {
     lines.push("", `[watchdog] 超时未完成，已通过 ${lines.length} 项`);

@@ -14,6 +14,7 @@ export function createTransferCoordinator({
   listen,
   createWindow,
   closeEmptyWindow,
+  discardWindow = async () => {},
   modelForSession,
   adoptToTab,
   removeSourceTab,
@@ -202,12 +203,22 @@ export function createTransferCoordinator({
     let record = null;
     let ticket = null;
     let prepared = false;
+    let createdTarget = null;
+    async function discardFailedTarget() {
+      if (!createdTarget || record?.completed) return;
+      try {
+        await discardWindow(createdTarget);
+      } catch (cleanupError) {
+        report(cleanupError);
+      }
+    }
     try {
       model = modelForSession(session);
       if (!model) throw new Error("待迁移标签的文档会话不存在");
       const snapshot = await model.prepareTransfer();
       prepared = true;
       const target = targetLabel ?? await createWindow();
+      if (targetLabel === null) createdTarget = target;
       ticket = await invoke("seal_document", {
         session, lease: model.lease, target, side, index, snapshot,
       });
@@ -215,6 +226,7 @@ export function createTransferCoordinator({
       return await Promise.race([driveSource(record), record.failure]);
     } catch (error) {
       if (!prepared || record?.completed || record?.eventCancelled) {
+        await discardFailedTarget();
         report(error);
         throw error;
       }
@@ -227,12 +239,14 @@ export function createTransferCoordinator({
         }
       }
       if (record?.eventCancelled) {
+        await discardFailedTarget();
         report(error);
         throw error;
       }
       update ??= earlyCancelled.get(ticket) ?? null;
       if (update) earlyCancelled.delete(ticket);
       if (prepared) model.rollbackTransfer(update?.lease ?? model.lease);
+      await discardFailedTarget();
       report(error);
       throw error;
     } finally {

@@ -103,7 +103,7 @@ test("timeout after accept rolls back to a newer source lease", async () => {
   assert.equal(backend.tabCount("main"), 1);
 });
 
-async function coordinatorHarness(backend, { failure = null, withTarget = true, timeoutMs = 1000, adoptGate = null } = {}) {
+async function coordinatorHarness(backend, { failure = null, withTarget = true, timeoutMs = 1000, adoptGate = null, createFailure = false } = {}) {
   const { createTransferCoordinator } = await import("../frontend/js/transfer.js");
   const source = backend.model("main");
   await source.open("a.csv");
@@ -113,6 +113,7 @@ async function coordinatorHarness(backend, { failure = null, withTarget = true, 
   const targetModels = new Map();
   const order = [];
   const errors = [];
+  const discarded = [];
 
   function modelForSession(session) {
     return source.sessionId === session ? source : targetModels.get(session) ?? null;
@@ -140,7 +141,11 @@ async function coordinatorHarness(backend, { failure = null, withTarget = true, 
   }
 
   const common = {
-    createWindow: async () => "doc-1",
+    createWindow: async () => {
+      if (createFailure) throw new Error("create failed");
+      return "doc-1";
+    },
+    discardWindow: (label) => { discarded.push(label); },
     closeEmptyWindow,
     modelForSession,
     adoptToTab,
@@ -167,7 +172,7 @@ async function coordinatorHarness(backend, { failure = null, withTarget = true, 
       listen: (event, callback) => backend.listenFor("doc-1", event, callback),
     });
   }
-  return { source, sourceTabs, targetTabs, targetModels, order, errors, sourceCoordinator, targetCoordinator };
+  return { source, sourceTabs, targetTabs, targetModels, order, errors, discarded, sourceCoordinator, targetCoordinator };
 }
 
 test("coordinator completes before removing the source and unlocks the target", async () => {
@@ -296,4 +301,95 @@ test("cancel during adopt removes the late target tab", async () => {
   for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(harness.targetTabs.size, 0);
   assert.equal(backend.calls.filter(([cmd]) => cmd === "big_close").length, 0);
+});
+
+test("single-tab menu exposes disabled split and enabled new-window action", async () => {
+  const { createTabMenuItems } = await import("../frontend/js/tabmenu.js");
+  const calls = [];
+  const items = createTabMenuItems({
+    splitOn: false,
+    tab: { id: 7, side: "A", transferState: "idle" },
+    tabCount: 1,
+    groupACount: 1,
+    actions: {
+      openSplit: (id) => calls.push(["split", id]),
+      moveTab: (id, side) => calls.push(["move", id, side]),
+      closeSplit: () => calls.push(["close-split"]),
+      openTabInNewWindow: (id) => calls.push(["new-window", id]),
+    },
+  });
+  assert.deepEqual(items.map((item) => item.label), ["在分屏中打开", "在新窗口打开"]);
+  assert.equal(items[0].disabled, true);
+  assert.equal(items[1].disabled, false);
+  items[1].onClick();
+  assert.deepEqual(calls, [["new-window", 7]]);
+});
+
+test("new-window menu completes before removing the last source tab", async () => {
+  const { createTabMenuItems } = await import("../frontend/js/tabmenu.js");
+  const backend = makeSharedBackend({ rows: 2, cols: 1 });
+  const harness = await coordinatorHarness(backend);
+  let migrating;
+  const items = createTabMenuItems({
+    splitOn: false,
+    tab: { id: 7, side: "A", transferState: "idle" },
+    tabCount: 1,
+    groupACount: 1,
+    actions: {
+      openSplit: () => {}, moveTab: () => {}, closeSplit: () => {},
+      openTabInNewWindow: () => {
+        migrating = harness.sourceCoordinator.transferTabToWindow(
+          harness.source.sessionId, null, "A", Number.MAX_SAFE_INTEGER,
+        );
+        return migrating;
+      },
+    },
+  });
+  items[1].onClick();
+  assert.equal(harness.sourceTabs.size, 1);
+  await migrating;
+  assert.deepEqual(harness.order, ["remove", "close"]);
+  assert.equal(harness.targetTabs.size, 1);
+  assert.equal(backend.calls.filter(([cmd]) => cmd === "big_close").length, 0);
+});
+
+for (const failure of ["create", "accept", "timeout"]) {
+  test(`${failure} failure preserves the source and only discards a new empty target`, async () => {
+    const backend = makeSharedBackend({ rows: 2, cols: 1 });
+    const harness = await coordinatorHarness(backend, {
+      createFailure: failure === "create",
+      failure: failure === "accept" ? "accept" : null,
+      withTarget: failure !== "timeout",
+      timeoutMs: failure === "timeout" ? 10 : 1000,
+    });
+    await assert.rejects(
+      harness.sourceCoordinator.transferTabToWindow(
+        harness.source.sessionId, null, "A", Number.MAX_SAFE_INTEGER,
+      ),
+      /create|accept|取消|超时/,
+    );
+    assert.equal(harness.sourceTabs.size, 1);
+    assert.equal(harness.source.modified(), true);
+    assert.equal(harness.source.canUndo(), true);
+    assert.deepEqual(harness.discarded, failure === "create" ? [] : ["doc-1"]);
+    assert.equal(harness.order.includes("close"), false);
+    assert.equal(backend.calls.filter(([cmd]) => cmd === "big_close").length, 0);
+    await harness.source.setData(0, 0, "source-preserved");
+  });
+}
+
+test("app scopes all targeted backend listeners to their window", async () => {
+  const { readFileSync } = await import("node:fs");
+  const app = readFileSync(new URL("../frontend/js/app.js", import.meta.url), "utf8");
+  assert.doesNotMatch(app, /tauri.event.listen/);
+  assert.ok(app.split("getCurrentWindow().listen").length - 1 >= 3);
+});
+
+test("app wires the pure tab menu and new-window action", async () => {
+  const { readFileSync } = await import("node:fs");
+  const app = readFileSync(new URL("../frontend/js/app.js", import.meta.url), "utf8");
+  assert.match(app, /import \{ createTabMenuItems \} from "\.\/tabmenu\.js";/);
+  assert.match(app, /createTabMenuItems\(\{/);
+  assert.match(app, /openTabInNewWindow/);
+  assert.match(app, /discardWindow:/);
 });
