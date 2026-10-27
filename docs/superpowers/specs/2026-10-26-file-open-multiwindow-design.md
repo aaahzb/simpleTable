@@ -2,7 +2,8 @@
 
 - 日期：2026-10-26
 - 分支：`feat/file-open-multiwindow`
-- 状态：设计已获用户确认，待书面规格审阅
+- 状态：Task 1–11 实现与自动收尾完成；Node 212/212、Rust 272/272（另 3 项忽略）、双 smoke 各 170/170，Windows release 直接第二进程入口及首文件单标签显示已复验
+- 验收边界：Windows 默认打开方式、跨窗口/分屏同路径激活的实机复验、当前版本真实鼠标/RDP、用户亲手关闭最后窗口和 macOS Finder/拖放实机仍待验收；Task 8 RDP 复测仅获用户“好像可以了”的整体反馈
 - 范围：Windows 单实例打开 CSV、macOS 文件关联打开 CSV、标签移到新窗口与窗口间拖放
 
 ## 1. 背景与已确认根因
@@ -134,11 +135,18 @@ simpleTable 当前是 Tauri 2 单进程、单窗口、多标签应用。每个�
 ## 8. 拖放与窗口行为
 
 - 同窗口投放继续调用现有 `moveTab(side, index)`，不经过跨窗口会话迁移。
-- 跨窗口 dragstart 建立带来源信息的 drag token；dragover 只计算插入位置，drop 才申请迁移。
-- 目标标签组 A/B 都可接收，落点规则复用同窗口插入索引计算。
+- 前端使用 Pointer Capture，超过 6 CSS px 总位移才开始拖放；捕获在首个 await 前完成，避免快速松开丢失投放。
+- begin、hover、drop 均携带最新 clientX/clientY；pointerup 必须写入最终坐标。源窗口 inner_position 与 scale_factor 将客户端 CSS 坐标换算为物理桌面坐标，不使用 JS screenX。
+- Windows 远程桌面下 GetCursorPos 可能返回 ERROR_ACCESS_DENIED(5)，拖放不得以全局光标查询为前提。该坐标协议同时保留负坐标、多显示器与 DPI 换算能力。
+- Rust 使用物理 outer_position/outer_size 命中窗口；隐藏、未 ready 和最小化窗口不参与。目标 inner_position/scale_factor 将物理点反算为 CSS 坐标，标签组 A/B 复用同窗口插入索引规则。
+- 跨窗口 drop 建立 dragToken/dropId 和一次性回执；drop 才申请迁移，hover 只更新插入指示。目标无效区域、拒绝、超时或销毁均不迁移。
 - 拖出形成新窗口时，目标窗口在有效投放位置显示；源窗口最后一个标签也按同一迁移协议处理。
+- 独立原生预览窗口显示被抓取标签并随物理点移动，不抢焦点、忽略鼠标、置顶且跳过任务栏，不注册为文档窗口。
+- 源标签降低不透明度，源和目标应用窗口在拖动期间通过 `body.tab-dragging` 对所有后代显示 grabbing 光标；完成、取消和源销毁均清理预览与抓取状态。
+- 有文档的窗口始终显示标签条，单标签也可直接作为拖出来源；空窗口不显示空标签条。
+- 创建预览的 begin 命令必须离开主线程执行，避免 WebView 构建与主事件循环相互等待。
 - Escape、无效投放、目标拒绝或创建失败均不删除源标签。
-- 原生 HTML5 跨窗口拖放需在 Windows 实机验证；macOS 实机同时覆盖此路径，不能用合成 DOM 事件替代最终验收。
+- Windows 实机验收必须包含远程桌面真实鼠标：A→A、A→B、A→另一窗口 A/B、桌面拖出、网格无效区和 Escape。macOS 实机也覆盖拖放；合成 DOM 事件不能替代最终验收。
 - 同一文件已打开时只激活既有标签；激活分屏中的标签时同时聚焦正确侧。
 
 ## 9. 关闭、退出与异常恢复

@@ -368,6 +368,34 @@ test("an empty window hides the tabbar but one document keeps a draggable tab", 
   assert.equal(groups["tab-group-a"].children[0].dataset.id, "1");
 });
 
+test("first file materializes and renders a single tab", async () => {
+  const app = readFileSync(new URL("../frontend/js/app.js", import.meta.url), "utf8");
+  const start = app.indexOf("async function openPathsAsTabs(");
+  const end = app.indexOf("\n/**", start + 1);
+  assert.ok(start >= 0 && end > start, "应能提取真实首文件打开函数");
+  let rendered = 0;
+  let activated = 0;
+  const context = {
+    tabs: [], activeId: null, dirty: false,
+    confirmDiscard: async () => true,
+    openPath: async () => true,
+    ensureTabbed: () => {
+      if (context.activeId !== null) return;
+      context.tabs.push({ id: 1, path: "a.csv" });
+      context.activeId = 1;
+    },
+    activeTab: () => context.tabs.find((tab) => tab.id === context.activeId) ?? null,
+    loadIntoNewTab: async () => { throw new Error("首文件不应新建第二个标签"); },
+    activateTab: async () => { activated += 1; return true; },
+    renderTabbar: () => { rendered += 1; },
+  };
+  vm.runInNewContext(app.slice(start, end) + "\nglobalThis.open = openPathsAsTabs;", context);
+  assert.equal(await context.open(["a.csv"]), true);
+  assert.equal(context.activeId, 1);
+  assert.equal(activated, 0, "首签已经活动，不应依赖额外切签");
+  assert.equal(rendered, 1, "首签实体化后必须立即渲染标签条");
+});
+
 test("a one-tab target exposes drop geometry and whole-window grabbing during external hover", () => {
   const app = readFileSync(new URL("../frontend/js/app.js", import.meta.url), "utf8");
   const extract = (name, next) => {

@@ -1026,6 +1026,8 @@ async function openPathsAsTabs(paths) {
     // 脏档确认已在本函数开头完成，openPath 不再重复弹窗
     if (!(await openPath(first, { noConfirm: true }))) return false;
     ensureTabbed();
+    // 首签已是活动档，不会再走 activateTab；实体化后必须立即显示标签条。
+    renderTabbar();
     firstId = activeTab()?.id ?? null;
   } else {
     ensureTabbed();
