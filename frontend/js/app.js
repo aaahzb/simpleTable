@@ -310,7 +310,7 @@ function ensureTabbed() {
 
 /** 重建页签条 DOM（分屏时左右两组）并刷新溢出态；激活页签自动滚入可视区 */
 function renderTabbar() {
-  tabbarEl.classList.toggle("show", tabs.length >= 2);
+  tabbarEl.classList.toggle("show", tabs.length > 0);
   tabbarEl.classList.toggle("split", splitOn);
   const groupA = document.getElementById("tab-group-a");
   const groupB = document.getElementById("tab-group-b");
@@ -348,9 +348,10 @@ function renderTabbar() {
       e.preventDefault();
       showTabMenu(t, e.clientX, e.clientY);
     });
-    el.draggable = true; // 拖拽换组/重排：事件层只做坐标换算，逻辑全在 moveTab
-    el.addEventListener("dragstart", (e) => onTabDragStart(e, t.id));
-    el.addEventListener("dragend", onTabDragEnd);
+    el.addEventListener("pointerdown", (e) => {
+      if (e.target.closest?.(".tab-close")) return;
+      void tabDragController.pointerDown(e, t.id);
+    });
     (splitOn && t.side === "B" ? groupB : groupA).appendChild(el);
   }
   updateTabOverflow();
@@ -411,121 +412,417 @@ function syncTabSplit() {
 // 窗口缩放/编辑窗格开合/分隔条拖拽等一切左网格尺寸变化，兜底同步页签组界
 new ResizeObserver(() => syncTabSplit()).observe(document.getElementById("grid-area"));
 
-// ---- 页签拖拽换组（HTML5 DnD）----
-// 事件层只做「坐标 → (side, index)」换算，全部状态逻辑在 moveTab（可冒烟直调）。
-// dataTransfer 在 dragover 里读不到数据（规范限制），被拖签 id 走模块级 dragTabId。
+/**
+ * 创建 Pointer Capture 标签拖放控制器。
+ *
+ * 源窗口只持有 dragToken；真实屏幕坐标由 Rust 查询。已有目标通过
+ * tab-drag-drop 回复分组和索引，桌面落点先建隐藏窗口再迁移同一 session。
+ *
+ * @param {object} deps - IPC、标签查询、迁移和 DOM 指示器适配器。
+ * @returns {object} 源指针事件与目标拖放事件处理函数。
+ */
+function createTabDragController(deps) {
+  const {
+    invoke,
+    getTab = () => null,
+    moveTab = async () => false,
+    transferTabToWindow = async () => { throw new Error("迁移未接入"); },
+    createWindow = async () => { throw new Error("新窗口未接入"); },
+    discardWindow = async () => {},
+    computeTarget = () => null,
+    prepareTarget = () => {},
+    previewTarget = () => {},
+    clearPreview = () => {},
+    setSourceActive = () => {},
+    onError = () => {},
+  } = deps;
+  let press = null;
+  let drag = null;
+  let externalToken = null;
 
-/** @type {number | null} 被拖签 id */
-let dragTabId = null;
-/** @type {{ side: "A" | "B", index: number } | null} 当前 dragover 算出的投放点 */
-let dropTarget = null;
+  function report(error) {
+    try { onError(error); } catch { /* 状态提示失败不能改变拖放结果 */ }
+  }
 
-/** 隐藏插入位置指示器 */
+  function releaseCapture(current) {
+    if (!current?.captured) return;
+    try { current.element.releasePointerCapture?.(current.pointerId); } catch { /* 已释放 */ }
+    current.captured = false;
+  }
+
+  function cleanup(current) {
+    if (!current || drag === current) drag = null;
+    if (!current || press?.id === current.id) press = null;
+    if (current) {
+      releaseCapture(current);
+      try { setSourceActive(false, current.id); } catch (error) { report(error); }
+    }
+    externalToken = null;
+    try { clearPreview(); } catch (error) { report(error); }
+  }
+
+  async function beginPress() {
+    const currentPress = press;
+    if (!currentPress) return;
+    const tab = getTab(currentPress.id);
+    const session = tab?.model?.sessionId;
+    const lease = tab?.model?.lease;
+    const transferState = tab?.model?._transferState ?? "idle";
+    if (transferState !== "idle"
+      || typeof session !== "number" || typeof lease !== "number") {
+      press = null;
+      return;
+    }
+    const current = {
+      ...currentPress, session, lease, token: null, starting: null,
+      hoverPromise: null, cancelled: false, failed: false, dropping: false,
+      captured: false,
+    };
+    drag = current;
+    press = null;
+    // 必须在首个 await 前捕获；快速松开时浏览器会在 begin IPC 返回前结束指针。
+    try {
+      current.element.setPointerCapture?.(current.pointerId);
+      current.captured = true;
+    } catch (error) {
+      current.failed = true;
+      report(error);
+    }
+    current.starting = (async () => {
+      if (current.failed) return;
+      try {
+        current.token = await invoke("begin_tab_drag", {
+          session, lease, title: tab.title || "未命名",
+          clientX: current.x, clientY: current.y,
+        });
+        if (current.cancelled) return;
+        setSourceActive(true, current.id);
+      } catch (error) {
+        current.failed = true;
+        report(error);
+      }
+    })();
+    await current.starting;
+    if (drag === current && !current.cancelled && !current.failed) await hover(current);
+  }
+
+  async function hover(current) {
+    if (drag !== current || current.cancelled || current.failed || current.dropping) return;
+    if (typeof current.token !== "number") return;
+    if (current.hoverPromise) return current.hoverPromise;
+    current.hoverPromise = (async () => {
+      try {
+        const outcome = await invoke("tab_drag_hover", {
+          dragToken: current.token, clientX: current.x, clientY: current.y,
+        });
+        if (drag !== current || current.cancelled || current.dropping) return;
+        const target = outcome?.kind === "sameWindow"
+          ? computeTarget(current.id, outcome.x, outcome.y)
+          : null;
+        previewTarget(target);
+      } catch (error) {
+        if (drag === current && !current.cancelled && !current.dropping) report(error);
+      }
+    })().finally(() => { current.hoverPromise = null; });
+    return current.hoverPromise;
+  }
+
+  async function pointerDown(event, id) {
+    if (event.button !== 0 || event.isPrimary === false || press || drag) return;
+    press = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      x: event.clientX,
+      y: event.clientY,
+      id,
+      element: event.currentTarget,
+    };
+  }
+
+  async function pointerMove(event) {
+    if (press && event.pointerId === press.pointerId) {
+      const distance = Math.hypot(event.clientX - press.startX, event.clientY - press.startY);
+      press.x = event.clientX;
+      press.y = event.clientY;
+      if (distance <= 6) return;
+      await beginPress();
+      return;
+    }
+    if (drag && event.pointerId === drag.pointerId) {
+      drag.x = event.clientX;
+      drag.y = event.clientY;
+      await hover(drag);
+    }
+  }
+
+  async function routeOutcome(current, outcome) {
+    if (!outcome || outcome.kind === "invalid") return false;
+    if (outcome.kind === "sameWindow") {
+      const target = computeTarget(current.id, outcome.x, outcome.y);
+      if (!target) return false;
+      return moveTab(current.id, target.side, target.index);
+    }
+    if (outcome.kind === "existing") {
+      await transferTabToWindow(
+        current.session, outcome.target, outcome.side, outcome.index,
+      );
+      return true;
+    }
+    if (outcome.kind === "newWindow") {
+      let created = null;
+      try {
+        created = await createWindow({ x: outcome.x, y: outcome.y });
+        await transferTabToWindow(
+          current.session, created, "A", Number.MAX_SAFE_INTEGER,
+        );
+        return true;
+      } catch (error) {
+        if (created) {
+          try { await discardWindow(created); } catch (cleanupError) { report(cleanupError); }
+        }
+        throw error;
+      }
+    }
+    return false;
+  }
+
+  async function pointerUp(event) {
+    const current = drag;
+    if (!current || event.pointerId !== current.pointerId) {
+      if (press && event.pointerId === press.pointerId) press = null;
+      return false;
+    }
+    event.preventDefault();
+    current.x = event.clientX;
+    current.y = event.clientY;
+    current.dropping = true;
+    try {
+      await current.starting;
+      await current.hoverPromise;
+      if (current.cancelled || current.failed || typeof current.token !== "number") return false;
+      const outcome = await invoke("drop_tab_drag", {
+        dragToken: current.token, clientX: current.x, clientY: current.y,
+      });
+      if (current.cancelled) return false;
+      return await routeOutcome(current, outcome);
+    } catch (error) {
+      report(error);
+      // drop 在原生路由或回执阶段报错时可能尚未 finish；尽力取消，避免永久阻塞后续拖放。
+      if (typeof current.token === "number") {
+        try {
+          await invoke("cancel_tab_drag", { dragToken: current.token });
+        } catch (cleanupError) {
+          report(cleanupError);
+        }
+      }
+      return false;
+    } finally {
+      cleanup(current);
+    }
+  }
+
+  async function cancel() {
+    const current = drag;
+    press = null;
+    if (!current) {
+      clearPreview();
+      return false;
+    }
+    current.cancelled = true;
+    try {
+      await current.starting;
+      if (typeof current.token === "number") {
+        await invoke("cancel_tab_drag", { dragToken: current.token });
+      }
+    } catch (error) {
+      report(error);
+    } finally {
+      cleanup(current);
+    }
+    return false;
+  }
+
+  async function targetHover(payload) {
+    externalToken = payload.dragToken;
+    prepareTarget();
+    previewTarget(computeTarget(null, payload.x, payload.y));
+  }
+
+  async function targetDrop(payload) {
+    externalToken = payload.dragToken;
+    let target = null;
+    try {
+      prepareTarget();
+      target = computeTarget(null, payload.x, payload.y);
+    } catch (error) {
+      report(error);
+    }
+    try {
+      await invoke("tab_drag_drop_result", {
+        dropId: payload.dropId,
+        side: target?.side ?? null,
+        index: target?.index ?? null,
+      });
+    } catch (error) {
+      report(error);
+    } finally {
+      externalToken = null;
+      clearPreview();
+    }
+  }
+
+  async function targetClear(payload = {}) {
+    if (externalToken === null || payload.dragToken === externalToken) {
+      externalToken = null;
+      clearPreview();
+    }
+  }
+
+  return {
+    pointerDown, pointerMove, pointerUp, cancel,
+    targetHover, targetDrop, targetClear,
+  };
+}
+
+// ---- Pointer Capture 页签拖放：同窗换组、跨窗迁移与桌面拖出 ----
+
+/** 隐藏插入位置指示器。 */
 function hideInsertIndicator() {
   document.getElementById("tab-insert").style.display = "none";
 }
 
 /**
- * 开始拖拽：记录被拖签；未分屏时亮出空的右组投放区（拖出分屏的入口）。
+ * 把窗口内 CSS 坐标换算为标签组和插入索引。
  *
- * @param {DragEvent} e - 事件。
- * @param {number} id - 被拖签 id。
- * @returns {void}
+ * 只有标签组矩形内是有效落点，网格和工具栏返回 null。源窗口排除被拖签，
+ * 外部目标的 dragId=null，因此目标已有标签全部参与中点索引计算。
+ *
+ * @param {number | null} dragId - 同窗被拖签；外部目标为 null。
+ * @param {number} x - 窗口内 CSS x。
+ * @param {number} y - 窗口内 CSS y。
+ * @returns {{side: "A" | "B", index: number, excludeId: number | null} | null} 有效落点。
  */
-function onTabDragStart(e, id) {
-  dragTabId = id;
-  e.dataTransfer.effectAllowed = "move";
-  e.dataTransfer.setData("text/plain", String(id)); // 双保险（合成事件/跨窗口场景）
-  if (!splitOn) tabbarEl.classList.add("dragpeek");
+function tabDropTargetAt(dragId, x, y) {
+  const sourceTab = typeof dragId === "number" ? tabs.find((t) => t.id === dragId) : null;
+  for (const side of ["A", "B"]) {
+    const group = document.getElementById(side === "B" ? "tab-group-b" : "tab-group-a");
+    const rect = group.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    if (x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom) continue;
+    if (sourceTab?.side === "A" && side === "B" && groupTabs("A").length === 1) {
+      return null; // 同窗口仍禁止拖空主组；跨窗口迁移不受此限制
+    }
+    const kids = [...group.querySelectorAll(".tab")]
+      .filter((el) => Number(el.dataset.id) !== dragId);
+    let index = kids.length;
+    for (let i = 0; i < kids.length; i += 1) {
+      const tabRect = kids[i].getBoundingClientRect();
+      if (x < tabRect.left + tabRect.width / 2) { index = i; break; }
+    }
+    return { side, index, excludeId: dragId };
+  }
+  return null;
 }
 
-/** 拖拽结束（投放或取消）：清理全部拖拽态（真实序列 drop → dragend，清理幂等）。 */
-function onTabDragEnd() {
-  dragTabId = null;
-  dropTarget = null;
-  tabbarEl.classList.remove("dragpeek");
-  hideInsertIndicator();
-}
-
-/**
- * 组容器上悬停：按 midX 算插入位（排除被拖签）并定位插入指示器。
- * 左组单签对右组不亮指示器且 dropEffect="none"（与 moveTab 的拖空保护一致）。
- *
- * @param {DragEvent} e - 事件（须 preventDefault 才允许投放）。
- * @param {"A" | "B"} side - 悬停组。
- * @returns {void}
- */
-function onGroupDragOver(e, side) {
-  if (dragTabId === null) return;
-  const t = tabs.find((x) => x.id === dragTabId);
-  if (!t) return;
-  if (side === "B" && t.side === "A" && groupTabs("A").length === 1) {
-    e.dataTransfer.dropEffect = "none"; // 左组是主组，禁止拖空（I3）
-    dropTarget = null;
+/** 显示与同窗口既有规则一致的插入指示器。 */
+function previewTabDropTarget(target) {
+  if (!target) {
     hideInsertIndicator();
     return;
   }
-  e.preventDefault(); // 允许 drop
-  e.dataTransfer.dropEffect = "move";
-  const group = document.getElementById(side === "B" ? "tab-group-b" : "tab-group-a");
+  const group = document.getElementById(target.side === "B" ? "tab-group-b" : "tab-group-a");
   const kids = [...group.querySelectorAll(".tab")]
-    .filter((el) => Number(el.dataset.id) !== dragTabId);
-  let index = kids.length; // 默认末尾
-  for (let i = 0; i < kids.length; i += 1) {
-    const r = kids[i].getBoundingClientRect();
-    if (e.clientX < r.left + r.width / 2) { index = i; break; }
-  }
-  dropTarget = { side, index };
-  // 插入指示器：#tab-scroll 内绝对定位（CSS 隐藏态，此处只管显示与横坐标）
-  const wrapR = tabScrollEl.getBoundingClientRect();
+    .filter((el) => Number(el.dataset.id) !== target.excludeId);
+  const wrapRect = tabScrollEl.getBoundingClientRect();
   let x;
-  if (index < kids.length) {
-    x = kids[index].getBoundingClientRect().left - wrapR.left - 1;
+  if (target.index < kids.length) {
+    x = kids[target.index].getBoundingClientRect().left - wrapRect.left - 1;
   } else if (kids.length) {
-    x = kids[kids.length - 1].getBoundingClientRect().right - wrapR.left - 1;
+    x = kids[kids.length - 1].getBoundingClientRect().right - wrapRect.left - 1;
   } else {
-    x = group.getBoundingClientRect().left - wrapR.left + 2; // 空组（dragpeek）：指组首
+    x = group.getBoundingClientRect().left - wrapRect.left + 2;
   }
-  const ind = document.getElementById("tab-insert");
-  ind.style.left = `${x}px`;
-  ind.style.display = "block";
+  const indicator = document.getElementById("tab-insert");
+  indicator.style.left = String(x) + "px";
+  indicator.style.display = "block";
 }
 
-/**
- * 拖离组容器：藏指示器（进入组内子元素不算拖离）。
- *
- * @param {DragEvent} e - 事件。
- * @returns {void}
- */
-function onGroupDragLeave(e) {
-  if (e.relatedTarget && e.currentTarget.contains(e.relatedTarget)) return;
-  dropTarget = null;
+/** 设置源标签抓取态；拖动结束必须清空内联样式。 */
+function setTabDragSourceVisual(active, id) {
+  // Pointer Capture 不会改变 CSS 悬停命中；整窗状态才能离开标签后保持抓取光标。
+  document.body.classList.toggle("tab-dragging", active);
+  const element = tabScrollEl.querySelector(".tab[data-id=\"" + id + "\"]");
+  if (!element) return;
+  element.style.opacity = active ? "0.45" : "";
+  element.style.cursor = active ? "grabbing" : "";
+}
+
+/** 未分屏窗口在拖放期间亮出右侧投放区。 */
+function prepareTabDropTarget() {
+  // 拖放期间确保标签条可见，并亮出未分屏窗口的右侧 A/B 投放区。
+  document.body.classList.add("tab-dragging");
+  tabbarEl.classList.add("show");
+  if (!splitOn) tabbarEl.classList.add("dragpeek");
+}
+
+/** 清理本窗口的 hover、插入指示器和临时右组。 */
+function clearTabDragPreview() {
+  document.body.classList.remove("tab-dragging");
   hideInsertIndicator();
+  tabbarEl.classList.remove("dragpeek");
+  tabbarEl.classList.toggle("show", tabs.length > 0); // 恢复日常显隐规则
 }
 
-/**
- * 投放：按 dragover 算好的 (side, index) 调 moveTab。
- *
- * @param {DragEvent} e - 事件。
- * @param {"A" | "B"} side - 投放组。
- * @returns {void}
- */
-function onGroupDrop(e, side) {
-  e.preventDefault();
-  const id = dragTabId ?? (Number(e.dataTransfer.getData("text/plain")) || null);
-  const target = dropTarget;
-  onTabDragEnd(); // 投放即结束：清理拖拽态（真实拖拽随后还有 dragend，幂等）
-  if (id === null || !target || target.side !== side) return;
-  void moveTab(id, side, target.index);
+function reportTabDragError(error) {
+  statusMsg("拖放失败：" + String(error?.message ?? error), 5000);
 }
 
-// 组容器拖拽监听（静态挂接一次；页签的 dragstart/dragend 在 renderTabbar 里随签挂）
-for (const [gid, side] of [["tab-group-a", "A"], ["tab-group-b", "B"]]) {
-  const g = document.getElementById(gid);
-  g.addEventListener("dragover", (e) => onGroupDragOver(e, side));
-  g.addEventListener("dragleave", onGroupDragLeave);
-  g.addEventListener("drop", (e) => onGroupDrop(e, side));
-}
+const tabDragController = createTabDragController({
+  invoke,
+  getTab: (id) => tabs.find((tab) => tab.id === id),
+  moveTab,
+  transferTabToWindow: (...args) => transferCoordinator.transferTabToWindow(...args),
+  createWindow: (position) => invoke("create_document_window", { position }),
+  discardWindow: (label) => invoke("close_empty_window", { targetLabel: label }),
+  computeTarget: tabDropTargetAt,
+  prepareTarget: prepareTabDropTarget,
+  previewTarget: previewTabDropTarget,
+  clearPreview: clearTabDragPreview,
+  setSourceActive: (active, id) => {
+    setTabDragSourceVisual(active, id);
+    if (active) prepareTabDropTarget();
+    else if (!splitOn) tabbarEl.classList.remove("dragpeek");
+  },
+  onError: reportTabDragError,
+});
+
+// 捕获前由 window 监听越过 6px 阈值；捕获后事件仍沿 DOM 冒泡到 window。
+window.addEventListener("pointermove", (event) => {
+  void tabDragController.pointerMove(event);
+});
+window.addEventListener("pointerup", (event) => {
+  void tabDragController.pointerUp(event);
+});
+window.addEventListener("pointercancel", () => {
+  void tabDragController.cancel();
+});
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") void tabDragController.cancel();
+});
+
+// emit_to 是 AnyLabel 定向；必须用当前 Window 监听，不能退回全局 event.listen。
+const tabDragListenerReady = Promise.all([
+  tauri.window.getCurrentWindow().listen("tab-drag-hover", (event) => {
+    void tabDragController.targetHover(event.payload).catch(reportTabDragError);
+  }),
+  tauri.window.getCurrentWindow().listen("tab-drag-drop", (event) => {
+    void tabDragController.targetDrop(event.payload).catch(reportTabDragError);
+  }),
+  tauri.window.getCurrentWindow().listen("tab-drag-clear", (event) => {
+    void tabDragController.targetClear(event.payload).catch(reportTabDragError);
+  }),
+]).catch((error) => { reportTabDragError(error); });
 
 /**
  * 打开一个独立的大文件引擎会话（每个页签一个，互不腾退）。
@@ -2433,6 +2730,7 @@ const gridLive = new Proxy(/** @type {any} */ ({}), {
     activatePath: activateQueuedPath,
     reportError: (error) => statusMsg(`打开失败：${error?.message ?? error}`, 5000),
   });
+  await tabDragListenerReady;
   await transferCoordinator.ready;
   await openPump.start();
   await openPump.idle();
@@ -2503,7 +2801,7 @@ window.__app = {
     side: t.side,
     current: splitOn && sideTab[t.side] === t.id,
   })),
-  activateTab, closeTab, openPathsAsTabs, moveTab,
+  activateTab, closeTab, openPathsAsTabs, moveTab, tabDropTargetAt,
   transferTabToWindow: transferCoordinator.transferTabToWindow,
   // 分屏视图：状态快照 / 建立 / 关闭
   split: () => ({

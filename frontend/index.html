@@ -79,6 +79,9 @@
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; overflow: hidden; }
 body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; }
+/* Pointer Capture 拖动期间覆盖各控件默认光标，包括网格、按钮与目标窗口。 */
+body.tab-dragging,
+body.tab-dragging * { cursor: grabbing !important; }
 #app { display: flex; flex-direction: column; height: 100vh; }
 
 /* ========== 工具栏（E4） ========== */
@@ -255,7 +258,7 @@ body.split #vsplit { display: block; }
 #pane-mirror .g { position: absolute; left: 0; top: 0; }
 
 /* ========== 多文件页签 ==========
-   ≥2 档才显示（.show）；溢出（.overflow）时出 ◀▶ 滚动按钮，滚轮亦可横滚 */
+   有文档即显示（.show），单标签也可作为拖出来源；溢出时出 ◀▶ 滚动按钮，滚轮亦可横滚 */
 #tabbar {
   display: none; align-items: stretch; height: 26px;
   border-top: 1px solid var(--border); background: #ececec; user-select: none;

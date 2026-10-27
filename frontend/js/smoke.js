@@ -1419,32 +1419,29 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     assert(tabEl("r3.csv")?.closest("#tab-group-b"), "r3 签元素应在右组容器");
   });
 
-  check("分组页签 N3：拖拽事件通路——合成 DnD 完成一次换侧", async () => {
-    // 前置：N2 后分屏中（A: r1,r2；B: r3），焦点 A。只测一条事件通路，
-    // 逻辑全排列由 moveTab 直调用例覆盖（合成 DragEvent 的行为与真拖可能有出入）。
+  check("分组页签 N3：真实 DOM 落点几何计算后完成一次换侧", async () => {
+    // 前置：N2 后分屏中（A: r1,r2；B: r3），焦点 A。
+    // 此处只验证真实 WebView 中的矩形换算和既有 moveTab，不用合成事件冒充原生鼠标拖放。
     const r2 = window.__app.tabs().find((x) => x.path?.endsWith("r2.csv"));
     const r3 = window.__app.tabs().find((x) => x.path?.endsWith("r3.csv"));
     const el = tabEl("r2.csv");
     assert(el?.closest("#tab-group-a"), "r2 应在左组");
-    const groupB = document.getElementById("tab-group-b");
     const rect = tabEl("r3.csv").getBoundingClientRect();
-    const dt = new DataTransfer();
-    el.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: dt }));
-    groupB.dispatchEvent(new DragEvent("dragover", {
-      bubbles: true, cancelable: true, clientX: rect.right + 4, clientY: rect.top + 5, dataTransfer: dt,
-    }));
-    groupB.dispatchEvent(new DragEvent("drop", {
-      bubbles: true, cancelable: true, clientX: rect.right + 4, clientY: rect.top + 5, dataTransfer: dt,
-    }));
-    el.dispatchEvent(new DragEvent("dragend", { bubbles: true, cancelable: true, dataTransfer: dt }));
-    await sleep(100); // drop 里 moveTab 是 async
+    const target = window.__app.tabDropTargetAt(r2.id, rect.right + 4, rect.top + 5);
+    assert(target?.side === "B" && target.index === 1 && target.excludeId === r2.id,
+      "右签后方应换算为 B/1，并排除源签 " + JSON.stringify(target));
+    const gridRect = document.getElementById("grid-area").getBoundingClientRect();
+    assert(window.__app.tabDropTargetAt(r2.id, gridRect.left + 5, gridRect.top + 5) === null,
+      "网格区域不得成为标签落点");
+    const ok = await window.__app.moveTab(r2.id, target.side, target.index);
+    assert(ok === true, "几何计算后的换侧应成功");
     const sp = window.__app.split();
     assert(sp.on === true && JSON.stringify(sp.b) === JSON.stringify([r3.id, r2.id]),
-      `r2 应移到右组末尾 ${JSON.stringify(sp)}`);
-    assert(sp.curB === r2.id, "被拖签应成右组当前签");
+      "r2 应移到右组末尾 " + JSON.stringify(sp));
+    assert(sp.curB === r2.id, "被移动签应成右组当前签");
     await waitFor(() => sideCellText("B", 0, 0) === "排二", "右格应显 r2");
     const ind = document.getElementById("tab-insert");
-    assert(!ind || getComputedStyle(ind).display === "none", "拖拽后插入指示器应隐藏");
+    assert(!ind || getComputedStyle(ind).display === "none", "移动后插入指示器应隐藏");
   });
 
   check("分组页签 N4：右组拖空自动收起分屏", async () => {

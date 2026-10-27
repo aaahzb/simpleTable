@@ -17,6 +17,8 @@ use serde::Serialize;
 use tauri::{Emitter, Manager};
 
 mod baseline;
+mod drag_registry;
+mod drag_preview;
 mod clipboard;
 mod engine;
 pub mod document_registry;
@@ -303,6 +305,7 @@ struct RuntimeState {
     docs: document_registry::DocumentRegistry,
     opens: open_request::OpenRequestQueue,
     windows: window_registry::WindowRegistry,
+    drags: drag_registry::DragRegistry,
 }
 
 type SharedRuntime = Arc<Mutex<RuntimeState>>;
@@ -1454,6 +1457,9 @@ fn handle_window_destroyed(app: &tauri::AppHandle, label: &str) {
         .cloned()
         .collect();
     let result = with_runtime(app, |runtime| {
+        if runtime.drags.window_destroyed(label) {
+            drag_preview::destroy(app);
+        }
         if runtime.windows.role(label).is_none() {
             return (Vec::new(), Vec::new(), Vec::new());
         }
@@ -1566,8 +1572,315 @@ fn discard_unready_window(app: &tauri::AppHandle, label: &str) {
     }
 }
 
+fn authorize_tab_drag(
+    app: &tauri::AppHandle,
+    source: &str,
+    drag_token: u64,
+) -> Result<(), String> {
+    with_runtime(app, |runtime| {
+        let (session, lease) = runtime.drags.authorize(drag_token, source)?;
+        runtime.docs.authorize(session, source, lease, Access::Write).map(|_| ())
+    })??;
+    Ok(())
+}
+
+fn source_physical_point(
+    window: &tauri::WebviewWindow,
+    client_x: f64,
+    client_y: f64,
+) -> Result<drag_registry::PhysicalPoint, String> {
+    let inner = window.inner_position().map_err(|error| format!("读取源窗口位置失败：{error}"))?;
+    let scale = window.scale_factor().map_err(|error| format!("读取源窗口缩放失败：{error}"))?;
+    drag_registry::client_to_physical(
+        drag_registry::PhysicalPoint { x: inner.x, y: inner.y },
+        scale,
+        drag_registry::ClientPoint { x: client_x, y: client_y },
+    )
+}
+
+// 预览 WebView 构建需要主事件循环，命令必须离开主线程以避免自等待。
+#[tauri::command(async)]
+fn begin_tab_drag(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    session: u64,
+    lease: u64,
+    title: String,
+    client_x: f64,
+    client_y: f64,
+) -> Result<u64, String> {
+    let source = window.label().to_string();
+    // 先验证坐标，避免登记 active drag 后才失败并留下无法取消的 token。
+    let point = source_physical_point(&window, client_x, client_y)?;
+    let token = with_runtime(&app, |runtime| {
+        runtime.docs.authorize(session, &source, lease, Access::Write)?;
+        runtime.drags.begin(session, &source, lease)
+    })??;
+    if let Err(error) = drag_preview::show_at(&app, &title, point) {
+        eprintln!("{error}");
+    }
+    Ok(token)
+}
+
+fn native_drag_route(
+    app: &tauri::AppHandle,
+    source: &str,
+    point: drag_registry::PhysicalPoint,
+) -> Result<(
+    drag_registry::DropRoute,
+    Vec<(tauri::WebviewWindow, drag_registry::WindowRect)>,
+), String> {
+    let recent = recent_ready_window_label(app);
+    let mut candidates = app.webview_windows().into_values().collect::<Vec<_>>();
+    candidates.sort_by_key(|window| if Some(window.label()) == recent.as_deref() { 0 } else { 1 });
+    let mut frames = Vec::new();
+    for window in candidates {
+        let label = window.label().to_string();
+        let eligible = with_runtime(app, |runtime| {
+            runtime.windows.role(&label).is_some() && runtime.windows.is_ready(&label)
+        }).unwrap_or(false);
+        if !eligible
+            || !window.is_visible().unwrap_or(false)
+            || window.is_minimized().unwrap_or(true)
+        {
+            continue;
+        }
+        let (Ok(origin), Ok(size)) = (window.outer_position(), window.outer_size()) else {
+            continue;
+        };
+        frames.push((window, drag_registry::WindowRect {
+            label,
+            x: origin.x,
+            y: origin.y,
+            w: size.width,
+            h: size.height,
+        }));
+    }
+    let rects = frames.iter().map(|(_, rect)| rect.clone()).collect::<Vec<_>>();
+    Ok((drag_registry::route_drop(&rects, source, point), frames))
+}
+
+fn drag_css_point(
+    frames: &[(tauri::WebviewWindow, drag_registry::WindowRect)],
+    label: &str,
+    point: drag_registry::PhysicalPoint,
+) -> Result<(f64, f64), String> {
+    let (window, _) = frames.iter().find(|(_, rect)| rect.label == label)
+        .ok_or_else(|| format!("拖放目标窗口已消失：{label}"))?;
+    let inner = window.inner_position().map_err(|error| error.to_string())?;
+    let scale = window.scale_factor().map_err(|error| error.to_string())?;
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("目标窗口 scale factor 无效".into());
+    }
+    Ok((
+        f64::from(point.x - inner.x) / scale,
+        f64::from(point.y - inner.y) / scale,
+    ))
+}
+
+fn clear_drag_indicator(app: &tauri::AppHandle, label: &str, drag_token: u64) {
+    if label.is_empty() {
+        return;
+    }
+    if let Err(error) = app.emit_to(
+        label,
+        "tab-drag-clear",
+        serde_json::json!({ "dragToken": drag_token }),
+    ) {
+        eprintln!("清理目标拖放指示器失败（{label}）：{error}");
+    }
+}
+
+fn update_drag_hover(
+    app: &tauri::AppHandle,
+    source: &str,
+    drag_token: u64,
+    target: Option<String>,
+) -> Result<(), String> {
+    let previous = with_runtime(app, |runtime| {
+        runtime.drags.set_hover(drag_token, source, target)
+    }).and_then(|result| result)?;
+    if let Some(label) = previous {
+        clear_drag_indicator(app, &label, drag_token);
+    }
+    Ok(())
+}
+
+fn finish_tab_drag(app: &tauri::AppHandle, source: &str, drag_token: u64) {
+    match with_runtime(app, |runtime| {
+        let previous = runtime.drags.finish(drag_token, source)?;
+        // 在运行态锁内回收，避免下一次 begin 与旧清理竞态。
+        drag_preview::destroy(app);
+        Ok::<Option<String>, String>(previous)
+    }).and_then(|result| result) {
+        Ok(previous) => {
+            if let Some(label) = previous {
+                clear_drag_indicator(app, &label, drag_token);
+            }
+        }
+        Err(error) => eprintln!("结束标签拖放失败：{error}"),
+    }
+}
+
 #[tauri::command]
-async fn create_document_window(app: tauri::AppHandle) -> Result<String, String> {
+fn tab_drag_hover(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    drag_token: u64,
+    client_x: f64,
+    client_y: f64,
+) -> Result<drag_registry::DragHover, String> {
+    let source = window.label().to_string();
+    authorize_tab_drag(&app, &source, drag_token)?;
+    let point = source_physical_point(&window, client_x, client_y)?;
+    let (route, frames) = native_drag_route(&app, &source, point)?;
+    drag_preview::follow(&app, point);
+    match route {
+        drag_registry::DropRoute::SameWindow { .. } => {
+            update_drag_hover(&app, &source, drag_token, None)?;
+            match drag_css_point(&frames, &source, point) {
+                Ok((x, y)) => Ok(drag_registry::DragHover::SameWindow { x, y }),
+                Err(_) => Ok(drag_registry::DragHover::Invalid),
+            }
+        }
+        drag_registry::DropRoute::AskTarget { label, .. } => {
+            let Ok((x, y)) = drag_css_point(&frames, &label, point) else {
+                update_drag_hover(&app, &source, drag_token, None)?;
+                return Ok(drag_registry::DragHover::Invalid);
+            };
+            update_drag_hover(&app, &source, drag_token, Some(label.clone()))?;
+            if let Err(error) = app.emit_to(
+                &label,
+                "tab-drag-hover",
+                serde_json::json!({ "dragToken": drag_token, "x": x, "y": y }),
+            ) {
+                eprintln!("投递目标拖放 hover 失败（{label}）：{error}");
+                update_drag_hover(&app, &source, drag_token, None)?;
+                return Ok(drag_registry::DragHover::Invalid);
+            }
+            Ok(drag_registry::DragHover::Existing)
+        }
+        drag_registry::DropRoute::NewWindow { .. } => {
+            update_drag_hover(&app, &source, drag_token, None)?;
+            Ok(drag_registry::DragHover::NewWindow)
+        }
+    }
+}
+
+#[tauri::command]
+async fn drop_tab_drag(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    drag_token: u64,
+    client_x: f64,
+    client_y: f64,
+) -> Result<drag_registry::DropOutcome, String> {
+    let source = window.label().to_string();
+    authorize_tab_drag(&app, &source, drag_token)?;
+    let point = source_physical_point(&window, client_x, client_y)?;
+    let (route, frames) = native_drag_route(&app, &source, point)?;
+    match route {
+        drag_registry::DropRoute::SameWindow { .. } => {
+            let outcome = match drag_css_point(&frames, &source, point) {
+                Ok((x, y)) => drag_registry::DropOutcome::SameWindow { x, y },
+                Err(_) => drag_registry::DropOutcome::Invalid,
+            };
+            finish_tab_drag(&app, &source, drag_token);
+            Ok(outcome)
+        }
+        drag_registry::DropRoute::NewWindow { x, y } => {
+            finish_tab_drag(&app, &source, drag_token);
+            Ok(drag_registry::DropOutcome::NewWindow { x, y })
+        }
+        drag_registry::DropRoute::AskTarget { label, .. } => {
+            let Ok((x, y)) = drag_css_point(&frames, &label, point) else {
+                finish_tab_drag(&app, &source, drag_token);
+                return Ok(drag_registry::DropOutcome::Invalid);
+            };
+            let (drop_id, receiver) = with_runtime(&app, |runtime| {
+                runtime.drags.ask_target(drag_token, &source, &label)
+            }).and_then(|result| result)?;
+            if let Err(error) = update_drag_hover(
+                &app, &source, drag_token, Some(label.clone()),
+            ) {
+                let _ = with_runtime(&app, |runtime| runtime.drags.abort_drop(drop_id));
+                finish_tab_drag(&app, &source, drag_token);
+                return Err(error);
+            }
+            if let Err(error) = app.emit_to(
+                &label,
+                "tab-drag-drop",
+                serde_json::json!({
+                    "dropId": drop_id, "dragToken": drag_token, "x": x, "y": y,
+                }),
+            ) {
+                eprintln!("投递目标拖放 drop 失败（{label}）：{error}");
+                let _ = with_runtime(&app, |runtime| runtime.drags.abort_drop(drop_id));
+                finish_tab_drag(&app, &source, drag_token);
+                return Ok(drag_registry::DropOutcome::Invalid);
+            }
+            let outcome = match tokio::time::timeout(
+                std::time::Duration::from_secs(2), receiver,
+            ).await {
+                Ok(Ok(Some(target))) => {
+                    if authorize_tab_drag(&app, &source, drag_token).is_ok() {
+                        drag_registry::DropOutcome::Existing {
+                            target: label,
+                            side: target.side,
+                            index: target.index,
+                        }
+                    } else {
+                        drag_registry::DropOutcome::Invalid
+                    }
+                }
+                Ok(Ok(None)) | Ok(Err(_)) => drag_registry::DropOutcome::Invalid,
+                Err(_) => {
+                    let _ = with_runtime(&app, |runtime| runtime.drags.abort_drop(drop_id));
+                    drag_registry::DropOutcome::Invalid
+                }
+            };
+            finish_tab_drag(&app, &source, drag_token);
+            Ok(outcome)
+        }
+    }
+}
+
+#[tauri::command]
+fn tab_drag_drop_result(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    drop_id: u64,
+    side: Option<String>,
+    index: Option<usize>,
+) -> Result<(), String> {
+    with_runtime(&app, |runtime| {
+        runtime.drags.drop_result(drop_id, window.label(), side.as_deref(), index)
+    })??;
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_tab_drag(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    drag_token: u64,
+) -> Result<(), String> {
+    let previous = with_runtime(&app, |runtime| {
+        let previous = runtime.drags.cancel(drag_token, window.label())?;
+        drag_preview::destroy(&app);
+        Ok::<Option<String>, String>(previous)
+    }).and_then(|result| result)?;
+    if let Some(label) = previous {
+        clear_drag_indicator(&app, &label, drag_token);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn create_document_window(
+    app: tauri::AppHandle,
+    position: Option<drag_registry::PhysicalPoint>,
+) -> Result<String, String> {
     let (label, receiver) = {
         let state = app.state::<SharedRuntime>();
         let mut runtime = state.lock().map_err(|e| e.to_string())?;
@@ -1593,6 +1906,13 @@ async fn create_document_window(app: tauri::AppHandle) -> Result<String, String>
             return Err(format!("创建文档窗口失败：{error}"));
         }
     };
+    if let Some(point) = position {
+        if let Err(error) = window.set_position(tauri::PhysicalPosition::new(point.x, point.y)) {
+            discard_unready_window(&app, &label);
+            let _ = window.destroy();
+            return Err(format!("设置文档窗口落点失败：{error}"));
+        }
+    }
     install_window_events(&app, &window);
     match tokio::time::timeout(std::time::Duration::from_secs(10), receiver).await {
         Ok(Ok(())) => Ok(label),
@@ -1618,6 +1938,9 @@ fn close_window_internal(
     let (entries, batches, cancellations, last) = {
         let state = app.state::<SharedRuntime>();
         let mut runtime = state.lock().map_err(|e| e.to_string())?;
+        if runtime.drags.window_destroyed(&label) {
+            drag_preview::destroy(app);
+        }
         if runtime.docs.has_outgoing(&label) {
             return Err("窗口存在正在迁出的文档，不能关闭".into());
         }
@@ -1787,6 +2110,11 @@ pub fn run() {
             create_document_window,
             close_window,
             close_empty_window,
+            begin_tab_drag,
+            tab_drag_hover,
+            drop_tab_drag,
+            tab_drag_drop_result,
+            cancel_tab_drag,
             seal_document,
             accept_transfer,
             transfer_adopted,
