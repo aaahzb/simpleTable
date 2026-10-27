@@ -375,6 +375,21 @@ impl DocumentFormat {
     }
 }
 
+/// 在文档状态修改前拒绝 TextLines 单元格中的 CR/LF。
+fn validate_text_lines_values<'a>(
+    format: DocumentFormat,
+    values: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    if format.is_text_lines()
+        && values.into_iter().any(|value| {
+            value.bytes().any(|b| b == b'\r' || b == b'\n')
+        })
+    {
+        return Err("纯文本单元格不能包含换行，请改用多行粘贴".into());
+    }
+    Ok(())
+}
+
 /// 按文档格式解析首条记录；纯文本始终把首个物理行作为唯一字段。
 fn parse_document_record(
     text: &str,
@@ -1404,6 +1419,88 @@ mod tests {
         assert_eq!(bf.meta().cols, 1);
         assert_eq!(bf.rows(0, 2), vec![vec!["first"], vec!["second"]]);
         assert!(!bf.meta().modified && !bf.meta().can_undo);
+        fs::remove_file(&p).ok();
+    }
+
+    fn assert_text_lines_rejected_without_mutation(
+        bf: &mut BigFile,
+        operation: impl FnOnce(&mut BigFile) -> Result<EditOutcome, String>,
+    ) {
+        let before_rows = bf.rows(0, 20);
+        let before_meta = bf.meta();
+        let error = operation(bf).unwrap_err();
+        assert!(error.contains("多行粘贴"), "错误应提示替代操作：{error}");
+        let after_meta = bf.meta();
+        assert_eq!(bf.rows(0, 20), before_rows);
+        assert_eq!(after_meta.rows, before_meta.rows);
+        assert_eq!(after_meta.cols, before_meta.cols);
+        assert_eq!(after_meta.modified, before_meta.modified);
+        assert_eq!(after_meta.can_undo, before_meta.can_undo);
+        assert_eq!(after_meta.can_redo, before_meta.can_redo);
+    }
+
+    #[test]
+    fn text_lines_multiline_values_are_rejected_atomically() {
+        let p = tmp_text("atomic", "txt", b"one\ntwo\nthree\n");
+        let mut bf = BigFile::open(&p).unwrap();
+        assert_text_lines_rejected_without_mutation(&mut bf, |bf|
+            bf.set_cell(0, 0, "bad\nline".into(), Approval::deny()));
+        assert_text_lines_rejected_without_mutation(&mut bf, |bf|
+            bf.set_cells(vec![(0, 0, "ok".into()), (1, 0, "bad\rline".into())],
+                Approval::deny()));
+        assert_text_lines_rejected_without_mutation(&mut bf, |bf|
+            bf.insert_rows(1, Some(vec![vec!["ok".into()], vec!["bad\nline".into()]]),
+                0, Approval::deny()));
+        assert_text_lines_rejected_without_mutation(&mut bf, |bf|
+            bf.paste_rows(0, 0, vec![vec!["ok".into()], vec!["bad\nline".into()]],
+                Approval::deny()));
+
+        bf.paste_rows(0, 0, vec![vec!["new-one".into()], vec!["new-two".into()]],
+            Approval::deny()).unwrap();
+        assert_eq!(bf.rows(0, 2), vec![vec!["new-one"], vec!["new-two"]]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn text_lines_paste_rows_cannot_expand_columns() {
+        let p = tmp_text("paste-fixed-column", "txt", b"one\ntwo\nthree\n");
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 10);
+        let error = bf.paste_rows(
+            0, 1, vec![vec!["extra".into()]], Approval::deny(),
+        ).unwrap_err();
+        assert!(error.contains("固定一列"), "错误应说明固定列限制：{error}");
+        assert_eq!(bf.rows(0, 10), before);
+        assert!(!bf.meta().modified && !bf.meta().can_undo && !bf.meta().can_redo);
+
+        let error = bf.paste_rows(
+            0, 0, vec![vec!["one".into(), "two".into()]], Approval::deny(),
+        ).unwrap_err();
+        assert!(error.contains("固定一列"), "错误应说明固定列限制：{error}");
+        assert_eq!(bf.rows(0, 10), before);
+        assert!(!bf.meta().modified && !bf.meta().can_undo && !bf.meta().can_redo);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn text_lines_external_import_newline_is_atomic_and_rect_paste_works() {
+        let p = tmp_text("import-atomic", "txt", b"one\ntwo\nthree\n");
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = bf.rows(0, 10);
+        let id = begin_import_bytes(&mut bf, b"ok\r\nbad\nline");
+        let error = bf.finish_paste_import(
+            &id, PasteDestination::SingleCell { row: 0, col: 0 }, Approval::deny(),
+        ).unwrap_err();
+        assert!(error.contains("多行粘贴"));
+        assert_eq!(bf.rows(0, 10), before);
+        assert!(!bf.meta().modified && !bf.meta().can_undo && !bf.meta().can_redo);
+        bf.cancel_paste_import(&id).unwrap();
+
+        let id = begin_import_bytes(&mut bf, b"new-one\r\nnew-two");
+        bf.finish_paste_import(
+            &id, PasteDestination::Rect { row: 0, col: 0 }, Approval::deny(),
+        ).unwrap();
+        assert_eq!(bf.rows(0, 2), vec![vec!["new-one"], vec!["new-two"]]);
         fs::remove_file(&p).ok();
     }
 
@@ -9483,6 +9580,10 @@ impl BigFile {
         cells: Vec<(u64, u32, String)>,
         schema: &Schema,
     ) -> Result<Vec<CellChange>, String> {
+        validate_text_lines_values(
+            self.format,
+            cells.iter().map(|(_, _, value)| value.as_str()),
+        )?;
         // 先解析全部地址，保证后置非法项不会留下前置半次写入。
         let mut resolved = Vec::with_capacity(cells.len());
         for (vrow, col, value) in cells {
@@ -10041,6 +10142,7 @@ impl BigFile {
         let ncols = self.schema.visible().len();
         let target = target.normalize(total_rows, ncols)?;
         let value = Self::read_import_single_value(&path)?;
+        validate_text_lines_values(self.format, std::iter::once(value.as_str()))?;
         let new_value = ValueRef::text(value);
         let new_text: &str = match &new_value {
             ValueRef::Text(text) => text.text.as_ref(),
@@ -10201,6 +10303,10 @@ impl BigFile {
         loop {
             let offset = reader.position();
             let Some(record) = reader.next_record()? else { break };
+            validate_text_lines_values(self.format, record.iter().map(String::as_str))?;
+            if self.format.is_text_lines() && (col > 0 || record.len() > 1) {
+                return Err("纯文本逐行文档固定一列，不支持扩列粘贴".into());
+            }
             offsets.push(offset);
             input_rows = input_rows.checked_add(1).ok_or("粘贴行数溢出")?;
             let required_cols = paste_start.checked_add(record.len()).ok_or("粘贴列数溢出")?;
@@ -10253,6 +10359,7 @@ impl BigFile {
     ) -> Result<GenerationSpec, String> {
         self.resolve_batch_cell(row, col)?;
         let value = Self::read_import_single_value(path)?;
+        validate_text_lines_values(self.format, std::iter::once(value.as_str()))?;
         let original_rows = self.indexed_data_rows();
         let original_cols = self.schema.visible().len();
         let schema = self.generation_schema(self.view_headers())?;
@@ -10277,6 +10384,7 @@ impl BigFile {
             self.resolve_batch_cell(row, col).map(|_| ())
         })?;
         let value = Self::read_import_single_value(path)?;
+        validate_text_lines_values(self.format, std::iter::once(value.as_str()))?;
         let schema = self.generation_schema(self.view_headers())?;
         Ok(GenerationSpec {
             rows: original_rows,
@@ -10540,6 +10648,15 @@ impl BigFile {
         let original_ncols = self.schema.visible().len();
         let paste_start = usize::try_from(col).map_err(|_| "粘贴列号溢出")?;
         if paste_start > original_ncols { return Err("粘贴起始列越界".into()); }
+        if self.format.is_text_lines() {
+            let mut preflight = RecordReader::open(path, b'\t')?;
+            while let Some(record) = preflight.next_record()? {
+                validate_text_lines_values(self.format, record.iter().map(String::as_str))?;
+                if col > 0 || record.len() > 1 {
+                    return Err("纯文本逐行文档固定一列，不支持扩列粘贴".into());
+                }
+            }
+        }
         let mut candidate = (*self.schema).clone();
         let mut target_ncols = original_ncols;
         let mut reader = RecordReader::open(&path, b'\t')?;
@@ -10759,6 +10876,15 @@ impl BigFile {
         mut rows: Vec<Vec<String>>,
         approval: Approval,
     ) -> Result<EditOutcome, String> {
+        validate_text_lines_values(
+            self.format,
+            rows.iter().flat_map(|row| row.iter().map(String::as_str)),
+        )?;
+        if self.format.is_text_lines()
+            && (col > 0 || rows.iter().any(|row| row.len() > 1))
+        {
+            return Err("纯文本逐行文档固定一列，不支持扩列粘贴".into());
+        }
         self.require_editable()?;
         self.refresh_indexed();
         if rows.is_empty() {
@@ -10878,6 +11004,7 @@ impl BigFile {
         value: String,
         approval: Approval,
     ) -> Result<EditOutcome, String> {
+        validate_text_lines_values(self.format, std::iter::once(value.as_str()))?;
         self.require_editable()?;
         let col = self.schema.view_id(col).ok_or("列号越界")?;
         let vrow = self.orig_vrow(vrow);
@@ -10919,6 +11046,12 @@ impl BigFile {
         count: u64,
         approval: Approval,
     ) -> Result<EditOutcome, String> {
+        if let Some(rows) = &rows {
+            validate_text_lines_values(
+                self.format,
+                rows.iter().flat_map(|row| row.iter().map(String::as_str)),
+            )?;
+        }
         self.require_editable()?;
         if self.is_sorted() {
             return Err("排序模式下暂不支持插入/删除行，请先退出排序".into());
