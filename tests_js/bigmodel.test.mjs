@@ -2,8 +2,11 @@
 // invoke/listen 全部注入 mock，脱离 Tauri 环境（node --test 直跑）。
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
+import vm from "node:vm";
 
 import { BigModel, BIG_PAGE, BIG_THRESHOLD } from "../frontend/js/bigmodel.js";
+import { undoBudgetBytes } from "../frontend/js/prefs.js";
 import { findVerticalEdge } from "../frontend/js/nav.js";
 import { makeFakeEngine, makeSharedBackend } from "./helpers/shared_bigmodel_fake.mjs";
 
@@ -1553,37 +1556,107 @@ test("undo budget 按 MiB 转为字节下发并刷新元数据", async () => {
   assert.equal(model.modified(), false);
 });
 
-test("open/create 创建会话后立即下发默认 64 MiB 预算", async () => {
+test("open/create 由后端套用进程预算，前端不再逐会话下发", async () => {
   const opened = makeFakeEngine();
   await opened.model.open("/x.csv");
-  assert.deepEqual(opened.calls.slice(0, 2).map(([cmd]) => cmd),
-    ["big_open", "big_set_undo_budget"]);
-  assert.equal(opened.calls[1][1].budgetBytes, 64 * 1024 * 1024);
+  assert.equal(opened.calls[0][0], "big_open");
+  assert.equal(opened.calls.filter(([cmd]) => cmd === "big_set_undo_budget").length, 0);
 
   const created = makeFakeEngine();
   await created.model.create("a,b\n1,2\n");
-  assert.deepEqual(created.calls.slice(0, 2).map(([cmd]) => cmd),
-    ["big_new", "big_set_undo_budget"]);
-  assert.equal(created.calls[1][1].budgetBytes, 64 * 1024 * 1024);
+  assert.equal(created.calls[0][0], "big_new");
+  assert.equal(created.calls.filter(([cmd]) => cmd === "big_set_undo_budget").length, 0);
 });
 
-test("默认撤销预算只影响之后 open/create 的会话", async () => {
-  const { setDefaultUndoBudgetMiB } = await import("../frontend/js/bigmodel.js");
-  assert.equal(typeof setDefaultUndoBudgetMiB, "function");
-  setDefaultUndoBudgetMiB(128);
-  try {
-    const existing = makeFakeEngine();
-    await existing.model.open("/old.csv");
-    assert.equal(existing.calls[1][1].budgetBytes, 128 * 1024 * 1024);
-    const before = existing.calls.length;
-    setDefaultUndoBudgetMiB(32);
-    const created = makeFakeEngine();
-    await created.model.create("a\n1\n", { headerless: true });
-    assert.equal(created.calls[1][1].budgetBytes, 32 * 1024 * 1024);
-    assert.equal(existing.calls.length, before, "已有会话不得被默认值 retroactive 修改");
-  } finally {
-    setDefaultUndoBudgetMiB(64);
-  }
+test("changeUndoBudget 只调用一次进程级命令且不改已迁移源模型", async () => {
+  const app = readFileSync(new URL("../frontend/js/app.js", import.meta.url), "utf8");
+  const start = app.indexOf("async function changeUndoBudget(");
+  const end = app.indexOf("\n/**", start + 1);
+  assert.ok(start >= 0 && end > start, "应提取真实 changeUndoBudget");
+  const calls = [];
+  const perModel = [];
+  const errors = [];
+  const persisted = [];
+  const sourceModel = {
+    meta: () => ({}),
+    setUndoBudget: async (value) => { perModel.push(value); },
+  };
+  const context = {
+    undoBudgetDialog: async () => 128,
+    undoBudgetMiB: 64,
+    undoBudgetBytes,
+    model: sourceModel,
+    tabs: [{ model: sourceModel }],
+    gridB: { model: null },
+    btnUndoBudget: { disabled: false },
+    setDefaultUndoBudgetMiB: () => {},
+    syncModelDirty: () => { perModel.push("dirty"); },
+    undoPrefs: { set: (value) => { persisted.push(value); } },
+    statusMsg: () => {},
+    errorDialog: async (title, error) => { errors.push([title, error]); },
+    invoke: async (cmd, args) => { calls.push([cmd, args]); },
+  };
+  vm.runInNewContext(app.slice(start, end) + "\nglobalThis.change = changeUndoBudget;", context);
+  await context.change();
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
+    ["set_undo_budget", { budgetBytes: 128 * 1024 * 1024 }],
+  ]);
+  assert.equal(perModel.length, 0, "不得遍历本窗或已迁移源模型逐一下发");
+  assert.deepEqual(errors, []);
+  assert.deepEqual(persisted, [128]);
+  assert.equal(context.undoBudgetMiB, 128);
+  assert.equal(context.btnUndoBudget.disabled, false);
+});
+
+test("冷启动在打开队列 ready 前同步持久化的进程预算", () => {
+  const app = readFileSync(new URL("../frontend/js/app.js", import.meta.url), "utf8");
+  const sync = app.indexOf('await invoke("set_undo_budget", { budgetBytes: undoBudgetBytes(undoBudgetMiB) });');
+  const ready = app.indexOf("await openPump.start();");
+  assert.ok(sync >= 0, "启动必须同步 localStorage 中的非默认预算");
+  assert.ok(ready > sync, "预算必须先于启动文件注册，避免在途 open 使用旧值");
+  assert.ok(app.includes("undo-budget-changed") && app.includes("getCurrentWindow().listen"),
+    "定向预算事件必须按当前窗口监听");
+});
+
+test("预算事件同步活动模型脏点但不覆盖状态栏", async () => {
+  const app = readFileSync(new URL("../frontend/js/app.js", import.meta.url), "utf8");
+  const refreshStart = app.indexOf("async function refreshUndoBudgetModel(");
+  const refreshEnd = app.indexOf("\n/**", refreshStart + 1);
+  const syncStart = app.indexOf("function syncModelDirty(");
+  const syncEnd = app.indexOf("\n/**", syncStart + 1);
+  assert.ok(refreshStart >= 0 && refreshEnd > refreshStart, "应提取真实预算事件刷新函数");
+  assert.ok(syncStart >= 0 && syncEnd > syncStart, "应提取真实脏点同步函数");
+  const refreshed = [];
+  const dirty = [];
+  const statusRefreshes = [];
+  let rendered = 0;
+  const current = {
+    sessionId: 7,
+    lease: 4,
+    modified: () => true,
+    _refreshMeta: async () => { refreshed.push([7, 4]); },
+  };
+  const context = {
+    tabs: [{ model: current }],
+    model: current,
+    setDirty: (value) => { dirty.push(value); },
+    renderTabbar: () => { rendered += 1; },
+    updateStatusText: () => { statusRefreshes.push("refresh"); },
+  };
+  const source = app.slice(syncStart, syncEnd) + "\n" + app.slice(refreshStart, refreshEnd)
+    + "\nglobalThis.refresh = refreshUndoBudgetModel; globalThis.sync = syncModelDirty;";
+  vm.runInNewContext(source, context);
+  assert.equal(await context.refresh({ session: 7, lease: 3 }), false, "旧 lease 不得刷新");
+  assert.equal(await context.refresh({ session: 8, lease: 4 }), false, "其他会话不得刷新");
+  assert.equal(await context.refresh({ session: 7, lease: 4 }), true);
+  assert.deepEqual(refreshed, [[7, 4]]);
+  assert.deepEqual(dirty, [true], "活动模型仍须同步引擎脏点");
+  assert.equal(rendered, 1, "活动页签脏点仍须重绘");
+  assert.equal(statusRefreshes.length, 0,
+    "预算元数据不改变行列或筛选，不得覆盖设置成功状态文案");
+  context.sync(current);
+  assert.deepEqual(dirty, [true, true]);
+  assert.equal(statusRefreshes.length, 1, "普通脏点同步仍应默认刷新状态栏");
 });
 
 test("modified() 读取引擎脏点且空模型安全", () => {
@@ -1700,4 +1773,96 @@ test("内部 token 粘贴直接调用引擎并重试固定点", async () => {
   assert.deepEqual(calls[1][1].approval, { allowFixedPoint: true, preflightId: 11 });
   assert.equal(refreshes, 1);
   assert.equal(dataEvents, 1);
+});
+
+/**
+ * 提取真实 smoke 的进程 IPC 拦截 helper，并模拟 Tauri 的冻结 core。
+ *
+ * @returns {{context: object, tauri: object, originalCore: object,
+ *   backendCalls: Array, invoke: Function}} 测试上下文与真实外层 invoke 闭包。
+ */
+function makeSmokeIpcHarness() {
+  const smoke = readFileSync(new URL("../frontend/js/smoke.js", import.meta.url), "utf8");
+  const start = smoke.indexOf("function deferProcessCommand(");
+  const end = smoke.indexOf('\n  check("撤销重做：跨过保存点时按引擎同步脏点"', start);
+  assert.ok(start >= 0 && end > start, "应提取真实 smoke 进程 IPC helpers");
+  const backendCalls = [];
+  const originalCore = Object.freeze({
+    invoke: async (cmd, args) => {
+      backendCalls.push([cmd, args]);
+      return cmd;
+    },
+  });
+  const tauri = { core: originalCore };
+  const context = { window: { __TAURI__: tauri } };
+  const source = '"use strict";\n' + smoke.slice(start, end)
+    + "\nglobalThis.deferProcessCommand = deferProcessCommand;"
+    + "\nglobalThis.captureProcessBudgetCalls = captureProcessBudgetCalls;";
+  vm.runInNewContext(source, context);
+  // 与 app.js 一致：捕获外层 tauri，但每次调用动态读取 core.invoke。
+  const invoke = (cmd, args) => tauri.core.invoke(cmd, args);
+  return { context, tauri, originalCore, backendCalls, invoke };
+}
+
+test("smoke IPC defer 在冻结 core 上暂停目标命令并转发其他命令", async () => {
+  const { context, tauri, originalCore, backendCalls, invoke } = makeSmokeIpcHarness();
+  const delay = context.deferProcessCommand("set_undo_budget");
+  let pending = null;
+  try {
+    pending = invoke("set_undo_budget", { budgetBytes: 1024 * 1024 });
+    await delay.entered;
+    assert.deepEqual(backendCalls, [], "目标命令必须停在真实后端之前");
+    assert.equal(await invoke("big_open", { path: "b.csv" }), "big_open",
+      "等待预算命令时仍须允许其他命令完成");
+    delay.release();
+    assert.equal(await pending, "set_undo_budget");
+    pending = null;
+  } finally {
+    delay.release();
+    delay.restore();
+    if (pending) await pending;
+  }
+  assert.equal(tauri.core, originalCore, "恢复后必须还原原 core 引用");
+  assert.deepEqual(backendCalls.map(([cmd]) => cmd), ["big_open", "set_undo_budget"]);
+});
+
+test("smoke IPC 在途 big_open 受阻时进程预算可以先完成", async () => {
+  const { context, tauri, originalCore, backendCalls, invoke } = makeSmokeIpcHarness();
+  const delay = context.deferProcessCommand("big_open");
+  let opening = null;
+  try {
+    opening = invoke("big_open", { path: "b.csv" });
+    await delay.entered;
+    assert.equal(await invoke("set_undo_budget", { budgetBytes: 1024 * 1024 }),
+      "set_undo_budget", "open 尚未注册时必须先能完成最新预算下发");
+    assert.deepEqual(backendCalls.map(([cmd]) => cmd), ["set_undo_budget"]);
+    delay.release();
+    assert.equal(await opening, "big_open");
+    opening = null;
+  } finally {
+    delay.release();
+    delay.restore();
+    if (opening) await opening;
+  }
+  assert.equal(tauri.core, originalCore);
+  assert.deepEqual(backendCalls.map(([cmd]) => cmd), ["set_undo_budget", "big_open"]);
+});
+
+test("smoke IPC capture 只记录预算调用并可恢复原 core", async () => {
+  const { context, tauri, originalCore, invoke } = makeSmokeIpcHarness();
+  const calls = [];
+  const restore = context.captureProcessBudgetCalls(calls);
+  try {
+    await invoke("set_undo_budget", { budgetBytes: 1024 * 1024 });
+    await invoke("big_meta", { session: 1 });
+    await invoke("set_undo_budget", { budgetBytes: 2 * 1024 * 1024 });
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].budgetBytes, 1024 * 1024);
+    assert.equal(calls[1].budgetBytes, 2 * 1024 * 1024);
+  } finally {
+    restore();
+  }
+  assert.equal(tauri.core, originalCore);
+  await invoke("set_undo_budget", { budgetBytes: 64 * 1024 * 1024 });
+  assert.equal(calls.length, 2, "恢复后不得继续记录调用");
 });

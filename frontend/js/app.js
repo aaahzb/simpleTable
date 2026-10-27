@@ -6,7 +6,7 @@
  */
 
 import { serializeCsv, serializeRecords } from "./csv.js";
-import { BigModel, setDefaultUndoBudgetMiB } from "./bigmodel.js";
+import { BigModel } from "./bigmodel.js";
 import { Grid } from "./grid.js";
 import { EditPane } from "./pane.js";
 import { showMenu } from "./menu.js";
@@ -15,7 +15,7 @@ import {
   errorDialog, fmtBytes, infoDialog, intDialog, newTableDialog, progressDialog,
   shortcutsDialog, sortDialog, undoBudgetDialog,
 } from "./dialogs.js";
-import { createUndoBudgetPrefs } from "./prefs.js";
+import { createUndoBudgetPrefs, undoBudgetBytes } from "./prefs.js";
 import { createOpenRequestPump } from "./openrequests.js";
 import { createWindowCloseCoordinator } from "./windowlifecycle.js";
 import { createTransferCoordinator } from "./transfer.js";
@@ -27,7 +27,6 @@ const invoke = (cmd, args) => tauri.core.invoke(cmd, args);
 
 const undoPrefs = createUndoBudgetPrefs(window.localStorage);
 let undoBudgetMiB = undoPrefs.get();
-setDefaultUndoBudgetMiB(undoBudgetMiB);
 
 /**
  * 创建带统一固定点确认的文档模型。
@@ -1859,48 +1858,65 @@ function updateUndoButtons() {
 }
 
 /**
- * 将引擎脏点同步到模型所属页签，不污染异步完成后的其他焦点外壳。
+ * 同步指定模型的引擎脏点、窗口标题和页签脏点。
  *
- * @param {BigModel} m - 已完成预算或历史操作的模型。
+ * @param {BigModel} m - 已完成元数据刷新的模型。
+ * @param {boolean} [refreshStatus=true] - 是否同时重算行列状态栏。
  * @returns {void}
  */
-function syncModelDirty(m) {
+function syncModelDirty(m, refreshStatus = true) {
   const modified = m.modified();
   if (m === model) {
     setDirty(modified);
-    updateStatusText();
+    if (refreshStatus) updateStatusText();
   } else {
     for (const t of tabs) if (t.model === m) t.dirty = modified;
   }
   renderTabbar();
 }
 
-/** 设置已打开及在途文档的历史预算，成功后再持久化之后新文档的默认值。 */
+/** 一次设置进程内所有文档及之后在途 open/create 的历史预算。 */
 async function changeUndoBudget() {
   const value = await undoBudgetDialog(undoBudgetMiB);
   if (value === null) return;
-  const models = new Set([model, ...tabs.map((t) => t.model), gridB.model]);
-  // 下发期间禁止再次发起，避免旧请求后完成覆盖新请求。
+  // 进程命令在途时禁止重复发起，成功后才更新并持久化共享偏好。
   btnUndoBudget.disabled = true;
   try {
-    // 设置期间及在途 open/create 都追随目标值；失败恢复旧默认，成功才持久化。
-    setDefaultUndoBudgetMiB(value);
-    for (const m of models) {
-      if (!m?.meta()) continue;
-      await m.setUndoBudget(value);
-      // 缩容可能淘汰历史或建立固定点；每个成功模型都立即同步自己的脏点。
-      syncModelDirty(m);
-    }
+    await invoke("set_undo_budget", { budgetBytes: undoBudgetBytes(value) });
     undoBudgetMiB = value;
     undoPrefs.set(value);
     statusMsg(`撤销/重做预算已设为每文档 ${value} MiB`, 3000);
   } catch (err) {
-    setDefaultUndoBudgetMiB(undoBudgetMiB);
     await errorDialog("设置撤销内存失败", String(err?.message ?? err));
   } finally {
     btnUndoBudget.disabled = false;
   }
 }
+
+/**
+ * 定向预算事件只刷新仍属于本窗口且 lease 匹配的模型。
+ *
+ * @param {{session: number, lease: number, budgetBytes: number}} payload - 后端事件载荷。
+ * @returns {Promise<boolean>} 是否找到当前模型并完成刷新。
+ * @throws {Error} 当前模型的元数据刷新失败。
+ */
+async function refreshUndoBudgetModel(payload) {
+  const current = tabs.find((tab) => tab.model.sessionId === payload.session)?.model
+    ?? (model?.sessionId === payload.session ? model : null);
+  if (!current || current.lease !== payload.lease) return false;
+  await current._refreshMeta();
+  // 缩容可能淘汰历史或建立固定点，必须同步该页签自己的脏点和按钮。
+  // 预算不改变行列、筛选或计时，不能为这次刷新覆盖设置成功提示。
+  syncModelDirty(current, false);
+  return true;
+}
+
+/** emit_to 定向事件必须监听当前 Window，不能使用跨窗全局 listen。 */
+const undoBudgetListenerReady = tauri.window.getCurrentWindow().listen("undo-budget-changed", (event) => {
+  void refreshUndoBudgetModel(event.payload).catch((error) => {
+    console.error("撤销预算事件刷新失败", error);
+  });
+});
 
 // ============ 撤销/重做（G3） ============
 
@@ -2732,6 +2748,13 @@ const gridLive = new Proxy(/** @type {any} */ ({}), {
   });
   await tabDragListenerReady;
   await transferCoordinator.ready;
+  await undoBudgetListenerReady;
+  try {
+    // 在 open queue 注册启动文件前恢复持久化预算，覆盖之后在途 open/create。
+    await invoke("set_undo_budget", { budgetBytes: undoBudgetBytes(undoBudgetMiB) });
+  } catch (err) {
+    await errorDialog("恢复撤销内存失败", String(err?.message ?? err));
+  }
   await openPump.start();
   await openPump.idle();
 

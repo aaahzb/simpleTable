@@ -300,12 +300,24 @@ fn io_err(path: &str, e: &std::io::Error) -> String {
 }
 
 /// 进程级运行状态；打开队列先于任何窗口 ready 建立，后续任务在此并入文档和窗口表。
-#[derive(Default)]
 struct RuntimeState {
     docs: document_registry::DocumentRegistry,
     opens: open_request::OpenRequestQueue,
     windows: window_registry::WindowRegistry,
     drags: drag_registry::DragRegistry,
+    undo_budget_bytes: u64,
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            docs: document_registry::DocumentRegistry::default(),
+            opens: open_request::OpenRequestQueue::default(),
+            windows: window_registry::WindowRegistry::default(),
+            drags: drag_registry::DragRegistry::default(),
+            undo_budget_bytes: history::DEFAULT_HISTORY_BUDGET_BYTES,
+        }
+    }
 }
 
 type SharedRuntime = Arc<Mutex<RuntimeState>>;
@@ -569,6 +581,7 @@ fn register_new_document(
         (None, None) => None,
         _ => return Err("replaceSession 与 replaceLease 必须同时提供".into()),
     };
+    let mut file = file;
     let mut guard = runtime.lock().map_err(|e| e.to_string())?;
     let old = match replacement {
         Some((session, lease)) => Some((
@@ -578,6 +591,8 @@ fn register_new_document(
         )),
         None => None,
     };
+    // BigFile 尚未共享；在同一元数据锁内套用在途 open/create 可见的最新预算。
+    file.set_history_budget(guard.undo_budget_bytes)?;
     let registered = guard.docs.insert_new(file, owner, path);
     if let Some((session, lease, _)) = &old {
         guard.docs.close(*session, owner, *lease)?;
@@ -589,6 +604,37 @@ fn register_new_document(
         drop(old.file.lock());
     }
     Ok(registered)
+}
+
+/// 更新进程预算并裁剪所有当前文档，返回实际仍存在且已更新的 session。
+///
+/// 元数据锁只用于更新全局值和快照 Arc；等待文件锁时不持有元数据锁。
+fn set_runtime_undo_budget(
+    runtime: &SharedRuntime,
+    budget_bytes: u64,
+) -> Result<Vec<u64>, String> {
+    let targets = {
+        let mut guard = runtime.lock().map_err(|e| e.to_string())?;
+        guard.undo_budget_bytes = budget_bytes;
+        guard.docs.file_handles()
+    };
+    let mut changed = Vec::with_capacity(targets.len());
+    for (session, file) in targets {
+        // 已关闭会话只剩测试或清理方持有的 Arc，不必再修改。
+        let exists = runtime
+            .lock()
+            .map_err(|e| e.to_string())?
+            .docs
+            .event_route(session)
+            .is_some();
+        if !exists {
+            continue;
+        }
+        let mut file = file.lock().map_err(|e| e.to_string())?;
+        file.set_history_budget(budget_bytes)?;
+        changed.push(session);
+    }
+    Ok(changed)
 }
 
 /// 查询文件大小（字节），打开路径路由用：≥ 阈值走大文件模式。
@@ -976,6 +1022,42 @@ fn big_redo(window: tauri::Window, state: tauri::State<SharedRuntime>, session: 
     with_big(&state, &window, session, lease, Access::Write, |bf| Ok(bf.redo()))
 }
 
+/// 一次设置进程内所有文档及之后在途 open/create 的历史预算。
+#[tauri::command]
+async fn set_undo_budget(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedRuntime>,
+    budget_bytes: u64,
+) -> Result<(), String> {
+    let runtime = state.inner().clone();
+    let task_runtime = runtime.clone();
+    let sessions = tauri::async_runtime::spawn_blocking(move || {
+        set_runtime_undo_budget(&task_runtime, budget_bytes)
+    })
+    .await
+    .map_err(|e| format!("撤销预算任务被取消：{e}"))??;
+    for session in sessions {
+        // 文件锁释放后重新读取路由；迁移已接管时只通知最新 owner/lease。
+        let route = runtime
+            .lock()
+            .map_err(|e| e.to_string())?
+            .docs
+            .event_route(session);
+        if let Some((owner, lease)) = route {
+            let _ = app.emit_to(
+                &owner,
+                "undo-budget-changed",
+                serde_json::json!({
+                    "session": session,
+                    "lease": lease,
+                    "budgetBytes": budget_bytes,
+                }),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// 执行一次筛选（rayon 并行扫描），返回命中数；被更新请求打断时返回 null。
 ///
 /// 长扫描走 spawn_blocking，避免占用异步运行时 worker；新请求通过
@@ -1132,6 +1214,95 @@ async fn big_save_as(
     run_big_save(window, state, session, lease, Some(path), approval).await
 }
 
+/// 在保存核心内完成路径预留、真实写盘和成功后的会话路径绑定。
+fn save_big_document<F>(
+    runtime: &SharedRuntime,
+    owner: &str,
+    session: u64,
+    lease: u64,
+    target: Option<std::path::PathBuf>,
+    approval: crate::history::Approval,
+    on_progress: F,
+) -> Result<engine::SaveOutcome, String>
+where
+    F: FnMut(u64, u64, u8, u64),
+{
+    save_big_document_after_write(
+        runtime, owner, session, lease, target, approval, on_progress, || {},
+    )
+}
+
+/// 保存核心的确定性测试屏障；生产 wrapper 传入空闭包，不改变行为。
+#[allow(clippy::too_many_arguments)]
+fn save_big_document_after_write<F, H>(
+    runtime: &SharedRuntime,
+    owner: &str,
+    session: u64,
+    lease: u64,
+    target: Option<std::path::PathBuf>,
+    approval: crate::history::Approval,
+    mut on_progress: F,
+    after_write: H,
+) -> Result<engine::SaveOutcome, String>
+where
+    F: FnMut(u64, u64, u8, u64),
+    H: FnOnce(),
+{
+    let entry = authorize_big(runtime, owner, session, lease, Access::Write)?;
+    entry.bump_gate();
+    if let Some(path) = target.as_deref() {
+        // 所有冲突都在取得文件锁和写目标字节之前检查。
+        runtime
+            .lock()
+            .map_err(|e| e.to_string())?
+            .opens
+            .reserve_save_path(session, path, owner)?;
+    }
+    let release_reservation = || {
+        if let Some(path) = target.as_deref() {
+            if let Ok(mut guard) = runtime.lock() {
+                guard.opens.release_save_reservation(session, path);
+            }
+        }
+    };
+    let result = (|| {
+        let mut file = entry.file.lock().map_err(|e| e.to_string())?;
+        // 文件锁可能与关闭/迁移竞争，取得后必须重新授权。
+        authorize_big(runtime, owner, session, lease, Access::Write)?;
+        file.refresh_indexed();
+        let outcome = match target.as_deref() {
+            Some(path) => file.save_as(path, approval, &mut on_progress),
+            None => file.save(approval, &mut on_progress),
+        }?;
+        if outcome.saved {
+            if let Some(path) = target.as_deref() {
+                // 文件锁仍持有：seal 无法越过屏障，路径归属先于迁移发布完成。
+                let mut guard = runtime.lock().map_err(|e| e.to_string())?;
+                guard.docs.authorize(session, owner, lease, Access::Write)?;
+                guard.opens.bind_session_path(session, path, owner)?;
+                // 上一行已校验映射，同一元数据锁内会话不可能被替换。
+                guard.docs.update_saved_path(session, path.to_path_buf());
+            }
+        }
+        Ok(outcome)
+    })();
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            release_reservation();
+            return Err(error);
+        }
+    };
+    if target.is_some() && !outcome.saved {
+        // 固定点首次请求和用户取消都没有落盘，不能绑定新路径。
+        release_reservation();
+        return Ok(outcome);
+    }
+    // 测试屏障只在写盘、成功绑定和文件锁释放之后运行。
+    after_write();
+    Ok(outcome)
+}
+
 /// `big_save`/`big_save_as` 共用实现。`target=None` 写回当前文件。
 async fn run_big_save(
     window: tauri::Window,
@@ -1143,8 +1314,6 @@ async fn run_big_save(
 ) -> Result<engine::SaveOutcome, String> {
     let runtime = state.inner().clone();
     let owner = window.label().to_string();
-    let entry = authorize_big(&runtime, &owner, session, lease, Access::Write)?;
-    entry.bump_gate();
     let app = window.app_handle().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (tx, rx) = std::sync::mpsc::channel::<(u64, u64, u8, u64)>();
@@ -1168,22 +1337,17 @@ async fn run_big_save(
                 );
             }
         });
-        let result = (|| {
-            let mut bf = entry.file.lock().map_err(|e| e.to_string())?;
-            authorize_big(&runtime, &owner, session, lease, Access::Write)?;
-            bf.refresh_indexed();
-            let mut on_progress = move |done: u64, total: u64, phase: u8, rows: u64| {
+        let result = save_big_document(
+            &runtime,
+            &owner,
+            session,
+            lease,
+            target.map(std::path::PathBuf::from),
+            approval,
+            move |done: u64, total: u64, phase: u8, rows: u64| {
                 let _ = tx.send((done, total, phase, rows));
-            };
-            match target {
-                Some(path) => bf.save_as(
-                    std::path::Path::new(&path),
-                    approval,
-                    &mut on_progress,
-                ),
-                None => bf.save(approval, &mut on_progress),
-            }
-        })();
+            },
+        );
         emitter.join().map_err(|e| format!("进度转发线程异常：{e:?}"))?;
         result
     })
@@ -2147,6 +2311,7 @@ pub fn run() {
             big_undo,
             big_redo,
             big_set_undo_budget,
+            set_undo_budget,
             big_filter,
             big_filter_count,
             big_filter_page,
@@ -2285,4 +2450,338 @@ fn cleanup_process_state(app: &tauri::AppHandle) {
     }
     // 可在 quit、RunEvent::Exit 和 smoke 出口重复调用；目录仅属于本进程。
     app.state::<ClipboardStore>().cleanup();
+}
+
+
+#[cfg(test)]
+mod task9_tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn memory_doc() -> BigFile {
+        BigFile::from_bytes(b"a,b\nx,y\n".to_vec(), false).unwrap()
+    }
+
+    fn register_memory(runtime: &SharedRuntime, owner: &str) -> BigSession {
+        register_new_document(runtime, owner, memory_doc(), None, None, None).unwrap()
+    }
+
+    fn fixture(label: &str, bytes: &[u8]) -> PathBuf {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/task9-runtime-fixtures");
+        fs::create_dir_all(&root).unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = root.join(format!("{}-{nonce}-{label}.csv", std::process::id()));
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn register_disk(runtime: &SharedRuntime, owner: &str, path: &Path) -> BigSession {
+        let file = BigFile::open(path).unwrap();
+        let opened = register_new_document(
+            runtime,
+            owner,
+            file,
+            Some(path.to_path_buf()),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut guard = runtime.lock().unwrap();
+        let opens = &mut guard.opens;
+        opens.mark_ready(owner);
+        let batch = opens.enqueue(vec![path.to_path_buf()], owner).remove(0);
+        let request_id = match batch.items[0] {
+            open_request::OpenItem::Open { request_id, .. } => request_id,
+            _ => panic!("new disk fixture must start with Open"),
+        };
+        opens.ack(owner, batch.batch_id).unwrap();
+        opens
+            .complete_open(request_id, path, opened.session, owner)
+            .unwrap();
+        opened
+    }
+
+    fn edit_twice(runtime: &SharedRuntime, owner: &str, session: &BigSession) {
+        let entry = authorize_big(
+            runtime,
+            owner,
+            session.session,
+            session.lease,
+            Access::Write,
+        )
+        .unwrap();
+        let mut file = entry.file.lock().unwrap();
+        file.set_cell(0, 0, "a".repeat(600 * 1024), Approval::deny())
+            .unwrap();
+        file.set_cell(0, 1, "b".repeat(600 * 1024), Approval::deny())
+            .unwrap();
+        assert_eq!(file.history_stats().undo_count, 2);
+    }
+
+    fn history_stats(
+        runtime: &SharedRuntime,
+        owner: &str,
+        session: u64,
+        lease: u64,
+    ) -> crate::history::HistoryStats {
+        let entry = authorize_big(runtime, owner, session, lease, Access::Read).unwrap();
+        let stats = entry.file.lock().unwrap().history_stats();
+        stats
+    }
+
+    #[test]
+    fn process_budget_shrinks_documents_owned_by_different_windows() {
+        let runtime = SharedRuntime::default();
+        let a = register_memory(&runtime, "main");
+        let b = register_memory(&runtime, "doc-1");
+        edit_twice(&runtime, "main", &a);
+        edit_twice(&runtime, "doc-1", &b);
+        set_runtime_undo_budget(&runtime, 1024 * 1024).unwrap();
+        for (owner, session) in [("main", a), ("doc-1", b)] {
+            let stats = history_stats(&runtime, owner, session.session, session.lease);
+            assert_eq!(stats.budget_bytes, 1024 * 1024);
+            assert_eq!(stats.undo_count, 1, "两个 owner 都必须淘汰最旧历史");
+            assert!(stats.bytes <= stats.budget_bytes);
+        }
+    }
+
+    #[test]
+    fn registration_uses_latest_budget_for_inflight_open_and_create() {
+        let runtime = SharedRuntime::default();
+        assert_eq!(
+            runtime.lock().unwrap().undo_budget_bytes,
+            64 * 1024 * 1024
+        );
+        let opened_before_change = memory_doc();
+        let created_before_change = memory_doc();
+        set_runtime_undo_budget(&runtime, 1024 * 1024).unwrap();
+        let opened = register_new_document(
+            &runtime,
+            "main",
+            opened_before_change,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let created = register_new_document(
+            &runtime,
+            "doc-1",
+            created_before_change,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            history_stats(&runtime, "main", opened.session, opened.lease)
+                .budget_bytes,
+            1024 * 1024
+        );
+        assert_eq!(
+            history_stats(&runtime, "doc-1", created.session, created.lease)
+                .budget_bytes,
+            1024 * 1024
+        );
+    }
+
+    #[test]
+    fn adopt_preserves_budget_and_event_route_uses_latest_owner_lease() {
+        let runtime = SharedRuntime::default();
+        let opened = register_memory(&runtime, "main");
+        set_runtime_undo_budget(&runtime, 1024 * 1024).unwrap();
+        let ticket = runtime
+            .lock()
+            .unwrap()
+            .docs
+            .seal(
+                opened.session,
+                "main",
+                opened.lease,
+                "doc-1",
+                "A",
+                0,
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let adopted = runtime
+            .lock()
+            .unwrap()
+            .docs
+            .accept(ticket, "doc-1")
+            .unwrap();
+        let route = runtime
+            .lock()
+            .unwrap()
+            .docs
+            .event_route(opened.session)
+            .unwrap();
+        assert_eq!(route, ("doc-1".to_string(), adopted.lease));
+        assert_eq!(
+            history_stats(&runtime, "doc-1", opened.session, adopted.lease).budget_bytes,
+            1024 * 1024,
+        );
+    }
+
+    #[test]
+    fn save_as_conflict_fails_before_writing_target_bytes() {
+        let runtime = SharedRuntime::default();
+        let source_path = fixture("source", b"a,b\nx,y\n");
+        let target_path = fixture("target", b"keep,bytes\nmust,stay\n");
+        let source = register_disk(&runtime, "main", &source_path);
+        let _target = register_disk(&runtime, "doc-1", &target_path);
+        let before = fs::read(&target_path).unwrap();
+        let error = save_big_document(
+            &runtime,
+            "main",
+            source.session,
+            source.lease,
+            Some(target_path.clone()),
+            Approval::deny(),
+            |_, _, _, _| {},
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("目标文件已在其他标签中打开"),
+            "实际错误：{error}"
+        );
+        assert_eq!(fs::read(&target_path).unwrap(), before);
+    }
+
+    #[test]
+    fn memory_save_as_to_new_file_binds_path() {
+        let runtime = SharedRuntime::default();
+        let source = register_memory(&runtime, "main");
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/task9-runtime-fixtures");
+        fs::create_dir_all(&root).unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let new_path = root.join(format!("memory-new-{}-{nonce}.csv", std::process::id()));
+        assert!(!new_path.exists(), "另存为目标必须初始不存在");
+        let outcome = save_big_document(
+            &runtime,
+            "main",
+            source.session,
+            source.lease,
+            Some(new_path.clone()),
+            Approval::deny(),
+            |_, _, _, _| {},
+        )
+        .unwrap();
+        assert!(outcome.saved);
+        let entry = authorize_big(
+            &runtime,
+            "main",
+            source.session,
+            source.lease,
+            Access::Read,
+        )
+        .unwrap();
+        assert_eq!(entry.path.as_deref(), Some(new_path.as_path()));
+    }
+
+    #[test]
+    fn successful_save_as_binds_new_path_and_releases_old_path() {
+        let runtime = SharedRuntime::default();
+        let old_path = fixture("old", b"a,b\nx,y\n");
+        let new_path = fixture("new", b"placeholder\n");
+        let source = register_disk(&runtime, "main", &old_path);
+        let outcome = save_big_document(
+            &runtime,
+            "main",
+            source.session,
+            source.lease,
+            Some(new_path.clone()),
+            Approval::deny(),
+            |_, _, _, _| {},
+        )
+        .unwrap();
+        assert!(outcome.saved);
+        let entry = authorize_big(
+            &runtime,
+            "main",
+            source.session,
+            source.lease,
+            Access::Read,
+        )
+        .unwrap();
+        assert_eq!(entry.path.as_deref(), Some(new_path.as_path()));
+        let mut guard = runtime.lock().unwrap();
+        let opens = &mut guard.opens;
+        let rebound = opens.enqueue(vec![new_path.clone()], "main").remove(0);
+        assert!(matches!(
+            rebound.items[0],
+            open_request::OpenItem::Activate { session, .. } if session == source.session
+        ));
+        opens.ack("main", rebound.batch_id).unwrap();
+        let reopened = opens.enqueue(vec![old_path.clone()], "main").remove(0);
+        assert!(matches!(
+            reopened.items[0],
+            open_request::OpenItem::Open { .. }
+        ));
+    }
+
+    #[test]
+    fn save_as_binds_new_path_before_after_write_seal() {
+        let runtime = SharedRuntime::default();
+        let old_path = fixture("race-old", b"a,b\nx,y\n");
+        let new_path = fixture("race-new", b"placeholder\n");
+        let source = register_disk(&runtime, "main", &old_path);
+        let mut sealed_ticket = None;
+        let outcome = save_big_document_after_write(
+            &runtime,
+            "main",
+            source.session,
+            source.lease,
+            Some(new_path.clone()),
+            Approval::deny(),
+            |_, _, _, _| {},
+            || {
+                let ticket = runtime
+                    .lock()
+                    .unwrap()
+                    .docs
+                    .seal(
+                        source.session,
+                        "main",
+                        source.lease,
+                        "doc-1",
+                        "A",
+                        0,
+                        serde_json::json!({}),
+                    )
+                    .unwrap();
+                sealed_ticket = Some(ticket);
+            },
+        )
+        .unwrap();
+        assert!(outcome.saved);
+        let (_, owner, lease) = runtime
+            .lock()
+            .unwrap()
+            .docs
+            .cancel(sealed_ticket.unwrap(), "main")
+            .unwrap();
+        assert_eq!(owner, "main");
+        let entry = authorize_big(
+            &runtime,
+            "main",
+            source.session,
+            lease,
+            Access::Read,
+        )
+        .unwrap();
+        assert_eq!(entry.path.as_deref(), Some(new_path.as_path()));
+    }
 }

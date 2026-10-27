@@ -227,6 +227,29 @@ impl DocumentRegistry {
         Ok(())
     }
 
+    /// 快照全部文档的共享文件句柄；调用方不得持元数据锁等待这些文件锁。
+    pub fn file_handles(&self) -> Vec<(u64, Arc<Mutex<BigFile>>)> {
+        self.sessions
+            .iter()
+            .map(|(session, entry)| (*session, entry.file.clone()))
+            .collect()
+    }
+
+    /// 读取定向事件应使用的最新 owner/lease；迁移 accept 后立即反映新路由。
+    pub fn event_route(&self, session: u64) -> Option<(String, u64)> {
+        self.sessions
+            .get(&session)
+            .map(|entry| (entry.owner.clone(), entry.lease))
+    }
+
+    /// 保存成功且 opened 映射已在同一元数据锁内绑定后，同步文档路径。
+    pub fn update_saved_path(&mut self, session: u64, path: PathBuf) {
+        self.sessions
+            .get_mut(&session)
+            .expect("保存路径绑定前必须仍持有已授权会话")
+            .path = Some(path);
+    }
+
     /// 窗口是否已不拥有任何文档。
     pub fn owner_is_empty(&self, owner: &str) -> bool {
         !self.sessions.values().any(|entry| entry.owner == owner)

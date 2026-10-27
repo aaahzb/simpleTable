@@ -13,7 +13,7 @@ pub enum PathKey {
 
 impl PathKey {
     pub fn new(path: &Path) -> Self {
-        let normalized = path.canonicalize().unwrap_or_else(|_| lexical_normalize(path));
+        let normalized = stable_path(path);
         match normalized.to_str() {
             #[cfg(windows)]
             Some(text) => Self::Unicode(text.to_lowercase()),
@@ -22,6 +22,76 @@ impl PathKey {
             None => Self::Opaque(normalized),
         }
     }
+}
+
+/// 解析最近的已存在父级并补回缺失组件，避免文件创建前后使用不同的键。
+fn stable_path(path: &Path) -> PathBuf {
+    if let Ok(resolved) = path.canonicalize() {
+        return simplify_windows_path(resolved);
+    }
+    let normalized = lexical_normalize(path);
+    let absolute = if normalized.is_absolute() {
+        normalized
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(&normalized),
+            Err(_) => return normalized,
+        }
+    };
+    let mut ancestor = absolute.clone();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(resolved) = ancestor.canonicalize() {
+            let mut resolved = simplify_windows_path(resolved);
+            for part in missing.iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        let Some(name) = ancestor.file_name().map(|name| name.to_os_string()) else {
+            return absolute;
+        };
+        missing.push(name);
+        if !ancestor.pop() {
+            return absolute;
+        }
+    }
+}
+
+/// canonicalize 的扩展前缀只是键的表示差异；这些键不会被用于文件 IO。
+#[cfg(windows)]
+fn simplify_windows_path(path: PathBuf) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    const VERBATIM: [u16; 4] = [92, 92, 63, 92];
+    if !wide.starts_with(&VERBATIM) {
+        return path;
+    }
+    let rest = &wide[VERBATIM.len()..];
+    if rest.len() >= 4
+        && rest[0] == 85
+        && rest[1] == 78
+        && rest[2] == 67
+        && rest[3] == 92
+    {
+        let mut simplified = vec![92, 92];
+        simplified.extend_from_slice(&rest[4..]);
+        return PathBuf::from(OsString::from_wide(&simplified));
+    }
+    if rest.len() >= 3
+        && matches!(rest[0], 65..=90 | 97..=122)
+        && rest[1] == 58
+        && rest[2] == 92
+    {
+        return PathBuf::from(OsString::from_wide(rest));
+    }
+    path
+}
+
+#[cfg(not(windows))]
+fn simplify_windows_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -184,6 +254,11 @@ impl OpenRequestQueue {
                         path: opened.path.clone(), session: opened.session,
                     }))
                 }
+            } else if let Some(saved) = self.save_reservations.get(&key) {
+                // 保存预留就是该 session 对目标路径的归属声明；打开只激活原标签。
+                Some((saved.owner.clone(), OpenItem::Activate {
+                    path: path.clone(), session: saved.session,
+                }))
             } else if let Some(pending) = self.reservations.get_mut(&key) {
                 pending.waiters += 1;
                 None
@@ -558,6 +633,53 @@ mod tests {
         q.ack("main", rebound.batch_id).unwrap();
         let reopened = q.enqueue(vec![PathBuf::from("a.csv")], "main").remove(0);
         assert!(matches!(reopened.items[0], OpenItem::Open { .. }));
+    }
+
+    #[test]
+    fn open_during_save_reservation_activates_session_without_second_open() {
+        let mut q = OpenRequestQueue::default();
+        open_one(&mut q, "a.csv", 1, "main");
+        q.reserve_save_path(1, Path::new("new.csv"), "main").unwrap();
+        q.mark_ready("doc-1");
+        let batches = q.enqueue(vec![PathBuf::from("new.csv")], "doc-1");
+        assert_eq!(batches.len(), 1, "保存中打开不得创建第二份 Open 预留");
+        assert_eq!(batches[0].target, "main");
+        assert!(matches!(batches[0].items[0], OpenItem::Activate { session: 1, .. }));
+        q.ack("main", batches[0].batch_id).unwrap();
+        q.bind_session_path(1, Path::new("new.csv"), "main").unwrap();
+        let rebound = q.enqueue(vec![PathBuf::from("new.csv")], "doc-1").remove(0);
+        assert_eq!(rebound.target, "main");
+        assert!(matches!(rebound.items[0], OpenItem::Activate { session: 1, .. }));
+    }
+
+    #[test]
+    fn save_reservation_key_survives_target_creation() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/task9-pathkey-fixtures");
+        std::fs::create_dir_all(&root).unwrap();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let target = root.join(format!("new-target-{}-{nonce}.csv", std::process::id()));
+        assert!(!target.exists(), "测试目标必须初始不存在");
+        let mut q = OpenRequestQueue::default();
+        q.mark_ready("main");
+        q.reserve_save_path(1, &target, "main").unwrap();
+
+        // 保存会让原本不存在的目标出现在磁盘上；PathKey 不得因此改变。
+        std::fs::write(&target, b"a,b\r\nx,y\r\n").unwrap();
+        q.mark_ready("doc-1");
+        let delivered = q.enqueue(vec![target.clone()], "doc-1");
+        let bound = q.bind_session_path(1, &target, "main");
+        bound.unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].target, "main");
+        assert!(matches!(
+            delivered[0].items[0],
+            OpenItem::Activate { session: 1, .. }
+        ));
     }
 
     #[test]

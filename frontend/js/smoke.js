@@ -3240,16 +3240,59 @@ x,y
     };
   }
 
-  function captureBudgetCalls(models, calls) {
-    const originals = models.map((m) => [m, m._rawInvoke]);
-    for (const [m, original] of originals) {
-      m._rawInvoke = async function (cmd, args) {
-        if (cmd === "big_set_undo_budget") calls.push(args);
-        return original.call(this, cmd, args);
-      };
-    }
+  function deferProcessCommand(cmd) {
+    let entered;
+    let release;
+    const enteredPromise = new Promise((r) => { entered = r; });
+    const gate = new Promise((r) => { release = r; });
+    const restore = interceptProcessInvoke(async (original, c, args, options) => {
+      if (c === cmd) {
+        entered();
+        await gate;
+      }
+      return original(c, args, options);
+    });
+    return {
+      entered: enteredPromise,
+      release: () => release(),
+      restore,
+    };
+  }
+
+  function captureProcessBudgetCalls(calls) {
+    return interceptProcessInvoke((original, cmd, args, options) => {
+      if (cmd === "set_undo_budget") calls.push(args);
+      return original(cmd, args, options);
+    });
+  }
+
+  /**
+   * 通过可写的外层 core 引用拦截真实 IPC；不修改冻结的 core 或 internals。
+   *
+   * @param {(original: Function, cmd: string, args?: object,
+   *   options?: object) => Promise<any>} intercept - 命令拦截与转发函数。
+   * @returns {() => void} 恢复原 core 引用的幂等函数。
+   */
+  function interceptProcessInvoke(intercept) {
+    const tauri = window.__TAURI__;
+    const originalCore = tauri.core;
+    const originalInvoke = originalCore.invoke;
+    const patchedCore = Object.create(originalCore);
+    Object.defineProperty(patchedCore, "invoke", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: async function (cmd, args, options) {
+        return intercept(originalInvoke, cmd, args, options);
+      },
+    });
+    tauri.core = patchedCore;
+    let restored = false;
     return () => {
-      for (const [m, original] of originals) m._rawInvoke = original;
+      if (restored) return;
+      if (tauri.core !== patchedCore) throw new Error("进程 IPC 拦截恢复顺序错误");
+      tauri.core = originalCore;
+      restored = true;
     };
   }
 
@@ -3333,8 +3376,7 @@ x,y
     await writeText(pA, "a,b\r\nx,y\r\n");
     await writeText(pB, "a,b\r\nm,n\r\n");
     await window.__app.openPathsAsTabs([pA]);
-    const modelA = window.__app.model;
-    const delay = deferModelCommand(modelA, "big_set_undo_budget");
+    const delay = deferProcessCommand("set_undo_budget");
     let configured = false;
     try {
       document.getElementById("btn-undo-budget").click();
@@ -3372,7 +3414,7 @@ x,y
     }
   });
 
-  check("撤销内存：设置前在途打开也追平目标预算", async () => {
+  check("撤销内存：设置前在途 open 完成后采用最新预算", async () => {
     await loadBasic();
     const stamp = Date.now();
     const pA = TMP + "/budget-inflight-a-" + stamp + ".csv";
@@ -3381,32 +3423,15 @@ x,y
     await writeText(pB, "a,b\r\nm,n\r\n");
     await window.__app.openPathsAsTabs([pA]);
     const modelA = window.__app.model;
-    const proto = Object.getPrototypeOf(modelA);
-    const original = proto._invoke;
-    let entered;
-    let release;
-    let watched = null;
-    const calls = [];
-    const enteredPromise = new Promise((r) => { entered = r; });
-    const gate = new Promise((r) => { release = r; });
-    proto._invoke = async function (cmd, args) {
-      if (cmd === "big_set_undo_budget" && this !== modelA) {
-        calls.push(args.budgetBytes);
-        if (this !== watched && watched === null) {
-          watched = this;
-          entered();
-          await gate;
-        }
-      }
-      return original.call(this, cmd, args);
-    };
+    // A 已打开，下一次 big_open 就是 B；与进程预算共用真实外层 IPC 拦截器。
+    const delay = deferProcessCommand("big_open");
     let opening = null;
     let configured = false;
     try {
       opening = window.__app.openPathsAsTabs([pB]);
-      await enteredPromise;
+      await delay.entered;
       assert(!window.__app.tabs().some((t) => t.path === pB),
-        "B 的旧初始预算受阻时必须仍未入签");
+        "B 的 big_open 受阻时必须仍未入签");
 
       document.getElementById("btn-undo-budget").click();
       await waitFor(() => document.querySelector(".modal-mask"), "在途预算设置框");
@@ -3416,19 +3441,25 @@ x,y
       await waitFor(() => document.getElementById("status-text").textContent
         .includes("每文档 1 MiB"), "在途场景先完成 A 的预算设置");
       configured = true;
-      release();
+      delay.release();
       await opening;
       opening = null;
-      assert(calls[0] === 64 * 1024 * 1024,
-        "夹具必须先延迟 B 的 64 MiB 初始命令");
-      assert(calls[calls.length - 1] === 1024 * 1024,
-        "B 的旧初始命令返回后必须补发最新 1 MiB 预算");
+      const modelB = window.__app.model;
+      assert(window.__app.tabs().find((t) => t.path === pB)?.active
+        && modelB.sessionId !== modelA.sessionId,
+      "在途 B 放行后必须作为独立会话入签");
+      await modelB.setData(0, 0, "c".repeat(600 * 1024));
+      await modelB.setData(0, 1, "d".repeat(600 * 1024));
+      assert(modelB.canUndo(), "在途 B 的大编辑应保留最近一步");
+      await window.__app.undo();
+      assert(!modelB.canUndo(),
+        "B 注册发生在全局变更之后，仍须按最新 1 MiB 淘汰最旧大步骤");
     } finally {
-      release();
+      delay.release();
       if (opening) {
         try { await opening; } catch { /* 清理在途打开，保留原测试错误。 */ }
       }
-      proto._invoke = original;
+      delay.restore();
       if (configured) {
         document.getElementById("btn-undo-budget").click();
         await waitFor(() => document.querySelector(".modal-mask"), "在途测试恢复 64 MiB");
@@ -3443,8 +3474,7 @@ x,y
 
   check("撤销内存：下发期间禁止重复设置", async () => {
     await loadBasic();
-    const m = window.__app.model;
-    const delay = deferModelCommand(m, "big_set_undo_budget");
+    const delay = deferProcessCommand("set_undo_budget");
     const button = document.getElementById("btn-undo-budget");
     let started = false;
     try {
@@ -3492,7 +3522,7 @@ x,y
   check("撤销内存：固定点取消保留现场，确认后仅可撤到固定点", async () => {
     await loadBasic();
     const budgetCalls = [];
-    const restoreBudgetSpy = captureBudgetCalls([window.__app.model], budgetCalls);
+    const restoreBudgetSpy = captureProcessBudgetCalls(budgetCalls);
     let configured = false;
     try {
       document.getElementById("btn-undo-budget").click();
@@ -3562,7 +3592,7 @@ x,y
     }
   });
 
-  check("撤销内存：全局设置逐页签下放且各自淘汰历史", async () => {
+  check("撤销内存：进程一次下发且各文档独立淘汰历史", async () => {
     await loadBasic();
     const p1 = `${TMP}/budget-a-${Date.now()}.csv`;
     const p2 = `${TMP}/budget-b-${Date.now()}.csv`;
@@ -3584,7 +3614,7 @@ x,y
     await model.setData(0, 1, "d".repeat(600 * 1024));
 
     const budgetCalls = [];
-    const restoreBudgetSpy = captureBudgetCalls([modelA, modelB], budgetCalls);
+    const restoreBudgetSpy = captureProcessBudgetCalls(budgetCalls);
     let configured = false;
     try {
       document.getElementById("btn-undo-budget").click();
@@ -3595,9 +3625,10 @@ x,y
       await waitFor(() => document.getElementById("status-text").textContent
         .includes("每文档 1 MiB"), "双页签 1 MiB 下发完成");
       configured = true;
-      assert(new Set(budgetCalls.map((c) => c.session)).size === 2
-        && budgetCalls.every((c) => c.budgetBytes === 1024 * 1024),
-      `两个页签都应收到各自的 1 MiB 预算命令：${JSON.stringify({
+      assert(budgetCalls.length === 1
+        && budgetCalls[0].budgetBytes === 1024 * 1024
+        && !("session" in budgetCalls[0]) && !("lease" in budgetCalls[0]),
+      `两个文档只能共享一次无 session/lease 的进程预算命令：${JSON.stringify({
         sidA, sidB, sameModel: modelA === modelB, budgetCalls,
       })}`);
 
