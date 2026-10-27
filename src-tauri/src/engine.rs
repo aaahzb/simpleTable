@@ -1346,6 +1346,67 @@ mod tests {
         fs::remove_file(&p).ok();
     }
 
+    #[test]
+    fn text_lines_filter_is_literal_and_uses_overlay() {
+        let p = tmp_text("filter", "txt", b"a,b\n\"quoted\"\nplain\n\n");
+        let mut bf = BigFile::open(&p).unwrap();
+        assert_eq!(bf.run_filter(&spec_one(0, "a,b")).unwrap(), 1);
+        assert_eq!(bf.run_filter(&spec_one(0, "\"quoted\"")).unwrap(), 1);
+        assert_eq!(bf.run_filter(&spec_one(0, "b\n\"quoted\"")).unwrap(), 0);
+        bf.set_cell(2, 0, "edited-hit".into(), Approval::deny()).unwrap();
+        assert_eq!(bf.run_filter(&spec_one(0, "edited-hit")).unwrap(), 1,
+            "筛选必须命中未保存覆盖层");
+        assert_eq!(bf.run_filter(&spec_one(0, "plain")).unwrap(), 0,
+            "被覆盖的磁盘旧值不应继续命中");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn text_lines_progressive_index_matches_full_open() {
+        let p = tmp_text("progressive", "log", b"first\n\n\"a\nb\"\r\nlast");
+        let full = BigFile::open(&p).unwrap();
+        let mut progressive = BigFile::open_progressive_full(
+            &p, 1, 1, 1, false, false,
+        ).unwrap();
+        progressive.drive_index_for_test();
+        assert_eq!(progressive.meta().rows, full.meta().rows);
+        assert_eq!(progressive.rows(0, 20), full.rows(0, 20));
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn text_lines_gbk_filter_matches_single_physical_line() {
+        let bytes = encoding_rs::GBK.encode("中文,1\n下一行\n").0.into_owned();
+        let p = tmp_text("gbk-filter", "log", &bytes);
+        let mut bf = BigFile::open(&p).unwrap();
+        assert_eq!(bf.run_filter(&spec_one(0, "中文,1")).unwrap(), 1);
+        assert_eq!(bf.filter_page(0, 10).rows, vec![vec!["中文,1"]]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn text_lines_rejects_header_and_column_structure_changes() {
+        let p = tmp_text("guards", "txt", b"first\nsecond\n");
+        let mut bf = BigFile::open(&p).unwrap();
+        let unchanged = bf.set_headerless(true, Approval::deny()).unwrap();
+        assert!(!unchanged.changed);
+        assert!(!bf.meta().can_undo);
+        assert!(bf.set_headerless(false, Approval::deny()).unwrap_err()
+            .contains("纯文本"));
+
+        for op in [
+            ColOp::Insert { pos: 0, name: "列2".into() },
+            ColOp::Delete { col: 0 },
+            ColOp::Rename { col: 0, name: "new".into() },
+        ] {
+            assert!(bf.push_col_op(op).unwrap_err().contains("纯文本"));
+        }
+        assert_eq!(bf.meta().cols, 1);
+        assert_eq!(bf.rows(0, 2), vec![vec!["first"], vec!["second"]]);
+        assert!(!bf.meta().modified && !bf.meta().can_undo);
+        fs::remove_file(&p).ok();
+    }
+
     /// 五数据行夹具：name,age,city。
     fn fixture_people() -> Vec<Vec<&'static str>> {
         vec![
@@ -7108,6 +7169,7 @@ impl RowSource<'_> {
 /// 字节级字段扫描器：引号感知解析，逐字段匹配（不建任何投影缓存）。
 struct FieldScan<'a> {
     enc: Encoding,
+    format: DocumentFormat,
     overlay: &'a HashMap<(u32, ColumnId), Arc<SharedText>>,
     needles: Vec<Needle>,
     needle_by_col: HashMap<u32, Vec<usize>>,
@@ -7144,7 +7206,7 @@ impl<'a> FieldScan<'a> {
         ncols: usize,
     ) -> Self {
         let resolved = ResolvedFilterSpec::identity_for_test(spec, ncols as u32);
-        Self::new_resolved(&resolved, enc, overlay, ncols)
+        Self::new_resolved(&resolved, enc, overlay, ncols, DocumentFormat::Csv)
     }
 
     fn new_resolved(
@@ -7152,6 +7214,7 @@ impl<'a> FieldScan<'a> {
         enc: Encoding,
         overlay: &'a HashMap<(u32, ColumnId), Arc<SharedText>>,
         ncols: usize,
+        format: DocumentFormat,
     ) -> Self {
         let mut needles = Vec::new();
         let mut needle_by_col: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -7210,6 +7273,7 @@ impl<'a> FieldScan<'a> {
         }
         Self {
             enc,
+            format,
             overlay,
             needles,
             needle_by_col,
@@ -7330,6 +7394,9 @@ impl<'a> FieldScan<'a> {
     /// 两级分发：GBK 且记录含非 ASCII 字节 → 标量状态机（双字节吞字节语义
     /// 逐字节依赖记录流，只有标量保证逐位一致）；其余 → memchr 驱动快路径。
     fn record_matches(&mut self, rec: u32, bytes: &[u8]) -> bool {
+        if self.format.is_text_lines() {
+            return self.record_matches_scalar(rec, bytes);
+        }
         if self.enc == Encoding::Gbk && !bytes.is_ascii() {
             self.record_matches_scalar(rec, bytes)
         } else {
@@ -7395,11 +7462,11 @@ impl<'a> FieldScan<'a> {
                     continue;
                 }
                 match b {
-                    b'"' => {
+                    b'"' if self.format == DocumentFormat::Csv => {
                         in_quotes = true;
                         i += 1;
                     }
-                    b',' => {
+                    b',' if self.format == DocumentFormat::Csv => {
                         self.end_field(rec, col);
                         if self.definitely_fails(col) {
                             return false;
@@ -9175,6 +9242,13 @@ impl BigFile {
             return false;
         };
         let bytes = &self.bytes()[s..e];
+        if self.format.is_text_lines() {
+            let text = decode_slice(self.backing_encoding, bytes);
+            return col == 0
+                && parse_document_record(&text, b',', self.format)
+                    .first()
+                    .is_some_and(|value| !value.is_empty());
+        }
         if self.backing_encoding == Encoding::Gbk {
             let text = decode_slice(self.backing_encoding, bytes);
             field_nonempty(text.as_bytes(), b',', col as usize)
@@ -10396,7 +10470,7 @@ impl BigFile {
             });
             let bytes: &[u8] = &mmap;
             std::str::from_utf8(bytes).map_err(|_| "generation 不是有效 UTF-8".to_string())?;
-            let idx = build_index(bytes);
+            let idx = build_index_with_format(bytes, self.format);
             let offset = if prepared.headerless { 0u32 } else { 1u32 };
             let expected_records = prepared.rows.checked_add(offset as u64)
                 .ok_or("generation 行数溢出")?;
@@ -11788,7 +11862,13 @@ impl BigFile {
         end: u64,
     ) -> Option<ChunkOut> {
         let mut hits = Vec::new();
-        let mut scan = FieldScan::new_resolved(resolved, self.backing_encoding, &self.overlay, self.base_ncols);
+        let mut scan = FieldScan::new_resolved(
+            resolved,
+            self.backing_encoding,
+            &self.overlay,
+            self.base_ncols,
+            self.format,
+        );
         for i in start..end {
             if let Some((g, id)) = gate {
                 if i & 0xFFF == 0 && g.load(Ordering::Relaxed) != id {
@@ -11937,6 +12017,9 @@ impl BigFile {
     /// # Errors
     /// 后台索引未完成时拒绝（列映射会打乱索引期 vrow == 记录号的前提）。
     pub fn push_col_op(&mut self, op: ColOp) -> Result<(), String> {
+        if self.format.is_text_lines() {
+            return Err("纯文本逐行文档固定一列，不支持列结构或列名修改".into());
+        }
         self.refresh_indexed();
         if self.is_indexing() {
             return Err("文件仍在索引中，暂不支持列操作".into());
@@ -11996,6 +12079,9 @@ impl BigFile {
     pub fn set_headerless(&mut self, on: bool, approval: Approval) -> Result<EditOutcome, String> {
         if on == self.headerless {
             return Ok(EditOutcome::unchanged());
+        }
+        if self.format.is_text_lines() {
+            return Err("纯文本逐行文档始终以第一行为数据".into());
         }
         if self.is_sorted() {
             return Err("排序模式下暂不支持切换首行语义，请先退出排序".into());
@@ -12459,7 +12545,7 @@ impl BigFile {
             return Err("Source 历史值列已不是物理源列".into());
         };
         let decoded = decode_slice(self.backing_encoding, raw);
-        let fields = parse_record(&decoded, b',');
+        let fields = parse_document_record(&decoded, b',', self.format);
         let value = fields.get(slot as usize).cloned().unwrap_or_default();
         if value.len() as u64 != *utf8_len {
             return Err("Source 历史值逻辑长度已变化".into());
@@ -12766,6 +12852,9 @@ impl BigFile {
 
     /// 执行待执行列操作：只提交共享 Schema，不改写源文件或行索引。
     pub fn apply_col_ops(&mut self, approval: Approval) -> Result<EditOutcome, String> {
+        if self.format.is_text_lines() {
+            return Err("纯文本逐行文档固定一列，不支持列结构或列名修改".into());
+        }
         if self.is_sorted() {
             return Err("排序模式下暂不支持列操作，请先退出排序".into());
         }
@@ -12817,7 +12906,7 @@ impl BigFile {
         let bytes: &[u8] = &mmap;
         self.cancel.store(true, Ordering::Relaxed); // 防御：旧索引线程不要再用旧映射
         self.partial = None;
-        self.idx = build_index(bytes);
+        self.idx = build_index_with_format(bytes, self.format);
         self.backing = Backing::Mmap(mmap);
         self.index_ms = t0.elapsed().as_millis() as u64;
         self.index_sync = true;
@@ -12880,7 +12969,7 @@ impl BigFile {
             memmap2::MmapOptions::new().map(&file).map_err(|e| e.to_string())?
         });
         let bytes: &[u8] = &mmap;
-        let idx = build_index(bytes);
+        let idx = build_index_with_format(bytes, self.format);
         let expected = n_data.checked_add(offset as u64).ok_or("写入后记录数溢出")?;
         if idx.n_records() as u64 != expected {
             return Err("写入后行数校验失败".into());
