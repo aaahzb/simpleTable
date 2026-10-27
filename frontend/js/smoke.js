@@ -1906,6 +1906,198 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     }
   }
 
+  // Diagnostic main 统一收集 Document 快照；子窗口只返回数据，不写报告或退出。
+  const smokeEvals = new Map();
+  let smokeEvalSeq = 0;
+  await window.__TAURI__.event.listen("smoke-eval-result", ({ payload }) => {
+    const pending = smokeEvals.get(payload?.evalId);
+    if (pending) pending.payload = payload;
+  });
+
+  /**
+   * 通过后端在指定 Document 中执行固定只读快照并等待定向回传。
+   *
+   * @param {string} label - 目标 Document 窗口标签。
+   * @returns {Promise<object>} 目标窗口只读快照。
+   */
+  async function evalWindow(label) {
+    const evalId = `smoke-${Date.now()}-${++smokeEvalSeq}`;
+    const pending = { payload: null };
+    smokeEvals.set(evalId, pending);
+    try {
+      await invoke("smoke_eval_result", { target: label, evalId });
+      await waitFor(() => pending.payload !== null, `${label} 快照回传`, 5000);
+      const { snapshot, error, source } = pending.payload;
+      if (error) throw new Error(`${label} 快照失败：${error}`);
+      assert(source === label, `快照来源应为 ${label}，实际 ${source}`);
+      return snapshot;
+    } finally {
+      smokeEvals.delete(evalId);
+    }
+  }
+
+  /**
+   * 让 main 请求 Document 执行一个受枚举约束的诊断动作。
+   *
+   * @param {string} label - Document 窗口标签。
+   * @param {string} action - 固定动作名。
+   * @param {object} args - 动作参数。
+   * @param {boolean} awaitResult - 是否等待动作后的只读快照。
+   * @returns {Promise<object | null>} 动作后快照；关窗/销毁不等待时为 null。
+   */
+  async function actOnWindow(label, action, args = {}, awaitResult = true) {
+    const evalId = `action-${Date.now()}-${++smokeEvalSeq}`;
+    const pending = { payload: null };
+    smokeEvals.set(evalId, pending);
+    try {
+      await invoke("smoke_document_action", { target: label, evalId, action, ...args });
+      if (!awaitResult) return null;
+      await waitFor(() => pending.payload !== null, `${label} 动作 ${action} 回传`, 10000);
+      const { snapshot, error, source } = pending.payload;
+      if (error) throw new Error(`${label} 动作 ${action} 失败：${error}`);
+      assert(source === label, `动作回传来源应为 ${label}，实际 ${source}`);
+      return snapshot;
+    } finally {
+      smokeEvals.delete(evalId);
+    }
+  }
+
+  /** 尽力销毁本场景创建的诊断 Document，不掩盖场景原始错误。 */
+  async function cleanupDocuments(labels) {
+    for (const label of new Set(labels.filter(Boolean))) {
+      try {
+        const exists = (await window.__TAURI__.window.getAllWindows())
+          .some((candidate) => candidate.label === label);
+        if (!exists) continue;
+        await actOnWindow(label, "destroy", {}, false);
+        await waitFor(async () => !(await window.__TAURI__.window.getAllWindows())
+          .some((candidate) => candidate.label === label), `${label} 清理`, 5000);
+      } catch { /* 保留场景自身断言；最终 finish_smoke 还会全进程清理 */ }
+    }
+  }
+
+  async function documentLabels() {
+    return (await window.__TAURI__.window.getAllWindows())
+      .filter((candidate) => candidate.label.startsWith("doc-"))
+      .map((candidate) => candidate.label);
+  }
+
+  let fixtureSeq = 0;
+  async function loadCsvFixtures(name, records) {
+    await window.__app.smokeLoadSmall([], []);
+    const root = `${TMP}/task10-${name}-${Date.now()}-${++fixtureSeq}`;
+    const paths = [];
+    for (const [fileName, content] of records) {
+      const path = `${root}/${fileName}.csv`;
+      await writeText(path, content);
+      paths.push(path);
+    }
+    assert(await window.__app.openPathsAsTabs([...paths]), `${name} 夹具应全部入签`);
+    const snapshot = window.__app.smokeSnapshot();
+    const sessions = Object.fromEntries(paths.map((path) => {
+      const tab = snapshot.tabs.find((item) => item.path === path);
+      assert(tab?.session, `${path} 应有独立 session`);
+      return [path, tab.session];
+    }));
+    return { paths, sessions, snapshot };
+  }
+
+  function tabWithSession(snapshot, session) {
+    return snapshot?.tabs?.find((tab) => tab.session === session) ?? null;
+  }
+
+  async function activateSession(session) {
+    const tab = tabWithSession(window.__app.smokeSnapshot(), session);
+    assert(tab, `main 应存在 session=${session}`);
+    assert(await window.__app.activateTab(tab.id), `main 应激活 session=${session}`);
+  }
+
+  async function transferAndFind(session, target = null, side = "A", index = 0) {
+    const before = new Set(await documentLabels());
+    await window.__app.transferTabToWindow(session, target, side, index);
+    if (target !== null) return target;
+    let created = null;
+    await waitFor(async () => {
+      const added = (await documentLabels()).filter((label) => !before.has(label));
+      if (added.length !== 1) return false;
+      created = added[0];
+      return true;
+    }, `session=${session} 拖出新窗口`);
+    return created;
+  }
+
+  function comparableState(tab) {
+    return {
+      session: tab?.session,
+      dirty: tab?.dirty,
+      canUndo: tab?.canUndo,
+      canRedo: tab?.canRedo,
+      filter: tab?.filter,
+      sort: tab?.sort,
+      pendingCols: tab?.pendingCols,
+      transferState: tab?.transferState,
+    };
+  }
+
+  async function beginInterruptedTransfer(name, beforeTransfer = null) {
+    const fixture = await loadCsvFixtures(name, [
+      ["move", "a,b\n1,2\n"],
+      ["keeper", "a,b\n3,4\n"],
+    ]);
+    const session = fixture.sessions[fixture.paths[0]];
+    const keeper = fixture.sessions[fixture.paths[1]];
+    if (beforeTransfer) await beforeTransfer(session);
+    const oldLease = tabWithSession(window.__app.smokeSnapshot(), session).lease;
+    let target = null;
+    let ticket = null;
+    let bigCloseCalls = 0;
+    let release;
+    let entered;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const completeEntered = new Promise((resolve) => { entered = resolve; });
+    const restore = interceptProcessInvoke(async (original, cmd, args, options) => {
+      if (cmd === "big_close") bigCloseCalls += 1;
+      if (cmd === "seal_document") {
+        target = args.target;
+        const result = await original(cmd, args, options);
+        ticket = result;
+        return result;
+      }
+      if (cmd === "complete_transfer") {
+        entered();
+        await gate;
+      }
+      return original(cmd, args, options);
+    });
+    let settled = false;
+    let outcome = null;
+    const pending = window.__app.transferTabToWindow(session, null, "A", 0);
+    pending.then(
+      () => { settled = true; outcome = "resolved"; },
+      () => { settled = true; outcome = "rejected"; },
+    );
+    await completeEntered;
+    return {
+      session, keeper, oldLease, pending, restore, release,
+      get target() { return target; },
+      get ticket() { return ticket; },
+      get settled() { return settled; },
+      get outcome() { return outcome; },
+      get bigCloseCalls() { return bigCloseCalls; },
+    };
+  }
+
+  async function finishInterruptedTransfer(run) {
+    await waitFor(() => run.settled, "迁移失败回滚落定", 20000);
+    assert(run.outcome === "rejected", `失败迁移必须拒绝，实际 ${run.outcome}`);
+    run.release();
+    run.restore();
+    await waitFor(() => tabWithSession(window.__app.smokeSnapshot(), run.session)
+      ?.transferState === "idle", "源文档解除 sealing");
+    assert(tabWithSession(window.__app.smokeSnapshot(), run.keeper), "失败迁移不得影响保留签");
+    assert(run.bigCloseCalls === 0, `失败回滚不得 big_close 源会话：${run.bigCloseCalls}`);
+  }
+
   /** 当前大模型（app.js 热交换后的实时模型） */
   const bigM = () => window.__app.model;
 
@@ -2663,10 +2855,35 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     const h = grid._uniformRowH;
     sc.scrollTop = oy + 7.25 * h; // 视口顶=命中序号 7.25
     grid._renderRows();
-    tbBtn("清除筛选").click();
+    // 失败诊断：记录真实 hit/target/restore，不改产品的清筛与锚定算法。
+    const anchorTrace = [];
+    const originalClearFilter = bm.clearFilter;
+    const originalRestoreAnchor = grid._restoreClearAnchor;
+    bm.clearFilter = async function (hitRow) {
+      const result = await originalClearFilter.call(this, hitRow);
+      anchorTrace.push({ stage: "clearFilter", hitRow, result });
+      return result;
+    };
+    grid._restoreClearAnchor = function (cap, target) {
+      const before = sc.scrollTop;
+      const result = originalRestoreAnchor.call(this, cap, target);
+      anchorTrace.push({ stage: "restore", cap, target, before, after: sc.scrollTop });
+      return result;
+    };
     const want = oy + 487.25 * h; // hit#7=vrow487，delta=-0.25
-    await waitFor(() => !bm.filterActive() && Math.abs(sc.scrollTop - want) < 2,
-      "清除筛选锚定到 vrow487.25 处");
+    try {
+      tbBtn("清除筛选").click();
+      await waitFor(() => !bm.filterActive() && Math.abs(sc.scrollTop - want) < 2,
+        "清除筛选锚定到 vrow487.25 处");
+    } catch (error) {
+      throw new Error(String(error?.message ?? error) + "；实际=" + JSON.stringify({
+        filterActive: bm.filterActive(), scrollTop: sc.scrollTop, want, oy, h,
+        yAnchor: grid._yAnchor(), current: cur(grid), trace: anchorTrace,
+      }));
+    } finally {
+      bm.clearFilter = originalClearFilter;
+      grid._restoreClearAnchor = originalRestoreAnchor;
+    }
     assert(cur(grid) === null, "无选中不应产生选中");
     assert(Math.abs(sc.scrollTop - want) < 2,
       `视口顶应锚在 487.25 行处（scrollTop≈${want}），实际 ${sc.scrollTop}`);
@@ -3817,6 +4034,26 @@ x,y
       "关签后文档 spool 必须删除");
   });
 
+  check("多窗口：Diagnostic main 定向读取空 Document 只读快照", async () => {
+    const label = await invoke("create_document_window", {});
+    try {
+      const snapshot = await evalWindow(label);
+      assert(snapshot && snapshot.label === label,
+        `快照窗口 label 应为 ${label}：${JSON.stringify(snapshot)}`);
+      assert(Array.isArray(snapshot.tabs) && snapshot.tabs.length === 0,
+        `新 Document 应没有页签：${JSON.stringify(snapshot)}`);
+      assert(snapshot.active === null, "没有页签时 active 快照应为 null");
+    } finally {
+      const target = (await window.__TAURI__.window.getAllWindows())
+        .find((candidate) => candidate.label === label);
+      if (target) {
+        await invoke("close_empty_window", { targetLabel: label });
+        await waitFor(async () => !(await window.__TAURI__.window.getAllWindows())
+          .some((candidate) => candidate.label === label), "空 Document 关闭");
+      }
+    }
+  });
+
   check("新窗口：右键标签迁移并显示目标，源窗口保留其他标签", async () => {
     await window.__app.closeSplit();
     const fa = `${TMP}/sv/a.csv`; const fb = `${TMP}/sv/b.csv`;
@@ -3838,6 +4075,274 @@ x,y
     }
     assert(docs.length === 1, "complete 后应显示一个文档窗口");
   });
+
+  check("多窗口：同进程独立 session、已有窗口 A/B 插入与拖出", async () => {
+    const created = [];
+    try {
+      const fixture = await loadCsvFixtures("groups", [
+        ["a", "h\na\n"], ["b", "h\nb\n"], ["c", "h\nc\n"],
+        ["d", "h\nd\n"], ["keeper", "h\nkeep\n"],
+      ]);
+      const [a, b, c, d, keeper] = fixture.paths.map((path) => fixture.sessions[path]);
+      assert(new Set([a, b, c, d, keeper]).size === 5, "同进程五个文档不得碰撞 session");
+      const group = await transferAndFind(a);
+      created.push(group);
+      await window.__app.transferTabToWindow(b, group, "A", 1);
+      let snapshot = await actOnWindow(group, "openSplit", { session: b });
+      assert(tabWithSession(snapshot, b)?.side === "B", "第二签应可进入目标 B 组");
+      await window.__app.transferTabToWindow(c, group, "B", 0);
+      snapshot = await evalWindow(group);
+      assert(tabWithSession(snapshot, a)?.side === "A"
+        && tabWithSession(snapshot, c)?.side === "B"
+        && tabWithSession(snapshot, b)?.side === "B",
+      `A/B 插入应保留各签会话和分组：${JSON.stringify(snapshot)}`);
+      assert(tabWithSession(snapshot, c)?.id !== tabWithSession(snapshot, b)?.id,
+        "B 组插入不得替换原标签");
+      const dragged = await transferAndFind(d);
+      created.push(dragged);
+      assert(dragged !== group, "拖出必须创建另一个 Document");
+      assert(tabWithSession(await evalWindow(dragged), d)?.transferState === "idle",
+        "拖出文档应保持同 session 并完成迁移");
+      const main = window.__app.smokeSnapshot();
+      assert(main.tabs.length === 1 && main.tabs[0].session === keeper,
+        "main 必须只保留 keeper，避免诊断窗口提前关闭");
+    } finally {
+      await cleanupDocuments(created);
+    }
+  });
+
+  check("多窗口：dirty、undo/redo、排序、筛选和列 pending 原会话保留", async () => {
+    const created = [];
+    try {
+      const fixture = await loadCsvFixtures("state", [
+        ["state", "name,score,note\nb,2,beta\nc,1,charlie\na,10,alpha\nd,4,delta"],
+        ["pending", "a,b\n1,2\n"],
+        ["keeper", "a,b\n3,4\n"],
+      ]);
+      const state = fixture.sessions[fixture.paths[0]];
+      const pending = fixture.sessions[fixture.paths[1]];
+      const keeper = fixture.sessions[fixture.paths[2]];
+      await activateSession(pending);
+      await model.insertColumns(1, 1);
+      const beforePending = comparableState(tabWithSession(window.__app.smokeSnapshot(), pending));
+      assert(beforePending.pendingCols, "迁移前列操作必须处于 pending");
+      // 普通切签会清旧模型筛选；state 最后准备，之后不得再激活其他 main 标签。
+      await activateSession(state);
+      assert(await window.__app.applyBigSort([{ col: 0, numeric: false, asc: false }],
+        { confirm: false }), "状态夹具应进入排序视图");
+      await model.setData(0, 1, "90");
+      await model.setData(0, 1, "91");
+      assert(await model.undo(), "保留一次 undo 和一次 redo");
+      grid.filters.set(0, "b");
+      await window.__app.runBigFilter();
+      await waitFor(() => model.filterActive() && model.rowCount() === 1, "迁移前筛选落定");
+      const beforeState = comparableState(tabWithSession(window.__app.smokeSnapshot(), state));
+      assert(beforeState.dirty && beforeState.canUndo && beforeState.canRedo
+        && beforeState.sort.sorted && beforeState.filter,
+      `迁移前状态夹具不完整：${JSON.stringify(beforeState)}`);
+      const target = await transferAndFind(pending);
+      created.push(target);
+      const sourceBeforeTransfer = comparableState(tabWithSession(window.__app.smokeSnapshot(), state));
+      assert(JSON.stringify(sourceBeforeTransfer) === JSON.stringify(beforeState),
+        "源端必须在临迁移前保持完整状态：" + JSON.stringify(sourceBeforeTransfer));
+      await window.__app.transferTabToWindow(state, target, "A", 1);
+      let snapshot = await evalWindow(target);
+      assert(JSON.stringify(comparableState(tabWithSession(snapshot, pending)))
+        === JSON.stringify({ ...beforePending, transferState: "idle" }),
+      `列 pending 迁移前后不一致：${JSON.stringify(snapshot)}`);
+      assert(JSON.stringify(comparableState(tabWithSession(snapshot, state)))
+        === JSON.stringify({ ...beforeState, transferState: "idle" }),
+      `排序/筛选/历史迁移前后不一致：${JSON.stringify(snapshot)}`);
+      snapshot = await actOnWindow(target, "undo");
+      assert(tabWithSession(snapshot, state)?.canRedo
+        && tabWithSession(snapshot, state)?.sort.sorted
+        && tabWithSession(snapshot, state)?.filter,
+      "目标窗口 undo 后仍应保留排序和筛选");
+      snapshot = await actOnWindow(target, "redo");
+      assert(JSON.stringify(comparableState(tabWithSession(snapshot, state)))
+        === JSON.stringify({ ...beforeState, transferState: "idle" }),
+      "目标窗口 redo 应恢复迁移时的精确状态");
+      assert(tabWithSession(window.__app.smokeSnapshot(), keeper), "main keeper 不应被状态场景修改");
+    } finally {
+      await cleanupDocuments(created);
+    }
+  });
+
+  check("多窗口：accepted 只读后取消，源签和会话无 big_close 回滚", async () => {
+    const run = await beginInterruptedTransfer("accepted-cancel");
+    try {
+      const accepted = await evalWindow(run.target);
+      assert(tabWithSession(accepted, run.session)?.transferState === "accepted",
+        `目标应处于 accepted：${JSON.stringify(accepted)}`);
+      assert(tabWithSession(window.__app.smokeSnapshot(), run.session)?.transferState === "sealing",
+        "源模型 complete 前必须 sealing");
+      let sourceWriteRejected = false;
+      try {
+        await invoke("big_set_cell", {
+          session: run.session, lease: run.oldLease, vrow: 0, col: 0, value: "forbidden",
+        });
+      } catch { sourceWriteRejected = true; }
+      assert(sourceWriteRejected, "sealing/accepted 屏障必须拒绝源写命令");
+      await invoke("cancel_transfer", { ticket: run.ticket });
+      await finishInterruptedTransfer(run);
+      await waitFor(async () => !(await documentLabels()).includes(run.target),
+        "取消后新建空目标应关闭");
+    } finally {
+      run.release();
+      run.restore();
+      if (run.ticket !== null && !run.settled) {
+        try { await invoke("cancel_transfer", { ticket: run.ticket }); } catch { /* 已取消 */ }
+      }
+      await cleanupDocuments([run.target]);
+    }
+  });
+
+  check("多窗口：complete 超时回滚且保留源 dirty/undo 会话", async () => {
+    const run = await beginInterruptedTransfer("timeout", async (session) => {
+      await activateSession(session);
+      await model.setData(0, 0, "dirty-before-timeout");
+    });
+    try {
+      const accepted = await evalWindow(run.target);
+      assert(tabWithSession(accepted, run.session)?.transferState === "accepted",
+        "超时前目标必须已 accepted");
+      await finishInterruptedTransfer(run);
+      const source = tabWithSession(window.__app.smokeSnapshot(), run.session);
+      assert(source?.session === run.session && source.transferState === "idle"
+        && source.dirty && source.canUndo,
+      `超时回滚必须保留源 dirty/undo 会话：${JSON.stringify(source)}`);
+    } finally {
+      run.release();
+      run.restore();
+      if (run.ticket !== null && !run.settled) {
+        try { await invoke("cancel_transfer", { ticket: run.ticket }); } catch { /* 已取消 */ }
+      }
+      await cleanupDocuments([run.target]);
+    }
+  });
+
+  check("多窗口：accepted 目标销毁后源窗口恢复同一文档", async () => {
+    const run = await beginInterruptedTransfer("destroy");
+    try {
+      const accepted = await evalWindow(run.target);
+      assert(tabWithSession(accepted, run.session)?.transferState === "accepted",
+        "销毁前目标必须 accepted");
+      await actOnWindow(run.target, "destroy", {}, false);
+      await finishInterruptedTransfer(run);
+      assert(!(await documentLabels()).includes(run.target), "目标窗口应已销毁");
+    } finally {
+      run.release();
+      run.restore();
+      if (run.ticket !== null && !run.settled) {
+        try { await invoke("cancel_transfer", { ticket: run.ticket }); } catch { /* 已取消 */ }
+      }
+      await cleanupDocuments([run.target]);
+    }
+  });
+
+  check("多窗口：Rect 临时 backing 迁移后可保存，关签清理 owned spool", async () => {
+    const created = [];
+    try {
+      const fixture = await loadCsvFixtures("spool", [
+        ["spool", "a,b,c\n1,2,3\n4,5,6\n7,8,9\n"],
+        ["keeper", "a,b\nkeep,1\n"],
+      ]);
+      const session = fixture.sessions[fixture.paths[0]];
+      const path = fixture.paths[0];
+      await activateSession(session);
+      const value = "界".repeat(3 * 1024 * 1024);
+      await model.clipboardClear(); // 隔离前一场景的应用内大复制 token
+      grid.select([2, 2]);
+      stubClipboard(value + "\tY\r\nP\tQ");
+      await grid.pasteClipboard();
+      try {
+        await waitFor(() => model.rowCount() === 4 && model.columnCount() === 4
+          && model.rawData(2, 2) === value && model.rawData(3, 2) === "P"
+          && model.rawData(3, 3) === "Q", "Rect 临时 backing 写入");
+      } catch (error) {
+        const diagnostic = {
+          meta: model.meta(),
+          rows: model.rowCount(),
+          cols: model.columnCount(),
+          largeValueLength: model.rawData(2, 2)?.length ?? null,
+          status: document.getElementById("status-text")?.textContent ?? null,
+        };
+        throw new Error(String(error?.message ?? error) + "；Rect 现场=" + JSON.stringify(diagnostic));
+      }
+      const spoolPath = await invoke("smoke_spool_path", { session, lease: model.lease });
+      lines.push("CLEANUP_PATH=" + spoolPath);
+      assert(await invoke("path_exists", { path: spoolPath }), "迁移前 owned spool 应存在");
+      const target = await transferAndFind(session);
+      created.push(target);
+      assert(await invoke("path_exists", { path: spoolPath }), "迁移不得删除或替换 owned spool");
+      let snapshot = await actOnWindow(target, "save");
+      assert(tabWithSession(snapshot, session)?.dirty === false, "目标窗口保存后应清除脏点");
+      assert(await invoke("path_exists", { path: spoolPath }), "保存后仍需保留会话 owned spool");
+      const parsed = parseCsv((await invoke("read_csv_file", { path })).text);
+      assert(parsed.rows[2][2] === value && parsed.rows[3][2] === "P"
+        && parsed.rows[3][3] === "Q", "迁移后的保存必须写入同一文档最新 Rect 内容");
+      snapshot = await actOnWindow(target, "closeActiveTabDiscard");
+      assert(snapshot.tabs.length === 0, "关签后目标应为空窗口");
+      assert(await invoke("path_exists", { path: spoolPath }) === false,
+        "关签必须清理同一 owned spool");
+    } finally {
+      await cleanupDocuments(created);
+    }
+  });
+
+  check("多窗口：最后一签成功迁回 main 后才关闭源 Document", async () => {
+    const created = [];
+    try {
+      const fixture = await loadCsvFixtures("last-tab", [
+        ["move", "a,b\n1,2\n"],
+        ["keeper", "a,b\n3,4\n"],
+      ]);
+      const session = fixture.sessions[fixture.paths[0]];
+      const keeper = fixture.sessions[fixture.paths[1]];
+      const target = await transferAndFind(session);
+      created.push(target);
+      assert((await evalWindow(target)).tabs.length === 1, "源 Document 应只有一个标签");
+      await actOnWindow(target, "transfer", {
+        session, targetLabel: "main", side: "A", index: 0,
+      }, false);
+      await waitFor(async () => !(await documentLabels()).includes(target)
+        && tabWithSession(window.__app.smokeSnapshot(), session)?.transferState === "idle",
+      "最后一签 complete、回迁和关源窗");
+      const main = window.__app.smokeSnapshot();
+      assert(tabWithSession(main, session) && tabWithSession(main, keeper),
+        "源窗关闭后 main 必须同时拥有回迁签和 keeper");
+      assert(await invoke("is_smoke"), "最后一签关源窗不得关闭 Diagnostic main 或退出进程");
+    } finally {
+      await cleanupDocuments(created);
+    }
+  });
+
+  check("多窗口：Document 不能 finish_smoke，关子窗不影响 main", async () => {
+    const created = [];
+    try {
+      const fixture = await loadCsvFixtures("child-close", [
+        ["child", "a\nchild\n"], ["keeper", "a\nkeep\n"],
+      ]);
+      const child = fixture.sessions[fixture.paths[0]];
+      const keeper = fixture.sessions[fixture.paths[1]];
+      const target = await invoke("create_document_window", {});
+      created.push(target);
+      await window.__app.transferTabToWindow(child, target, "A", 0);
+      const snapshot = await actOnWindow(target, "finishSmokeProbe");
+      assert(snapshot.label === target && tabWithSession(snapshot, child),
+        "finish_smoke 被拒后 Document 应继续持有原子窗口文档");
+      assert(await invoke("is_smoke"), "Document 伪造报告不得结束 Diagnostic main");
+      await actOnWindow(target, "closeWindowDiscard", {}, false);
+      await waitFor(async () => !(await documentLabels()).includes(target), "只关闭子窗口");
+      assert(await invoke("is_smoke"), "关闭子窗口不得退出 main");
+      assert(tabWithSession(window.__app.smokeSnapshot(), keeper), "关闭子窗口不得关闭 main 文档");
+    } finally {
+      await cleanupDocuments(created);
+    }
+  });
+
+  lines.push("", "MANUAL Windows/RDP 真实鼠标：A→A 换序、A/B 落签、拖出新窗、无效投放、Escape、抓取预览与负坐标/DPI。");
+  lines.push("MANUAL 最后一个窗口由用户关闭后退出进程：Task 11 平台验收，不以 finish_smoke 的 process::exit 替代。");
 
   // ---- 执行（看门狗：整体超时强制收尾，防挂死） ----
   const watchdog = setTimeout(async () => {

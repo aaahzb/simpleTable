@@ -1,7 +1,6 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -33,6 +32,40 @@ function newestMtime(dir) {
   return newest;
 }
 
+/**
+ * 强校验 smoke 报告的实际断言行、唯一汇总和清理探针。
+ *
+ * @param {string} text - UTF-8 报告全文。
+ * @param {(path: string) => boolean} pathExists - 清理路径存在性检查。
+ * @returns {{passes: number, failures: number, total: number, failed: number,
+ *   cleanupPaths: string[]}} 实际行数、汇总数字和清理路径。
+ * @throws {Error} 报告缺项、计数不一致或清理路径仍存在。
+ */
+export function validateSmokeReport(text, pathExists) {
+  const lines = text.split(/\r?\n/);
+  const passes = lines.filter((line) => line.startsWith("✓")).length;
+  const failures = lines.filter((line) => line.startsWith("✗")).length;
+  const summaries = [...text.matchAll(/^合计[ \t]+(\d+)[ \t]+项，失败[ \t]+(\d+)[ \t]+项[ \t]*\r?$/gm)];
+  if (summaries.length !== 1) throw new Error("冒烟报告必须包含唯一合计汇总");
+  const total = Number(summaries[0][1]);
+  const failed = Number(summaries[0][2]);
+  if (!Number.isSafeInteger(total) || total <= 0) throw new Error("冒烟汇总总数必须大于 0");
+  if (!Number.isSafeInteger(failed)) throw new Error("冒烟汇总失败数无效");
+  if (passes + failures !== total) {
+    throw new Error(`实际 ✓/✗ 行数与汇总总数不一致：${passes}+${failures} != ${total}`);
+  }
+  if (failures !== failed) {
+    throw new Error(`实际 ✗ 行数与汇总失败数不一致：${failures} != ${failed}`);
+  }
+  const cleanupPaths = [...text.matchAll(/^CLEANUP_PATH=(.+)$/gm)]
+    .map((match) => match[1].trim());
+  if (cleanupPaths.length < 1) throw new Error("冒烟报告缺少 CLEANUP_PATH");
+  for (const cleanupPath of cleanupPaths) {
+    if (pathExists(cleanupPath)) throw new Error(`退出后临时目录仍存在：${cleanupPath}`);
+  }
+  return { passes, failures, total, failed, cleanupPaths };
+}
+
 try {
   const before = new Map(exes.map(([, exe]) => [exe,
     fs.existsSync(exe) ? fs.statSync(exe).mtimeMs : 0]));
@@ -55,16 +88,9 @@ try {
     if (!fs.existsSync(report)) throw new Error(`${kind} smoke report missing: ${report}`);
     const text = fs.readFileSync(report, "utf8");
     process.stdout.write(`\n${kind} report: ${report}\n${text}\n`);
-    const cleanupPaths = [...text.matchAll(/^CLEANUP_PATH=(.+)$/gm)]
-      .map((m) => m[1].trim());
-    assert.ok(cleanupPaths.length >= 1, "冒烟未报告清理探针");
-    for (const cleanupPath of cleanupPaths) {
-      assert.equal(fs.existsSync(cleanupPath), false, `退出后临时目录仍存在：${cleanupPath}`);
-    }
+    const stats = validateSmokeReport(text, fs.existsSync);
     if (status !== 0) throw new Error(`${kind} smoke exited ${status}`);
-    if (!/合计\s+\d+\s+项，失败\s+0\s+项/.test(text)) {
-      throw new Error(`${kind} smoke summary is not zero-failure`);
-    }
+    if (stats.failures !== 0) throw new Error(`${kind} smoke has ${stats.failures} failures`);
   }
   console.log("dual build, embed timestamps, and dual smoke: PASS");
 } catch (error) {

@@ -198,6 +198,223 @@ fn smoke_spool_path(
     with_big(&state, &window, session, lease, Access::Read, |bf| Ok(bf.spool_root().to_string_lossy().into_owned()))
 }
 
+/// Diagnostic main 定向读取一个 Document 的固定只读快照。
+///
+/// 目标窗口不能提供脚本、写总报告或退出进程；callback 只把 JSON 数据回传 main。
+const SMOKE_SNAPSHOT_SCRIPT: &str = r#"(() => {
+  try {
+    if (typeof window.__app?.smokeSnapshot !== "function") {
+      throw new Error("目标窗口尚未提供只读快照");
+    }
+    return { snapshot: window.__app.smokeSnapshot(), error: null };
+  } catch (error) {
+    return { snapshot: null, error: String(error?.message ?? error) };
+  }
+})()"#;
+
+const SMOKE_ACTION_SCRIPT: &str = r#"(() => {
+  const evalId = __SMOKE_ACTION_EVAL_ID__;
+  const source = __SMOKE_ACTION_SOURCE__;
+  const reply = (snapshot, error) => window.__TAURI__.event.emit(
+    "smoke-eval-result", { evalId, source, snapshot, error });
+  try {
+    if (typeof window.__app?.smokeAction !== "function"
+        || typeof window.__app?.smokeSnapshot !== "function"
+        || typeof window.__TAURI__?.event?.emit !== "function") {
+      throw new Error("目标窗口尚未提供固定诊断动作或诊断回传");
+    }
+    const request = __SMOKE_ACTION_REQUEST__;
+    // WebView2 ExecuteScript 不等待 Promise；同步只确认受理，完成事件仍定向回 main。
+    Promise.resolve(window.__app.smokeAction(request)).then(
+      () => reply(window.__app.smokeSnapshot(), null),
+      (error) => reply(null, String(error?.message ?? error)),
+    ).catch((error) => console.error("回传 Document 冒烟动作失败", error));
+    return { accepted: true, error: null };
+  } catch (error) {
+    return { accepted: false, snapshot: null, error: String(error?.message ?? error) };
+  }
+})()"#;
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SmokeEvalResult {
+    eval_id: String,
+    source: String,
+    snapshot: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
+#[tauri::command]
+fn smoke_eval_result(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    target: String,
+    eval_id: String,
+) -> Result<(), String> {
+    if !is_diagnostic_main(&app, window.label())
+        || std::env::var_os("SIMPLE_TABLE_SMOKE").is_none()
+    {
+        return Err("只有 Diagnostic main 可以读取跨窗口冒烟快照".into());
+    }
+    if eval_id.trim().is_empty() || eval_id.len() > 128 {
+        return Err("冒烟 evalId 不能为空且不得超过 128 字节".into());
+    }
+    let is_document = with_runtime(&app, |runtime| {
+        runtime.windows.role(&target) == Some(window_registry::WindowRole::Document)
+    })?;
+    if !is_document {
+        return Err("跨窗口冒烟快照只允许读取 Document".into());
+    }
+    let target_window = app
+        .get_webview_window(&target)
+        .ok_or_else(|| format!("目标 Document 不存在：{target}"))?;
+    let callback_app = app.clone();
+    target_window
+        .eval_with_callback(SMOKE_SNAPSHOT_SCRIPT, move |raw| {
+            let (snapshot, error) = match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(value) => {
+                    let snapshot = value.get("snapshot").cloned().filter(|v| !v.is_null());
+                    let mut error = value
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    if snapshot.is_none() && error.is_none() {
+                        error = Some("目标快照没有返回有效数据".into());
+                    }
+                    (snapshot, error)
+                }
+                Err(parse_error) => (
+                    None,
+                    Some(format!("目标快照 JSON 无效：{parse_error}；原始值：{raw}")),
+                ),
+            };
+            let payload = SmokeEvalResult {
+                eval_id: eval_id.clone(),
+                source: target.clone(),
+                snapshot,
+                error,
+            };
+            if let Err(emit_error) = callback_app.emit_to("main", "smoke-eval-result", payload) {
+                eprintln!("回传跨窗口冒烟快照失败：{emit_error}");
+            }
+        })
+        .map_err(|error| format!("执行 Document 只读快照失败：{error}"))
+}
+
+/// Diagnostic main 请求 Document 执行固定诊断动作；不接收任意 JavaScript。
+#[tauri::command]
+fn smoke_document_action(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    target: String,
+    eval_id: String,
+    action: String,
+    session: Option<u64>,
+    target_label: Option<String>,
+    side: Option<String>,
+    index: Option<usize>,
+) -> Result<(), String> {
+    if !is_diagnostic_main(&app, window.label())
+        || std::env::var_os("SIMPLE_TABLE_SMOKE").is_none()
+    {
+        return Err("只有 Diagnostic main 可以驱动跨窗口冒烟动作".into());
+    }
+    if eval_id.trim().is_empty() || eval_id.len() > 128 {
+        return Err("冒烟 evalId 不能为空且不得超过 128 字节".into());
+    }
+    let is_document = with_runtime(&app, |runtime| {
+        runtime.windows.role(&target) == Some(window_registry::WindowRole::Document)
+    })?;
+    if !is_document {
+        return Err("跨窗口冒烟动作只允许驱动 Document".into());
+    }
+    let target_window = app
+        .get_webview_window(&target)
+        .ok_or_else(|| format!("目标 Document 不存在：{target}"))?;
+    let request = match action.as_str() {
+        "openSplit" => serde_json::json!({
+            "action": "openSplit",
+            "session": session.ok_or_else(|| "openSplit 缺少 session".to_string())?,
+        }),
+        "transfer" => {
+            let session = session.ok_or_else(|| "transfer 缺少 session".to_string())?;
+            let side = side.unwrap_or_else(|| "A".into());
+            if side != "A" && side != "B" {
+                return Err("transfer side 只能是 A 或 B".into());
+            }
+            if let Some(label) = &target_label {
+                let valid_target = with_runtime(&app, |runtime| {
+                    label == "main"
+                        || runtime.windows.role(label)
+                            == Some(window_registry::WindowRole::Document)
+                })?;
+                if !valid_target {
+                    return Err("transfer 目标只能是 main 或 Document".into());
+                }
+            }
+            serde_json::json!({
+                "action": "transfer",
+                "session": session,
+                "targetLabel": target_label,
+                "side": side,
+                "index": index.unwrap_or(0),
+            })
+        }
+        "save" | "undo" | "redo" | "closeActiveTabDiscard" | "closeWindowDiscard"
+        | "finishSmokeProbe" => serde_json::json!({ "action": action }),
+        "destroy" => {
+            return target_window
+                .destroy()
+                .map_err(|error| format!("销毁诊断 Document 失败：{error}"));
+        }
+        _ => return Err(format!("未知 Document 冒烟动作：{action}")),
+    };
+    let request_json = serde_json::to_string(&request)
+        .map_err(|error| format!("序列化 Document 冒烟动作失败：{error}"))?;
+    let eval_id_json = serde_json::to_string(&eval_id)
+        .map_err(|error| format!("序列化 Document 冒烟 evalId 失败：{error}"))?;
+    let target_json = serde_json::to_string(&target)
+        .map_err(|error| format!("序列化 Document 冒烟来源失败：{error}"))?;
+    let script = SMOKE_ACTION_SCRIPT
+        .replace("__SMOKE_ACTION_REQUEST__", &request_json)
+        .replace("__SMOKE_ACTION_EVAL_ID__", &eval_id_json)
+        .replace("__SMOKE_ACTION_SOURCE__", &target_json);
+    let callback_app = app.clone();
+    target_window
+        .eval_with_callback(&script, move |raw| {
+            let (snapshot, error) = match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(value) => {
+                    if value.get("accepted").and_then(serde_json::Value::as_bool) == Some(true) {
+                        return; // 异步动作完成后由固定脚本发 smoke-eval-result。
+                    }
+                    let snapshot = value.get("snapshot").cloned().filter(|v| !v.is_null());
+                    let mut error = value
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    if snapshot.is_none() && error.is_none() {
+                        error = Some(format!("目标动作未确认执行；原始值：{raw}"));
+                    }
+                    (snapshot, error)
+                }
+                Err(parse_error) => (
+                    None,
+                    Some(format!("目标动作 JSON 无效：{parse_error}；原始值：{raw}")),
+                ),
+            };
+            let payload = SmokeEvalResult {
+                eval_id: eval_id.clone(),
+                source: target.clone(),
+                snapshot,
+                error,
+            };
+            if let Err(emit_error) = callback_app.emit_to("main", "smoke-eval-result", payload) {
+                eprintln!("回传 Document 冒烟动作失败：{emit_error}");
+            }
+        })
+        .map_err(|error| format!("执行 Document 固定冒烟动作失败：{error}"))
+}
+
 /// 读取 CSV 文件并按 utf-8-sig → utf-8 → gbk 顺序识别编码（对齐 csv_io.py）。
 ///
 /// # Parameters
@@ -2266,6 +2483,8 @@ pub fn run() {
             smoke_write_repeat,
             smoke_tmp_dir,
             smoke_spool_path,
+            smoke_eval_result,
+            smoke_document_action,
             read_csv_file,
             write_csv_file,
             pick_open_path,

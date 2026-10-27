@@ -869,9 +869,12 @@ async function loadDoc(p, tabId, headerless = false, reuseModel = null) {
  * 换档/装载后的视图重置：清筛选选区、滚动回顶、窗格清空、计数与按钮刷新。
  *
  * @param {Grid} g - 目标网格（焦点侧；分屏焦点交换不调用本函数）。
+ * @param {{preserveFilter?: boolean, filterSnapshot?: object | null}} [opts] - adopt 筛选恢复选项。
  */
-function applyViewState(g) {
-  g.clearFilters({ anchor: false });
+function applyViewState(g, { preserveFilter = false, filterSnapshot = null } = {}) {
+  // setModel 会重建表头并 refilter；adopt 必须先恢复条件，否则空控件会清掉引擎命中集。
+  if (preserveFilter) restoreFilterControls(g, filterSnapshot);
+  else g.clearFilters({ anchor: false });
   g.clearSelection();
   g.setModel(model);
   g.scrollEl.scrollTop = 0;
@@ -930,9 +933,10 @@ function applyDocToCurrent(doc, p) {
  * focusSide 从 sideTab 取签）。点焦点组内其他签/未分屏 = 现状换绑路径。
  *
  * @param {number} id - 目标页签 id。
+ * @param {{preserveFilter?: boolean, filterSnapshot?: object | null}} [opts] - adopt 筛选恢复选项。
  * @returns {Promise<boolean>} true = 已切换；false = 用户取消或打开失败。
  */
-async function activateTab(id) {
+async function activateTab(id, { preserveFilter = false, filterSnapshot = null } = {}) {
   if (id === activeId) return true;
   const t = tabs.find((x) => x.id === id);
   if (!t) return false;
@@ -962,7 +966,7 @@ async function activateTab(id) {
   activeId = id;
   path = t.path;
   if (splitOn) sideTab[focusedSide] = id; // 分屏激活侧外签：焦点侧重绑新签
-  applyViewState(fgrid());
+  applyViewState(fgrid(), { preserveFilter, filterSnapshot });
   setDirty(t.dirty);
   renderTabbar();
   return true;
@@ -1108,10 +1112,9 @@ async function detachTab(id, { closeEngine = false } = {}) {
   return true;
 }
 
-/** 只回写迁移快照中的筛选控件；引擎已有命中集，绝不重新执行 big_filter。 */
-function restoreAdoptedFilter(t, filter) {
+/** 只回写指定 Grid 的筛选条件，不触发筛选或清筛 IPC。 */
+function restoreFilterControls(g, filter) {
   if (!filter) return;
-  const g = gridOfSide(splitOn ? t.side : "A");
   g.filters.clear();
   g.filterModes.clear();
   for (const item of filter.cols ?? []) {
@@ -1128,8 +1131,14 @@ function restoreAdoptedFilter(t, filter) {
   );
   g.multi.text = String(filter.multiText ?? "");
   g.multi.on = !!g.multi.text || g.multi.cols.size > 0;
-  // 仅按快照重建输入框/严格模式/多选框，不触发筛选或清筛 IPC。
   g._renderHeader();
+}
+
+/** 恢复 adopt Grid 及共享多重筛选控件；绝不重新执行 big_filter。 */
+function restoreAdoptedFilter(t, filter) {
+  if (!filter) return;
+  const g = gridOfSide(splitOn ? t.side : "A");
+  restoreFilterControls(g, filter);
   tb.multiFilter.classList.toggle("on", g.multi.on);
   multiWrap.classList.toggle("hidden", !g.multi.on);
   multiInput.value = g.multi.text;
@@ -1155,7 +1164,12 @@ async function adoptToTab(adopted) {
   if (activeId === null && model.sessionId !== null) ensureTabbed();
   const side = adopted.side === "B" && splitOn ? "B" : "A";
   insertTabIntoGroup(t, side, adopted.index);
-  if (!(await activateTab(t.id))) throw new Error("迁移标签未能激活");
+  if (!(await activateTab(t.id, {
+    preserveFilter: snapshot.filter != null,
+    filterSnapshot: snapshot.filter,
+  }))) {
+    throw new Error("迁移标签未能激活");
+  }
   restoreAdoptedFilter(t, snapshot.filter);
   renderTabbar();
   updateStatusText();
@@ -2799,6 +2813,104 @@ const gridLive = new Proxy(/** @type {any} */ ({}), {
   }
 })();
 
+/**
+ * 生成供 Diagnostic main 跨窗口核验的纯数据快照，不执行命令或修改状态。
+ *
+ * @returns {object} 当前窗口、全部页签和活动文档的只读状态。
+ */
+function smokeSnapshot() {
+  const modelSnapshot = (m) => {
+    if (!m || m.isBig !== true || typeof m.sessionId !== "number") return null;
+    const meta = m.meta() ?? {};
+    return {
+      session: m.sessionId,
+      lease: m.lease,
+      dirty: m.modified(),
+      canUndo: m.canUndo(),
+      canRedo: m.canRedo(),
+      filter: m._filterOn ? {
+        cols: (m._filterView?.cols ?? []).map((item) => item.slice()),
+        multiCols: [...(m._filterView?.multiCols ?? [])],
+        multiText: m._filterView?.multiText ?? "",
+      } : null,
+      sort: { sorted: meta.sorted === true },
+      pendingCols: meta.pending_cols === true,
+      transferState: m._transferState ?? "idle",
+    };
+  };
+  const tabSnapshots = tabs.map((t) => ({
+    id: t.id,
+    title: t.title,
+    path: t.path,
+    side: t.side,
+    active: t.id === activeId,
+    current: splitOn && sideTab[t.side] === t.id,
+    ...modelSnapshot(t.model),
+  }));
+  const current = activeTab();
+  return {
+    label: tauri.window.getCurrentWindow().label,
+    tabs: tabSnapshots,
+    active: current ? tabSnapshots.find((t) => t.id === current.id) ?? null : null,
+  };
+}
+
+/**
+ * 执行 Diagnostic main 经 Rust 白名单转发的固定诊断动作。
+ *
+ * @param {{action: string, session?: number, targetLabel?: string | null,
+ *   side?: string, index?: number}} request - 后端校验后的动作请求。
+ * @returns {Promise<void>} 动作完成后由调用方读取 smokeSnapshot。
+ * @throws {Error} 动作、会话或底层操作失败。
+ */
+async function smokeAction(request) {
+  const tab = request.session === undefined ? null
+    : tabs.find((item) => item.model?.sessionId === request.session);
+  if (request.session !== undefined && !tab) {
+    throw new Error("诊断动作找不到 session=" + request.session);
+  }
+  switch (request.action) {
+    case "openSplit":
+      if (!(await openSplit(tab.id))) throw new Error("诊断分屏打开失败");
+      return;
+    case "undo":
+      await undo();
+      return;
+    case "redo":
+      await redo();
+      return;
+    case "save":
+      if (!(await saveFile())) throw new Error("诊断保存失败");
+      return;
+    case "transfer":
+      await transferCoordinator.transferTabToWindow(
+        request.session, request.targetLabel ?? null, request.side ?? "A", request.index ?? 0);
+      return;
+    case "closeActiveTabDiscard": {
+      const current = activeTab();
+      if (!current || !(await detachTab(current.id, { closeEngine: true }))) {
+        throw new Error("诊断放弃关签失败");
+      }
+      return;
+    }
+    case "closeWindowDiscard":
+      for (const item of [...tabs]) await detachTab(item.id, { closeEngine: true });
+      await invoke("close_window");
+      return;
+    case "finishSmokeProbe":
+      try {
+        await invoke("finish_smoke", { report: "DOCUMENT_FORGED_REPORT", code: 97 });
+      } catch (error) {
+        const message = String(error?.message ?? error);
+        if (message.includes("只有 Diagnostic main")) return;
+        throw error;
+      }
+      throw new Error("Document 的 finish_smoke 未被权限守卫拒绝");
+    default:
+      throw new Error("未知诊断动作：" + request.action);
+  }
+}
+
 // 供冒烟测试与调试使用
 window.__app = {
   get model() { return model; },
@@ -2813,8 +2925,8 @@ window.__app = {
   isBigMode: () => model.isBig === true,
   isHeaderless: () => model.isHeaderless?.() === true,
   toggleHeaderless,
-  // 冒烟专用：复位页签会话后装载内存引擎夹具表
-  smokeLoadSmall,
+  // 冒烟专用：跨窗口只读快照、固定诊断动作与内存引擎夹具装载
+  smokeSnapshot, smokeAction, smokeLoadSmall,
   // 多档页签：快照 / 切换 / 关闭 / 批量拖入 / 移组
   tabs: () => tabs.map((t) => ({
     id: t.id, title: t.title, path: t.path,
