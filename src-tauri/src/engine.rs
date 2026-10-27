@@ -355,6 +355,41 @@ fn parse_record(text: &str, delimiter: u8) -> Vec<String> {
     fields
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentFormat {
+    Csv,
+    TextLines,
+}
+
+impl DocumentFormat {
+    fn from_path(path: &Path) -> Self {
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some(ext) if ext.eq_ignore_ascii_case("txt")
+                || ext.eq_ignore_ascii_case("log") => Self::TextLines,
+            _ => Self::Csv,
+        }
+    }
+
+    fn is_text_lines(self) -> bool {
+        self == Self::TextLines
+    }
+}
+
+/// 按文档格式解析首条记录；纯文本始终把首个物理行作为唯一字段。
+fn parse_document_record(
+    text: &str,
+    delimiter: u8,
+    format: DocumentFormat,
+) -> Vec<String> {
+    match format {
+        DocumentFormat::Csv => parse_record(text, delimiter),
+        DocumentFormat::TextLines => {
+            let end = text.find(|ch| ch == '\r' || ch == '\n').unwrap_or(text.len());
+            vec![text[..end].to_string()]
+        }
+    }
+}
+
 /// 判断一条 CSV 记录中第 `target` 个字段是否有内容。
 ///
 /// 与 `parse_record` 使用同一套宽松引号方言，但只跟踪“是否出现过内容”，
@@ -537,31 +572,37 @@ fn build_index_seq(bytes: &[u8]) -> RawIndex {
     RawIndex { line_off, rec_lines }
 }
 
-/// 并行建索引（三趟，见模块头注释）。
-pub fn build_index(bytes: &[u8]) -> RawIndex {
+/// 并行收集所有物理行偏移；CSV 与纯文本共用这一趟。
+fn physical_line_offsets(bytes: &[u8]) -> Vec<u64> {
     let n = bytes.len();
-    // ---- pass ①：行偏移（按字节分块并行 memchr，块间有序拼接） ----
     let workers = rayon::current_num_threads().max(1);
     let part = n / workers + 1;
     let parts: Vec<Vec<u64>> = (0..workers)
         .into_par_iter()
         .map(|w| {
-            let s = (w * part).min(n);
-            let e = ((w + 1) * part).min(n);
-            if s >= e {
+            let start = (w * part).min(n);
+            let end = ((w + 1) * part).min(n);
+            if start >= end {
                 return Vec::new();
             }
-            memchr_iter(b'\n', &bytes[s..e])
-                .map(|p| (s + p + 1) as u64)
+            memchr_iter(b'\n', &bytes[start..end])
+                .map(|pos| (start + pos + 1) as u64)
                 .collect()
         })
         .collect();
     let total = 1 + parts.iter().map(|v| v.len()).sum::<usize>();
     let mut line_off: Vec<u64> = Vec::with_capacity(total);
     line_off.push(0);
-    for mut v in parts {
-        line_off.append(&mut v);
+    for mut part in parts {
+        line_off.append(&mut part);
     }
+    line_off
+}
+
+/// 并行建 CSV 索引（三趟，见模块头注释）。
+pub fn build_index(bytes: &[u8]) -> RawIndex {
+    let n = bytes.len();
+    let line_off = physical_line_offsets(bytes);
     let lines = line_off.len();
 
     // ---- pass ②：band 引号迁移表（band 按行号对齐） ----
@@ -609,6 +650,41 @@ pub fn build_index(bytes: &[u8]) -> RawIndex {
         rec_lines.append(&mut v);
     }
     RawIndex { line_off, rec_lines }
+}
+
+/// 按文档格式建索引；纯文本中每个物理行都是记录，包括空行。
+fn build_index_with_format(bytes: &[u8], format: DocumentFormat) -> RawIndex {
+    match format {
+        DocumentFormat::Csv => build_index(bytes),
+        DocumentFormat::TextLines => {
+            let line_off = physical_line_offsets(bytes);
+            let n = bytes.len() as u64;
+            let rec_lines = (0..line_off.len())
+                .into_par_iter()
+                .filter(|&line| line_off[line] < n)
+                .map(|line| line as u32)
+                .collect();
+            RawIndex { line_off, rec_lines }
+        }
+    }
+}
+
+#[cfg(test)]
+fn build_index_seq_with_format(bytes: &[u8], format: DocumentFormat) -> RawIndex {
+    match format {
+        DocumentFormat::Csv => build_index_seq(bytes),
+        DocumentFormat::TextLines => {
+            let mut line_off = vec![0];
+            line_off.extend(memchr_iter(b'\n', bytes).map(|pos| (pos + 1) as u64));
+            let rec_lines = line_off
+                .iter()
+                .enumerate()
+                .filter(|(_, &offset)| offset < bytes.len() as u64)
+                .map(|(line, _)| line as u32)
+                .collect();
+            RawIndex { line_off, rec_lines }
+        }
+    }
 }
 
 // ============================================================
@@ -711,6 +787,50 @@ fn scan_chunk(
         cur.line_started_open = false;
     }
     (line_off, rec_lines)
+}
+
+/// 分块扫描纯文本物理行；逗号、引号与空行都没有 CSV 结构含义。
+fn scan_text_lines_chunk(
+    bytes: &[u8],
+    cur: &mut ScanCursor,
+    max_bytes: usize,
+) -> (Vec<u64>, Vec<u32>) {
+    let n = bytes.len();
+    if cur.pos >= n {
+        return (Vec::new(), Vec::new());
+    }
+    let end = cur.pos.saturating_add(max_bytes.max(1)).min(n);
+    let mut line_off = Vec::new();
+    let mut rec_lines = Vec::new();
+    let mut from = cur.pos;
+    while let Some(rel) = memchr(b'\n', &bytes[from..end]) {
+        let q = from + rel;
+        rec_lines.push(cur.line_no);
+        line_off.push((q + 1) as u64);
+        cur.line_no += 1;
+        cur.line_start = q + 1;
+        from = q + 1;
+    }
+    cur.pos = end;
+    cur.in_quotes = false;
+    cur.line_started_open = false;
+    if end == n && cur.line_start < n {
+        rec_lines.push(cur.line_no);
+        cur.line_start = n;
+    }
+    (line_off, rec_lines)
+}
+
+fn scan_chunk_with_format(
+    bytes: &[u8],
+    cur: &mut ScanCursor,
+    max_bytes: usize,
+    format: DocumentFormat,
+) -> (Vec<u64>, Vec<u32>) {
+    match format {
+        DocumentFormat::Csv => scan_chunk(bytes, cur, max_bytes),
+        DocumentFormat::TextLines => scan_text_lines_chunk(bytes, cur, max_bytes),
+    }
 }
 
 /// 当前已完整、可安全展示的记录数。
@@ -1134,6 +1254,96 @@ mod tests {
             .join(format!("st_engine_{}_{}.csv", name, std::process::id()));
         fs::write(&p, bytes).unwrap();
         p
+    }
+
+    /// 写临时纯文本夹具；扩展名决定文档格式。
+    fn tmp_text(name: &str, ext: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "st_engine_{}_{}.{}", name, std::process::id(), ext
+        ));
+        fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    fn scan_all_with(bytes: &[u8], chunk: usize, format: DocumentFormat) -> RawIndex {
+        let mut cur = ScanCursor::new();
+        let mut line_off = vec![0];
+        let mut rec_lines = Vec::new();
+        while cur.pos < bytes.len() {
+            let (offsets, records) = scan_chunk_with_format(bytes, &mut cur, chunk, format);
+            line_off.extend(offsets);
+            rec_lines.extend(records);
+        }
+        RawIndex { line_off, rec_lines }
+    }
+
+    #[test]
+    fn text_lines_index_preserves_blank_lines_and_literal_quotes() {
+        let bytes = b"first,\"raw\"\r\n\r\n  spaced  \n\"unterminated\nlast";
+        let seq = build_index_seq_with_format(bytes, DocumentFormat::TextLines);
+        let parallel = build_index_with_format(bytes, DocumentFormat::TextLines);
+        assert_eq!(seq.rec_lines, vec![0, 1, 2, 3, 4]);
+        assert_eq!(&parallel.line_off, &seq.line_off);
+        assert_eq!(&parallel.rec_lines, &seq.rec_lines);
+        for chunk in 1..=bytes.len() {
+            let scanned = scan_all_with(bytes, chunk, DocumentFormat::TextLines);
+            assert_eq!(&scanned.line_off, &seq.line_off, "chunk={chunk} 行偏移不一致");
+            assert_eq!(&scanned.rec_lines, &seq.rec_lines, "chunk={chunk} 记录不一致");
+        }
+    }
+
+    #[test]
+    fn text_lines_terminal_newline_does_not_create_phantom_row() {
+        for (bytes, expected) in [
+            (&b"a\n"[..], vec![0]),
+            (&b"a\n\n"[..], vec![0, 1]),
+            (&b""[..], vec![]),
+        ] {
+            assert_eq!(build_index_with_format(bytes, DocumentFormat::TextLines).rec_lines,
+                expected);
+        }
+    }
+
+    #[test]
+    fn text_lines_open_txt_and_log_as_headerless_single_column() {
+        for ext in ["txt", "log"] {
+            let p = tmp_text("open", ext, b"first,\"raw\"\r\n\r\nlast");
+            let bf = BigFile::open_with(&p, false).unwrap();
+            let meta = bf.meta();
+            assert!(meta.text_lines);
+            assert!(meta.headerless);
+            assert_eq!(meta.rows, 3);
+            assert_eq!(meta.cols, 1);
+            assert_eq!(meta.headers, vec!["列1"]);
+            assert_eq!(bf.rows(0, 10), vec![
+                vec!["first,\"raw\""], vec![""], vec!["last"],
+            ]);
+            fs::remove_file(&p).ok();
+        }
+    }
+
+    #[test]
+    fn text_lines_open_preserves_bom_and_gbk() {
+        let bom = tmp_text("bom", "TXT", b"\xEF\xBB\xBFfirst\n");
+        let bf = BigFile::open(&bom).unwrap();
+        assert_eq!(bf.rows(0, 1), vec![vec!["first"]]);
+        fs::remove_file(&bom).ok();
+
+        let gbk = encoding_rs::GBK.encode("中文,\"raw\"\r\n").0.into_owned();
+        let p = tmp_text("gbk", "log", &gbk);
+        let bf = BigFile::open(&p).unwrap();
+        assert_eq!(bf.rows(0, 1), vec![vec!["中文,\"raw\""]]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn text_lines_empty_file_is_rejected() {
+        let p = tmp_text("empty", "txt", b"");
+        match BigFile::open(&p) {
+            Err(err) => assert_eq!(err, "空文件"),
+            Ok(_) => panic!("空文件应被拒绝"),
+        }
+        fs::remove_file(&p).ok();
     }
 
     /// 五数据行夹具：name,age,city。
@@ -6761,6 +6971,8 @@ pub struct BigMeta {
     pub headers: Vec<String>,
     /// 首行是否作为普通数据（无列名模式）。
     pub headerless: bool,
+    #[serde(rename = "textLines")]
+    pub text_lines: bool,
     pub encoding: String,
     pub pending_cols: bool,
     pub can_undo: bool,
@@ -7812,6 +8024,8 @@ pub struct BigFile {
     has_bom: bool,
     /// 无列名模式：记录 0 也是数据，列名为虚拟的 列1..N。
     headerless: bool,
+    /// 磁盘扩展名确定的文档格式；内存新建固定为 CSV。
+    format: DocumentFormat,
     /// 共享行排列：Identity 无分配，Perm 由活动状态和历史共同持有。
     order: RowOrder,
     /// 内容修改计数：每次单元格/行结构变化递增，保存后归零。
@@ -7847,6 +8061,8 @@ impl BigFile {
     #[cfg(test)]
     pub fn open_with(path: &Path, headerless: bool) -> Result<Self, String> {
         let t0 = Instant::now();
+        let format = DocumentFormat::from_path(path);
+        let headerless = headerless || format.is_text_lines();
         let file = fs::File::open(path)
             .map_err(|e| format!("打开失败：{}（{}）", path.display(), e))?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
@@ -7861,6 +8077,7 @@ impl BigFile {
             Backing::Mmap(mmap),
             meta.len(),
             meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            format,
             headerless,
             t0,
         )
@@ -7884,6 +8101,7 @@ impl BigFile {
             Backing::Ram(buf),
             total,
             std::time::SystemTime::UNIX_EPOCH,
+            DocumentFormat::Csv,
             headerless,
             t0,
         )
@@ -7896,6 +8114,7 @@ impl BigFile {
         backing: Backing,
         total_bytes: u64,
         base_mtime: std::time::SystemTime,
+        format: DocumentFormat,
         headerless: bool,
         t0: Instant,
     ) -> Result<Self, String> {
@@ -7903,12 +8122,13 @@ impl BigFile {
         let enc = sniff_encoding(bytes);
         // BOM 只对 UTF-8 有意义（GBK 文件可能以相同字节开头纯属巧合）
         let has_bom = enc == Encoding::Utf8 && bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
-        let idx = build_index(bytes);
+        let idx = build_index_with_format(bytes, format);
         if idx.n_records() == 0 {
             return Err("文件中没有记录".into());
         }
         let (hs, he) = idx.record_span(bytes.len(), 0);
-        let mut first_fields = parse_record(&decode_slice(enc, &bytes[hs..he]), b',');
+        let mut first_fields =
+            parse_document_record(&decode_slice(enc, &bytes[hs..he]), b',', format);
         if enc == Encoding::Utf8 {
             if let Some(first) = first_fields.first_mut() {
                 if let Some(stripped) = first.strip_prefix('\u{FEFF}') {
@@ -7966,6 +8186,7 @@ impl BigFile {
             base_mtime,
             has_bom,
             headerless,
+            format,
             order: RowOrder::Identity,
             revision: 0,
         })
@@ -8029,6 +8250,8 @@ impl BigFile {
         headerless: bool,
     ) -> Result<Self, String> {
         let t0 = Instant::now();
+        let format = DocumentFormat::from_path(path);
+        let headerless = headerless || format.is_text_lines();
         let spool = new_session_spool()?;
         let file = fs::File::open(path)
             .map_err(|e| format!("打开失败：{}（{}）", path.display(), e))?;
@@ -8049,7 +8272,8 @@ impl BigFile {
         let mut rec_lines: Vec<u32> = Vec::new();
         let mut done = false;
         loop {
-            let (o, r) = scan_chunk(bytes, &mut cur, initial_bytes.max(1));
+            let (o, r) =
+                scan_chunk_with_format(bytes, &mut cur, initial_bytes.max(1), format);
             line_off.extend(o);
             rec_lines.extend(r);
             if cur.pos >= bytes.len() {
@@ -8073,8 +8297,11 @@ impl BigFile {
         // （后续记录）不会混入表头。
         let header_start = line_off[rec_lines[0] as usize] as usize;
         let header_end = if done { bytes.len() } else { cur.pos };
-        let mut first_fields =
-            parse_record(&decode_slice(enc, &bytes[header_start..header_end]), b',');
+        let mut first_fields = parse_document_record(
+            &decode_slice(enc, &bytes[header_start..header_end]),
+            b',',
+            format,
+        );
         if enc == Encoding::Utf8 {
             if let Some(first) = first_fields.first_mut() {
                 if let Some(stripped) = first.strip_prefix('\u{FEFF}') {
@@ -8112,7 +8339,7 @@ impl BigFile {
                 std::thread::Builder::new()
                     .name("csv-index".into())
                     .spawn(move || {
-                        Self::index_worker(mmap2, p2, c2, cur, chunk_bytes, t0);
+                        Self::index_worker(mmap2, p2, c2, cur, chunk_bytes, t0, format);
                     })
                     .map_err(|e| format!("启动索引线程失败：{e}"))?;
             }
@@ -8160,6 +8387,7 @@ impl BigFile {
             base_mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
             has_bom,
             headerless,
+            format,
             order: RowOrder::Identity,
             revision: 0,
         })
@@ -8181,6 +8409,7 @@ impl BigFile {
         mut cur: ScanCursor,
         chunk_bytes: usize,
         started: Instant,
+        format: DocumentFormat,
     ) {
         // 磁盘顺序扫描是重 IO：线程级降到 BELOW_NORMAL，让 UI/读页优先。
         let _bg = bg::BackgroundGuard::enter();
@@ -8189,7 +8418,8 @@ impl BigFile {
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
-            let (o, r) = scan_chunk(bytes, &mut cur, chunk_bytes.max(1));
+            let (o, r) =
+                scan_chunk_with_format(bytes, &mut cur, chunk_bytes.max(1), format);
             let done = cur.pos >= bytes.len();
             let mut st = partial.lock().unwrap();
             st.line_off.extend(o);
@@ -8211,7 +8441,8 @@ impl BigFile {
         let mut cur = p.lock().unwrap().cursor;
         let bytes: &[u8] = self.bytes();
         loop {
-            let (o, r) = scan_chunk(bytes, &mut cur, INDEX_CHUNK_BYTES);
+            let (o, r) =
+                scan_chunk_with_format(bytes, &mut cur, INDEX_CHUNK_BYTES, self.format);
             let done = cur.pos >= bytes.len();
             let mut st = p.lock().unwrap();
             st.line_off.extend(o);
@@ -8603,6 +8834,7 @@ impl BigFile {
             cols: self.view_ncols(),
             headers: self.view_headers(),
             headerless: self.headerless,
+            text_lines: self.format.is_text_lines(),
             encoding: match self.output_encoding {
                 Encoding::Utf8 => "utf-8".into(),
                 Encoding::Gbk => "gbk".into(),
@@ -8787,7 +9019,11 @@ impl BigFile {
         let Some((s, e)) = self.src_span(rec) else {
             return vec![String::new(); self.base_ncols];
         };
-        let mut fields = parse_record(&decode_slice(self.backing_encoding, &self.bytes()[s..e]), b',');
+        let mut fields = parse_document_record(
+            &decode_slice(self.backing_encoding, &self.bytes()[s..e]),
+            b',',
+            self.format,
+        );
         if fields.len() < self.base_ncols {
             fields.resize(self.base_ncols, String::new());
         } else if fields.len() > self.base_ncols {
