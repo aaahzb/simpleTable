@@ -25,5 +25,5 @@ test("single-instance stays pinned to 2.3.4", () => {
   const manifest = readFileSync(new URL("../src-tauri/Cargo.toml", import.meta.url), "utf8");
   const lock = readFileSync(new URL("../src-tauri/Cargo.lock", import.meta.url), "utf8");
   assert.ok(manifest.includes("tauri-plugin-single-instance = \"=2.3.4\""));
-  assert.ok(lock.includes("name = \"tauri-plugin-single-instance\"\nversion = \"2.3.4\""));
+  assert.match(lock, /name = "tauri-plugin-single-instance"\r?\nversion = "2\.3\.4"/);
 });
