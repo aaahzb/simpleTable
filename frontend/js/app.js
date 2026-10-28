@@ -20,6 +20,7 @@ import { createOpenRequestPump } from "./openrequests.js";
 import { createWindowCloseCoordinator } from "./windowlifecycle.js";
 import { createTransferCoordinator } from "./transfer.js";
 import { createTabMenuItems } from "./tabmenu.js";
+import { isSupportedDocumentPath } from "./filetypes.js";
 
 /** @type {any} Tauri v2 全局对象（withGlobalTauri） */
 const tauri = window.__TAURI__;
@@ -1546,14 +1547,17 @@ function refreshBigUi() {
 function refreshHeaderlessUi() {
   if (!tbReady) return; // 同上：构造期静默
   if (!tb.headerless) return;
-  const on = model.isHeaderless?.() === true;
+  const textLines = model.isTextLines();
+  const on = textLines || model.isHeaderless?.() === true;
   const pending = model.colOpsPending?.() === true;
   const sorted = model.meta?.()?.sorted === true;
   tb.headerless.classList.toggle("on", on);
-  // 无列（无法生成列1..N）、列操作待执行或排序视图中（切换会错位）时禁用
-  tb.headerless.disabled = headerlessBusy || model.columnCount() === 0 || pending || sorted;
-  tb.headerless.title = "开启后：第一行作为数据参与筛选/编辑，列名显示为 列1、列2…；"
-    + "关闭时：当前第一行成为列名并从数据中移除。仅对当前页签生效，不写入磁盘。";
+  // 纯文本固定首行数据；CSV 仍按无列、列操作或排序状态禁用。
+  tb.headerless.disabled = textLines || headerlessBusy
+    || model.columnCount() === 0 || pending || sorted;
+  tb.headerless.title = textLines ? "纯文本档始终以第一行为数据"
+    : "开启后：第一行作为数据参与筛选/编辑，列名显示为 列1、列2…；"
+      + "关闭时：当前第一行成为列名并从数据中移除。仅对当前页签生效，不写入磁盘。";
 }
 
 /**
@@ -2088,10 +2092,10 @@ async function newFile() {
 
 /** 所有用户入口统一提交进程级打开队列，由 owner 窗口串行消费。 */
 async function submitOpenPaths(paths) {
-  const csvs = paths.filter((p) => p.toLowerCase().endsWith(".csv"));
-  if (!csvs.length) return false;
+  const pathsToOpen = paths.filter(isSupportedDocumentPath);
+  if (!pathsToOpen.length) return false;
   try {
-    await invoke("open_requests_submit", { paths: csvs });
+    await invoke("open_requests_submit", { paths: pathsToOpen });
     return true;
   } catch (err) {
     await errorDialog("打开失败", String(err?.message ?? err));
@@ -2264,11 +2268,20 @@ async function saveFileAs(target = null) {
     return false;
   }
   let p = target;
+  const textLines = model.isTextLines();
   if (!p) {
-    p = await invoke("pick_save_path", { defaultName: "未命名.csv" });
+    p = await invoke("pick_save_path", {
+      defaultName: textLines ? "未命名.txt" : "未命名.csv",
+      textLines,
+    });
     if (!p) return false;
   }
-  if (!p.toLowerCase().endsWith(".csv")) p += ".csv";
+  const lower = p.toLowerCase();
+  if (textLines) {
+    if (!lower.endsWith(".txt") && !lower.endsWith(".log")) p += ".txt";
+  } else if (!lower.endsWith(".csv")) {
+    p += ".csv";
+  }
 
   const ok = await runBigWrite(
     () => model.saveAs(p),
@@ -2314,8 +2327,8 @@ window.addEventListener("focus", async () => {
 // ---- 拖放打开 ----
 tauri.window.getCurrentWindow().listen("tauri://drag-drop", async (e) => {
   const paths = e.payload?.paths ?? [];
-  const csvs = paths.filter((x) => x.toLowerCase().endsWith(".csv"));
-  if (csvs.length) await submitOpenPaths(csvs);
+  const pathsToOpen = paths.filter(isSupportedDocumentPath);
+  if (pathsToOpen.length) await submitOpenPaths(pathsToOpen);
 });
 
 // ---- 关闭前确认 ----
@@ -2488,14 +2501,22 @@ function showColMenu(e) {
   const cols = fgrid().selectedCols();
   if (!cols.length) return;
   const col = cols[0];
-  showMenu(e.clientX, e.clientY, [
-    { label: `在左侧插入 ${cols.length} 列`, onClick: () => insertColumnsAt(cols) },
-    null,
-    { label: `删除选中的 ${cols.length} 列…`, onClick: () => deleteColumns(cols) },
+  const textLines = model.isTextLines();
+  const items = [
     { label: `清除选中 ${cols.length} 列的内容…`, onClick: () => clearColumns(cols) },
-    null,
-    { label: "重命名列…", disabled: model.isHeaderless?.() === true, onClick: () => renameColumn(col) },
-  ]);
+  ];
+  if (!textLines) {
+    items.unshift(
+      { label: `在左侧插入 ${cols.length} 列`, onClick: () => insertColumnsAt(cols) },
+      null,
+      { label: `删除选中的 ${cols.length} 列…`, onClick: () => deleteColumns(cols) },
+    );
+    items.push(
+      null,
+      { label: "重命名列…", disabled: model.isHeaderless?.() === true, onClick: () => renameColumn(col) },
+    );
+  }
+  showMenu(e.clientX, e.clientY, items);
 }
 
 /** 单元格右键菜单：按选区跨度插入/删除/清除行列 + 拆分粘贴 */
@@ -2503,17 +2524,25 @@ function showCellMenu(e) {
   const rows = fgrid().selectedRows();
   const cols = fgrid().selectedCols();
   const n = fgrid().selectedCells().length;
-  showMenu(e.clientX, e.clientY, [
+  const textLines = model.isTextLines();
+  const items = [
     { label: "按行拆分粘贴", onClick: () => fgrid().pasteClipboard(true) },
     null,
     { label: `在上方插入 ${rows.length} 行`,
       onClick: () => op(model.insertRows(Math.min(...rows), rows.length)) },
-    { label: `在左侧插入 ${cols.length} 列`, onClick: () => insertColumnsAt(cols) },
+  ];
+  if (!textLines) {
+    items.push({ label: `在左侧插入 ${cols.length} 列`, onClick: () => insertColumnsAt(cols) });
+  }
+  items.push(
     null,
     { label: `删除选区跨越的 ${rows.length} 行…`, onClick: () => deleteRows(rows) },
-    { label: `删除选区跨越的 ${cols.length} 列…`, onClick: () => deleteColumns(cols) },
-    { label: `清除选区 ${n} 个单元格内容…`, onClick: () => clearSelCells(n) },
-  ]);
+  );
+  if (!textLines) {
+    items.push({ label: `删除选区跨越的 ${cols.length} 列…`, onClick: () => deleteColumns(cols) });
+  }
+  items.push({ label: `清除选区 ${n} 个单元格内容…`, onClick: () => clearSelCells(n) });
+  showMenu(e.clientX, e.clientY, items);
 }
 
 /**
@@ -2847,6 +2876,7 @@ function smokeSnapshot() {
     side: t.side,
     active: t.id === activeId,
     current: splitOn && sideTab[t.side] === t.id,
+    textLines: t.model?.isTextLines() ?? false,
     ...modelSnapshot(t.model),
   }));
   const current = activeTab();

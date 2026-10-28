@@ -6,7 +6,7 @@ function editOutcome({ changed = false, insertedRows = 0, removedRows = 0 } = {}
 }
 
 /** 造一个内存版"引擎"：N 行 M 列的顺序数据 + 记录 invoke 调用。 */
-function createEngine({ rows = 1000, cols = 3, data: initial = null } = {}, calls) {
+function createEngine({ rows = 1000, cols = 3, data: initial = null, textLines = false } = {}, calls) {
   let data = initial
     ? initial.map((r) => r.slice())
     : Array.from({ length: rows }, (_, r) =>
@@ -29,6 +29,7 @@ function createEngine({ rows = 1000, cols = 3, data: initial = null } = {}, call
     can_redo: false, modified: false,
     filtered: filter !== null,
     headerless,
+    textLines,
     // 渐进索引字段：普通夹具视为"已索引完成"
     indexing: false,
     ram_backed: ramBacked,
@@ -44,7 +45,7 @@ function createEngine({ rows = 1000, cols = 3, data: initial = null } = {}, call
   const invoke = async (cmd, args = {}) => {
       switch (cmd) {
         case "big_open":
-          headerless = !!args.headerless;
+          headerless = textLines || !!args.headerless;
           hasPath = true;
           return meta();
         case "big_new": {

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
 import { createOpenRequestPump } from "../frontend/js/openrequests.js";
 
 test("ready batch and emitted batches are consumed serially with ack", async () => {
@@ -46,4 +47,12 @@ test("failed item releases reservation through backend and does not block next i
   assert.deepEqual(seen, ["bad.csv", "activate:ok.csv"]);
   assert.ok(calls.some(([cmd, args]) => cmd === "open_requests_fail"
     && args.requestId === 1 && args.path === "bad.csv"));
+});
+
+test("app uses engine TextLines metadata for save-as and UI locks", () => {
+  const app = readFileSync(new URL("../frontend/js/app.js", import.meta.url), "utf8");
+  assert.match(app, /model\.isTextLines\(\)/);
+  assert.match(app, /defaultName:\s*textLines\s*\?\s*"未命名\.txt"\s*:\s*"未命名\.csv"/);
+  assert.match(app, /textLines\s*\?\s*"纯文本档始终以第一行为数据"/);
+  assert.match(app, /if\s*\(!textLines\)/);
 });

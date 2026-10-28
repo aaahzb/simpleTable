@@ -506,6 +506,14 @@ export class BigModel {
   }
 
   /**
+   * 是否为引擎识别的纯文本逐行文档。
+   * @returns {boolean} meta.textLines 为 true；旧引擎缺字段时 false。
+   */
+  isTextLines() {
+    return !!this._meta?.textLines;
+  }
+
+  /**
    * 切换「首行非列名」模式（引擎段表 O(1) 插/删首行）。
    *
    * 实际切换后清空筛选和窗口缓存，并记录可撤销的 HeaderMode 历史。

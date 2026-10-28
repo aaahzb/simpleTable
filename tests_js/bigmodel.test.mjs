@@ -1866,3 +1866,19 @@ test("smoke IPC capture 只记录预算调用并可恢复原 core", async () => 
   await invoke("set_undo_budget", { budgetBytes: 64 * 1024 * 1024 });
   assert.equal(calls.length, 2, "恢复后不得继续记录调用");
 });
+
+test("TextLines metadata is read from the engine and survives meta refresh", async () => {
+  const backend = makeSharedBackend({ rows: 2, cols: 1, textLines: true });
+  const model = backend.model();
+  await model.open("/fixture.txt", { headerless: false });
+  assert.equal(model.isTextLines(), true);
+  assert.equal(model.isHeaderless(), true);
+  await model._refreshMeta();
+  assert.equal(model.isTextLines(), true);
+});
+
+test("ordinary CSV metadata remains non-TextLines", async () => {
+  const { model } = makeFakeEngine({ rows: 2, cols: 1 });
+  await model.open("/fixture.csv");
+  assert.equal(model.isTextLines(), false);
+});

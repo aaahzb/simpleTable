@@ -3,6 +3,16 @@ import { existsSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 import vm from "node:vm";
 import { makeSharedBackend } from "./helpers/shared_bigmodel_fake.mjs";
+import { isSupportedDocumentPath } from "../frontend/js/filetypes.js";
+
+test("open entries accept CSV TXT LOG and reject other extensions", () => {
+  for (const path of ["a.csv", "b.CSV", "c.txt", "d.TxT", "e.log", "f.LOG"]) {
+    assert.equal(isSupportedDocumentPath(path), true, path);
+  }
+  for (const path of ["a.csv.exe", "README.md", "txt", "acsv", "a.tsv"]) {
+    assert.equal(isSupportedDocumentPath(path), false, path);
+  }
+});
 
 function loadControllerFactory() {
   const app = readFileSync(new URL("../frontend/js/app.js", import.meta.url), "utf8");
