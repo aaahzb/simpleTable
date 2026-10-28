@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20arm64-lightgrey)
 
-![simpleTable 主界面：多行内容在格内保持单行，右侧编辑窗格显示全文](docs/img/main.jpg)
+![simpleTable 主界面：多行内容在格内保持单行，右侧编辑窗格显示全文](docs/img/main.png)
 
 simpleTable 是免费开源的桌面表格工具，适合长备注、超大 CSV，以及需要逐行查看的 TXT/LOG。数据留在本机，不监听端口，也不上传文件。
 
@@ -34,6 +34,13 @@ Windows 和 macOS 的文件关联都由你手动选择。simpleTable 只声明�
 3. 在列表头输入关键字筛选，按 `Ctrl+S` 保存。
 
 需要完整快捷键、性能说明、编码规则或 macOS 首次打开说明，请进入用户指南。
+
+## 更多视图
+
+| 分屏对照 | TXT/LOG 纯文本逐行 |
+|---|---|
+| 两个文档、两组页签，各自保持独立会话。 | 每个物理行一个数据行，固定“列1”，不解析 CSV 引号或逗号。 |
+| ![simpleTable 分屏对照](docs/img/split-view.png) | ![simpleTable TXT/LOG 逐行视图](docs/img/text-lines.png) |
 
 ## 文档
 

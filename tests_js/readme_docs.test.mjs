@@ -12,7 +12,7 @@ test("README is a concise product entry with documentation links", () => {
     assert.ok(readme.includes(text), `首页缺少 ${text}`);
   }
   assert.doesNotMatch(readme, /^#{2,4} (实测性能|常见问题|项目结构)$/m);
-  assert.match(readme, /docs\/img\/main\.jpg/);
+  assert.match(readme, /docs\/img\/main\.png/);
 });
 
 test("manual and development details remain available in layered docs", () => {
@@ -29,4 +29,14 @@ test("manual and development details remain available in layered docs", () => {
   for (const match of read("README.md").matchAll(/\]\((docs\/[^)]+)\)/g)) {
     assert.ok(exists(match[1]), `失效相对链接：${match[1]}`);
   }
+});
+
+test("README uses three current PNG screenshots and no stale JPEG", () => {
+  const readme = read("README.md");
+  for (const image of ["main.png", "split-view.png", "text-lines.png"]) {
+    assert.ok(readme.includes(`docs/img/${image}`), `首页未引用 ${image}`);
+    assert.ok(exists(`docs/img/${image}`), `正式截图 ${image} 不存在`);
+  }
+  assert.ok(!readme.includes("docs/img/main.jpg"), "旧图引用必须移除");
+  assert.ok(!exists("docs/img/main.jpg"), "旧 JPEG 必须在新图验收后删除");
 });
