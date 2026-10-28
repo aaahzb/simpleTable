@@ -62,6 +62,10 @@ async function waitGo(invoke, dir, name) {
  * @param {object} ctx.grid - Grid 实例。 @param {string} ctx.mode - 场景名。
  */
 export async function runPark({ invoke, grid, mode }) {
+  if (mode.startsWith("readme-")) {
+    const { runReadmeScene } = await import("./readme_scene.js");
+    return runReadmeScene({ invoke, grid, mode });
+  }
   // 标记直接写临时目录根（smoke_write_bytes 不会建子目录）
   const dir = await invoke("smoke_tmp_dir");
   // 入口即写 hello：区分"runPark 没进来"与"进来后挂起"
