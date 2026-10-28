@@ -120,6 +120,14 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     out
 }
 
+pub fn is_supported_path(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("csv")
+            || ext.eq_ignore_ascii_case("txt")
+            || ext.eq_ignore_ascii_case("log")
+    })
+}
+
 pub fn normalize_args(args: Vec<OsString>, cwd: &Path) -> Vec<PathBuf> {
     args.into_iter()
         .skip(1)
@@ -128,11 +136,7 @@ pub fn normalize_args(args: Vec<OsString>, cwd: &Path) -> Vec<PathBuf> {
             if path.to_str().is_some_and(|text| text.starts_with('-')) {
                 return None;
             }
-            let is_csv = path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"));
-            if !is_csv {
+            if !is_supported_path(&path) {
                 return None;
             }
             let absolute = if path.is_absolute() { path } else { cwd.join(path) };
@@ -546,13 +550,14 @@ mod tests {
     }
 
     #[test]
-    fn args_resolve_csv_against_each_invocation_cwd() {
-        let cwd = Path::new(if cfg!(windows) { r"C:\work" } else { "/work" });
-        let got = normalize_args(
-            vec!["simpleTable.exe".into(), "--smoke".into(), "a.CSV".into(), "x.txt".into()],
-            cwd,
-        );
-        assert_eq!(got, vec![cwd.join("a.CSV")]);
+    fn args_resolve_supported_documents_against_each_invocation_cwd() {
+        let cwd = Path::new(r"D:\fixtures");
+        let got = normalize_args(vec![
+            "simpleTable.exe".into(), "--smoke".into(),
+            "a.CSV".into(), "b.TxT".into(), "c.LOG".into(),
+            "x.exe".into(), "README.md".into(),
+        ], cwd);
+        assert_eq!(got, vec![cwd.join("a.CSV"), cwd.join("b.TxT"), cwd.join("c.LOG")]);
     }
 
     #[test]

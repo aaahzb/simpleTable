@@ -46,6 +46,22 @@
         "role": "Editor",
         "contentTypes": ["public.comma-separated-values-text"],
         "mimeType": "text/csv"
+      },
+      {
+        "ext": ["txt"],
+        "name": "Text Document",
+        "description": "Plain text document",
+        "role": "Editor",
+        "contentTypes": ["public.plain-text"],
+        "mimeType": "text/plain"
+      },
+      {
+        "ext": ["log"],
+        "name": "Log Document",
+        "description": "Log document",
+        "role": "Editor",
+        "contentTypes": ["public.plain-text"],
+        "mimeType": "text/plain"
       }
     ]
   }

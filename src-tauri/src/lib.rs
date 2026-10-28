@@ -468,7 +468,7 @@ fn write_csv_file(path: String, text: String) -> Result<(), String> {
 #[tauri::command]
 fn pick_open_path() -> Option<String> {
     rfd::FileDialog::new()
-        .add_filter("CSV 表格", &["csv"])
+        .add_filter("表格与纯文本", &["csv", "txt", "log"])
         .add_filter("所有文件", &["*"])
         .pick_file()
         .map(|p| p.to_string_lossy().into_owned())
@@ -478,13 +478,19 @@ fn pick_open_path() -> Option<String> {
 ///
 /// # Parameters
 /// - `default_name`: 默认文件名（如 "未命名.csv"）。
+/// - `text_lines`: 是否为固定一列的纯文本文档。
 ///
 /// # Returns
 /// 选中的路径；取消返回 null。
 #[tauri::command]
-fn pick_save_path(default_name: String) -> Option<String> {
+fn pick_save_path(default_name: String, text_lines: bool) -> Option<String> {
+    let (label, extensions): (&str, &[&str]) = if text_lines {
+        ("纯文本", &["txt", "log"])
+    } else {
+        ("CSV 表格", &["csv"])
+    };
     rfd::FileDialog::new()
-        .add_filter("CSV 表格", &["csv"])
+        .add_filter(label, extensions)
         .set_file_name(&default_name)
         .save_file()
         .map(|p| p.to_string_lossy().into_owned())
@@ -2556,11 +2562,10 @@ pub fn run() {
                     let mut paths = Vec::new();
                     for url in urls {
                         match open_request::file_url_to_path(url.as_str()) {
-                            Ok(path) if path.extension().and_then(|ext| ext.to_str())
-                                .is_some_and(|ext| ext.eq_ignore_ascii_case("csv")) => {
+                            Ok(path) if open_request::is_supported_path(&path) => {
                                 paths.push(path);
                             }
-                            Ok(_) => eprintln!("忽略非 CSV 的 Opened URL：{url}"),
+                            Ok(_) => eprintln!("忽略不支持的 Opened URL：{url}"),
                             Err(error) => eprintln!("忽略无效 Opened URL：{error}"),
                         }
                     }
