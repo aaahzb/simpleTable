@@ -2866,6 +2866,8 @@ function smokeSnapshot() {
       } : null,
       sort: { sorted: meta.sorted === true },
       pendingCols: meta.pending_cols === true,
+      headerless: m.isHeaderless?.() === true,
+      columnCount: m.columnCount(),
       transferState: m._transferState ?? "idle",
     };
   };
@@ -2911,6 +2913,11 @@ async function smokeAction(request) {
     case "redo":
       await redo();
       return;
+    case "setCell": {
+      const outcome = await tab.model.setData(request.row, request.col, request.value);
+      if (!outcome?.changed) throw new Error("诊断单元格未变化");
+      return;
+    }
     case "save":
       if (!(await saveFile())) throw new Error("诊断保存失败");
       return;

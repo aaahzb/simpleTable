@@ -1709,6 +1709,9 @@ export class Grid {
       return;
     }
     if (!text) return;
+    // TextLines 格内禁止换行：多行外部文本必须走区域粘贴，每行进一格。
+    const multiLineTextLines = this.model.isTextLines?.() === true
+      && /[\r\n]/.test(text);
     // 一对多填充（Excel）：剪贴板是单格单值（无 Tab/换行的单行，内外部来源皆然）
     // 且选区超过一格 → 全选区填充。必须先于"纯文本整段进当前格"分支判定，
     // 否则外部单值文本会被整段吞进当前格。forceSplit（按行拆分粘贴）不填充。
@@ -1723,7 +1726,7 @@ export class Grid {
             ? { kind: "rect", row: rect.row, col: rect.col, rows: rect.rows, cols: rect.cols }
             : { kind: "cells", cells: this.selectedCells() },
         };
-      } else if (!forceSplit && !text.includes("\t")) {
+      } else if (!forceSplit && !text.includes("\t") && !multiLineTextLines) {
         destination = { kind: "singleCell", row: r0, col: c0 };
       }
       await this._pasteExternalLarge(text, destination);
@@ -1740,8 +1743,8 @@ export class Grid {
       (text === this.lastCopiedText ||
        text === this.lastCopiedText.replace(/\r\n$/, "") ||
        text.replace(/\r\n$/, "") === this.lastCopiedText.replace(/\r\n$/, ""));
-    if (!forceSplit && !mine && !text.includes("\t")) {
-      // 外部无 Tab 纯文本：整段进当前格（长文粘贴），换行保留
+    if (!forceSplit && !mine && !text.includes("\t") && !multiLineTextLines) {
+      // CSV 外部无 Tab 纯文本：整段进当前格（长文粘贴），换行保留
       Promise.resolve(
         this.model.setData(r0, c0, text.replace(/\r\n/g, "\n").replace(/[\r\n]+$/, "")),
       ).catch((err) => this.hooks.statusMsg(String(err?.message ?? err), 3000));

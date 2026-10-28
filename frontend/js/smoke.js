@@ -4341,6 +4341,222 @@ x,y
     }
   });
 
+
+  /** 放弃并关闭 main 当前活动签，避免脏档确认阻塞后续场景。 */
+  async function discardMainActiveTab() {
+    if (window.__app.smokeSnapshot().active) {
+      await window.__app.smokeAction({ action: "closeActiveTabDiscard" });
+    }
+  }
+
+  /**
+   * 打开小型纯文本夹具并预热全部行，供同步快照断言使用。
+   *
+   * @param {string} path - 夹具全路径。
+   * @returns {Promise<void>}
+   */
+  async function openTextFixture(path) {
+    assert(await window.__app.openPathsAsTabs([path]), "纯文本夹具应入签：" + path);
+    await waitFor(() => model.rowCount() > 0, "纯文本行数落定");
+    await model.warmup();
+  }
+
+  check("TXT/LOG：物理行读取、保存与重开保持纯文本", async () => {
+    const content = 'first,"raw"\n\n中文\t\\path\nlast';
+    const expected = [['first,"raw"'], [""], ["中文\t\\path"], ["last"]];
+    for (const ext of ["txt", "log"]) {
+      await window.__app.smokeLoadSmall([], []);
+      const file = TMP + "/text-lines-read-" + Date.now() + "-" + (++fixtureSeq) + "." + ext;
+      try {
+        await writeText(file, content);
+        await openTextFixture(file);
+        assert(model.isTextLines() && model.isHeaderless(),
+          ext + " 必须固定 TextLines/headerless");
+        assert(model.columnCount() === 1, ext + " 必须只有一列");
+        assert(JSON.stringify(model.headers()) === JSON.stringify(["列1"]),
+          "虚拟列名必须为列1");
+        assert(JSON.stringify(tableSnapshot()) === JSON.stringify(expected),
+          ext + " 逐行内容错误：" + JSON.stringify(tableSnapshot()));
+
+        await model.setData(0, 0, 'edited,"literal"');
+        assert(window.__app.isDirty(), "编辑后纯文本应标脏");
+        assert(await window.__app.saveFile(), ext + " 应保存成功");
+        await waitFor(() => !window.__app.isDirty(), ext + " 保存后脏点清除");
+
+        // 强制关签再从磁盘打开，排除只读前端缓存的假重开。
+        await discardMainActiveTab();
+        await openTextFixture(file);
+        const reopened = [['edited,"literal"'], [""], ["中文\t\\path"], ["last"]];
+        assert(model.isTextLines() && model.isHeaderless()
+          && model.columnCount() === 1, ext + " 重开后格式必须不变");
+        assert(JSON.stringify(tableSnapshot()) === JSON.stringify(reopened),
+          ext + " 重开内容错误：" + JSON.stringify(tableSnapshot()));
+        const disk = await invoke("read_csv_file", { path: file });
+        const expectedText = 'edited,"literal"\r\n\n中文\t\\path\nlast';
+        assert(disk.text === expectedText,
+          ext + " 保存必须无 CSV 包围引号、保留空行和未编辑行尾："
+          + JSON.stringify(disk.text));
+      } finally {
+        await discardMainActiveTab();
+      }
+    }
+  });
+
+  check("TextLines：多行粘贴成功且格内换行原子拒绝", async () => {
+    await window.__app.smokeLoadSmall([], []);
+    const file = TMP + "/text-lines-paste-" + Date.now() + "-" + (++fixtureSeq) + ".txt";
+    try {
+      await writeText(file, "alpha\nbeta\ngamma");
+      await openTextFixture(file);
+      await model.clipboardClear();
+      grid.select([0, 0]);
+      stubClipboard("new-one\r\nnew-two");
+      await grid.pasteClipboard();
+      await waitFor(() => tableEquals([["new-one"], ["new-two"], ["gamma"]]),
+        "多行剪贴板应按物理行写入两个单元格");
+
+      const before = {
+        table: tableSnapshot(),
+        rows: model.rowCount(),
+        columns: model.columnCount(),
+        headers: model.headers(),
+        dirty: window.__app.isDirty(),
+        canUndo: model.canUndo(),
+        canRedo: model.canRedo(),
+      };
+      assert(before.dirty && before.canUndo && !before.canRedo,
+        "拒绝前必须有可核对的脏档和 undo 状态");
+      let rejected = false;
+      try {
+        await model.setData(0, 0, "bad\nline");
+      } catch {
+        rejected = true;
+      }
+      assert(rejected, "TextLines 单元格写入换行必须 reject");
+      const after = {
+        table: tableSnapshot(),
+        rows: model.rowCount(),
+        columns: model.columnCount(),
+        headers: model.headers(),
+        dirty: window.__app.isDirty(),
+        canUndo: model.canUndo(),
+        canRedo: model.canRedo(),
+      };
+      assert(JSON.stringify(after) === JSON.stringify(before),
+        "换行拒绝后表格与历史状态必须原子不变："
+        + JSON.stringify(before) + " -> " + JSON.stringify(after));
+    } finally {
+      await discardMainActiveTab();
+    }
+  });
+
+  check("TextLines：另存为仅接受 TXT/LOG 且重开格式不变", async () => {
+    await window.__app.smokeLoadSmall([], []);
+    const root = TMP + "/text-lines-save-as-" + Date.now() + "-" + (++fixtureSeq);
+    const source = root + "/source.txt";
+    const txtTarget = root + "/copy.txt";
+    const csvTarget = root + "/rejected.csv";
+    const logTarget = root + "/copy.LOG";
+    try {
+      await writeText(source, "first\n\nlast");
+      await openTextFixture(source);
+      const txtOutcome = await invoke("big_save_as", {
+        session: model.sessionId,
+        lease: model.lease,
+        path: txtTarget,
+        approval: { allowFixedPoint: false, preflightId: null },
+      });
+      assert(txtOutcome?.saved === true,
+        "TXT 另存为应成功：" + JSON.stringify(txtOutcome));
+      assert(await invoke("path_exists", { path: txtTarget }), "TXT 目标必须存在");
+
+      await discardMainActiveTab();
+      await openTextFixture(txtTarget);
+      assert(model.isTextLines(), "TXT 另存为重开后仍为 TextLines");
+      let csvRejected = false;
+      try {
+        await invoke("big_save_as", {
+          session: model.sessionId,
+          lease: model.lease,
+          path: csvTarget,
+          approval: { allowFixedPoint: false, preflightId: null },
+        });
+      } catch {
+        csvRejected = true;
+      }
+      assert(csvRejected, "TextLines 另存为 CSV 必须 reject");
+      assert(!(await invoke("path_exists", { path: csvTarget })),
+        "被拒的 CSV 目标不得创建");
+
+      const logOutcome = await invoke("big_save_as", {
+        session: model.sessionId,
+        lease: model.lease,
+        path: logTarget,
+        approval: { allowFixedPoint: false, preflightId: null },
+      });
+      assert(logOutcome?.saved === true,
+        "大写 LOG 另存为应成功：" + JSON.stringify(logOutcome));
+      await discardMainActiveTab();
+      await openTextFixture(logTarget);
+      assert(model.isTextLines() && model.isHeaderless()
+        && model.columnCount() === 1, "LOG 重开后 TextLines/headerless/一列不得改变");
+      assert(tableEquals([["first"], [""], ["last"]]), "LOG 另存为内容必须完整");
+    } finally {
+      await discardMainActiveTab();
+    }
+  });
+
+  check("TextLines：跨窗口 adopt 保留格式及编辑撤销重做", async () => {
+    await window.__app.smokeLoadSmall([], []);
+    const created = [];
+    const file = TMP + "/text-lines-adopt-" + Date.now() + "-" + (++fixtureSeq) + ".txt";
+    const keeper = file + ".keeper.csv";
+    const originalText = "alpha\nbeta\nlast";
+    const undoneText = "alpha\r\nbeta\nlast";
+    const editedText = "target-edited\r\nbeta\nlast";
+    try {
+      await writeText(file, originalText);
+      await writeText(keeper, "h\nkeep\n");
+      assert(await window.__app.openPathsAsTabs([keeper]), "main 应先打开保留签");
+      await openTextFixture(file);
+      const session = window.__app.smokeSnapshot().active?.session;
+      assert(session, "迁移前 TXT 必须有 session");
+      const target = await transferAndFind(session);
+      created.push(target);
+      assert(window.__app.smokeSnapshot().tabs.some((tab) => tab.path === keeper),
+        "迁出目标 TXT 后 main 必须保留 keeper");
+      let snapshot = await evalWindow(target);
+      let tab = tabWithSession(snapshot, session);
+      assert(tab?.textLines === true && tab?.headerless === true
+        && tab?.columnCount === 1,
+      "目标窗口必须保留 TextLines/headerless/一列：" + JSON.stringify(tab));
+
+      snapshot = await actOnWindow(target, "setCell", {
+        session, row: 0, col: 0, value: "target-edited",
+      });
+      tab = tabWithSession(snapshot, session);
+      assert(tab?.dirty && tab?.canUndo, "目标窗口编辑后应有 dirty/undo");
+      await actOnWindow(target, "save");
+      assert((await invoke("read_csv_file", { path: file })).text === editedText,
+        "目标窗口编辑保存后必须写入纯文本行而非 CSV");
+
+      snapshot = await actOnWindow(target, "undo");
+      assert(tabWithSession(snapshot, session)?.canRedo, "目标窗口 undo 后应可 redo");
+      await actOnWindow(target, "save");
+      assert((await invoke("read_csv_file", { path: file })).text === undoneText,
+        "目标窗口一次 undo 必须恢复逻辑内容，撤销编辑行写 CRLF");
+
+      snapshot = await actOnWindow(target, "redo");
+      assert(tabWithSession(snapshot, session)?.canUndo, "目标窗口 redo 后应可 undo");
+      await actOnWindow(target, "save");
+      assert((await invoke("read_csv_file", { path: file })).text === editedText,
+        "目标窗口一次 redo 必须重放相同纯文本内容");
+    } finally {
+      await cleanupDocuments(created);
+      await window.__app.smokeLoadSmall([], []);
+    }
+  });
+
   lines.push("", "MANUAL Windows/RDP 真实鼠标：A→A 换序、A/B 落签、拖出新窗、无效投放、Escape、抓取预览与负坐标/DPI。");
   lines.push("MANUAL 最后一个窗口由用户关闭后退出进程：Task 11 平台验收，不以 finish_smoke 的 process::exit 替代。");
 

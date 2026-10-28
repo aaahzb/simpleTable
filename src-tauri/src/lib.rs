@@ -313,6 +313,9 @@ fn smoke_document_action(
     target_label: Option<String>,
     side: Option<String>,
     index: Option<usize>,
+    row: Option<usize>,
+    col: Option<usize>,
+    value: Option<String>,
 ) -> Result<(), String> {
     if !is_diagnostic_main(&app, window.label())
         || std::env::var_os("SIMPLE_TABLE_SMOKE").is_none()
@@ -360,6 +363,13 @@ fn smoke_document_action(
                 "index": index.unwrap_or(0),
             })
         }
+        "setCell" => serde_json::json!({
+            "action": "setCell",
+            "session": session.ok_or_else(|| "setCell 缺少 session".to_string())?,
+            "row": row.ok_or_else(|| "setCell 缺少 row".to_string())?,
+            "col": col.ok_or_else(|| "setCell 缺少 col".to_string())?,
+            "value": value.ok_or_else(|| "setCell 缺少 value".to_string())?,
+        }),
         "save" | "undo" | "redo" | "closeActiveTabDiscard" | "closeWindowDiscard"
         | "finishSmokeProbe" => serde_json::json!({ "action": action }),
         "destroy" => {

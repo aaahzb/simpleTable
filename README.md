@@ -9,12 +9,12 @@
 
 ![主界面：格内的多行文本压成一行，右侧编辑窗格显示全文](docs/img/main.jpg)
 
-把带换行的长文本（每日行程、长备注、地址……）放进格子，行高列宽不会被撑开：格内压成一行，点选格子，右侧编辑窗格显示全文并可直接编辑。数据始终是纯文本 CSV——可 diff、可版本管理、与 Excel/WPS 双向兼容。
+把带换行的长文本（每日行程、长备注、地址……）放进格子，行高列宽不会被撑开：格内压成一行，点选格子，右侧编辑窗格显示全文并可直接编辑。CSV 数据始终是纯文本——可 diff、可版本管理、与 Excel/WPS 双向兼容；TXT/LOG 则按物理行编辑，见下文。
 
 ## 为什么是 simpleTable
 
 - **格子不变形**：多行文本在格内压成一行，右侧窗格看全文。再长的备注也不会把表格撑得七零八落。
-- **大文件能干活，不只是"能打开"**：所有磁盘 CSV 都走同一套 mmap + 渐进索引引擎——千万行毫秒级出界面，已索引部分立即可滚动；索引完成后键入即筛、编辑、撤销、保存全部可用。需要排序时再按需载入内存。
+- **大文件能干活，不只是"能打开"**：所有磁盘 CSV、TXT 和 LOG 都走同一套 mmap + 渐进索引引擎——千万行毫秒级出界面，已索引部分立即可滚动；索引完成后键入即筛、编辑、撤销、保存全部可用。需要排序时再按需载入内存。
 - **轻**：Windows 单个 exe 约 10 MB，不监听端口、不联网，双击即用（Windows 10/11 自带 WebView2，无需另装运行时；LTSC 等精简系统需补装）。
 
 ## 快速开始
@@ -24,10 +24,10 @@
 | **Windows 10+** | [simpletable.exe](https://github.com/aaahzb/simpleTable/releases/latest) | 免安装，双击即用。LTSC 等精简系统需先装 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) |
 | **macOS（Apple Silicon）** | [simpleTable-macos-arm64.dmg](https://github.com/aaahzb/simpleTable/releases/latest) | 拖入「应用程序」。未走 Apple 公证，首次打开见下方说明 |
 
-打开方式：把 CSV 拖进窗口 / `simpletable.exe 文件.csv` / 工具栏「打开」。
+打开方式：把 CSV、TXT 或 LOG 拖进窗口 / `simpletable.exe 文件.csv`（也接受 `.txt`、`.log`）/ 工具栏「打开」。
 
-- **Windows 默认打开方式**：将 CSV 的打开方式设为 simpletable.exe 后，首次双击会启动应用；应用已运行时再次双击，第二个进程只转交文件路径和工作目录，随后在已有进程最近使用的窗口新增标签。同一路径已打开时聚焦原窗口、原标签及正确的分屏侧；不带 CSV 再启动只聚焦窗口，不增加空标签。
-- **macOS Finder 关联**：应用声明 CSV 的 Editor 文件关联。Finder 双击 CSV 时，冷启动和已运行两种入口都直接把文件送入同一打开队列，不需要再次拖入；同一路径仍只保留一个文档会话。
+- **Windows 默认打开方式**：由你在系统中手动将 CSV、TXT 或 LOG 的打开方式设为 simpletable.exe，应用不写注册表。首次双击会启动应用；应用已运行时再次双击，第二个进程只转交文件路径和工作目录，随后在已有进程最近使用的窗口新增标签。同一路径已打开时聚焦原窗口、原标签及正确的分屏侧；不带文件再启动只聚焦窗口，不增加空标签。
+- **macOS Finder 关联**：应用只把 CSV、TXT 和 LOG 声明为候选 Editor，不更改默认打开方式；TXT/LOG 仍可默认由其他程序打开。对已由你选择 simpleTable 的类型，Finder 双击时，冷启动和已运行两种入口都直接把文件送入同一打开队列，不需要再次拖入；同一路径仍只保留一个文档会话。
 
 > [!NOTE]
 > macOS 版为 ad-hoc 签名、未走 Apple 公证：首次打开若提示"无法验证开发者"，右键 → 打开；若提示"已损坏"，终端执行 `xattr -cr /Applications/simpleTable.app` 后再打开。仅支持 Apple Silicon（arm64），Intel Mac 不提供。
@@ -35,6 +35,13 @@
 **上手 10 秒**：拖入 CSV → 点一个带换行的格子，右侧看全文 → 在表头筛选框里打字，结果即时出现。
 
 ## 功能
+
+### TXT/LOG 纯文本逐行
+
+- `.txt` 和 `.log` 不是 CSV：每个物理行对应一个数据行，形成 n×1 表格；首行是普通数据，唯一虚拟列名固定为“列1”。逗号、双引号、Tab 和反斜杠都是普通字符，中间空行保留。
+- 单元格不能包含 CR/LF；多行剪贴板按物理行写入多行。编辑、筛选、排序、撤销/重做与 CSV 共用同一引擎。
+- 保存不写表头或 CSV 引号，保留原编码、BOM、空行和未编辑源行的原始字节；编辑或新增行使用 CRLF。支持 UTF-8、UTF-8 BOM、GBK，不新增 UTF-16。
+- 另存为仅接受 `.txt` 或 `.log`，不会转存 `.csv`。文件关联只是候选 Editor，Windows/macOS 默认打开方式仍由你决定。
 
 ### 查看与编辑
 
@@ -250,17 +257,17 @@ Excel / WPS 的工作表上限是 1,048,576 行，超出会被截断。simpleTab
 Rust + Tauri 2 外壳，前端是原生 HTML/CSS/JS，无构建步骤。需要 Rust 工具链（[rustup](https://rustup.rs/)）和 Node.js（仅跑前端单测）。
 
 ```bash
-# 前端逻辑单测（212 项通过）
+# 前端逻辑单测（216 项通过）
 node --test tests_js/*.test.mjs
 
-# Rust 引擎单测（272 项通过，另 3 项默认忽略基准）
+# Rust 引擎单测（289 项通过，另 3 项默认忽略基准）
 cd src-tauri && cargo test
 
 # 编译并运行（前端资产编译时嵌入 exe，改完前端需重新 build）
 cargo build
 ./target/debug/simpletable.exe
 
-# 真机冒烟自检：真实 WebView2，debug/release 各 170 项断言
+# 真机冒烟自检：真实 WebView2，debug/release 各 174 项断言
 ./target/debug/simpletable.exe --smoke   # 报告写 %TEMP%\simpletable_smoke_report.txt
 
 # 双构建、前端嵌入时间检查和 debug/release 双真机冒烟
@@ -269,7 +276,7 @@ cd .. && node scripts/verify-local.mjs
 
 `--smoke` 和 `--park` 是隔离诊断模式，不注册单实例，也不会把测试参数转交给正常窗口；迁移产生的子窗口不会重复运行启动路径或诊断套件。
 
-平台验收边界：Windows 默认打开方式、真实鼠标/RDP 拖放和最后一个窗口由用户关闭仍需在 release exe 上验收。macOS 需在新的 `.app` 上验证 Finder 冷启动/已运行双击、同路径激活、跨窗口真实拖放与拖出；Windows 环境的配置检查和编译通过不等于 macOS 实机验收。
+平台验收边界：Windows 默认打开方式、真实鼠标/RDP 拖放和最后一个窗口由用户关闭仍需在 release exe 上验收。macOS 需在新的 `.app` 上验证 Finder 冷启动/已运行双击、同路径激活、跨窗口真实拖放与拖出，并确认 TXT/LOG 默认打开其他程序不受影响；Windows 环境的配置检查和编译通过不等于 macOS 实机验收。
 
 推 `main` / PR 触发 CI（Windows：node + cargo test + 冒烟；macOS arm64：编译 + 引擎单测）；推 `v*` tag 自动发 GitHub Release（Windows exe + macOS dmg）。
 
@@ -278,7 +285,7 @@ cd .. && node scripts/verify-local.mjs
 ```
 frontend/            纯 HTML/CSS/JS：自绘虚拟滚动网格 + 编辑窗格 + 对话框
   js/bigmodel.js     统一数据模型（全表唯一：窗口缓存 / 渐进索引轮询 / 内存排序 / 乐观编辑）
-  js/smoke.js        --smoke 对抗自检套件（170 项）
+  js/smoke.js        --smoke 对抗自检套件（174 项）
 src-tauri/           Tauri 2 外壳 + Rust 数据引擎（mmap / 行索引 / 覆盖层 / 流式保存）
 tests_js/            node:test 逻辑层单测
 scripts/             截图 / 采样巡检脚本（开发用）
