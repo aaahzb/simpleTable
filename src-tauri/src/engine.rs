@@ -1504,6 +1504,117 @@ mod tests {
         fs::remove_file(&p).ok();
     }
 
+    #[test]
+    fn text_lines_save_preserves_encoding_bom_raw_rows_and_no_csv_quotes() {
+        let p = tmp_text("save", "txt", b"\xEF\xBB\xBFa,b\r\n\"raw\"\n\nlast\n");
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "edited,\"literal\"".into(), Approval::deny()).unwrap();
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 1), vec![vec!["a,b"]]);
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, 1), vec![vec!["edited,\"literal\""]]);
+        bf.insert_rows(4, Some(vec![vec!["new\\line".into()]]), 0,
+            Approval::deny()).unwrap();
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        let out = fs::read(&p).unwrap();
+        assert!(out.starts_with(&[0xEF, 0xBB, 0xBF]));
+        assert_eq!(&out[3..],
+            b"edited,\"literal\"\r\n\"raw\"\n\nlast\nnew\\line\r\n");
+        assert!(bf.meta().text_lines && bf.meta().headerless);
+        assert_eq!(bf.rows(0, 10), vec![
+            vec!["edited,\"literal\""], vec!["\"raw\""], vec![""],
+            vec!["last"], vec!["new\\line"],
+        ]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn text_lines_gbk_save_roundtrip_and_extension_guard() {
+        let bytes = encoding_rs::GBK.encode("中文\n下一行\n").0.into_owned();
+        let p = tmp_text("gbk-save", "log", &bytes);
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "改后,中文".into(), Approval::deny()).unwrap();
+        let csv = p.with_extension("csv");
+        assert!(bf.save_as(&csv, Approval::deny(), |_, _, _, _| {}).is_err());
+        assert!(!csv.exists());
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        let out = fs::read(&p).unwrap();
+        let decoded = encoding_rs::GBK.decode(&out).0;
+        assert_eq!(decoded, "改后,中文\r\n下一行\n");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn text_lines_fixed_point_generation_keeps_format_and_literal_cell() {
+        let p = tmp_text("fixed-generation", "txt", b"one\ntwo\nthree\n");
+        let mut bf = BigFile::open(&p).unwrap();
+        let store = ClipboardStore::create_unique().unwrap();
+        let token = store.put_test_bytes(b"edited,\"literal\"").unwrap();
+        let destination = PasteDestination::SingleCell { row: 0, col: 0 };
+        let prepared = bf.prepare_paste_generation(
+            store.get(&token).unwrap(), &destination,
+        ).unwrap();
+        bf.commit_prepared_generation(prepared).unwrap();
+        assert!(bf.meta().text_lines && bf.meta().headerless);
+        assert_eq!(bf.rows(0, 3), vec![
+            vec!["edited,\"literal\""], vec!["two"], vec!["three"],
+        ]);
+        store.cleanup();
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn csv_save_as_rejects_non_csv_extension_without_losing_edits() {
+        let p = tmp_csv("save-as-extension", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "unsaved".into(), Approval::deny()).unwrap();
+        let before = bf.rows(0, 5);
+        let target = p.with_extension("txt");
+        let error = match bf.save_as(&target, Approval::deny(), |_, _, _, _| {}) {
+            Err(error) => error,
+            Ok(_) => {
+                fs::remove_file(&target).ok();
+                panic!("CSV 不应另存为非 CSV 扩展名");
+            }
+        };
+        assert!(error.contains(".csv"), "错误应提示正确扩展名：{error}");
+        assert!(!target.exists());
+        assert_eq!(bf.rows(0, 5), before);
+        assert!(bf.meta().modified);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn text_lines_ram_sort_generation_and_save_as_keep_format() {
+        let p = tmp_text("generation", "log", b"b,2\n\"a\"\n\nlast\n");
+        let mut bf = load_ram(&p);
+        bf.sort_by_levels(&[SortLevel { col: 0, numeric: false, asc: true }],
+            Approval::deny()).unwrap();
+        bf.set_cell(2, 0, "edited,\"literal\"".into(), Approval::deny()).unwrap();
+        assert!(bf.meta().ram_backed && bf.meta().text_lines);
+        assert_eq!(bf.meta().cols, 1);
+
+        let txt = p.with_extension("TXT");
+        let first = bf.save_as(&txt, Approval::deny(), |_, _, _, _| {}).unwrap();
+        assert!(!first.saved);
+        let request = first.fixed_point.expect("排序保存应先请求固定点确认");
+        let saved = bf.save_as(
+            &txt, Approval::allow(request.preflight_id), |_, _, _, _| {},
+        ).unwrap();
+        assert!(saved.saved);
+        let reopened = BigFile::open(&txt).unwrap();
+        assert!(reopened.meta().text_lines && reopened.meta().headerless);
+        let mut values: Vec<String> = reopened.rows(0, 10).into_iter()
+            .map(|row| row[0].clone()).collect();
+        values.sort();
+        assert_eq!(values, vec!["", "\"a\"", "edited,\"literal\"", "last"]);
+
+        bf.exit_sort_mode(true, Approval::deny()).unwrap();
+        assert!(bf.meta().text_lines);
+        fs::remove_file(&p).ok();
+        fs::remove_file(&txt).ok();
+    }
+
     /// 五数据行夹具：name,age,city。
     fn fixture_people() -> Vec<Vec<&'static str>> {
         vec![
@@ -6202,7 +6313,7 @@ keep,old,target
     /// 可编辑——钉死 replace_with_retry 不得无条件丢弃内存字节。
     #[test]
     fn save_as_rename_failure_keeps_memory_session() {
-        let dir = std::env::temp_dir().join(format!("st_engine_memfail_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("st_engine_memfail_{}.csv", std::process::id()));
         fs::create_dir(&dir).unwrap();
         let mut bf = BigFile::from_bytes(people_csv(), false).unwrap();
         bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
@@ -6213,7 +6324,7 @@ keep,old,target
         bf.set_cell(0, 1, "32".into(), Approval::deny()).unwrap();
         assert_eq!(bf.rows(0, 1)[0][1], "32");
         let tmp = std::env::temp_dir()
-            .join(format!("st_engine_memfail_{}.simpletable-tmp", std::process::id()));
+            .join(format!("st_engine_memfail_{}.csv.simpletable-tmp", std::process::id()));
         fs::remove_file(&tmp).ok();
         fs::remove_dir(&dir).ok();
     }
@@ -10426,7 +10537,7 @@ impl BigFile {
             let mut written = 0u64;
             let headers = self.generation_headers(&spec.schema, spec.cols as usize);
             if !spec.headerless {
-                Self::write_generation_record(&mut writer, &headers, &mut written)?;
+                self.write_generation_record(&mut writer, &headers, &mut written)?;
             }
             let mut reader = match &spec.kind {
                 GenerationKind::Rect { path, .. } => Some(RecordReader::open(path, b'\t')?),
@@ -10480,7 +10591,7 @@ impl BigFile {
                         }
                     }
                 }
-                Self::write_generation_record(&mut writer, &fields, &mut written)?;
+                self.write_generation_record(&mut writer, &fields, &mut written)?;
             }
             if let GenerationKind::Rect { offsets, existing_rows, input_rows, col, .. } = &spec.kind {
                 for input_index in *existing_rows..*input_rows {
@@ -10492,7 +10603,7 @@ impl BigFile {
                             .checked_add(j).ok_or("粘贴列号溢出")?;
                         if target < fields.len() { fields[target] = value; }
                     }
-                    Self::write_generation_record(&mut writer, &fields, &mut written)?;
+                    self.write_generation_record(&mut writer, &fields, &mut written)?;
                 }
             }
             writer.flush().map_err(|e| format!("冲刷 generation 失败：{e}"))?;
@@ -10509,11 +10620,12 @@ impl BigFile {
     }
 
     fn write_generation_record(
+        &self,
         writer: &mut impl Write,
         fields: &[String],
         written: &mut u64,
     ) -> Result<(), String> {
-        let bytes = encode_record(fields, b',', Encoding::Utf8);
+        let bytes = encode_document_record(fields, b',', self.format, Encoding::Utf8)?;
         writer.write_all(&bytes).map_err(|e| format!("写入 generation 失败：{e}"))?;
         *written = written.checked_add(bytes.len() as u64).ok_or("generation 字节数溢出")?;
         Ok(())
@@ -10589,7 +10701,7 @@ impl BigFile {
                 let (start, end) = idx.record_span(bytes.len(), record);
                 let text = std::str::from_utf8(&bytes[start..end])
                     .map_err(|_| "generation 不是有效 UTF-8".to_string())?;
-                let fields = parse_record(text, b',');
+                let fields = parse_document_record(text, b',', self.format);
                 if record == 0 && !prepared.headerless {
                     let headers = self.generation_headers(&prepared.schema, prepared.cols as usize);
                     if fields != headers { return Err("generation 表头校验失败".into()); }
@@ -12313,6 +12425,20 @@ impl BigFile {
         approval: Approval,
         progress: F,
     ) -> Result<SaveOutcome, String> {
+        let valid_extension = target.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
+            match self.format {
+                DocumentFormat::Csv => ext.eq_ignore_ascii_case("csv"),
+                DocumentFormat::TextLines => {
+                    ext.eq_ignore_ascii_case("txt") || ext.eq_ignore_ascii_case("log")
+                }
+            }
+        });
+        if !valid_extension {
+            return Err(match self.format {
+                DocumentFormat::Csv => "CSV 文档另存为必须使用 .csv 扩展名".into(),
+                DocumentFormat::TextLines => "纯文本文档另存为只能使用 .txt 或 .log 扩展名".into(),
+            });
+        }
         // 目标就是当前文件：按普通保存处理（同一路径无需“切换会话”）
         if target == self.path {
             return self.save(approval, progress);
@@ -12822,8 +12948,8 @@ impl BigFile {
             w.write_all(&[0xEF, 0xBB, 0xBF]).map_err(|e| e.to_string())?;
         }
         // 表头模式先写列名；无列名模式段表第一行就是数据第一行。
-        if !self.headerless {
-            w.write_all(&encode_record(&saved_headers, b',', self.output_encoding))
+        if !self.headerless && !self.format.is_text_lines() {
+            w.write_all(&encode_document_record(&saved_headers, b',', self.format, self.output_encoding)?)
                 .map_err(|e| e.to_string())?;
         }
         let total = self.seg.vrow_count();
@@ -12847,7 +12973,7 @@ impl BigFile {
                     Some(ResolvedRow::Src(rec)) => {
                         if source_layout_changed || edited.contains(&rec) {
                             let f = self.src_fields(rec);
-                            w.write_all(&encode_record(&f, b',', self.output_encoding))
+                            w.write_all(&encode_document_record(&f, b',', self.format, self.output_encoding)?)
                                 .map_err(|e| e.to_string())?;
                         } else {
                             let (s, e) = self.src_span(rec).unwrap_or((0, 0));
@@ -12860,7 +12986,7 @@ impl BigFile {
                     }
                     Some(ResolvedRow::Ins { block, row }) => {
                         let f = self.ins_fields(block, row);
-                        w.write_all(&encode_record(&f, b',', self.output_encoding))
+                        w.write_all(&encode_document_record(&f, b',', self.format, self.output_encoding)?)
                             .map_err(|e| e.to_string())?;
                     }
                     None => {}
@@ -12914,7 +13040,7 @@ impl BigFile {
                                 self.write_raw_range(&mut w, rs, rec)?;
                             }
                             let f = self.src_fields(rec);
-                            w.write_all(&encode_record(&f, b',', self.output_encoding))
+                            w.write_all(&encode_document_record(&f, b',', self.format, self.output_encoding)?)
                                 .map_err(|e| e.to_string())?;
                         } else if run.is_none() {
                             run = Some(rec);
@@ -12935,7 +13061,7 @@ impl BigFile {
                         for (row_index, _) in rows.rows.iter().enumerate() {
                             let row = u32::try_from(row_index).map_err(|_| "插入行号越界")?;
                             let f = self.ins_fields(block, row);
-                            w.write_all(&encode_record(&f, b',', self.output_encoding))
+                            w.write_all(&encode_document_record(&f, b',', self.format, self.output_encoding)?)
                                 .map_err(|e| e.to_string())?;
                             done += 1;
                             if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
@@ -13198,12 +13324,37 @@ fn serialize_record(fields: &[String], delimiter: u8) -> String {
     out
 }
 
-/// 按编码序列化并转字节（UTF-8 带原文编码；GBK 重新编码）。
-fn encode_record(fields: &[String], delimiter: u8, enc: Encoding) -> Vec<u8> {
-    let s = serialize_record(fields, delimiter);
+/// 将单个字符串按文档编码转换为字节。
+fn encode_text(enc: Encoding, text: &str) -> Vec<u8> {
     match enc {
-        Encoding::Utf8 => s.into_bytes(),
-        Encoding::Gbk => encoding_rs::GBK.encode(&s).0.into_owned(),
+        Encoding::Utf8 => text.as_bytes().to_vec(),
+        Encoding::Gbk => encoding_rs::GBK.encode(text).0.into_owned(),
+    }
+}
+
+/// 将 CSV 记录转义后按指定编码写入。
+fn encode_record(fields: &[String], delimiter: u8, enc: Encoding) -> Vec<u8> {
+    encode_text(enc, &serialize_record(fields, delimiter))
+}
+
+/// 按文档格式编码一条记录；TextLines 只写一个无引号字段和 CRLF。
+fn encode_document_record(
+    fields: &[String],
+    delimiter: u8,
+    format: DocumentFormat,
+    enc: Encoding,
+) -> Result<Vec<u8>, String> {
+    match format {
+        DocumentFormat::Csv => Ok(encode_record(fields, delimiter, enc)),
+        DocumentFormat::TextLines => {
+            if fields.len() != 1 {
+                return Err("纯文本文档必须保持一列".into());
+            }
+            validate_text_lines_values(format, fields.iter().map(String::as_str))?;
+            let mut encoded = encode_text(enc, &fields[0]);
+            encoded.extend_from_slice(b"\r\n");
+            Ok(encoded)
+        }
     }
 }
 
