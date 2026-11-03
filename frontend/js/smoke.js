@@ -718,7 +718,7 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
 
   check("工具栏按钮齐全且撤销/重做随栈置灰", async () => {
     const texts = [...document.querySelectorAll("#toolbar button")].map((b) => b.textContent);
-    for (const t of ["新建", "打开", "保存", "另存为", "撤销", "重做", "排序…", "清除筛选", "多重筛选", "首行非列名", "快捷键"]) {
+    for (const t of ["新建", "打开", "保存", "另存为", "撤销", "重做", "排序…", "清除筛选", "多重筛选", "首行非列名", "Tips"]) {
       assert(texts.includes(t), `工具栏缺少 ${t}`);
     }
     await loadBasic(); // load 清空撤销栈
@@ -730,33 +730,38 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await waitFor(() => !undoB.disabled, "改动后撤销应可用");
   });
 
-  check("布局：工具栏不撑宽页面，快捷键按钮与编辑窗格都在窗口内", () => {
+  check("布局：工具栏不撑宽页面，Tips 按钮与编辑窗格都在窗口内", () => {
     const vw = window.innerWidth;
     assert(document.documentElement.scrollWidth <= vw + 1,
-      `页面不得横向溢出：scrollWidth=${document.documentElement.scrollWidth} innerWidth=${vw}`);
-    const btn = tbBtn("快捷键");
+      `页面不得横向溢出：${document.documentElement.scrollWidth}/${vw}`);
+    const btn = tbBtn("Tips");
     const br = btn.getBoundingClientRect();
     assert(br.width > 0 && br.left >= 0 && br.right <= vw + 1,
-      `快捷键按钮应在窗口内：left=${Math.round(br.left)} right=${Math.round(br.right)} innerWidth=${vw}`);
+      `Tips 应在窗口内：${Math.round(br.left)}/${Math.round(br.right)}/${vw}`);
     const pane = document.getElementById("pane").getBoundingClientRect();
-    assert(pane.width > 100 && pane.right <= vw + 1,
-      `编辑窗格应完整可见：width=${Math.round(pane.width)} right=${Math.round(pane.right)} innerWidth=${vw}`);
+    assert(pane.width > 100 && pane.right <= vw + 1, "编辑窗格应完整可见");
   });
 
-  check("快捷键按钮：位于工具栏最右，打开快捷键一览", async () => {
-    const btn = tbBtn("快捷键");
-    assert(btn, "工具栏应有快捷键按钮");
+  check("Tips：位于工具栏最右，含正则示例并保留快捷键", async () => {
+    const btn = tbBtn("Tips");
+    assert(btn, "工具栏应有 Tips 按钮");
     assert(document.getElementById("toolbar").lastElementChild === btn,
-      "快捷键按钮应位于工具栏最右（编辑窗格上方）");
+      "Tips 应位于工具栏最右");
     btn.click();
-    await waitFor(() => document.querySelector(".modal-mask"), "快捷键对话框");
-    const text = document.querySelector(".modal-mask").textContent;
+    await waitFor(() => document.querySelector(".modal-mask"), "Tips 对话框");
+    const mask = document.querySelector(".modal-mask");
+    const text = mask.textContent;
+    assert(mask.querySelector(".modal-title")?.textContent === "Tips", "标题应为 Tips");
+    for (const tip of ["筛选正则示例", "(?i)", "^ABC", "ABC-001", "XYZ$",
+      "part-XYZ", "^ABC.*XYZ$", "ABC-001-XYZ"]) {
+      assert(text.includes(tip), `Tips 缺少「${tip}」`);
+    }
     for (const k of ["F2 / 双击", "Enter / Tab", "Alt+Enter", "Ctrl+C / Ctrl+X / Ctrl+V",
       "Ctrl+Z / Ctrl+Y", "Ctrl+↑ / Ctrl+↓", "Ctrl+G", "Ctrl+S", "Ctrl+滚轮"]) {
       assert(text.includes(k), `快捷键说明缺少「${k}」`);
     }
-    assert(clickModalButton("关闭"), "快捷键对话框应有「关闭」按钮");
-    await waitFor(() => !document.querySelector(".modal-mask"), "关闭快捷键对话框");
+    assert(clickModalButton("关闭"), "Tips 应有关闭按钮");
+    await waitFor(() => !document.querySelector(".modal-mask"), "关闭 Tips");
   });
 
   check("显示符号按钮位于编辑窗格标题右侧（工具栏不再有）", async () => {

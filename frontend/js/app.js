@@ -1843,12 +1843,12 @@ btnUndoBudget.addEventListener("mousedown", (e) => e.preventDefault());
 toolbar.appendChild(btnUndoBudget);
 tb.undoBudget = btnUndoBudget;
 
-// 快捷键说明：靠右对齐，位于编辑窗格「显示符号」按钮的正上方。
+// Tips：靠右对齐，位于编辑窗格「显示符号」按钮的正上方。
 // 窗口较窄/高 DPI 时工具栏换行，按钮仍保持在所在行的最右。
 const btnShortcuts = document.createElement("button");
 btnShortcuts.id = "btn-shortcuts";
-btnShortcuts.textContent = "快捷键";
-btnShortcuts.title = "查看键盘快捷键";
+btnShortcuts.textContent = "Tips";
+btnShortcuts.title = "查看筛选正则示例与键盘快捷键";
 btnShortcuts.addEventListener("click", () => { void shortcutsDialog(); });
 btnShortcuts.addEventListener("mousedown", (e) => e.preventDefault());
 toolbar.appendChild(btnShortcuts);

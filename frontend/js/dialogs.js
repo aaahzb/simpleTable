@@ -572,7 +572,33 @@ export async function shortcutsDialog() {
     tbody.appendChild(tr);
   }
   table.append(thead, tbody);
-  await modal("键盘快捷键", table, [{ text: "关闭", value: null, primary: true }]);
+  const body = document.createElement("div");
+  const regexTitle = document.createElement("h3");
+  regexTitle.textContent = "筛选正则示例";
+  const hint = document.createElement("p");
+  hint.textContent = "将对应列筛选模式切到 .*；默认区分大小写，可用 (?i) 忽略大小写。";
+  const regexTable = document.createElement("table");
+  regexTable.className = "shortcut-table";
+  const regexRows = [
+    ["需求", "正则", "命中示例"],
+    ["开头为 ABC", "^ABC", "ABC-001"],
+    ["结尾为 XYZ", "XYZ$", "part-XYZ"],
+    ["开头为 ABC 且结尾为 XYZ", "^ABC.*XYZ$", "ABC-001-XYZ"],
+  ];
+  for (const [rowIndex, values] of regexRows.entries()) {
+    const tr = document.createElement("tr");
+    for (const [columnIndex, value] of values.entries()) {
+      const cell = document.createElement(rowIndex === 0 ? "th" : "td");
+      if (rowIndex > 0 && columnIndex === 1) cell.className = "kbd";
+      cell.textContent = value;
+      tr.appendChild(cell);
+    }
+    regexTable.appendChild(tr);
+  }
+  const shortcutTitle = document.createElement("h3");
+  shortcutTitle.textContent = "键盘快捷键";
+  body.append(regexTitle, hint, regexTable, shortcutTitle, table);
+  await modal("Tips", body, [{ text: "关闭", value: null, primary: true }]);
 }
 
 /**
