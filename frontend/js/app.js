@@ -2073,8 +2073,9 @@ async function newFile() {
   const pristine = tabs.length === 0 && activeId === null && path === null && !dirty
     && model.rowCount() === 0 && model.columnCount() === 0;
   if (pristine) {
-    // 启动空表原位替换（尚未入签体系；事件已在建会话前绑定）
+    // 启动空表原位替换并立即入签（事件已在建会话前绑定）
     model = m;
+    ensureTabbed();
     applyViewState(fgrid());
     setDirty(false);
     renderTabbar();
