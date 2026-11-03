@@ -22,13 +22,14 @@ export const ZOOM_MAX = 3.0;
 export const ZOOM_STEP = 1.15;
 const MIN_COL_W = 24;
 const MIN_ROW_H = 10;
-/** 严格三态开关符号：0 包含 / 1 严格等于·不分大小写 / 2 严格等于·区分大小写 */
-const STRICT_GLYPHS = ["~", "=", "≡"];
-/** 严格三态按钮悬停文案（与 STRICT_GLYPHS 同序） */
+/** 列筛选四态：0 包含 / 1 等于·不分大小写 / 2 等于·区分大小写 / 3 正则。 */
+const STRICT_GLYPHS = ["~", "=", "≡", ".*"];
+/** 四态按钮悬停文案，与 STRICT_GLYPHS 同序。 */
 const STRICT_TITLES = [
   "包含匹配（默认）——点击切换为「严格等于·不分大小写」",
   "严格等于·不分大小写——点击切换为「严格等于·区分大小写」",
-  "严格等于·区分大小写——点击切回「包含」",
+  "严格等于·区分大小写——点击切换为「正则匹配」",
+  "正则匹配（默认区分大小写，可用 (?i) 忽略）——点击切回「包含」",
 ];
 
 /**
@@ -1163,12 +1164,12 @@ export class Grid {
       this._filterCondChanged();
     });
 
-    // ---- 严格三态开关点击：0 → 1 → 2 → 0 循环（列级独立设置） ----
+    // ---- 四态循环：0 → 1 → 2 → 3 → 0，每列独立保存。 ----
     this.headerEl.addEventListener("click", (e) => {
       const st = e.target.closest(".col-strict");
       if (!st) return;
       const col = Number(st.dataset.col);
-      const mode = ((this.filterModes.get(col) ?? 0) + 1) % 3;
+      const mode = ((this.filterModes.get(col) ?? 0) + 1) % 4;
       if (mode) this.filterModes.set(col, mode); else this.filterModes.delete(col);
       st.dataset.mode = String(mode);
       st.textContent = STRICT_GLYPHS[mode];

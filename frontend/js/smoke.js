@@ -494,15 +494,15 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await waitFor(() => bigM().rowCount() === 2, "还原落定");
   });
 
-  // ========== 严格三态开关（~ 包含 → = 等于·不分大小写 → ≡ 等于·区分大小写） ==========
+  // ========== 严格/正则四态开关（~ → = → ≡ → .*） ==========
 
-  check("严格三态：按钮常显、点击循环 0→1→2→0、各态命中数", async () => {
+  check("严格/正则四态：按钮常显、点击循环 0→1→2→3→0、各态命中数", async () => {
     await window.__app.smokeLoadSmall(
       ["品", "码"],
       [["abc", "A1"], ["xabc", "a2"], ["ABC", "A1"]],
     );
     const btn = document.querySelector('.col-strict[data-col="0"]');
-    assert(btn, "筛选框内应有严格三态按钮");
+    assert(btn, "筛选框内应有严格/正则四态按钮");
     assert(btn.dataset.mode === "0" && btn.textContent === "~", "默认应为包含（~）");
     grid.filters.set(0, "abc");
     await window.__app.runBigFilter();
@@ -515,28 +515,34 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await window.__app.runBigFilter();
     assert(btn.dataset.mode === "2" && btn.textContent === "≡", "第二次点击应为 ≡");
     await waitFor(() => grid.visCount() === 1, "严格CS abc 应只中 abc 1 行");
+    btn.click(); // → 正则·默认区分大小写
+    await window.__app.runBigFilter();
+    assert(btn.dataset.mode === "3" && btn.textContent === ".*", "第三次点击应为 .*");
+    await waitFor(() => grid.visCount() === 2, "正则 abc 部分搜索应中 abc/xabc 2 行");
     btn.click(); // → 回包含
     await window.__app.runBigFilter();
-    assert(btn.dataset.mode === "0", "第三次点击应回包含");
+    assert(btn.dataset.mode === "0" && btn.textContent === "~", "第四次点击应回包含");
     await waitFor(() => grid.visCount() === 3, "回包含后应恢复 3 行");
-    await loadBasic(); // 还原基础夹具表
+    await loadBasic();
   });
 
-  check("严格三态：表头重建后按钮态保持，清除筛选复位", async () => {
+  check("严格/正则四态：表头重建后按钮态保持，清除筛选复位", async () => {
     await loadBasic();
     const btn = document.querySelector('.col-strict[data-col="1"]');
-    btn.click(); // 第 1 列 → mode 1
-    assert(grid.filterModes.get(1) === 1, "filterModes 应记录 mode 1");
-    grid.setMultiOn(true); // 触发表头重建（多重筛选复选框出现）
+    btn.click();
+    btn.click();
+    btn.click();
+    assert(grid.filterModes.get(1) === 3, "filterModes 应记录 mode 3");
+    grid.setMultiOn(true);
     const btn2 = document.querySelector('.col-strict[data-col="1"]');
-    assert(btn2 && btn2.dataset.mode === "1" && btn2.textContent === "=",
-      "表头重建后按钮态应从 filterModes 回填");
+    assert(btn2 && btn2.dataset.mode === "3" && btn2.textContent === ".*",
+      "表头重建后应从 filterModes 回填正则态");
     grid.setMultiOn(false);
     grid.clearFilters();
-    assert(grid.filterModes.size === 0, "清除筛选应清空严格模式");
+    assert(grid.filterModes.size === 0, "清除筛选应清空模式");
     const btn3 = document.querySelector('.col-strict[data-col="1"]');
     assert(btn3 && btn3.dataset.mode === "0" && btn3.textContent === "~",
-      "清除筛选后按钮应复位为 ~");
+      "清除筛选后应复位为 ~");
   });
 
   // ========== 多重筛选 ==========
