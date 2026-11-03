@@ -35,6 +35,7 @@ use crate::schema::{ColumnId, ColumnStorage, Schema};
 use crate::spool::{history_text_bytes, PasteImport, RowSnapshot, SessionSpool};
 use memchr::{memchr, memchr_iter};
 use rayon::prelude::*;
+use regex::Regex;
 use std::time::{Duration, Instant};
 
 // ============================================================
@@ -1680,6 +1681,121 @@ mod tests {
         fs::remove_file(&p).ok();
     }
 
+
+    /// 正则第四态：部分搜索、用户示例、大小写和 Tips 锚点。
+    #[test]
+    fn field_scan_regex_anchors_case_and_tips() {
+        let u = Encoding::Utf8;
+        let user = spec_mode(0, r"^a\d+[A-Z]+", 3);
+        assert!(scan3(&user, u, b"a12ABC-start,x\r\n"));
+        assert!(!scan3(&user, u, b"A12ABC,x\r\n"));
+        assert!(!scan3(&user, u, b"xa12ABC,x\r\n"));
+        assert!(!scan3(&user, u, b"a12abc,x\r\n"));
+        assert!(scan3(&spec_mode(0, "ABC", 3), u, b"xxABCyy,x\r\n"));
+        assert!(scan3(&spec_mode(0, "^ABC$", 3), u, b"ABC,x\r\n"));
+        assert!(!scan3(&spec_mode(0, "^ABC$", 3), u, b"xABC,x\r\n"));
+        assert!(scan3(&spec_mode(0, "(?i)^abc$", 3), u, b"AbC,x\r\n"));
+        assert!(scan3(&spec_mode(0, "^ABC", 3), u, b"ABC-001,x\r\n"));
+        assert!(!scan3(&spec_mode(0, "^ABC", 3), u, b"xABC-001,x\r\n"));
+        assert!(scan3(&spec_mode(0, "XYZ$", 3), u, b"part-XYZ,x\r\n"));
+        assert!(!scan3(&spec_mode(0, "XYZ$", 3), u, b"XYZ-part,x\r\n"));
+        assert!(scan3(&spec_mode(0, "^ABC.*XYZ$", 3), u, b"ABC-001-XYZ,x\r\n"));
+    }
+
+    /// 正则在去引号、还原转义、多行格和两种编码的逻辑字段上运行。
+    #[test]
+    fn field_scan_regex_quotes_multiline_utf8_and_gbk() {
+        let u = Encoding::Utf8;
+        assert!(scan3(&spec_mode(0, r#"^a"b$"#, 3), u, b"\"a\"\"b\",x\r\n"));
+        assert!(scan3(&spec_mode(0, "^a,b$", 3), u, b"\"a,b\",x\r\n"));
+        assert!(scan3(&spec_mode(0, r"^first\nsecond$", 3), u, b"\"first\nsecond\",x\r\n"));
+        assert!(scan3(&spec_mode(0, r"(?s)^first.*second$", 3), u, b"\"first\nsecond\",x\r\n"));
+        assert!(scan3(&spec_mode(0, r"^北京\d+$", 3), u, "北京123,x\r\n".as_bytes()));
+        let gbk = encoding_rs::GBK.encode("北京123,x\r\n").0.into_owned();
+        assert!(scan_one(&spec_mode(0, r"^北京\d+$", 3), Encoding::Gbk, &gbk));
+        let gbk_ci = encoding_rs::GBK.encode("中,AbC\r\n").0.into_owned();
+        assert!(scan_one(&spec_mode(1, r"(?i)^abc$", 3), Encoding::Gbk, &gbk_ci));
+    }
+
+    /// 无效表达式在首次和后续筛选中均保留旧状态。
+    #[test]
+    fn big_filter_regex_invalid_preserves_previous_result() {
+        let p = tmp_csv("regex_invalid", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        for bad in ["[", r"(?=A)", r"(a)\1"] {
+            let err = bf.run_filter(&spec_mode(0, bad, 3)).unwrap_err();
+            assert!(err.starts_with("REGEX_INVALID:"), "{err}");
+            assert!(!bf.has_filter());
+            assert!(bf.last_spec.is_none());
+        }
+        assert_eq!(bf.run_filter(&spec_mode(0, "^A", 3)).unwrap(), 1);
+        let before_hits = bf.stable_hits.clone();
+        let before_display = bf.display_hits.clone();
+        let before_spec = bf.last_spec.clone();
+        let before_page = bf.filter_page(0, 10).rows;
+        let bad = FilterSpec {
+            cols: vec![(0, "^A".into(), 3), (1, "[".into(), 3)],
+            multi_cols: Vec::new(),
+            multi_text: String::new(),
+        };
+        let err = bf.run_filter(&bad).unwrap_err();
+        assert!(err.starts_with("REGEX_INVALID:") && err.contains("列 2"), "{err}");
+        assert_eq!(bf.stable_hits, before_hits);
+        assert_eq!(bf.display_hits, before_display);
+        assert_eq!(bf.last_spec, before_spec);
+        assert_eq!(bf.filter_page(0, 10).rows, before_page);
+        fs::remove_file(&p).ok();
+    }
+
+    /// 正则禁止前缀收窄，相同有效条件仍短路。
+    #[test]
+    fn big_filter_regex_disables_narrowing_and_short_circuits() {
+        let p = tmp_csv("regex_narrow", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        assert_eq!(bf.run_filter(&spec_mode(0, "^A", 3)).unwrap(), 1);
+        assert_eq!(bf.last_filter_stats().scanned_rows, 5);
+        assert_eq!(bf.run_filter(&spec_mode(0, "^Al", 3)).unwrap(), 1);
+        assert_eq!(bf.last_filter_stats().scanned_rows, 5);
+        assert_eq!(bf.run_filter(&spec_mode(0, "^Al", 3)).unwrap(), 1);
+        assert_eq!(bf.last_filter_stats().scanned_rows, 0);
+        fs::remove_file(&p).ok();
+    }
+
+    /// 多列正则保持 AND，多重筛选保持额外的包含 OR。
+    #[test]
+    fn big_filter_regex_multi_column_and_multi_or() {
+        let p = tmp_csv("regex_multi", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let and = FilterSpec {
+            cols: vec![(0, "^A".into(), 3), (2, "Beijing$".into(), 3)],
+            multi_cols: Vec::new(),
+            multi_text: String::new(),
+        };
+        assert_eq!(bf.run_filter(&and).unwrap(), 1);
+        assert_eq!(bf.filter_page(0, 1).rows[0][0], "Alice");
+        let with_multi = FilterSpec {
+            cols: vec![(2, "^Beijing$".into(), 3)],
+            multi_cols: vec![0],
+            multi_text: "Carol".into(),
+        };
+        assert_eq!(bf.run_filter(&with_multi).unwrap(), 1);
+        assert_eq!(bf.filter_page(0, 1).rows[0][0], "Carol");
+        fs::remove_file(&p).ok();
+    }
+
+    /// 正则扫描取消后继续暴露上一次成功结果。
+    #[test]
+    fn big_filter_regex_cancel_keeps_previous() {
+        let p = tmp_csv("regex_cancel", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        assert_eq!(bf.run_filter(&spec_mode(0, "^A", 3)).unwrap(), 1);
+        let gate = AtomicU64::new(7);
+        assert_eq!(bf.run_filter_cancelable(&spec_mode(0, "^b", 3), &gate, 6).unwrap(), None);
+        assert_eq!(bf.filter_len(), 1);
+        assert_eq!(bf.filter_page(0, 1).rows[0][0], "Alice");
+        assert_eq!(bf.run_filter_cancelable(&spec_mode(0, "^b", 3), &gate, 7).unwrap(), Some(1));
+        fs::remove_file(&p).ok();
+    }
     /// 纵向边缘夹具：flag 列呈 [1,2,空,空,3,4]。
     fn edge_gap_bytes() -> Vec<u8> {
         b"id,flag\r\nA,1\r\nB,2\r\nC,\r\nD,\r\nE,3\r\nF,4\r\n".to_vec()
@@ -7197,15 +7313,39 @@ pub enum ColOp {
 
 /// 筛选条件（与前端 grid.js _refilter 语义对齐：逐列"并且" +
 /// 多重筛选勾选列"或"叠加；mode 0/1 的 needle 与 multi_text 均已小写化，
-/// mode 2 关键字保持原样大小写）。
+/// mode 2/3 关键字保持原样大小写）。
 #[derive(Clone, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct FilterSpec {
     /// (列号, 关键字, 匹配模式)，列间 AND。
-    /// 模式：0=包含、1=严格等于(不分大小写)、2=严格等于(区分大小写)。
+    /// 模式：0=包含、1=严格等于(不分大小写)、2=严格等于(区分大小写)、3=正则。
     pub cols: Vec<(u32, String, u8)>,
     /// 多重筛选：勾选列 + 小写关键字（空串 = 未启用），列间 OR（恒为包含匹配）。
     pub multi_cols: Vec<u32>,
     pub multi_text: String,
+}
+
+/// 为一次筛选编译全部列正则；返回 Vec 与 spec.cols 按条件下标对齐。
+///
+/// # Parameters
+/// - `spec`: 已完成模式 0/1 小写归一化的筛选条件。
+///
+/// # Returns
+/// 每个条件对应的预编译正则；非模式 3 为 None。
+///
+/// # Errors
+/// 表达式无效时返回带稳定前缀和 1 基视图列号的错误。
+fn compile_regexes(spec: &FilterSpec) -> Result<Vec<Option<Regex>>, String> {
+    spec.cols
+        .iter()
+        .map(|(col, pattern, mode)| {
+            if *mode != 3 {
+                return Ok(None);
+            }
+            Regex::new(pattern).map(Some).map_err(|error| {
+                format!("REGEX_INVALID:列 {}：{error}", col.saturating_add(1))
+            })
+        })
+        .collect()
 }
 
 /// 筛选命中页：行内容与各命中行的原始数据行号（0 基）成对下发。
@@ -7331,14 +7471,16 @@ impl ResolvedFilterSpec {
     }
 }
 
-/// 单条筛选关键字（mode 0/1 已小写；mode 2 保持原样大小写）。
+/// 单条筛选关键字（mode 0/1 已小写；mode 2/3 保持原样大小写）。
 struct Needle {
     col: u32,
     column: Option<ColumnId>,
     overlay_only: bool,
     text: String,
-    /// 匹配模式：0 包含 / 1 严格等于·不分大小写 / 2 严格等于·区分大小写。
+    /// 匹配模式：0 包含 / 1 严格等于·不分大小写 / 2 严格等于·区分大小写 / 3 正则。
     mode: u8,
+    /// 模式 3 的预编译表达式；克隆共享自动机，不重新编译。
+    regex: Option<Regex>,
     ascii: bool,
     multi: bool,
     hit: bool,
@@ -7387,9 +7529,9 @@ struct FieldScan<'a> {
     field_buf: Vec<u8>,
     /// 字段的 ASCII 可匹配字节：GBK 次字节不入内，避免次字节误中 ASCII 关键字。
     match_buf: Vec<u8>,
-    /// 未折叠的字段原始字节：仅 mode 2（区分大小写）比较用，keep_raw 时才填充。
+    /// 未折叠的字段原始字节：mode 2/3 比较用，keep_raw 时才填充。
     raw_buf: Vec<u8>,
-    /// 是否存在 mode 2 needle（无则 raw_buf 全程不填充，默认零开销）。
+    /// 是否存在 mode 2/3 needle（无则 raw_buf 全程不填充，默认零开销）。
     keep_raw: bool,
     has_multi: bool,
     /// 快路径引号位缓冲（逐记录复用；无引号记录零分配）。
@@ -7414,7 +7556,8 @@ impl<'a> FieldScan<'a> {
         ncols: usize,
     ) -> Self {
         let resolved = ResolvedFilterSpec::identity_for_test(spec, ncols as u32);
-        Self::new_resolved(&resolved, enc, overlay, ncols, DocumentFormat::Csv)
+        let regexes = compile_regexes(spec).expect("测试正则必须有效");
+        Self::new_resolved(&resolved, enc, overlay, ncols, DocumentFormat::Csv, &regexes)
     }
 
     fn new_resolved(
@@ -7423,10 +7566,11 @@ impl<'a> FieldScan<'a> {
         overlay: &'a HashMap<(u32, ColumnId), Arc<SharedText>>,
         ncols: usize,
         format: DocumentFormat,
+        regexes: &[Option<Regex>],
     ) -> Self {
         let mut needles = Vec::new();
         let mut needle_by_col: HashMap<u32, Vec<usize>> = HashMap::new();
-        for (target, text, mode) in &spec.cols {
+        for (condition_index, (target, text, mode)) in spec.cols.iter().enumerate() {
             let (col, column, overlay_only) = match *target {
                 ResolvedFilterColumn::Source { id, col } => (col, Some(id), false),
                 ResolvedFilterColumn::Inserted(id) => (0, Some(id), true),
@@ -7439,6 +7583,11 @@ impl<'a> FieldScan<'a> {
                 overlay_only,
                 text: text.clone(),
                 mode: *mode,
+                regex: if *mode == 3 {
+                    regexes.get(condition_index).cloned().flatten()
+                } else {
+                    None
+                },
                 ascii: text.is_ascii(),
                 multi: false,
                 hit: false,
@@ -7463,6 +7612,7 @@ impl<'a> FieldScan<'a> {
                     overlay_only,
                     text: spec.multi_text.clone(),
                     mode: 0,
+                    regex: None,
                     ascii: spec.multi_text.is_ascii(),
                     multi: true,
                     hit: false,
@@ -7474,7 +7624,7 @@ impl<'a> FieldScan<'a> {
                 }
             }
         }
-        let keep_raw = needles.iter().any(|needle| needle.mode == 2);
+        let keep_raw = needles.iter().any(|needle| needle.mode == 2 || needle.mode == 3);
         let mut col_flags = vec![0u8; ncols];
         for col in needle_by_col.keys() {
             col_flags[*col as usize] |= 1;
@@ -7519,6 +7669,7 @@ impl<'a> FieldScan<'a> {
     /// 对已解码的稳定列值应用与原始字节扫描一致的匹配语义。
     fn value_hit(needle: &Needle, value: &str) -> bool {
         match needle.mode {
+            3 => needle.regex.as_ref().is_some_and(|regex| regex.is_match(value)),
             2 => value == needle.text,
             1 if needle.ascii => value.to_ascii_lowercase() == needle.text,
             1 => value.to_lowercase() == needle.text,
@@ -7528,8 +7679,8 @@ impl<'a> FieldScan<'a> {
     }
 
     /// 字段结束：匹配该列关键字（覆盖层优先）。
-    /// 三态：0 包含（折叠子串）/ 1 严格等于·不分大小写（折叠整等）/
-    /// 2 严格等于·区分大小写（比未折叠 raw_buf）。
+    /// 四态：0 包含 / 1 整等·不分大小写 / 2 整等·区分大小写 / 3 正则。
+    /// 后两态使用未折叠 raw_buf；正则在解码后的逻辑字段上执行部分搜索。
     fn end_field(&mut self, rec: u32, col: u32) {
         let flag = self.col_flags.get(col as usize).copied().unwrap_or(0);
         if flag & 1 != 0 {
@@ -7543,6 +7694,10 @@ impl<'a> FieldScan<'a> {
                     let hit = match overlay {
                         Some(value) => Self::value_hit(needle, value.text.as_ref()),
                         None => match needle.mode {
+                            3 => needle.regex.as_ref().is_some_and(|regex| {
+                                let value = decode_slice(self.enc, &self.raw_buf);
+                                regex.is_match(value.as_ref())
+                            }),
                             2 if needle.ascii => self.raw_buf.as_slice() == needle.text.as_bytes(),
                             2 => decode_slice(self.enc, &self.raw_buf) == needle.text,
                             1 if needle.ascii => self.match_buf.as_slice() == needle.text.as_bytes(),
@@ -12017,12 +12172,13 @@ impl BigFile {
         // 契约：needle 已小写；再归一化一次防守（成本 O(条件数)）
         let mut spec = spec.clone();
         for (_, kw, mode) in &mut spec.cols {
-            // mode 2（严格·区分大小写）关键字保持原样大小写
-            if *mode != 2 {
+            // mode 2/3 保留用户原始大小写
+            if *mode != 2 && *mode != 3 {
                 *kw = kw.to_lowercase();
             }
         }
         spec.multi_text = spec.multi_text.to_lowercase();
+        let regexes = compile_regexes(&spec)?;
 
         // 完全相同条件：直接复用上次结果（编辑/插删/撤销都会清空 last_spec）
         if self.stable_hits.is_some() && self.last_spec.as_ref() == Some(&spec) {
@@ -12068,7 +12224,7 @@ impl BigFile {
             .map(|ci| {
                 let start = ci as u64 * chunk;
                 let end = (start + chunk).min(source.len());
-                self.scan_chunk(&spec, &resolved, gate, source, start, end)
+                self.scan_chunk(&spec, &resolved, &regexes, gate, source, start, end)
             })
             .collect();
 
@@ -12101,6 +12257,7 @@ impl BigFile {
         &self,
         spec: &FilterSpec,
         resolved: &ResolvedFilterSpec,
+        regexes: &[Option<Regex>],
         gate: Option<(&AtomicU64, u64)>,
         source: RowSource,
         start: u64,
@@ -12113,6 +12270,7 @@ impl BigFile {
             &self.overlay,
             self.base_ncols,
             self.format,
+            regexes,
         );
         for i in start..end {
             if let Some((g, id)) = gate {

@@ -3338,6 +3338,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "rayon",
+ "regex",
  "rfd",
  "serde",
  "serde_json",
