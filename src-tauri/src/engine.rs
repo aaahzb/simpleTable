@@ -1796,6 +1796,41 @@ mod tests {
         assert_eq!(bf.run_filter_cancelable(&spec_mode(0, "^b", 3), &gate, 7).unwrap(), Some(1));
         fs::remove_file(&p).ok();
     }
+
+    /// 正则同时命中覆盖层和插入行；排序只重排既有命中集。
+    #[test]
+    fn big_filter_regex_overlay_inserted_and_sorted() {
+        let p = tmp_csv(
+            "regex_overlay_inserted",
+            b"id,code\r\na,ABC-001\r\nb,part-XYZ\r\nc,other\r\n",
+        );
+        let mut bf = load_ram(&p);
+        bf.set_cell(0, 1, "a12ABC-edit".into(), Approval::deny()).unwrap();
+        bf.insert_rows(
+            bf.meta().rows,
+            Some(vec![vec!["z".into(), "a99ZZ-insert".into()]]),
+            1,
+            Approval::deny(),
+        ).unwrap();
+        let spec = spec_mode(1, r"^a\d+[A-Z]+", 3);
+        assert_eq!(bf.run_filter(&spec).unwrap(), 2);
+        let page = bf.filter_page(0, 10);
+        assert_eq!(
+            page.rows.iter().map(|row| row[1].as_str()).collect::<Vec<_>>(),
+            vec!["a12ABC-edit", "a99ZZ-insert"],
+        );
+        bf.sort_by_levels(
+            &[SortLevel { col: 0, numeric: false, asc: false }],
+            Approval::deny(),
+        ).unwrap();
+        let sorted = bf.filter_page(0, 10);
+        assert_eq!(
+            sorted.rows.iter().map(|row| row[1].as_str()).collect::<Vec<_>>(),
+            vec!["a99ZZ-insert", "a12ABC-edit"],
+        );
+        assert_eq!(sorted.vrows.len(), 2);
+        fs::remove_file(&p).ok();
+    }
     /// 纵向边缘夹具：flag 列呈 [1,2,空,空,3,4]。
     fn edge_gap_bytes() -> Vec<u8> {
         b"id,flag\r\nA,1\r\nB,2\r\nC,\r\nD,\r\nE,3\r\nF,4\r\n".to_vec()
@@ -12291,7 +12326,7 @@ impl BigFile {
                 }
                 Some(ResolvedRow::Ins { block, row }) => {
                     let fields = self.ins_fields(block, row);
-                    if spec_matches(spec, &self.map_fields_to_view(&fields)) {
+                    if spec_matches(spec, &self.map_fields_to_view(&fields), regexes) {
                         hits.push(orig);
                     }
                 }
@@ -13430,9 +13465,20 @@ fn generic_headers(ncols: usize) -> Vec<String> {
     (1..=ncols).map(|i| format!("列{i}")).collect()
 }
 
-/// 筛选匹配（语义对齐 grid.js _refilter：多重 OR 叠加逐列 AND；
-/// needle 与 multi_text 均已小写化，单元格现场小写化）。
-fn spec_matches(spec: &FilterSpec, fields: &[String]) -> bool {
+/// 对已解码逻辑字段执行筛选；列条件 AND，多重筛选 OR。
+///
+/// # Parameters
+/// - `spec`: 已归一化的筛选条件。
+/// - `fields`: 当前插入行的视图字段。
+/// - `regexes`: 与 spec.cols 对齐的预编译正则。
+///
+/// # Returns
+/// 所有列条件命中且多重筛选至少一列命中时为 true。
+fn spec_matches(
+    spec: &FilterSpec,
+    fields: &[String],
+    regexes: &[Option<Regex>],
+) -> bool {
     if !spec.multi_text.is_empty() {
         let hit = spec.multi_cols.iter().any(|&c| {
             fields
@@ -13443,8 +13489,12 @@ fn spec_matches(spec: &FilterSpec, fields: &[String]) -> bool {
             return false;
         }
     }
-    for (c, kw, mode) in &spec.cols {
+    for (index, (c, kw, mode)) in spec.cols.iter().enumerate() {
         let hit = fields.get(*c as usize).is_some_and(|f| match *mode {
+            3 => regexes
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some_and(|regex| regex.is_match(f)),
             2 => f == kw,                                // 严格·区分大小写
             1 => f.to_lowercase() == *kw,                // 严格·不分大小写
             _ => f.to_lowercase().contains(kw.as_str()), // 包含
