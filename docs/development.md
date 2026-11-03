@@ -7,17 +7,17 @@
 Rust + Tauri 2 外壳，前端是原生 HTML/CSS/JS，无构建步骤。需要 Rust 工具链（[rustup](https://rustup.rs/)）和 Node.js（仅跑前端单测）。
 
 ```bash
-# 前端逻辑单测（216 项通过）
+# 前端逻辑单测（224 项通过）
 node --test tests_js/*.test.mjs
 
-# Rust 引擎单测（289 项通过，另 3 项默认忽略基准）
+# Rust 引擎单测（296 项通过，另 3 项默认忽略基准）
 cd src-tauri && cargo test
 
 # 编译并运行（前端资产编译时嵌入 exe，改完前端需重新 build）
 cargo build
 ./target/debug/simpletable.exe
 
-# 真机冒烟自检：真实 WebView2，debug/release 各 176 项断言
+# 真机冒烟自检：真实 WebView2，debug/release 各 177 项断言
 ./target/debug/simpletable.exe --smoke   # 报告写 %TEMP%\simpletable_smoke_report.txt
 
 # 双构建、前端嵌入时间检查和 debug/release 双真机冒烟
@@ -35,7 +35,7 @@ cd .. && node scripts/verify-local.mjs
 ```
 frontend/            纯 HTML/CSS/JS：自绘虚拟滚动网格 + 编辑窗格 + 对话框
   js/bigmodel.js     统一数据模型（全表唯一：窗口缓存 / 渐进索引轮询 / 内存排序 / 乐观编辑）
-  js/smoke.js        --smoke 对抗自检套件（176 项）
+  js/smoke.js        --smoke 对抗自检套件（177 项）
 src-tauri/           Tauri 2 外壳 + Rust 数据引擎（mmap / 行索引 / 覆盖层 / 流式保存）
 tests_js/            node:test 逻辑层单测
 scripts/             截图 / 采样巡检脚本（开发用）
