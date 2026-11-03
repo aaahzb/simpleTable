@@ -545,6 +545,58 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       "清除筛选后应复位为 ~");
   });
 
+  check("正则筛选：用户示例、首尾锚点、无效表达式保留旧结果", async () => {
+    await window.__app.smokeLoadSmall(
+      ["code", "note"],
+      [
+        ["a12ABC-start", "ABC-001"],
+        ["A12ABC", "part-XYZ"],
+        ["a7Z", "ABC-001-XYZ"],
+        ["a12abc", "other"],
+      ],
+    );
+    const codeMode = document.querySelector('.col-strict[data-col="0"]');
+    codeMode.click();
+    codeMode.click();
+    codeMode.click();
+    grid.filters.set(0, "^a\\d+[A-Z]+");
+    await window.__app.runBigFilter();
+    await waitFor(() => grid.visCount() === 2, "用户正则只应命中 a 开头两行");
+
+    grid.filters.delete(0);
+    const noteMode = document.querySelector('.col-strict[data-col="1"]');
+    noteMode.click();
+    noteMode.click();
+    noteMode.click();
+    for (const [pattern, count] of [["^ABC", 2], ["XYZ$", 2], ["^ABC.*XYZ$", 1]]) {
+      grid.filters.set(1, pattern);
+      await window.__app.runBigFilter();
+      await waitFor(() => grid.visCount() === count, `${pattern} 应命中 ${count} 行`);
+    }
+    await waitFor(() => model.rawData(grid.visAt(0), 1) === "ABC-001-XYZ", "首尾锚点命中内容");
+    const beforeCount = grid.visCount();
+    const beforeValue = model.rawData(grid.visAt(0), 1);
+
+    grid.filters.set(1, "[");
+    const invalidRun = window.__app.runBigFilter();
+    await waitFor(() => document.querySelector(".modal-mask")
+      || document.getElementById("status-text").textContent.includes("正则表达式无效"),
+    "无效正则应写状态栏；旧实现会弹窗以形成 RED");
+    const errorMask = document.querySelector(".modal-mask");
+    if (errorMask) clickModalButton("确定");
+    await invalidRun;
+    assert(!errorMask, "无效正则不应弹模态框");
+    assert(grid.visCount() === beforeCount, "无效正则应保留旧命中数");
+    assert(model.rawData(grid.visAt(0), 1) === beforeValue, "无效正则应保留旧内容");
+    assert(document.getElementById("status-text").textContent.includes("正则表达式无效"),
+      "状态栏应显示正则错误");
+
+    grid.filters.set(1, "(?i)^abc.*xyz$");
+    await window.__app.runBigFilter();
+    await waitFor(() => grid.visCount() === 1, "改为有效 (?i) 表达式后应恢复命中");
+    await loadBasic();
+  });
+
   // ========== 多重筛选 ==========
 
   check("多重筛选：按钮在清除筛选右侧，开启出现输入框与默认勾选的列复选框", async () => {

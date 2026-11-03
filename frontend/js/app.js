@@ -1623,7 +1623,7 @@ let bigFilterSeq = 0;
  * 收集大模式当前筛选条件（逐列 AND + 多重 OR）。
  *
  * @returns {{kws: Array<[number, string, number]>, mKw: string, mCols: number[]}}
- *   列号/关键字/严格模式（0 包含 / 1 等于·不分大小写 / 2 等于·区分大小写）、
+ *   列号/关键字/匹配模式（0 包含 / 1 等于·不分大小写 / 2 等于·区分大小写 / 3 正则）、
  *   多重关键字与勾选列。
  */
 function collectBigFilter() {
@@ -1699,7 +1699,15 @@ async function runBigFilter(opts = {}) {
     statusMsg(`匹配 ${n} 行 · 用时 ${fmtDuration(lastFilterMs)}`, 4000);
     updateStatusText();
   } catch (err) {
-    if (seq === bigFilterSeq) await errorDialog("筛选失败", String(err?.message ?? err));
+    if (seq !== bigFilterSeq) return;
+    const message = String(err?.message ?? err);
+    const marker = "REGEX_INVALID:";
+    const at = message.indexOf(marker);
+    if (at >= 0) {
+      statusMsg(`正则表达式无效：${message.slice(at + marker.length)}`, 0);
+      return;
+    }
+    await errorDialog("筛选失败", message);
   }
 }
 
