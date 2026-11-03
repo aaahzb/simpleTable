@@ -3880,6 +3880,87 @@ x,y
       "应提示空表格无需保存");
   });
 
+  check("新建首档应立即拥有可见独立页签", async () => {
+    try {
+      await window.__app.smokeLoadSmall([], []);
+      tbBtn("新建").click();
+      await waitFor(() => document.querySelector(".modal-mask"), "新建首档对话框");
+      const mask = document.querySelector(".modal-mask");
+      mask.querySelector("#newtable-cols").value = "2";
+      mask.querySelector("#newtable-rows").value = "2";
+      assert(clickModalButton("确定"), "新建首档确定");
+      await waitFor(() => window.__app.isBigMode() && model.rowCount() === 2,
+        "新建首档 2×2 落定");
+      const session = model.sessionId;
+      const tabs = window.__app.tabs();
+      assert(tabs.length === 1, `新建首档应立即入签，实际页签数 ${tabs.length}`);
+      assert(tabs[0].active && tabs[0].title === "未命名" && tabs[0].path === null,
+        `新建首档标签身份错误：${JSON.stringify(tabs[0])}`);
+      assert(window.__app.smokeSnapshot().active?.session === session,
+        "可见标签必须绑定刚创建的同一引擎会话");
+      const bar = document.getElementById("tabbar");
+      assert(getComputedStyle(bar).display !== "none", "新建首档标签条应可见");
+      const el = bar.querySelector(`.tab[data-id="${tabs[0].id}"]`);
+      assert(el?.classList.contains("active"), "新建首档应有活动标签元素");
+      assert(el.querySelector(".tab-close"), "新建首档标签应可关闭");
+    } finally {
+      await window.__app.smokeLoadSmall([], []);
+    }
+  });
+
+  check("新建首档编辑后打开 CSV 应新增标签并保留原会话", async () => {
+    let pendingOpen = null;
+    try {
+      await window.__app.smokeLoadSmall([], []);
+      tbBtn("新建").click();
+      await waitFor(() => document.querySelector(".modal-mask"), "新建保留场景对话框");
+      const mask = document.querySelector(".modal-mask");
+      mask.querySelector("#newtable-cols").value = "2";
+      mask.querySelector("#newtable-rows").value = "3";
+      assert(clickModalButton("确定"), "新建保留场景确定");
+      await waitFor(() => window.__app.isBigMode() && model.rowCount() === 3,
+        "新建保留场景落定");
+      const newSession = model.sessionId;
+      await model.setData(1, 0, "保留这笔修改");
+      await waitFor(() => window.__app.isDirty() && model.canUndo(), "新建档编辑与撤销就绪");
+      const target = `${TMP}/newdoc-open.csv`;
+      await writeText(target, "名称,值\r\n磁盘文件,42\r\n");
+
+      pendingOpen = window.__app.openPathsAsTabs([target]);
+      await sleep(100);
+      const modal = document.querySelector(".modal-mask");
+      const prompted = modal?.textContent.includes("未保存") === true;
+      if (prompted) clickModalButton("取消"); // RED 时解除模态，避免后续用例被污染
+      const opened = await pendingOpen;
+      pendingOpen = null;
+      assert(prompted === false, "打开另一个文件不应把新建档当作待关闭文档");
+      assert(opened === true, "CSV 应成功打开");
+      const tabs = window.__app.tabs();
+      assert(tabs.length === 2, `新建档与 CSV 应共存为两签：${JSON.stringify(tabs)}`);
+      const unnamed = tabs.find((tab) => tab.path === null);
+      const disk = tabs.find((tab) => tab.path === target);
+      assert(unnamed?.dirty === true && disk?.active === true,
+        `新建档应保留脏态且 CSV 激活：${JSON.stringify(tabs)}`);
+
+      await window.__app.activateTab(unnamed.id);
+      assert(model.sessionId === newSession, "切回新建档必须复用原会话");
+      assert(model.rawData(1, 0) === "保留这笔修改" && window.__app.isDirty(),
+        "新建档内容与脏态不得因打开 CSV 丢失");
+      assert(await model.undo() === true, "新建档原撤销栈应可用");
+      await waitFor(() => model.rawData(1, 0) === "",
+        "新建档撤销后应恢复编辑前内容并落定");
+      assert(await model.redo() === true, "新建档原重做栈应可用");
+      await waitFor(() => model.rawData(1, 0) === "保留这笔修改",
+        "新建档重做后应重放编辑并落定");
+    } finally {
+      if (pendingOpen) {
+        clickModalButton("取消");
+        await pendingOpen;
+      }
+      await window.__app.smokeLoadSmall([], []);
+    }
+  });
+
   check("新建表格：只定列数×行数，默认 60 行并处于首行非列名", async () => {
     await window.__app.smokeLoadSmall([], []);
 
