@@ -26,6 +26,7 @@ mod history;
 pub mod open_request;
 pub mod window_registry;
 mod order;
+mod process_memory;
 mod ram_load;
 mod ram_region;
 mod schema;
