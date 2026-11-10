@@ -26,3 +26,15 @@ url = "2"
 tauri-plugin-single-instance = "=2.3.4"
 fs2 = "0.4"
 tokio = { version = "1", features = ["sync", "time"] }
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_Memory",
+  "Win32_System_ProcessStatus",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
