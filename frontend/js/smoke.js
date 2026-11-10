@@ -691,6 +691,48 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
     await waitFor(() => model.rawData(0, 2) === "古城", "撤销应复原到夹具原值");
   });
 
+  check("编辑窗格 Esc 返回网格：保留写回并可继续选格、打字", async () => {
+    await loadBasic();
+    clickCell(grid, 0, 2);
+    const pe = document.getElementById("pane-edit");
+    const scroller = document.getElementById("grid-scroll");
+    pe.focus();
+    pe.selectionStart = pe.selectionEnd = pe.value.length;
+    const before = pe.value;
+    const selected = grid.selectedSet.size;
+    assert(document.execCommand("insertText", false, "X"), "窗格原生插入应成功");
+    await waitFor(() => model.rawData(0, 2) === before + "X", "窗格输入应实时写回");
+    key(pe, "Escape", { isComposing: true });
+    assert(document.activeElement === pe, "输入法组合态 Esc 应留给输入法");
+    key(pe, "Escape");
+    assert(document.activeElement === scroller,
+      `Esc 后焦点应回网格（实际 ${document.activeElement?.id ?? document.activeElement?.tagName}）`);
+    assert(cur(grid)?.[0] === 0 && cur(grid)?.[1] === 2, "Esc 后当前格应保持");
+    assert(grid.selectedSet.size === selected, "Esc 不应清空选区");
+    assert(model.rawData(0, 2) === before + "X", "Esc 不应撤销已实时写回的内容");
+    key(scroller, "ArrowDown");
+    assert(cur(grid)?.[0] === 1 && cur(grid)?.[1] === 2, "返回后方向键应立即移动当前格");
+    key(scroller, "Z");
+    const ed = document.getElementById("cell-editor");
+    assert(grid.editing && ed.value === "Z", "返回后打字应执行替换式编辑");
+    key(ed, "Escape");
+  });
+
+  check("格内编辑 Esc 取消后焦点回网格且方向键立即可用", async () => {
+    await loadBasic();
+    grid.select([0, 0]);
+    const scroller = document.getElementById("grid-scroll");
+    scroller.focus();
+    key(scroller, "F2");
+    const ed = document.getElementById("cell-editor");
+    assert(grid.editing, "F2 应打开格内编辑器");
+    key(ed, "Escape");
+    assert(document.activeElement === scroller,
+      `取消后焦点应回网格（实际 ${document.activeElement?.id ?? document.activeElement?.tagName}）`);
+    key(scroller, "ArrowDown");
+    assert(cur(grid)?.[0] === 1 && cur(grid)?.[1] === 0, "取消后方向键应立即移动当前格");
+  });
+
   check("窗格 Tab 键入制表符且焦点不逃离（可 Ctrl+Z 撤销）", async () => {
     const pe = document.getElementById("pane-edit");
     pe.focus();

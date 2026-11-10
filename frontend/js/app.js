@@ -2689,6 +2689,14 @@ document.addEventListener("keydown", (e) => {
     saveFile();
     return;
   }
+  // 窗格内容已实时写回：Esc 只退出窗格焦点，不撤销内容，也不清空网格选区。
+  // 输入法组合态的 Esc 用于取消组字；不阻断冒泡，window 仍可取消标签拖动。
+  if (e.key === "Escape" && !e.isComposing
+      && e.target === document.getElementById("pane-edit")) {
+    e.preventDefault();
+    fgrid().scrollEl.focus();
+    return;
+  }
   // Ctrl+Z / Ctrl+Y：输入控件内让浏览器原生文本撤销接管
   if (inField) return;
   if (mods && !e.shiftKey && (e.key === "g" || e.key === "G")) {

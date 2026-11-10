@@ -541,7 +541,7 @@ export async function shortcutsDialog() {
     ["F2 / 双击", "编辑当前格原文"],
     ["Enter / Tab", "提交并下移 / 右移"],
     ["Alt+Enter", "编辑时格内换行"],
-    ["Esc", "取消编辑"],
+    ["Esc", "格内编辑：取消；编辑窗格：返回网格；选择态：清空选区"],
     ["Delete", "清除选中格"],
     ["Ctrl+C / Ctrl+X / Ctrl+V", "复制 / 剪切 / 粘贴（TSV，与 Excel 互通）"],
     ["Ctrl+Z / Ctrl+Y", "撤销 / 重做"],

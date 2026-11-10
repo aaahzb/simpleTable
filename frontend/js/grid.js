@@ -1546,12 +1546,16 @@ export class Grid {
     this.closeEditor();
   }
 
+  /** 关闭格内编辑器；仅在编辑器持有焦点时把键盘焦点还给网格。 */
   closeEditor() {
+    const hadFocus = document.activeElement === this.editorEl;
     this.editing = null;
     this.editorEl.style.display = "none";
     this.editorEl.onblur = null;
     this.editorEl.onkeydown = null;
     this.editorEl.oninput = null;
+    // 不能依赖隐藏元素后的浏览器默认焦点恢复；hadFocus 防止装载/重绘抢走其他输入框焦点。
+    if (hadFocus) this.scrollEl.focus();
   }
 
   // ============ 剪贴板（G1/G2/G4） ============
