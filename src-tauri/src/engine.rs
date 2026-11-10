@@ -31,6 +31,8 @@ use crate::history::{
     DEFAULT_HISTORY_BUDGET_BYTES,
 };
 use crate::order::{project_filter, Perm, RowOrder};
+use crate::ram_load::{prepare_load, run_prepared_load, LoadEvent, LoadOptions, LoadResult};
+use crate::ram_region::FinishedRam;
 use crate::schema::{ColumnId, ColumnStorage, Schema};
 use crate::spool::{history_text_bytes, PasteImport, RowSnapshot, SessionSpool};
 use memchr::{memchr, memchr_iter};
@@ -2720,7 +2722,7 @@ a,b
                 *byte = b'X';
             }
         }
-        bf.backing = Backing::Ram(replacement);
+        bf.backing = Backing::Ram(RamBuffer::Vec(replacement));
         assert!(bf.undo());
         assert_eq!(bf.rows(0, 5), before);
         fs::remove_file(&p).ok();
@@ -5492,6 +5494,333 @@ keep,old,target
         );
     }
 
+    // ---- 连续 RAM 后备转换：内容、历史、索引和故障恢复 ----
+
+    use crate::ram_load::{LoadEvent, LoadFault, LoadOptions};
+
+    thread_local! {
+        static CONVERT_RESERVE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static CONVERT_RESTORE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// 父模块在 cfg(test) 下查询线程本地预留故障，避免并行测试互相影响。
+    pub(super) fn conversion_reserve_fault() -> bool {
+        CONVERT_RESERVE_FAULT.with(std::cell::Cell::get)
+    }
+
+    /// 父模块在 cfg(test) 下查询线程本地恢复映射故障。
+    pub(super) fn conversion_restore_fault() -> bool {
+        CONVERT_RESTORE_FAULT.with(std::cell::Cell::get)
+    }
+
+    struct ConversionFaultGuard;
+
+    impl Drop for ConversionFaultGuard {
+        fn drop(&mut self) {
+            CONVERT_RESERVE_FAULT.with(|flag| flag.set(false));
+            CONVERT_RESTORE_FAULT.with(|flag| flag.set(false));
+        }
+    }
+
+    fn conversion_fault_guard(reserve: bool, restore: bool) -> ConversionFaultGuard {
+        CONVERT_RESERVE_FAULT.with(|flag| flag.set(reserve));
+        CONVERT_RESTORE_FAULT.with(|flag| flag.set(restore));
+        ConversionFaultGuard
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ConversionSnapshot {
+        revision: i64,
+        history: HistoryStats,
+        epoch: u64,
+        rows: Vec<Vec<String>>,
+        filtered: Vec<Vec<String>>,
+    }
+
+    fn conversion_snapshot(bf: &BigFile) -> ConversionSnapshot {
+        ConversionSnapshot {
+            revision: bf.revision,
+            history: bf.history_stats(),
+            epoch: bf.index_epoch,
+            rows: bf.rows(0, bf.meta().rows as u32),
+            filtered: bf.filter_page(0, 1000).rows,
+        }
+    }
+
+    fn convert_for_test(bf: &mut BigFile, fault: LoadFault) -> Result<ConvertStatus, String> {
+        let cancel = AtomicBool::new(false);
+        bf.convert_mmap_to_ram(
+            &cancel,
+            LoadOptions {
+                chunk_bytes: 16,
+                workers: 2,
+                fault,
+            },
+            |_| {},
+        )
+    }
+
+    #[test]
+    fn backing_conversion_preserves_bytes_history_filter_and_index_epoch() {
+        let p = tmp_csv("convert_preserve", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+        bf.run_filter(&spec_one(0, "Alice")).unwrap();
+        let before = conversion_snapshot(&bf);
+        let weak = match &bf.backing {
+            Backing::Mmap(m) => Arc::downgrade(m),
+            _ => panic!("预期 mmap"),
+        };
+        let cancel = AtomicBool::new(false);
+        assert!(bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap());
+        assert!(matches!(bf.backing, Backing::Ram(RamBuffer::Region(_))));
+        assert!(weak.upgrade().is_none(), "读取完成前旧 Arc<Mmap> 必须全部释放");
+        assert_eq!(conversion_snapshot(&bf), before);
+        assert!(bf.undo());
+        assert_eq!(bf.rows(0, 1)[0][1], "30");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn progressive_conversion_joins_index_worker_and_releases_its_mmap_arc() {
+        let p = tmp_csv("convert_join", &people_csv());
+        let mut bf = BigFile::open_progressive_with(&p, 8, 1, 16, true).unwrap();
+        let weak = match &bf.backing {
+            Backing::Mmap(m) => Arc::downgrade(m),
+            _ => panic!("预期 mmap"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while bf.is_indexing() && Instant::now() < deadline {
+            bf.refresh_indexed();
+            std::thread::yield_now();
+        }
+        assert!(!bf.is_indexing(), "后台索引未在 5 秒内完成");
+        let cancel = AtomicBool::new(false);
+        bf.load_into_ram(&cancel, &mut |_, _| {}).unwrap();
+        assert!(bf.index_thread.is_none());
+        assert!(weak.upgrade().is_none());
+        assert_eq!(bf.rows(0, 1)[0][0], "Alice");
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn conversion_read_fault_restores_mmap_without_changing_revision_or_history() {
+        let p = tmp_csv("convert_fault", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 0, "unsaved".into(), Approval::deny()).unwrap();
+        bf.run_filter(&spec_one(0, "unsaved")).unwrap();
+        let before = conversion_snapshot(&bf);
+        let error = convert_for_test(&mut bf, LoadFault::ReadAfter(32)).unwrap_err();
+        assert!(error.contains("读取"));
+        assert!(!bf.is_ram_backed());
+        assert_eq!(conversion_snapshot(&bf), before);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn backing_conversion_format_matrix_preserves_state() {
+        let gbk = encoding_rs::GBK
+            .encode("name,age\r\nAlice爱丽丝,30\r\n")
+            .0
+            .into_owned();
+        let cases = vec![
+            tmp_csv("convert_utf8", &people_csv()),
+            tmp_csv("convert_gbk", &gbk),
+            tmp_csv(
+                "convert_quoted",
+                b"name,note\r\nAlice,\"line1\nline2\"\r\nbob,x\r\n",
+            ),
+            tmp_csv("convert_no_newline", b"name,age\r\nAlice,30"),
+            tmp_text("convert_text", "txt", b"Alice\xe5\x8c\x97\xe4\xba\xac\nBob\n"),
+        ];
+        for p in cases {
+            let mut bf = BigFile::open(&p).unwrap();
+            bf.run_filter(&spec_one(0, "Alice")).unwrap();
+            let before = conversion_snapshot(&bf);
+            assert_eq!(convert_for_test(&mut bf, LoadFault::None).unwrap(), ConvertStatus::Converted);
+            assert!(matches!(bf.backing, Backing::Ram(RamBuffer::Region(_))));
+            assert_eq!(conversion_snapshot(&bf), before, "路径：{}", p.display());
+            fs::remove_file(&p).ok();
+        }
+    }
+
+    #[test]
+    fn backing_conversion_preserves_insert_delete_history_roundtrip() {
+        let p = tmp_csv("convert_row_history", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.insert_rows(
+            1,
+            Some(vec![vec!["NEW".into(), "1".into(), "Z".into()]]),
+            0,
+            Approval::deny(),
+        )
+        .unwrap();
+        bf.remove_rows(vec![0], Approval::deny()).unwrap();
+        bf.run_filter(&spec_one(0, "NEW")).unwrap();
+        let before = conversion_snapshot(&bf);
+        assert_eq!(convert_for_test(&mut bf, LoadFault::None).unwrap(), ConvertStatus::Converted);
+        assert_eq!(conversion_snapshot(&bf), before);
+        assert!(bf.undo());
+        assert!(bf.redo());
+        assert!(bf.undo());
+        assert!(bf.undo());
+        assert!(bf.redo());
+        assert!(bf.redo());
+        assert_eq!(bf.rows(0, bf.meta().rows as u32), before.rows);
+        assert_eq!(bf.history_stats(), before.history);
+        assert_eq!(bf.index_epoch, before.epoch);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn backing_conversion_preserves_shared_schema_history_roundtrip() {
+        let p = tmp_csv("convert_schema_history", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.push_col_op(ColOp::Insert {
+            pos: 1,
+            name: "gender".into(),
+        })
+        .unwrap();
+        bf.apply_col_ops(Approval::deny()).unwrap();
+        bf.run_filter(&spec_one(0, "Alice")).unwrap();
+        let before = conversion_snapshot(&bf);
+        assert_eq!(convert_for_test(&mut bf, LoadFault::None).unwrap(), ConvertStatus::Converted);
+        assert_eq!(conversion_snapshot(&bf), before);
+        assert!(bf.undo());
+        assert_eq!(bf.meta().cols, 3);
+        assert_eq!(bf.rows(0, 1)[0][1], "30");
+        assert!(bf.redo());
+        assert_eq!(bf.meta().cols, 4);
+        assert_eq!(bf.rows(0, 1)[0][1], "");
+        assert_eq!(bf.history_stats(), before.history);
+        assert_eq!(bf.index_epoch, before.epoch);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn backing_conversion_reserve_fault_keeps_original_mmap() {
+        let p = tmp_csv("convert_reserve_fault", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.run_filter(&spec_one(0, "Alice")).unwrap();
+        let before = conversion_snapshot(&bf);
+        let weak = match &bf.backing {
+            Backing::Mmap(m) => Arc::downgrade(m),
+            _ => panic!("预期 mmap"),
+        };
+        let _guard = conversion_fault_guard(true, false);
+        let error = convert_for_test(&mut bf, LoadFault::None).unwrap_err();
+        assert!(error.contains("预留"));
+        assert!(!bf.is_ram_backed());
+        assert!(weak.upgrade().is_some(), "预留失败不得解除原 mmap");
+        assert_eq!(conversion_snapshot(&bf), before);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn backing_conversion_commit_and_read_faults_restore_state() {
+        for (name, fault, expected) in [
+            ("commit", LoadFault::CommitAt(32), "提交"),
+            ("read", LoadFault::ReadAfter(32), "读取"),
+        ] {
+            let p = tmp_csv(&format!("convert_{name}_fault"), &people_csv());
+            let mut bf = BigFile::open(&p).unwrap();
+            bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+            bf.run_filter(&spec_one(0, "Alice")).unwrap();
+            let before = conversion_snapshot(&bf);
+            let error = convert_for_test(&mut bf, fault).unwrap_err();
+            assert!(error.contains(expected), "{name}: {error}");
+            assert!(!bf.is_ram_backed());
+            assert_eq!(conversion_snapshot(&bf), before);
+            fs::remove_file(&p).ok();
+        }
+    }
+
+    #[test]
+    fn backing_conversion_file_stamp_change_restores_without_reloading_edits() {
+        let p = tmp_csv("convert_stamp_fault", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+        bf.run_filter(&spec_one(0, "Alice")).unwrap();
+        let before = conversion_snapshot(&bf);
+        let changed = AtomicBool::new(false);
+        let modified = fs::metadata(&p).unwrap().modified().unwrap() + Duration::from_secs(5);
+        let cancel = AtomicBool::new(false);
+        let error = bf
+            .convert_mmap_to_ram(
+                &cancel,
+                LoadOptions {
+                    chunk_bytes: 16,
+                    workers: 2,
+                    fault: LoadFault::None,
+                },
+                |event| {
+                    if matches!(event, LoadEvent::Finished { .. }) {
+                        let file = fs::OpenOptions::new().write(true).open(&p).unwrap();
+                        file.set_modified(modified).unwrap();
+                        changed.store(true, Ordering::Relaxed);
+                    }
+                },
+            )
+            .unwrap_err();
+        assert!(changed.load(Ordering::Relaxed));
+        assert!(error.contains("EXTERNAL_CHANGED"), "{error}");
+        assert!(!bf.is_ram_backed());
+        assert_eq!(conversion_snapshot(&bf), before);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn backing_conversion_restore_fault_reports_both_errors() {
+        let p = tmp_csv("convert_restore_fault", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+        bf.run_filter(&spec_one(0, "Alice")).unwrap();
+        let before = conversion_snapshot(&bf);
+        let guard = conversion_fault_guard(false, true);
+        let error = convert_for_test(&mut bf, LoadFault::ReadAfter(32)).unwrap_err();
+        assert!(error.contains("读取"), "{error}");
+        assert!(error.contains("恢复 mmap 也失败"), "{error}");
+        drop(guard);
+        bf.backing = bf.map_current_backing().unwrap();
+        assert_eq!(conversion_snapshot(&bf), before);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn backing_conversion_cancel_after_progress_restores_state_without_finish() {
+        let p = tmp_csv("convert_partial_cancel", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+        bf.run_filter(&spec_one(0, "Alice")).unwrap();
+        let before = conversion_snapshot(&bf);
+        let cancel = AtomicBool::new(false);
+        let finished = AtomicBool::new(false);
+        let status = bf
+            .convert_mmap_to_ram(
+                &cancel,
+                LoadOptions {
+                    chunk_bytes: 16,
+                    workers: 2,
+                    fault: LoadFault::None,
+                },
+                |event| {
+                    match event {
+                        LoadEvent::Progress { done, .. } if done > 0 => {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                        LoadEvent::Finished { .. } => finished.store(true, Ordering::Relaxed),
+                        _ => {}
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(status, ConvertStatus::Cancelled);
+        assert!(!finished.load(Ordering::Relaxed));
+        assert!(!bf.is_ram_backed());
+        assert_eq!(conversion_snapshot(&bf), before);
+        fs::remove_file(&p).ok();
+    }
+
     // ---- 排序模式：内存后备（Backing::Ram） ----
 
     #[test]
@@ -8132,6 +8461,12 @@ struct PartialIndex {
     index_ms: u64,
 }
 
+/// 私有 RAM 可来自普通新建 Vec，也可来自完成写入的连续地址区域。
+enum RamBuffer {
+    Vec(Vec<u8>),
+    Region(FinishedRam),
+}
+
 /// 会话字节后备：常规浏览用只读文件映射；排序模式载入后换成私有内存缓冲。
 ///
 /// 读路径一律经 [`BigFile::bytes`] 取字节，不直接假设后备类型——这样
@@ -8140,7 +8475,7 @@ enum Backing {
     /// 文件映射：后台索引线程也持有一份 Arc，读路径不复制文件内容。
     Mmap(Arc<memmap2::Mmap>),
     /// 私有内存缓冲：与磁盘映射解耦后可释放映射，稳定态约 1× 文件大小。
-    Ram(Vec<u8>),
+    Ram(RamBuffer),
 }
 
 impl Backing {
@@ -8148,7 +8483,8 @@ impl Backing {
     fn bytes(&self) -> &[u8] {
         match self {
             Backing::Mmap(m) => m,
-            Backing::Ram(v) => v,
+            Backing::Ram(RamBuffer::Vec(v)) => v,
+            Backing::Ram(RamBuffer::Region(r)) => r.as_slice(),
         }
     }
 
@@ -8156,6 +8492,31 @@ impl Backing {
     fn is_ram(&self) -> bool {
         matches!(self, Backing::Ram(_))
     }
+}
+
+/// 转换前后用于识别外部写入的文件长度与修改时间。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: std::time::SystemTime,
+}
+
+impl FileStamp {
+    fn read(path: &Path) -> Result<Self, String> {
+        let meta = fs::metadata(path).map_err(|e| format!("读取后备文件状态失败：{e}"))?;
+        Ok(Self {
+            len: meta.len(),
+            modified: meta
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConvertStatus {
+    Converted,
+    Cancelled,
 }
 
 /// 排序模式内存估算（弹窗展示用；单位字节）。
@@ -8446,6 +8807,8 @@ pub struct BigFile {
     partial: Option<Arc<Mutex<PartialIndex>>>,
     /// 会话销毁时通知后台线程退出（每块检查一次）。
     cancel: Arc<AtomicBool>,
+    /// 后台索引线程所有权；转换和销毁前必须 join，避免遗留 Arc<Mmap>。
+    index_thread: Option<std::thread::JoinHandle<()>>,
     /// 打开起点：计算实时已用时间。
     open_started: Instant,
     /// 首屏同步索引耗时（毫秒）。
@@ -8502,6 +8865,9 @@ impl Drop for BigFile {
     fn drop(&mut self) {
         // 后台线程每块检查；文件关闭/换档后不继续占用磁盘。
         self.cancel.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.index_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -8525,6 +8891,11 @@ impl BigFile {
     /// 文件不可读/为空/无记录时返回错误字符串。
     #[cfg(test)]
     pub fn open_with(path: &Path, headerless: bool) -> Result<Self, String> {
+        Self::open_complete(path, headerless)
+    }
+
+    /// 同步完成索引的完整打开；测试与独立内存诊断共用同一引擎构造。
+    pub(crate) fn open_complete(path: &Path, headerless: bool) -> Result<Self, String> {
         let t0 = Instant::now();
         let format = DocumentFormat::from_path(path);
         let headerless = headerless || format.is_text_lines();
@@ -8563,7 +8934,7 @@ impl BigFile {
         let total = buf.len() as u64;
         Self::from_parts(
             PathBuf::new(),
-            Backing::Ram(buf),
+            Backing::Ram(RamBuffer::Vec(buf)),
             total,
             std::time::SystemTime::UNIX_EPOCH,
             DocumentFormat::Csv,
@@ -8623,6 +8994,7 @@ impl BigFile {
             idx,
             partial: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            index_thread: None,
             open_started: t0,
             open_ms,
             index_ms: open_ms,
@@ -8787,8 +9159,8 @@ impl BigFile {
         let open_ms = t0.elapsed().as_millis() as u64;
         let total_bytes = meta.len();
 
-        let (partial, idx, index_ms) = if done {
-            (None, RawIndex { line_off, rec_lines }, open_ms)
+        let (partial, idx, index_ms, index_thread) = if done {
+            (None, RawIndex { line_off, rec_lines }, open_ms, None)
         } else {
             let p = Arc::new(Mutex::new(PartialIndex {
                 line_off,
@@ -8797,21 +9169,25 @@ impl BigFile {
                 done: false,
                 index_ms: 0,
             }));
+            let mut index_thread = None;
             if background {
                 let mmap2 = mmap.clone();
                 let p2 = p.clone();
                 let c2 = cancel.clone();
-                std::thread::Builder::new()
-                    .name("csv-index".into())
-                    .spawn(move || {
-                        Self::index_worker(mmap2, p2, c2, cur, chunk_bytes, t0, format);
-                    })
-                    .map_err(|e| format!("启动索引线程失败：{e}"))?;
+                index_thread = Some(
+                    std::thread::Builder::new()
+                        .name("csv-index".into())
+                        .spawn(move || {
+                            Self::index_worker(mmap2, p2, c2, cur, chunk_bytes, t0, format);
+                        })
+                        .map_err(|e| format!("启动索引线程失败：{e}"))?,
+                );
             }
             (
                 Some(p),
                 RawIndex { line_off: Vec::new(), rec_lines: Vec::new() },
                 0,
+                index_thread,
             )
         };
 
@@ -8824,6 +9200,7 @@ impl BigFile {
             idx,
             partial,
             cancel,
+            index_thread,
             open_started: t0,
             open_ms,
             index_ms,
@@ -8856,6 +9233,17 @@ impl BigFile {
             order: RowOrder::Identity,
             revision: 0,
         })
+    }
+
+    /// 索引完成后接管线程所有权；不得在 UI meta 查询中无条件阻塞。
+    fn join_index_worker(&mut self) -> Result<(), String> {
+        if self.is_indexing() {
+            return Err("文件仍在索引中".into());
+        }
+        let Some(handle) = self.index_thread.take() else {
+            return Ok(());
+        };
+        handle.join().map_err(|_| "索引线程异常终止".into())
     }
 
     /// 后台索引线程主体：单线程顺序扫描剩余字节，每块发布一次。
@@ -9215,58 +9603,130 @@ impl BigFile {
         }
     }
 
-    /// 把文件内容分块复制到私有内存缓冲；完成后释放文件映射。
-    ///
-    /// 复制期间每块检查 `cancel`：取消只丢弃半成品缓冲，原 mmap 视图原样保留，
-    /// 不改文件、不标脏。索引未完成时拒绝（排序键需要完整行索引）。
-    ///
-    /// # Parameters
-    /// - `cancel`: 取消标志（由命令层持有，点击取消即置位）。
-    /// - `progress`: 进度回调 `(已复制字节, 总字节)`；首尾各必发一次。
-    ///
-    /// # Returns
-    /// true = 已切换为内存后备；false = 用户取消（后备保持不变）。
-    ///
-    /// # Errors
-    /// 索引未完成或内存分配失败时返回错误；取消不算错误。
-    pub fn load_into_ram(
+    /// 把 mmap 转为连续 RAM；observer 可被多个 worker 并发调用。
+    fn convert_mmap_to_ram<O>(
         &mut self,
         cancel: &AtomicBool,
-        progress: &mut impl FnMut(u64, u64),
-    ) -> Result<bool, String> {
-        let total = self.bytes().len();
+        options: LoadOptions,
+        observer: O,
+    ) -> Result<ConvertStatus, String>
+    where
+        O: Fn(LoadEvent) + Sync,
+    {
         if self.is_ram_backed() {
-            progress(total as u64, total as u64);
-            return Ok(true);
+            return Ok(ConvertStatus::Cancelled);
         }
-        // 后台索引恰好完成时先并回正式结构，再判断是否还在索引。
         self.refresh_indexed();
         if self.is_indexing() {
-            return Err("索引尚未完成，暂时不能载入内存".into());
+            return Err("文件仍在索引中".into());
         }
-        // 先一次性预留，内存不足时在开始拷贝前就失败（而不是拷到一半才 OOM）。
-        let mut buf: Vec<u8> = Vec::new();
-        buf.try_reserve_exact(total)
-            .map_err(|_| format!("内存不足：无法分配 {:.1} MB 文件缓冲", total as f64 / 1048576.0))?;
-        const COPY_CHUNK: usize = 8 * 1024 * 1024;
-        let mut done = 0usize;
-        let mut last_emit: Option<Instant> = None;
-        progress(0, total as u64);
-        while done < total {
-            if cancel.load(Ordering::Relaxed) {
-                return Ok(false); // buf 在此丢弃，mmap 仍是后备
-            }
-            let end = (done + COPY_CHUNK).min(total);
-            buf.extend_from_slice(&self.bytes()[done..end]);
-            done = end;
-            if progress_gate(&mut last_emit, PROGRESS_MIN_GAP) || done == total {
-                progress(done as u64, total as u64);
-            }
+        self.join_index_worker()?;
+        let before = FileStamp::read(&self.backing_path)?;
+        let file = fs::File::open(&self.backing_path).map_err(|e| e.to_string())?;
+        // 原 mmap 在预留期间保持有效；预留失败直接返回，现场不变。
+        #[cfg(test)]
+        if self::tests::conversion_reserve_fault() {
+            return Err("注入预留失败".into());
         }
-        // 索引已完成且后台线程已退出，切换后旧映射可立即释放。
-        self.backing = Backing::Ram(buf);
-        progress(total as u64, total as u64);
-        Ok(true)
+        let prepared = prepare_load(file, options, &observer)?;
+        let previous = std::mem::replace(
+            &mut self.backing,
+            Backing::Ram(RamBuffer::Vec(Vec::new())),
+        );
+        debug_assert!(matches!(previous, Backing::Mmap(_)));
+        drop(previous); // 读取开始前释放最后一个完整源 Arc<Mmap>。
+        match run_prepared_load(prepared, cancel, &observer) {
+            Ok(LoadResult::Complete(ram)) => match FileStamp::read(&self.backing_path) {
+                Ok(after) if after == before => {
+                    self.backing = Backing::Ram(RamBuffer::Region(ram));
+                    Ok(ConvertStatus::Converted)
+                }
+                Ok(_) => {
+                    drop(ram);
+                    self.restore_after_conversion(
+                        "EXTERNAL_CHANGED: 转换期间后备文件发生变化".into(),
+                        false,
+                    )
+                }
+                Err(error) => {
+                    drop(ram);
+                    self.restore_after_conversion(error, false)
+                }
+            },
+            Ok(LoadResult::Cancelled) => match FileStamp::read(&self.backing_path) {
+                Ok(after) if after == before => {
+                    self.restore_after_conversion("用户取消".into(), true)
+                }
+                Ok(_) => self.restore_after_conversion(
+                    "EXTERNAL_CHANGED: 取消时发现后备文件发生变化".into(),
+                    false,
+                ),
+                Err(error) => self.restore_after_conversion(error, false),
+            },
+            Err(error) => self.restore_after_conversion(error, false),
+        }
+    }
+
+    /// 取消/失败统一按 backing_path 重建 mmap，不改索引代际或历史。
+    fn restore_after_conversion(
+        &mut self,
+        error: String,
+        cancelled: bool,
+    ) -> Result<ConvertStatus, String> {
+        match self.map_current_backing() {
+            Ok(backing) => {
+                self.backing = backing;
+                if cancelled {
+                    Ok(ConvertStatus::Cancelled)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(recovery) => Err(format!(
+                "转换失败：{error}\n恢复 mmap 也失败：{recovery}"
+            )),
+        }
+    }
+
+    fn map_current_backing(&self) -> Result<Backing, String> {
+        #[cfg(test)]
+        if self::tests::conversion_restore_fault() {
+            return Err("注入恢复 mmap 失败".into());
+        }
+        let file = fs::File::open(&self.backing_path).map_err(|e| e.to_string())?;
+        let mmap = unsafe {
+            memmap2::MmapOptions::new()
+                .map(&file)
+                .map_err(|e| e.to_string())?
+        };
+        Ok(Backing::Mmap(Arc::new(mmap)))
+    }
+
+    /// 保留现有临时排序 RAM 接口；Mutex 只序列化 UI 回调，不串行化读取。
+    pub fn load_into_ram<F>(
+        &mut self,
+        cancel: &AtomicBool,
+        progress: &mut F,
+    ) -> Result<bool, String>
+    where
+        F: FnMut(u64, u64) + Send,
+    {
+        if self.is_ram_backed() {
+            let total = self.bytes().len() as u64;
+            progress(total, total);
+            return Ok(true);
+        }
+        let progress = Mutex::new(progress);
+        let observer = |event| {
+            if let LoadEvent::Progress { done, total } = event {
+                let mut callback = progress.lock().unwrap();
+                (*callback)(done, total);
+            }
+        };
+        match self.convert_mmap_to_ram(cancel, LoadOptions::default(), observer)? {
+            ConvertStatus::Converted => Ok(true),
+            ConvertStatus::Cancelled => Ok(false),
+        }
     }
 
     pub fn meta(&self) -> BigMeta {
