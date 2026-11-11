@@ -251,6 +251,22 @@ impl<T> HistoryLedger<T> {
         rebuilt.redo = redo;
         Ok(PreparedHistory { ledger: rebuilt })
     }
+    /// 新文件大小确定后重建账本，并复用普通缩容的最旧淘汰规则。
+    pub fn prepare_rebuild_with_eviction(
+        undo: VecDeque<HistoryEntry<T>>,
+        redo: VecDeque<HistoryEntry<T>>,
+        budget_bytes: u64,
+    ) -> Result<PreparedHistory<T>, HistoryError> {
+        // 先完成完整共享计费，再统一缩容，避免转换顺序影响淘汰结果。
+        let mut rebuilt = HistoryLedger::new(u64::MAX);
+        for entry in undo.iter().chain(redo.iter()) {
+            rebuilt.charge_rebuild(entry)?;
+        }
+        rebuilt.undo = undo;
+        rebuilt.redo = redo;
+        rebuilt.apply_budget_for_preview(budget_bytes)?;
+        Ok(PreparedHistory { ledger: rebuilt })
+    }
     pub fn commit_rebuild(&mut self, prepared: PreparedHistory<T>) {
         *self = prepared.ledger;
     }
