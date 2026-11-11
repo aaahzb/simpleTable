@@ -9503,7 +9503,8 @@ impl BigFile {
     }
 
     /// 当前后备的只读字节视图（mmap 或内存缓冲）。
-    fn bytes(&self) -> &[u8] {
+    #[doc(hidden)]
+    pub(crate) fn bytes(&self) -> &[u8] {
         self.backing.bytes()
     }
 
@@ -14031,10 +14032,10 @@ impl BigFile {
             w.flush().map_err(|e| e.to_string())?;
             drop(w);
             progress(flushed_weighted(total), total, PHASE_FLUSH, done);
-            let prepared_reopen = self.prepare_reopen(&tmp)?;
             let memory_budget = if self.memory_mode {
+                let total_bytes = fs::metadata(&tmp).map_err(|e| e.to_string())?.len();
                 Some(effective_undo_budget_bytes(
-                    prepared_reopen.total_bytes,
+                    total_bytes,
                     true,
                     self.undo_policy,
                 )?)
@@ -14049,12 +14050,12 @@ impl BigFile {
                 self.save_to_memory_impl(
                     &tmp,
                     dest,
-                    prepared_reopen,
                     load_options,
                     emergency_budget,
                     &observer,
                 )?
             } else {
+                let prepared_reopen = self.prepare_reopen(&tmp)?;
                 self.replace_with_retry(&tmp, dest)?;
                 prepared_reopen
             };
@@ -14136,10 +14137,10 @@ impl BigFile {
         w.flush().map_err(|e| e.to_string())?;
         drop(w);
         progress(flushed_weighted(total), total, PHASE_FLUSH, done);
-        let mut prepared_reopen = self.prepare_reopen(&tmp)?;
         let memory_budget = if self.memory_mode {
+            let total_bytes = fs::metadata(&tmp).map_err(|e| e.to_string())?.len();
             Some(effective_undo_budget_bytes(
-                prepared_reopen.total_bytes,
+                total_bytes,
                 true,
                 self.undo_policy,
             )?)
@@ -14153,21 +14154,24 @@ impl BigFile {
                     SaveRebuildPolicy::EvictOldest,
                 )?);
             }
+        }
+        let prepared_reopen = if self.memory_mode {
             let emergency_budget = self.prepare_undo_policy_for_mode(
                 self.undo_policy,
                 false,
             )?;
-            prepared_reopen = self.save_to_memory_impl(
+            self.save_to_memory_impl(
                 &tmp,
                 dest,
-                prepared_reopen,
                 load_options,
                 emergency_budget,
                 &observer,
-            )?;
+            )?
         } else {
+            let prepared_reopen = self.prepare_reopen(&tmp)?;
             self.replace_with_retry(&tmp, dest)?;
-        }
+            prepared_reopen
+        };
         if switch_path {
             self.path = dest.to_path_buf();
         }
@@ -14308,6 +14312,12 @@ impl BigFile {
         // 换名前可能用空 RAM 占位摘除旧 mmap，因此这里总是先恢复真实映射。
         let recovery = self.map_current_backing()?;
         self.backing = recovery;
+        if self.idx.n_records() == 0 {
+            // 新 RAM 预留前已释放旧索引；任何降级读取前都先恢复其行定位能力。
+            let t0 = Instant::now();
+            self.idx = build_index_with_format(self.backing.bytes(), self.format);
+            self.index_ms = t0.elapsed().as_millis() as u64;
+        }
         #[cfg(test)]
         if self::memory_save_tests::old_ram_recovery_fault() {
             return Err("注入旧 RAM 恢复失败".into());
@@ -14348,12 +14358,11 @@ impl BigFile {
         }
     }
 
-    /// 内存保存共用的资源状态机；成功只返回可提交的新后备和已建索引。
+    /// 内存保存先释放旧 RAM 再建新索引和新后备，失败仍恢复旧 RAM。
     fn save_to_memory_impl<O>(
         &mut self,
         tmp: &Path,
         dest: &Path,
-        prepared: PreparedReopen,
         options: LoadOptions,
         emergency_budget: PreparedUndoPolicy,
         observer: &O,
@@ -14369,7 +14378,15 @@ impl BigFile {
         drop(old_ram);
         observer(SaveRamEvent::Phase(SaveRamPhase::OldRamReleased { old_bytes }));
 
-        let prepared = match Self::prepare_memory_reopen(tmp, prepared, options, observer) {
+        // 第二套索引及其并行构建缓冲不得与旧完整 RAM 同时存在。
+        let prepared = match self.prepare_reopen(tmp).and_then(|prepared| {
+            // 新索引已验证，旧索引必须在完整新 RAM 提交前让出；失败时从旧后备重建。
+            self.idx = RawIndex {
+                line_off: Vec::new(),
+                rec_lines: Vec::new(),
+            };
+            Self::prepare_memory_reopen(tmp, prepared, options, observer)
+        }) {
             Ok(prepared) => prepared,
             Err(error) => {
                 let error = format!(

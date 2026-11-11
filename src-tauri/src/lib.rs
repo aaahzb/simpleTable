@@ -27,6 +27,8 @@ pub mod open_request;
 pub mod window_registry;
 mod order;
 mod process_memory;
+#[doc(hidden)]
+pub mod diagnostics;
 mod ram_load;
 mod ram_region;
 mod schema;

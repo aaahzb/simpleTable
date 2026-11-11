@@ -1,6 +1,6 @@
 # 持续集成：推送 main、提 PR 或手动触发时自动构建 + 自检。
-# Windows：node 逻辑单测（216）+ Rust 引擎单测（289）+ 完整冒烟（真实 WebView2，174 项断言）；
-# macOS：arm64 编译检查 + Rust 引擎单测（Apple Silicon 首个运行时验证，Windows 专属用例自动跳过）。
+# Windows：node 逻辑单测 + Rust 引擎单测 + release 真实峰值硬门禁 + 完整冒烟（真实 WebView2）；
+# macOS：arm64 编译检查 + Rust 引擎单测 + release 真实峰值硬门禁（Windows 专属用例自动跳过）。
 name: CI
 
 on:
@@ -36,6 +36,42 @@ jobs:
       - name: Rust 引擎单测（cargo test，含字节透传/进度相位等引擎断言）
         run: cargo test
         working-directory: src-tauri
+
+      - name: 编译 release 内存峰值验收器
+        run: cargo build --release --bin memory_peak
+        working-directory: src-tauri
+
+      - name: 真实私有内存峰值硬门禁（64 MiB）
+        shell: bash
+        working-directory: src-tauri
+        run: |
+          set -euo pipefail
+          exe="target/release/memory_peak.exe"
+          base="target/memory-peak"
+          mkdir -p "$base"
+          run_case() {
+            local scenario="$1"
+            local workers="$2"
+            local preload="$3"
+            "$exe" run --scenario "$scenario" --file "$base/fixture-64.csv" --workers "$workers" --preload "$preload" --report "$base/$scenario-64-w$workers-preload-$preload.json"
+          }
+          for workers in 1 4; do
+            for preload in false true; do
+              run_case convert "$workers" "$preload"
+            done
+          done
+          run_case cancel 4 false
+          run_case commit-fail 4 false
+          run_case read-fail 4 false
+          run_case save 4 false
+
+      - name: 上传真实内存峰值报告（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-peak-windows
+          path: src-tauri/target/memory-peak/*.json
+          if-no-files-found: error
 
       - name: 冒烟自检（真实 WebView 端到端断言，失败看下方报告）
         working-directory: src-tauri
@@ -74,3 +110,39 @@ jobs:
       - name: Rust 引擎单测（macOS arm64 本机跑，Windows 专属用例 cfg 跳过）
         run: cargo test
         working-directory: src-tauri
+
+      - name: 编译 release 内存峰值验收器
+        run: cargo build --release --bin memory_peak
+        working-directory: src-tauri
+
+      - name: 真实私有内存峰值硬门禁（64 MiB）
+        shell: bash
+        working-directory: src-tauri
+        run: |
+          set -euo pipefail
+          exe="target/release/memory_peak"
+          base="target/memory-peak"
+          mkdir -p "$base"
+          run_case() {
+            local scenario="$1"
+            local workers="$2"
+            local preload="$3"
+            sudo -n "$exe" run --scenario "$scenario" --file "$base/fixture-64.csv" --workers "$workers" --preload "$preload" --report "$base/$scenario-64-w$workers-preload-$preload.json"
+          }
+          for workers in 1 4; do
+            for preload in false true; do
+              run_case convert "$workers" "$preload"
+            done
+          done
+          run_case cancel 4 false
+          run_case commit-fail 4 false
+          run_case read-fail 4 false
+          run_case save 4 false
+
+      - name: 上传真实内存峰值报告（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-peak-macos
+          path: src-tauri/target/memory-peak/*.json
+          if-no-files-found: error

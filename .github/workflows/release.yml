@@ -1,4 +1,4 @@
-# 发布流水线：推 v* tag → Windows 冒烟自检（发布门槛）→ 并行构建
+# 发布流水线：推 v* tag → Windows 单测、冒烟与真实内存峰值硬门禁 → 并行构建
 # Windows x64 exe 与 macOS arm64 dmg → 汇总发布 GitHub Release。
 # 手动触发（workflow_dispatch）：只构建并留产物，不创建 Release。
 name: Release
@@ -19,7 +19,7 @@ env:
 
 jobs:
   test:
-    name: 发布门槛：Windows 冒烟自检
+    name: 发布门槛：Windows 单测、冒烟与内存峰值
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,13 +41,42 @@ jobs:
         run: cargo build
         working-directory: src-tauri
 
-      - name: 冒烟自检（174 项断言，报告打在日志里）
+      - name: 冒烟自检（真实 WebView2，报告打在日志里）
         working-directory: src-tauri
         env:
           SMOKE_REPORT_PATH: ${{ github.workspace }}/smoke-report.txt
         run: |
           .\target\debug\simpletable.exe --smoke
           Get-Content "${{ github.workspace }}/smoke-report.txt"
+
+      - name: 编译 release 内存峰值验收器
+        run: cargo build --release --bin memory_peak
+        working-directory: src-tauri
+
+      - name: 真实私有内存峰值发布硬门禁（64 MiB）
+        shell: bash
+        working-directory: src-tauri
+        run: |
+          set -euo pipefail
+          exe="target/release/memory_peak.exe"
+          base="target/memory-peak"
+          mkdir -p "$base"
+          run_case() {
+            local scenario="$1"
+            "$exe" run --scenario "$scenario" --file "$base/fixture-64.csv" --workers 4 --preload false --report "$base/$scenario-64-w4-preload-false.json"
+          }
+          run_case convert
+          run_case cancel
+          run_case read-fail
+          run_case save
+
+      - name: 上传真实内存峰值发布报告（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-peak-release-windows
+          path: src-tauri/target/memory-peak/*.json
+          if-no-files-found: error
 
   windows-x64:
     name: 构建 Windows x64
