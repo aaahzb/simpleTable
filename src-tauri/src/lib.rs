@@ -7,7 +7,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 冒烟自检强制大模式（运行期开关，供 smoke 大文件段在小夹具上路由大模式）。
@@ -33,10 +33,11 @@ mod schema;
 mod spool;
 use clipboard::{ClipboardMeta, ClipboardStore, CopyOutcome};
 use engine::{BigFile, BigMeta, ClearTarget, ColOp, FilterPage, FilterSpec, SortEstimate, SortLevel};
-use history::{Approval, EditOutcome};
+use history::{Approval, EditOutcome, FixedPointRequest, UndoPolicy};
+use ram_load::{LoadEvent, LoadOptions};
 use document_registry::{
     Access, AdoptedNotice, AdoptedSession, BigEntry, BigSession, DestroyOutcome,
-    TransferRoute, TransferUpdate,
+    SessionInfo, TransferRoute, TransferUpdate,
 };
 
 /// 读文件结果：解码后的纯文本 + 实际使用的编码名（供状态栏展示）。
@@ -535,6 +536,14 @@ fn io_err(path: &str, e: &std::io::Error) -> String {
     format!("{path}: {reason}")
 }
 
+/// 一次原子下发的普通撤销预算和内存模式驻留千分比。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoSettings {
+    pub budget_bytes: u64,
+    pub resident_permille: u32,
+}
+
 /// 进程级运行状态；打开队列先于任何窗口 ready 建立，后续任务在此并入文档和窗口表。
 struct RuntimeState {
     docs: document_registry::DocumentRegistry,
@@ -542,6 +551,7 @@ struct RuntimeState {
     windows: window_registry::WindowRegistry,
     drags: drag_registry::DragRegistry,
     undo_budget_bytes: u64,
+    resident_permille: u32,
 }
 
 impl Default for RuntimeState {
@@ -552,6 +562,7 @@ impl Default for RuntimeState {
             windows: window_registry::WindowRegistry::default(),
             drags: drag_registry::DragRegistry::default(),
             undo_budget_bytes: history::DEFAULT_HISTORY_BUDGET_BYTES,
+            resident_permille: history::DEFAULT_RESIDENT_PERMILLE,
         }
     }
 }
@@ -827,8 +838,13 @@ fn register_new_document(
         )),
         None => None,
     };
-    // BigFile 尚未共享；在同一元数据锁内套用在途 open/create 可见的最新预算。
-    file.set_history_budget(guard.undo_budget_bytes)?;
+    // BigFile 尚未共享；同一 runtime 锁内准备并提交完整策略，在途打开不会看到半套设置。
+    let policy = UndoPolicy {
+        budget_bytes: guard.undo_budget_bytes,
+        resident_permille: guard.resident_permille,
+    };
+    let prepared = file.prepare_undo_policy(policy)?;
+    file.commit_undo_policy(prepared);
     let registered = guard.docs.insert_new(file, owner, path);
     if let Some((session, lease, _)) = &old {
         guard.docs.close(*session, owner, *lease)?;
@@ -842,35 +858,118 @@ fn register_new_document(
     Ok(registered)
 }
 
-/// 更新进程预算并裁剪所有当前文档，返回实际仍存在且已更新的 session。
+fn validate_undo_policy(budget_bytes: u64, resident_permille: u32) -> Result<(), String> {
+    const MIN_BUDGET_BYTES: u64 = 1024 * 1024;
+    const MAX_BUDGET_BYTES: u64 = 1024 * MIN_BUDGET_BYTES;
+    if !(MIN_BUDGET_BYTES..=MAX_BUDGET_BYTES).contains(&budget_bytes) {
+        return Err("普通撤销预算需在 1–1024 MiB 之间".into());
+    }
+    // 复用引擎的 checked 整数校验，不在 Runtime 另写一套比例范围规则。
+    history::effective_undo_budget_bytes(
+        0,
+        true,
+        UndoPolicy {
+            budget_bytes,
+            resident_permille,
+        },
+    )?;
+    Ok(())
+}
+
+enum PolicyAttempt {
+    Busy(Arc<Mutex<BigFile>>),
+    Complete(Vec<SessionInfo>),
+}
+
+/// 原子更新当前及未来文档的完整撤销策略。
 ///
-/// 元数据锁只用于更新全局值和快照 Arc；等待文件锁时不持有元数据锁。
+/// 所有文档锁按 session 顺序取得并一直持到统一提交。任一遇忙或预检失败都不写
+/// 全局默认或其他文档；遇忙时在全部锁外等待并从头重试，避免与既有文档内二次
+/// 授权形成 runtime/document 等待环。
+fn set_runtime_undo_policy_with_wait_hook<H>(
+    runtime: &SharedRuntime,
+    budget_bytes: u64,
+    resident_permille: u32,
+    mut on_wait: H,
+) -> Result<Vec<SessionInfo>, String>
+where
+    H: FnMut(),
+{
+    validate_undo_policy(budget_bytes, resident_permille)?;
+    let policy = UndoPolicy {
+        budget_bytes,
+        resident_permille,
+    };
+    loop {
+        let attempt = {
+            let mut guard = runtime.lock().map_err(|e| e.to_string())?;
+            let entries = guard.docs.entries_in_session_order();
+            let mut prepared = Vec::with_capacity(entries.len());
+            let mut busy = None;
+            for (_, entry) in &entries {
+                match entry.file.try_lock() {
+                    Ok(file) => {
+                        let change = file.prepare_undo_policy(policy)?;
+                        prepared.push((file, change));
+                    }
+                    Err(TryLockError::WouldBlock) => {
+                        busy = Some(Arc::clone(&entry.file));
+                        break;
+                    }
+                    Err(TryLockError::Poisoned(error)) => {
+                        return Err(format!("文档锁已损坏：{error}"));
+                    }
+                }
+            }
+            if let Some(file) = busy {
+                PolicyAttempt::Busy(file)
+            } else {
+                // 所有预检和文档锁均仍有效；提交阶段不再分配、等待或失败。
+                for (mut file, change) in prepared {
+                    file.commit_undo_policy(change);
+                }
+                guard.undo_budget_bytes = budget_bytes;
+                guard.resident_permille = resident_permille;
+                PolicyAttempt::Complete(guard.docs.session_infos())
+            }
+        };
+        match attempt {
+            PolicyAttempt::Complete(infos) => return Ok(infos),
+            PolicyAttempt::Busy(file) => {
+                // 测试屏障位于 runtime 和全部文档锁释放之后。
+                on_wait();
+                drop(file.lock().map_err(|e| e.to_string())?);
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+fn set_runtime_undo_policy(
+    runtime: &SharedRuntime,
+    budget_bytes: u64,
+    resident_permille: u32,
+) -> Result<Vec<SessionInfo>, String> {
+    set_runtime_undo_policy_with_wait_hook(
+        runtime,
+        budget_bytes,
+        resident_permille,
+        || {},
+    )
+}
+
+#[cfg(test)]
+/// 兼容旧单预算调用；驻留比例沿用调用时完整策略中的当前值。
 fn set_runtime_undo_budget(
     runtime: &SharedRuntime,
     budget_bytes: u64,
 ) -> Result<Vec<u64>, String> {
-    let targets = {
-        let mut guard = runtime.lock().map_err(|e| e.to_string())?;
-        guard.undo_budget_bytes = budget_bytes;
-        guard.docs.file_handles()
-    };
-    let mut changed = Vec::with_capacity(targets.len());
-    for (session, file) in targets {
-        // 已关闭会话只剩测试或清理方持有的 Arc，不必再修改。
-        let exists = runtime
-            .lock()
-            .map_err(|e| e.to_string())?
-            .docs
-            .event_route(session)
-            .is_some();
-        if !exists {
-            continue;
-        }
-        let mut file = file.lock().map_err(|e| e.to_string())?;
-        file.set_history_budget(budget_bytes)?;
-        changed.push(session);
-    }
-    Ok(changed)
+    let resident_permille = runtime
+        .lock()
+        .map_err(|e| e.to_string())?
+        .resident_permille;
+    set_runtime_undo_policy(runtime, budget_bytes, resident_permille)
+        .map(|infos| infos.into_iter().map(|info| info.session).collect())
 }
 
 /// 查询文件大小（字节），打开路径路由用：≥ 阈值走大文件模式。
@@ -1045,6 +1144,213 @@ fn big_sort_cancel(
         .load_cancel
         .store(true, Ordering::Relaxed);
     Ok(())
+}
+
+/// 内存模式进入/退出的统一返回；固定点协议沿用现有 camelCase IPC。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryModeOutcome {
+    pub changed: bool,
+    pub cancelled: bool,
+    pub fixed_point: Option<FixedPointRequest>,
+    pub meta: BigMeta,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MemoryProgress {
+    session: u64,
+    lease: u64,
+    done: u64,
+    total: u64,
+}
+
+const MEMORY_PROGRESS_EVENT: &str = "big-memory-progress";
+
+/// 只有原 owner/lease 仍可读文档时才交付进度；迁移或关闭后静默丢弃旧事件。
+fn route_memory_progress<F>(
+    runtime: &SharedRuntime,
+    owner: &str,
+    session: u64,
+    lease: u64,
+    done: u64,
+    total: u64,
+    emit: F,
+) -> bool
+where
+    F: FnOnce(MemoryProgress),
+{
+    if authorize_big(runtime, owner, session, lease, Access::Read).is_err() {
+        return false;
+    }
+    emit(MemoryProgress {
+        session,
+        lease,
+        done,
+        total,
+    });
+    true
+}
+
+/// 内存进入的同步核心；生产命令在 spawn_blocking 中调用，测试可注入小文件门槛。
+fn enter_memory_document_with_options<O>(
+    runtime: &SharedRuntime,
+    owner: &str,
+    session: u64,
+    lease: u64,
+    minimum_bytes: u64,
+    options: LoadOptions,
+    observer: O,
+) -> Result<MemoryModeOutcome, String>
+where
+    O: Fn(LoadEvent) + Sync,
+{
+    let entry = authorize_big(runtime, owner, session, lease, Access::Write)?;
+    entry.load_cancel.store(false, Ordering::Relaxed);
+    entry.bump_gate();
+    let _bg = engine::bg::BackgroundGuard::enter();
+    let mut file = entry.file.lock().map_err(|e| e.to_string())?;
+    authorize_big(runtime, owner, session, lease, Access::Write)?;
+    file.refresh_indexed();
+    let changed = file.enter_memory_mode_with_options(
+        &entry.load_cancel,
+        minimum_bytes,
+        options,
+        observer,
+    )?;
+    let cancelled = !changed && entry.load_cancel.load(Ordering::Relaxed);
+    Ok(MemoryModeOutcome {
+        changed,
+        cancelled,
+        fixed_point: None,
+        meta: file.meta(),
+    })
+}
+
+/// 取消只设置原子标志；尤其不能在这里等待正在转换的文档写锁。
+fn cancel_memory_document(
+    runtime: &SharedRuntime,
+    owner: &str,
+    session: u64,
+    lease: u64,
+) -> Result<(), String> {
+    authorize_big(runtime, owner, session, lease, Access::Cancel)?
+        .load_cancel
+        .store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+fn exit_memory_document(
+    runtime: &SharedRuntime,
+    owner: &str,
+    session: u64,
+    lease: u64,
+    approval: Approval,
+) -> Result<MemoryModeOutcome, String> {
+    let entry = authorize_big(runtime, owner, session, lease, Access::Write)?;
+    entry.bump_gate();
+    let _bg = engine::bg::BackgroundGuard::enter();
+    let mut file = entry.file.lock().map_err(|e| e.to_string())?;
+    authorize_big(runtime, owner, session, lease, Access::Write)?;
+    file.refresh_indexed();
+    let outcome = file.exit_memory_mode(approval)?;
+    Ok(MemoryModeOutcome {
+        changed: outcome.exited,
+        cancelled: false,
+        fixed_point: outcome.fixed_point,
+        meta: file.meta(),
+    })
+}
+
+/// 返回当前后备大小、105% 转换上限和真实系统可用内存。
+#[tauri::command]
+fn big_memory_mode_estimate(
+    window: tauri::Window,
+    state: tauri::State<SharedRuntime>,
+    session: u64,
+    lease: u64,
+) -> Result<engine::MemoryEstimate, String> {
+    with_big(&state, &window, session, lease, Access::Read, |file| {
+        file.memory_estimate()
+    })
+}
+
+/// 分块转换为持久内存模式，进度只发给发起操作的 owner/lease。
+#[tauri::command]
+async fn big_memory_mode_enter(
+    window: tauri::Window,
+    state: tauri::State<'_, SharedRuntime>,
+    session: u64,
+    lease: u64,
+) -> Result<MemoryModeOutcome, String> {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, u64)>();
+        let emitter_runtime = runtime.clone();
+        let emit_owner = owner.clone();
+        let emitter = std::thread::spawn(move || {
+            while let Ok((done, total)) = rx.recv() {
+                route_memory_progress(
+                    &emitter_runtime,
+                    &emit_owner,
+                    session,
+                    lease,
+                    done,
+                    total,
+                    |progress| {
+                        let _ = app.emit_to(&emit_owner, MEMORY_PROGRESS_EVENT, progress);
+                    },
+                );
+            }
+        });
+        let result = enter_memory_document_with_options(
+            &runtime,
+            &owner,
+            session,
+            lease,
+            engine::MEMORY_MODE_MIN_BYTES,
+            LoadOptions::default(),
+            move |event| {
+                if let LoadEvent::Progress { done, total } = event {
+                    let _ = tx.send((done, total));
+                }
+            },
+        );
+        emitter.join().map_err(|e| format!("内存进度转发线程异常：{e:?}"))?;
+        result
+    })
+    .await
+    .map_err(|e| format!("内存模式任务被取消：{e}"))?
+}
+
+/// 取消正在进行的内存转换；幂等且不等待文档写锁。
+#[tauri::command]
+fn big_memory_mode_cancel(
+    window: tauri::Window,
+    state: tauri::State<SharedRuntime>,
+    session: u64,
+    lease: u64,
+) -> Result<(), String> {
+    cancel_memory_document(&state, window.label(), session, lease)
+}
+
+/// 退出持久内存模式；可能返回撤销预算固定点请求。
+#[tauri::command]
+async fn big_memory_mode_exit(
+    window: tauri::Window,
+    state: tauri::State<'_, SharedRuntime>,
+    session: u64,
+    lease: u64,
+    approval: Approval,
+) -> Result<MemoryModeOutcome, String> {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        exit_memory_document(&runtime, &owner, session, lease, approval)
+    })
+    .await
+    .map_err(|e| format!("退出内存模式任务被取消：{e}"))?
 }
 
 /// 应用排序（需已载入内存）。排序计算在阻塞线程执行，完成后返回最新 meta。
@@ -1258,40 +1564,61 @@ fn big_redo(window: tauri::Window, state: tauri::State<SharedRuntime>, session: 
     with_big(&state, &window, session, lease, Access::Write, |bf| Ok(bf.redo()))
 }
 
-/// 一次设置进程内所有文档及之后在途 open/create 的历史预算。
+/// 一次设置进程内所有文档及之后在途 open/create 的完整撤销策略。
+/// 旧调用未提供 residentPermille 时沿用当前值，新调用应一次提供两个字段。
 #[tauri::command]
 async fn set_undo_budget(
     app: tauri::AppHandle,
     state: tauri::State<'_, SharedRuntime>,
     budget_bytes: u64,
-) -> Result<(), String> {
+    resident_permille: Option<u32>,
+) -> Result<Vec<SessionInfo>, String> {
     let runtime = state.inner().clone();
+    let resident_permille = match resident_permille {
+        Some(value) => value,
+        None => runtime.lock().map_err(|e| e.to_string())?.resident_permille,
+    };
+    let settings = UndoSettings {
+        budget_bytes,
+        resident_permille,
+    };
     let task_runtime = runtime.clone();
     let sessions = tauri::async_runtime::spawn_blocking(move || {
-        set_runtime_undo_budget(&task_runtime, budget_bytes)
+        set_runtime_undo_policy(
+            &task_runtime,
+            settings.budget_bytes,
+            settings.resident_permille,
+        )
     })
     .await
     .map_err(|e| format!("撤销预算任务被取消：{e}"))??;
-    for session in sessions {
-        // 文件锁释放后重新读取路由；迁移已接管时只通知最新 owner/lease。
+    let mut current = Vec::with_capacity(sessions.len());
+    for info in sessions {
+        // 文件锁和 runtime 更新锁均已释放；迁移后只通知最新 owner/lease。
         let route = runtime
             .lock()
             .map_err(|e| e.to_string())?
             .docs
-            .event_route(session);
+            .event_route(info.session);
         if let Some((owner, lease)) = route {
             let _ = app.emit_to(
                 &owner,
                 "undo-budget-changed",
                 serde_json::json!({
-                    "session": session,
+                    "session": info.session,
                     "lease": lease,
-                    "budgetBytes": budget_bytes,
+                    "budgetBytes": settings.budget_bytes,
+                    "residentPermille": settings.resident_permille,
                 }),
             );
+            current.push(SessionInfo {
+                session: info.session,
+                owner,
+                lease,
+            });
         }
     }
-    Ok(())
+    Ok(current)
 }
 
 /// 执行一次筛选（rayon 并行扫描），返回命中数；被更新请求打断时返回 null。
@@ -2531,6 +2858,10 @@ pub fn run() {
             big_sort_cancel,
             big_sort_apply,
             big_sort_exit,
+            big_memory_mode_estimate,
+            big_memory_mode_enter,
+            big_memory_mode_cancel,
+            big_memory_mode_exit,
             big_meta,
             big_stale,
             big_rows,
@@ -3022,3 +3353,6 @@ mod task9_tests {
         assert_eq!(entry.path.as_deref(), Some(new_path.as_path()));
     }
 }
+
+#[cfg(test)]
+mod memory_runtime_tests;

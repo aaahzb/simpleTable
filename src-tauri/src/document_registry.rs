@@ -68,6 +68,15 @@ pub struct BigSession {
     pub meta: BigMeta,
 }
 
+/// 全局设置完成后用于返回值和定向事件的路由快照。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    pub session: u64,
+    pub owner: String,
+    pub lease: u64,
+}
+
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
@@ -225,6 +234,29 @@ impl DocumentRegistry {
         }
         self.sessions.remove(&session);
         Ok(())
+    }
+
+    /// 按 session 顺序快照全部文档，供全局策略以固定顺序准备和提交。
+    pub fn entries_in_session_order(&self) -> Vec<(u64, BigEntry)> {
+        let mut entries: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|(session, entry)| (*session, entry.clone()))
+            .collect();
+        entries.sort_by_key(|(session, _)| *session);
+        entries
+    }
+
+    /// 返回确定顺序的会话路由，供设置结果和后续定向事件使用。
+    pub fn session_infos(&self) -> Vec<SessionInfo> {
+        self.entries_in_session_order()
+            .into_iter()
+            .map(|(session, entry)| SessionInfo {
+                session,
+                owner: entry.owner,
+                lease: entry.lease,
+            })
+            .collect()
     }
 
     /// 快照全部文档的共享文件句柄；调用方不得持元数据锁等待这些文件锁。

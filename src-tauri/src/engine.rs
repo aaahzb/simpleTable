@@ -107,7 +107,7 @@ fn renamed_weighted(total: u64) -> u64 {
 /// 整体下调，流式写盘被拖慢；线程级只降调度优先级，无该副作用。
 /// 离开作用域时恢复进入前的优先级。
 #[cfg(windows)]
-mod bg {
+pub(crate) mod bg {
     use std::ffi::c_void;
 
     type Handle = *mut c_void;
@@ -149,7 +149,7 @@ mod bg {
 /// 非 Windows 平台：守卫为空结构（Tauri 前端与引擎逻辑跨平台一致，
 /// 优先级隔离仅 Windows 需要——macOS 的 QoS 由 GCD 自动处理）。
 #[cfg(not(windows))]
-mod bg {
+pub(crate) mod bg {
     pub struct BackgroundGuard;
 
     impl BackgroundGuard {
@@ -10483,6 +10483,12 @@ impl BigFile {
 
     #[cfg(test)]
     pub fn backing_path(&self) -> &Path { &self.backing_path }
+
+    /// 仅在测试中替换预算计算使用的后备字节数，不改动真实文件或后备内容。
+    #[cfg(test)]
+    pub fn set_backing_bytes_for_test(&mut self, total_bytes: u64) {
+        self.total_bytes = total_bytes;
+    }
 
     /// 仅供冒烟诊断读取本会话独占临时目录。
     pub fn spool_root(&self) -> &Path { self.spool.root() }
