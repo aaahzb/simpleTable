@@ -34,6 +34,7 @@ const TRANSFER_READ_COMMANDS = new Set([
   "big_meta", "big_rows", "big_filter_page", "big_filter_count",
   "big_filter_hit_view_row", "big_find_edge", "big_stale",
   "big_sort_estimate", "big_copy", "big_clipboard_meta",
+  "big_memory_mode_estimate",
 ]);
 
 /** 这些命令在途时不进入 sealing，避免保存/重写与迁移屏障交叉。 */
@@ -41,6 +42,7 @@ const TRANSFER_BLOCK_COMMANDS = new Set([
   "big_save", "big_save_as", "big_sort_load", "big_sort_apply", "big_sort_exit",
   "big_col_apply", "big_paste_import_begin", "big_paste_import_chunk",
   "big_paste_import_finish", "big_paste_clipboard",
+  "big_memory_mode_enter", "big_memory_mode_exit",
 ]);
 
 
@@ -153,10 +155,12 @@ export class BigModel {
     if (typeof this._sid !== "number" || typeof this._lease !== "number") {
       throw new Error("大文件会话尚未建立");
     }
-    if (this._transferState === "sealing") {
+    const transferCancel = cmd === "big_memory_mode_cancel";
+    if (this._transferState === "sealing" && !transferCancel) {
       return Promise.reject(new Error("文档正在迁移，请稍后重试"));
     }
-    if (this._transferState === "accepted" && !TRANSFER_READ_COMMANDS.has(cmd)) {
+    if (this._transferState === "accepted"
+      && !TRANSFER_READ_COMMANDS.has(cmd) && !transferCancel) {
       return Promise.reject(new Error("迁移接管中，文档当前只读"));
     }
     const key = Symbol(cmd);
@@ -702,6 +706,68 @@ export class BigModel {
    */
   async onSortProgress(cb) {
     return this._listen("big-sort-progress", (e) => {
+      const { session, lease, done, total } = e.payload;
+      if (session === this._sid && lease === this._lease) cb(done, total);
+    });
+  }
+
+  /**
+   * 估算持久内存模式转换的文件体量和峰值上限。
+   *
+   * @returns {Promise<object>} 引擎内存模式估算。
+   */
+  async memoryEstimate() {
+    return this._invoke("big_memory_mode_estimate");
+  }
+
+  /**
+   * 进入持久内存模式；已有临时 RAM 后备时只做原地提升。
+   *
+   * @returns {Promise<object>} MemoryModeOutcome；取消时不刷新元数据。
+   */
+  async enterMemoryMode() {
+    const outcome = await this._invoke("big_memory_mode_enter");
+    if (!outcome.cancelled) await this._refreshMeta();
+    return outcome;
+  }
+
+  /**
+   * 取消正在进行的内存模式转换，不等待文档写锁。
+   *
+   * @returns {Promise<any>} 引擎取消结果。
+   */
+  async cancelMemoryModeLoad() {
+    return this._invoke("big_memory_mode_cancel");
+  }
+
+  /**
+   * 退出持久内存模式；需要缩容时原样返回固定点供调用方确认。
+   *
+   * @param {{allowFixedPoint?: boolean, preflightId?: number | null}} [approval]
+   *   固定点批准；首次预检默认不批准。
+   * @returns {Promise<object>} MemoryModeOutcome；固定点未批准时不刷新元数据。
+   */
+  async exitMemoryMode({ allowFixedPoint = false, preflightId = null } = {}) {
+    const outcome = await this._invoke("big_memory_mode_exit", {
+      approval: { allowFixedPoint, preflightId },
+    });
+    if (!outcome.fixedPoint) await this._refreshMeta();
+    return outcome;
+  }
+
+  /** @returns {boolean} 当前文档是否为持久内存模式。 */
+  memoryMode() {
+    return Boolean(this._meta?.memory_mode);
+  }
+
+  /**
+   * 订阅当前会话和租约的内存模式转换进度。
+   *
+   * @param {(done: number, total: number) => void} cb - 回调（字节）。
+   * @returns {Promise<Function>} 取消监听函数。
+   */
+  async onMemoryProgress(cb) {
+    return this._listen("big-memory-progress", (e) => {
       const { session, lease, done, total } = e.payload;
       if (session === this._sid && lease === this._lease) cb(done, total);
     });

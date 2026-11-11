@@ -1,23 +1,41 @@
 import { BigModel } from "../../frontend/js/bigmodel.js";
 import { findVerticalEdge } from "../../frontend/js/nav.js";
+import { effectiveUndoBudgetBytes } from "../../frontend/js/prefs.js";
 
 function editOutcome({ changed = false, insertedRows = 0, removedRows = 0 } = {}) {
   return { changed, insertedRows, removedRows, fixedPoint: null, cancelled: false };
 }
 
 /** 造一个内存版"引擎"：N 行 M 列的顺序数据 + 记录 invoke 调用。 */
-function createEngine({ rows = 1000, cols = 3, data: initial = null, textLines = false } = {}, calls) {
+function createEngine({
+  rows = 1000, cols = 3, data: initial = null, textLines = false,
+  totalBytes: initialTotalBytes = 1024, savedTotalBytes = null,
+  ramBacked: initialRamBacked = false, memoryMode: initialMemoryMode = false,
+  hasPath: initialHasPath = false, historyBytes = 0, undoPolicy: initialPolicy = {},
+} = {}, calls) {
   let data = initial
     ? initial.map((r) => r.slice())
     : Array.from({ length: rows }, (_, r) =>
       Array.from({ length: cols }, (_, c) => `r${r}c${c}`),
     );
   let headerless = false;
-  let ramBacked = false;
-  let hasPath = false; // big_open 置 true、big_new 置 false
+  let ramBacked = initialRamBacked || initialMemoryMode;
+  let memoryMode = initialMemoryMode;
+  let totalBytes = initialTotalBytes;
+  let hasPath = initialHasPath; // big_open 置 true、big_new 置 false
   let sorted = false;
   let ncols = cols; // big_new 后随文本重估列数
   let baseHeaders = Array.from({ length: cols }, (_, c) => `h${c}`);
+  const undoPolicy = {
+    budgetBytes: Number(initialPolicy.budgetBytes ?? 64 * 1024 * 1024),
+    residentPermille: Number(initialPolicy.residentPermille ?? 1000),
+  };
+  const effectiveBudget = () => Number(effectiveUndoBudgetBytes({
+    budgetMiB: undoPolicy.budgetBytes / (1024 * 1024),
+    residentPermille: undoPolicy.residentPermille,
+    fileBytes: BigInt(totalBytes),
+    memoryMode,
+  }));
   const generic = () => Array.from({ length: ncols }, (_, c) => `列${c + 1}`);
   const meta = () => ({
     rows: data.length,
@@ -33,10 +51,12 @@ function createEngine({ rows = 1000, cols = 3, data: initial = null, textLines =
     // 渐进索引字段：普通夹具视为"已索引完成"
     indexing: false,
     ram_backed: ramBacked,
+    memory_mode: memoryMode,
+    effective_undo_budget_bytes: effectiveBudget(),
     has_path: hasPath,
     sorted,
-    indexed_bytes: 1024,
-    total_bytes: 1024,
+    indexed_bytes: totalBytes,
+    total_bytes: totalBytes,
     open_ms: 3,
     index_ms: 3,
     elapsed_ms: 3,
@@ -87,6 +107,11 @@ function createEngine({ rows = 1000, cols = 3, data: initial = null, textLines =
           return editOutcome({ changed, insertedRows, removedRows });
         }
         case "big_set_undo_budget":
+          undoPolicy.budgetBytes = Number(args.budgetBytes);
+          if (args.residentPermille !== undefined) {
+            undoPolicy.residentPermille = Number(args.residentPermille);
+          }
+          return meta();
         case "big_meta":
           return meta();
         case "big_rows": {
@@ -223,18 +248,62 @@ function createEngine({ rows = 1000, cols = 3, data: initial = null, textLines =
           return null;
         case "big_col_apply":
           return editOutcome({ changed: true });
+        case "big_memory_mode_estimate":
+          return {
+            file_bytes: totalBytes,
+            limit_bytes: Math.floor(totalBytes * 105 / 100),
+            available_bytes: 1 << 30,
+            already_ram: ramBacked,
+            can_enter: hasPath,
+            reason: hasPath ? null : "当前文档无磁盘后备",
+          };
+        case "big_memory_mode_enter": {
+          if (!hasPath) throw new Error("新建且从未保存的文档不能开启持久内存模式");
+          const changed = !memoryMode;
+          memoryMode = true;
+          ramBacked = true;
+          return { changed, cancelled: false, fixedPoint: null, meta: meta() };
+        }
+        case "big_memory_mode_cancel":
+          return null;
+        case "big_memory_mode_exit": {
+          if (!memoryMode) {
+            return { changed: false, cancelled: false, fixedPoint: null, meta: meta() };
+          }
+          if (historyBytes > undoPolicy.budgetBytes
+            && !args.approval?.allowFixedPoint) {
+            return {
+              changed: false,
+              cancelled: false,
+              fixedPoint: {
+                kind: "memoryModeExit",
+                operation: "退出内存模式",
+                requiredBytes: historyBytes,
+                budgetBytes: undoPolicy.budgetBytes,
+                preflightId: 1,
+              },
+              meta: meta(),
+            };
+          }
+          memoryMode = false;
+          ramBacked = false;
+          return { changed: true, cancelled: false, fixedPoint: null, meta: meta() };
+        }
         case "big_save":
         case "big_save_as":
-          // 真实引擎保存/另存为后重开文件：筛选结果被丢弃、排序视图已物理落盘
+          // 持久模式保留 RAM；临时排序 RAM 保存后仍恢复 mmap。
           filter = null;
           sorted = false;
+          ramBacked = memoryMode;
+          totalBytes = savedTotalBytes ?? totalBytes;
+          if (cmd === "big_save_as") hasPath = true;
           return { saved: true, fixedPoint: null, cancelled: false };
         case "big_sort_estimate":
           return {
-            file_bytes: 1024,
+            file_bytes: totalBytes,
             row_count: data.length,
-            new_bytes: 4096,
-            peak_bytes: 8192,
+            new_bytes: totalBytes * 4,
+            peak_bytes: totalBytes * 8,
             available_bytes: 1 << 30,
           };
         case "big_sort_load":
@@ -272,7 +341,7 @@ function createEngine({ rows = 1000, cols = 3, data: initial = null, textLines =
         }
         case "big_sort_exit":
           sorted = false;
-          if (args.releaseRam !== false) ramBacked = false;
+          if (args.releaseRam !== false && !memoryMode) ramBacked = false;
           return editOutcome({ changed: true });
         case "big_close":
           return null;
@@ -284,7 +353,7 @@ function createEngine({ rows = 1000, cols = 3, data: initial = null, textLines =
   };
   const capture = () => ({
     data: data.map((row) => row.slice()),
-    headerless, ramBacked, hasPath, sorted, ncols,
+    headerless, ramBacked, memoryMode, totalBytes, hasPath, sorted, ncols,
     baseHeaders: baseHeaders.slice(),
     filter: filter ? filter.slice() : null,
   });
@@ -292,6 +361,8 @@ function createEngine({ rows = 1000, cols = 3, data: initial = null, textLines =
     data = state.data.map((row) => row.slice());
     headerless = state.headerless;
     ramBacked = state.ramBacked;
+    memoryMode = state.memoryMode;
+    totalBytes = state.totalBytes;
     hasPath = state.hasPath;
     sorted = state.sorted;
     ncols = state.ncols;
@@ -322,6 +393,7 @@ export function makeSharedBackend(options = {}) {
     "big_filter", "big_clear_filter", "big_col_push", "big_col_pop",
     "big_col_clear", "big_col_apply", "big_save", "big_save_as",
     "big_sort_load", "big_sort_cancel", "big_sort_apply", "big_sort_exit",
+    "big_memory_mode_enter", "big_memory_mode_exit",
   ]);
   const historyCommands = new Set([
     "big_set_headerless", "big_set_cell", "big_set_cells", "big_paste",
@@ -339,7 +411,9 @@ export function makeSharedBackend(options = {}) {
     if (!entry) throw new Error("大文件会话未打开");
     if (entry.owner !== owner) throw new Error("窗口不是文档 owner");
     if (entry.lease !== lease) throw new Error("文档 lease 已过期");
-    if (entry.state === "sealed") throw new Error("文档正在迁移");
+    if (entry.state === "sealed" && access !== "cancel") {
+      throw new Error("文档正在迁移");
+    }
     if (access === "write" && entry.state !== "idle") {
       throw new Error("迁移目标当前只读");
     }
@@ -540,7 +614,8 @@ export function makeSharedBackend(options = {}) {
       }
       const entry = authorize(
         sessions.get(Number(args.session)), owner, args.lease,
-        writeCommands.has(cmd) ? "write" : "read",
+        cmd === "big_memory_mode_cancel"
+          ? "cancel" : writeCommands.has(cmd) ? "write" : "read",
       );
       let result;
       if (cmd === "big_undo" || cmd === "big_redo") {

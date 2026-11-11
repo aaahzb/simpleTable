@@ -5,7 +5,14 @@
  * 添加 N 行、通用确认（是/否）、未保存三选（保存/放弃/取消）、信息/错误提示。
  */
 
-import { normalizeUndoBudgetMiB } from "./prefs.js";
+import {
+  DEFAULT_RESIDENT_PERMILLE,
+  effectiveUndoBudgetBytes,
+  formatByteQuantity,
+  normalizeResidentPermille,
+  normalizeUndoBudgetMiB,
+  parseResidentPercent,
+} from "./prefs.js";
 
 /**
  * 底层模态框：遮罩 + 标题 + 内容 + 按钮行。
@@ -98,9 +105,9 @@ export function fmtBytes(n) {
 /**
  * 生成固定点确认文案。
  *
- * @param {{kind: "stepOverBudget" | "saveTransform" | "sortMaterialization",
- *   operation: string, requiredBytes: number, budgetBytes: number,
- *   preflightId: number}} request - 引擎固定点请求。
+ * @param {{kind: "stepOverBudget" | "saveTransform" | "sortMaterialization" |
+ *   "memoryModeExit", operation: string, requiredBytes: number,
+ *   budgetBytes: number, preflightId: number}} request - 引擎固定点请求。
  * @returns {string} 包含操作原因和撤销边界的完整提示。
  * @throws {Error} 固定点类型未知时抛出。
  */
@@ -117,6 +124,10 @@ export function fixedPointMessage(request) {
   }
   if (request.kind === "sortMaterialization") {
     return "按当前排序保存会物化当前行序。" + tail;
+  }
+  if (request.kind === "memoryModeExit") {
+    return "退出内存模式将恢复普通撤销预算，可能淘汰最旧历史。"
+      + "\n取消则保持内存模式、RAM 后备和当前编辑现场。" + tail;
   }
   throw new Error("未知固定点类型");
 }
@@ -139,31 +150,97 @@ export async function confirmFixedPointDialog(request) {
 }
 
 /**
- * 设置每个文档的撤销/重做共用历史预算。
+ * 设置普通撤销预算与内存模式驻留撤销比例，并实时试算有效预算。
  *
- * @param {unknown} def - 当前 MiB 预算。
- * @returns {Promise<number | null>} 确认返回 1–1024 的整数；取消返回 null，
- *   非法输入按统一规则回退 64。
+ * @param {unknown | {budgetMiB: unknown, residentPermille: unknown}} def -
+ *   新对象协议的双值设置；旧数字调用仍按 MiB 解释。
+ * @param {{hasPath: boolean, totalBytes: number | bigint,
+ *   memoryMode: boolean}} [preview] - 当前文档后备和生命周期。
+ * @returns {Promise<{budgetMiB: number, residentPermille: number} | number | null>}
+ *   新调用返回双值对象，旧数字调用返回 MiB；取消返回 null。
  */
-export async function undoBudgetDialog(def) {
+export async function undoBudgetDialog(def, preview = { hasPath: false }) {
+  const legacy = typeof def !== "object" || def === null;
+  const settings = legacy
+    ? { budgetMiB: def, residentPermille: DEFAULT_RESIDENT_PERMILLE }
+    : def;
   const body = document.createElement("div");
   const hint = document.createElement("div");
   hint.className = "dialog-tip";
-  hint.textContent = "撤销/重做共用此预算，每页签独立记账。"
-    + "降低预算可能淘汰最旧历史；连一步也无法保留时会建立固定点。";
-  const label = document.createElement("label");
-  label.textContent = "每文档预算（MiB，1–1024）：";
-  const input = document.createElement("input");
-  input.type = "number";
-  input.min = "1";
-  input.max = "1024";
-  input.step = "1";
-  input.value = String(def);
-  label.appendChild(input);
-  body.append(hint, label);
+  hint.style.whiteSpace = "pre-line";
+  hint.textContent = "撤销/重做共用预算，每页签独立记账。"
+    + "降低预算可能淘汰最旧历史。\n"
+    + "普通文档有效预算 = 普通预算\n"
+    + "内存模式文档有效预算 =\n"
+    + "    max（普通预算，当前后备文件总字节数 × 驻留撤销百分比）";
+  const budgetLabel = document.createElement("label");
+  budgetLabel.textContent = "普通预算（MiB，1–1024）：";
+  const budget = document.createElement("input");
+  budget.id = "undo-budget-mib";
+  budget.type = "number";
+  budget.min = "1";
+  budget.max = "1024";
+  budget.step = "1";
+  budget.value = String(normalizeUndoBudgetMiB(settings.budgetMiB));
+  budgetLabel.appendChild(budget);
+  const residentLabel = document.createElement("label");
+  residentLabel.textContent = "驻留撤销百分比（0%–1000%，步长 0.1%）：";
+  const resident = document.createElement("input");
+  resident.id = "undo-resident-percent";
+  resident.type = "number";
+  resident.min = "0";
+  resident.max = "1000.0";
+  resident.step = "0.1";
+  resident.value = (normalizeResidentPermille(settings.residentPermille) / 10).toFixed(1);
+  residentLabel.appendChild(resident);
+  const previewBox = document.createElement("div");
+  previewBox.className = "dialog-tip";
+  previewBox.style.whiteSpace = "pre-line";
+  body.append(hint, budgetLabel, residentLabel, previewBox);
+
+  const currentSettings = () => ({
+    budgetMiB: normalizeUndoBudgetMiB(budget.value),
+    residentPermille: parseResidentPercent(resident.value)
+      ?? DEFAULT_RESIDENT_PERMILLE,
+  });
+  const renderPreview = () => {
+    const current = currentSettings();
+    const normal = effectiveUndoBudgetBytes({
+      ...current, fileBytes: 0n, memoryMode: false,
+    });
+    if (!preview.hasPath) {
+      previewBox.textContent = "当前文档无磁盘后备，内存模式不可开启\n"
+        + `普通预算：${formatByteQuantity(normal)}\n`
+        + "提高预算只扩大历史上限，不会预分配内存。";
+      return;
+    }
+    const fileBytes = preview.totalBytes;
+    const effective = effectiveUndoBudgetBytes({
+      ...current, fileBytes, memoryMode: Boolean(preview.memoryMode),
+    });
+    const entering = effectiveUndoBudgetBytes({
+      ...current, fileBytes, memoryMode: true,
+    });
+    previewBox.textContent = `普通预算：${formatByteQuantity(normal)}\n`
+      + `当前文件大小：${formatByteQuantity(fileBytes)}\n`
+      + `驻留撤销百分比：${(current.residentPermille / 10).toFixed(1)}%\n`
+      + `当前有效预算：${formatByteQuantity(effective)}\n`
+      + `若开启后的有效预算：${formatByteQuantity(entering)}\n`
+      + "提高预算只扩大历史上限，不会预分配内存。";
+  };
+  budget.addEventListener("input", renderPreview);
+  resident.addEventListener("input", renderPreview);
+  renderPreview();
   const value = await modal("撤销内存", body, [
     { text: "取消", value: null },
-    { text: "确定", value: () => normalizeUndoBudgetMiB(input.value), primary: true },
+    {
+      text: "确定",
+      value: () => {
+        const result = currentSettings();
+        return legacy ? result.budgetMiB : result;
+      },
+      primary: true,
+    },
   ]);
   return typeof value === "function" ? value() : null;
 }

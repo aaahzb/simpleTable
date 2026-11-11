@@ -72,6 +72,127 @@ export function createUndoBudgetPrefs(storage) {
   };
 }
 
+/** 普通预算与驻留撤销比例的组合设置键。 */
+export const UNDO_SETTINGS_PREF_KEY = "simpletable.undo_settings.v2";
+/** 默认驻留撤销比例：100%，内部使用整数千分比。 */
+export const DEFAULT_RESIDENT_PERMILLE = 1000;
+/** 最大驻留撤销比例：1000%。 */
+export const MAX_RESIDENT_PERMILLE = 10000;
+
+/**
+ * 将十进制百分比文本解析为整数千分比。
+ *
+ * @param {unknown} raw - 0 至 1000.0 的百分比文本，最多一位小数。
+ * @returns {number | null} 合法时返回 0 至 10000；否则返回 null。
+ */
+export function parseResidentPercent(raw) {
+  const text = String(raw).trim();
+  const match = /^(\d{1,4})(?:\.(\d))?$/.exec(text);
+  if (!match) return null;
+  const value = Number(match[1]) * 10 + Number(match[2] || "0");
+  return value <= MAX_RESIDENT_PERMILLE ? value : null;
+}
+
+/**
+ * 归一化内部驻留撤销千分比。
+ *
+ * @param {unknown} raw - 原始整数千分比。
+ * @returns {number} 0 至 10000 的整数；非法值回退 1000。
+ */
+export function normalizeResidentPermille(raw) {
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 0 && value <= MAX_RESIDENT_PERMILLE
+    ? value : DEFAULT_RESIDENT_PERMILLE;
+}
+
+/**
+ * 计算文档当前的有效撤销预算。
+ *
+ * @param {{budgetMiB: number, residentPermille: number,
+ *   fileBytes: number | bigint, memoryMode: boolean}} options - 策略与文档状态。
+ * @returns {bigint} 普通预算与驻留预算的较大者；驻留部分向上取整。
+ */
+export function effectiveUndoBudgetBytes({
+  budgetMiB, residentPermille, fileBytes, memoryMode,
+}) {
+  const budget = BigInt(budgetMiB) * 1024n * 1024n;
+  if (!memoryMode) return budget;
+  const bytes = typeof fileBytes === "bigint" ? fileBytes : BigInt(fileBytes);
+  const permille = BigInt(normalizeResidentPermille(residentPermille));
+  const scaled = (bytes * permille + 999n) / 1000n;
+  return scaled > budget ? scaled : budget;
+}
+
+/**
+ * 用二进制单位格式化任意精度字节数，不经过 Number 转换。
+ *
+ * @param {number | bigint} numberOrBigInt - 非负整数字节数。
+ * @returns {string} B 使用整数，其余单位保留两位小数。
+ */
+export function formatByteQuantity(numberOrBigInt) {
+  let bytes = typeof numberOrBigInt === "bigint"
+    ? numberOrBigInt : BigInt(numberOrBigInt);
+  if (bytes < 1024n) return `${bytes} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+  let whole = bytes;
+  let fraction = 0n;
+  let unit = 0;
+  while (whole >= 1024n && unit < units.length) {
+    fraction = ((whole % 1024n) * 100n) / 1024n;
+    whole /= 1024n;
+    unit += 1;
+  }
+  return `${whole}.${fraction.toString().padStart(2, "0")} ${units[unit - 1]}`;
+}
+
+/**
+ * 创建普通预算与驻留撤销比例的版本化偏好存取器。
+ *
+ * @param {Storage | null | undefined} storage - localStorage 或同接口对象。
+ * @returns {{get: () => {budgetMiB: number, residentPermille: number},
+ *   set: (value: object) => {budgetMiB: number, residentPermille: number}}}
+ *   优先读取 v2；缺失或损坏时迁移旧 v1 预算，存储异常不阻断设置。
+ */
+export function createUndoSettingsPrefs(storage) {
+  const fallback = () => ({
+    budgetMiB: createUndoBudgetPrefs(storage).get(),
+    residentPermille: DEFAULT_RESIDENT_PERMILLE,
+  });
+  return {
+    /** @returns {{budgetMiB: number, residentPermille: number}} 当前双值设置。 */
+    get() {
+      try {
+        const saved = JSON.parse(storage?.getItem(UNDO_SETTINGS_PREF_KEY));
+        if (saved) {
+          return {
+            budgetMiB: normalizeUndoBudgetMiB(saved.budgetMiB),
+            residentPermille: normalizeResidentPermille(saved.residentPermille),
+          };
+        }
+      } catch {
+        // 损坏的 v2 继续走旧版迁移，不让设置页失效。
+      }
+      return fallback();
+    },
+    /**
+     * @param {{budgetMiB: unknown, residentPermille: unknown}} value - 待保存双值。
+     * @returns {{budgetMiB: number, residentPermille: number}} 实际采用值。
+     */
+    set(value) {
+      const normalized = {
+        budgetMiB: normalizeUndoBudgetMiB(value.budgetMiB),
+        residentPermille: normalizeResidentPermille(value.residentPermille),
+      };
+      try {
+        storage?.setItem(UNDO_SETTINGS_PREF_KEY, JSON.stringify(normalized));
+      } catch {
+        // 与旧设置一致：持久化失败不阻断当前进程采用新值。
+      }
+      return normalized;
+    },
+  };
+}
+
 /**
  * 探测当前平台标识（用于路径大小写规则）。
  *

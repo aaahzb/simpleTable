@@ -250,6 +250,71 @@ test("document recovery adopts the idle session and unlocks without complete", a
   assert.equal(backend.calls.filter(([cmd]) => cmd === "big_close").length, 0);
 });
 
+test("prepareTransfer rejects in-flight memory enter and exit", async () => {
+  for (const command of ["big_memory_mode_enter", "big_memory_mode_exit"]) {
+    const backend = makeSharedBackend({ rows: 2, cols: 1 });
+    const source = backend.model("main");
+    await source.open("a.csv");
+    const rawInvoke = source._rawInvoke;
+    let finish;
+    source._rawInvoke = (cmd, args) => {
+      if (cmd === command) return new Promise((resolve) => { finish = resolve; });
+      return rawInvoke(cmd, args);
+    };
+    const inflight = source._invoke(command);
+    const preparing = source.prepareTransfer();
+    setTimeout(() => finish({}), 0);
+    const rejected = await preparing.then(() => false, () => true);
+    finish({});
+    await inflight;
+    if (source._transferState !== "idle") source.rollbackTransfer(source.lease);
+    assert.equal(rejected, true, `${command} 在途时必须阻止迁移`);
+  }
+});
+
+test("内存 estimate 可在 accepted 读取，cancel 可穿过迁移取消阶段", async () => {
+  const backend = makeSharedBackend({ rows: 2, cols: 1, totalBytes: 64 * 1024 * 1024 });
+  const source = backend.model("main");
+  await source.open("a.csv");
+  await source.prepareTransfer();
+  await assert.rejects(source.memoryEstimate(), /迁移/);
+  await assert.rejects(source.enterMemoryMode(), /迁移/);
+  await assert.rejects(source.exitMemoryMode(), /迁移/);
+  await source.cancelMemoryModeLoad();
+  const ticket = backend.seal(source.sessionId, "main", source.lease, "doc-1", {});
+  await source.cancelMemoryModeLoad();
+  const adopted = backend.accept(ticket, "doc-1");
+  const target = backend.model("doc-1");
+  await target.adopt(adopted);
+  await target.memoryEstimate();
+  await target.cancelMemoryModeLoad();
+  await assert.rejects(target.enterMemoryMode(), /只读|迁移/);
+  await assert.rejects(target.exitMemoryMode(), /只读|迁移/);
+  const cancels = backend.calls.filter(([cmd]) => cmd === "big_memory_mode_cancel");
+  assert.equal(cancels.length, 3);
+});
+
+test("内存进度在迁移后忽略旧 lease 并接收新 lease", async () => {
+  const backend = makeSharedBackend({ rows: 2, cols: 1 });
+  const source = backend.model("main");
+  await source.open("a.csv");
+  const staleLease = source.lease;
+  await source.prepareTransfer();
+  const ticket = backend.seal(source.sessionId, "main", staleLease, "doc-1", {});
+  const adopted = backend.accept(ticket, "doc-1");
+  const target = backend.model("doc-1");
+  await target.adopt(adopted);
+  const progress = [];
+  await target.onMemoryProgress((done, total) => progress.push([done, total]));
+  await backend.emit("big-memory-progress", {
+    session: adopted.session, lease: staleLease, done: 1, total: 2,
+  }, "doc-1");
+  await backend.emit("big-memory-progress", {
+    session: adopted.session, lease: adopted.lease, done: 3, total: 4,
+  }, "doc-1");
+  assert.deepEqual(progress, [[3, 4]]);
+});
+
 test("prepareTransfer rejects an in-flight save and succeeds after it settles", async () => {
   const backend = makeSharedBackend({ rows: 2, cols: 1 });
   const source = backend.model("main");

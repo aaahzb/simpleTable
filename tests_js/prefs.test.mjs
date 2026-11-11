@@ -149,3 +149,57 @@ test("撤销预算持久化合法整数且 storage 失败不阻断", () => {
   assert.equal(denied.set(128), 128);
   assert.equal(denied.get(), 64);
 });
+
+test("撤销设置从旧 v1 迁移且双值持久化", async () => {
+  const { createUndoSettingsPrefs, UNDO_SETTINGS_PREF_KEY } = await import("../frontend/js/prefs.js");
+  assert.equal(typeof createUndoSettingsPrefs, "function");
+  const storage = makeStorage({ [UNDO_BUDGET_PREF_KEY]: "32" });
+  const prefs = createUndoSettingsPrefs(storage);
+  assert.deepEqual(prefs.get(), { budgetMiB: 32, residentPermille: 1000 });
+  assert.deepEqual(prefs.set({ budgetMiB: 128, residentPermille: 250 }),
+    { budgetMiB: 128, residentPermille: 250 });
+  assert.deepEqual(prefs.get(), { budgetMiB: 128, residentPermille: 250 });
+  assert.deepEqual(JSON.parse(storage.getItem(UNDO_SETTINGS_PREF_KEY)),
+    { budgetMiB: 128, residentPermille: 250 });
+  assert.equal(storage.getItem(UNDO_BUDGET_PREF_KEY), "32", "迁移不删除旧设置");
+  storage.setItem(UNDO_SETTINGS_PREF_KEY, "{broken");
+  assert.deepEqual(prefs.get(), { budgetMiB: 32, residentPermille: 1000 });
+});
+
+test("驻留百分比按十进制文本解析且只允许 0.1% 步长", async () => {
+  const { parseResidentPercent, normalizeResidentPermille } = await import("../frontend/js/prefs.js");
+  assert.equal(typeof parseResidentPercent, "function");
+  for (const [raw, expected] of [["0", 0], ["0.1", 1], ["100", 1000],
+    ["999.9", 9999], ["1000.0", 10000], [" 2.5 ", 25]]) {
+    assert.equal(parseResidentPercent(raw), expected, raw);
+  }
+  for (const raw of ["-1", "1000.1", "1.23", "abc", "", "NaN", "1.", ".1"]) {
+    assert.equal(parseResidentPercent(raw), null, raw);
+  }
+  assert.equal(normalizeResidentPermille(250), 250);
+  assert.equal(normalizeResidentPermille(10001), 1000);
+  assert.equal(normalizeResidentPermille(-1), 1000);
+});
+
+test("有效预算使用整数向上取整和任意精度 BigInt", async () => {
+  const { effectiveUndoBudgetBytes } = await import("../frontend/js/prefs.js");
+  assert.equal(typeof effectiveUndoBudgetBytes, "function");
+  assert.equal(effectiveUndoBudgetBytes({ budgetMiB: 1, residentPermille: 1,
+    fileBytes: 1001n, memoryMode: true }), 1024n * 1024n);
+  assert.equal(effectiveUndoBudgetBytes({ budgetMiB: 0, residentPermille: 1,
+    fileBytes: 1001n, memoryMode: true }), 2n);
+  assert.equal(effectiveUndoBudgetBytes({ budgetMiB: 1, residentPermille: 10000,
+    fileBytes: 1001n, memoryMode: false }), 1024n * 1024n);
+  const huge = (1n << 70n) + 1n;
+  assert.equal(effectiveUndoBudgetBytes({ budgetMiB: 0, residentPermille: 10000,
+    fileBytes: huge, memoryMode: true }), (huge * 10000n + 999n) / 1000n);
+});
+
+test("任意精度字节格式化不先转成 Number", async () => {
+  const { formatByteQuantity } = await import("../frontend/js/prefs.js");
+  assert.equal(typeof formatByteQuantity, "function");
+  assert.equal(formatByteQuantity(512n), "512 B");
+  assert.equal(formatByteQuantity(1536n), "1.50 KiB");
+  assert.equal(formatByteQuantity(3n * 1024n * 1024n * 1024n), "3.00 GiB");
+  assert.equal(formatByteQuantity(1n << 70n), "1048576.00 PiB");
+});

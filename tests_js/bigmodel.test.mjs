@@ -1888,3 +1888,132 @@ test("ordinary CSV metadata remains non-TextLines", async () => {
   await model.open("/fixture.csv");
   assert.equal(model.isTextLines(), false);
 });
+
+test("已有临时 RAM 提升调用内存命令且不调用 sort_load", async () => {
+  const backend = makeSharedBackend({ rows: 2, cols: 1,
+    totalBytes: 64 * 1024 * 1024, ramBacked: true });
+  const model = backend.model();
+  await model.open("/x.csv");
+  const outcome = await model.enterMemoryMode();
+  assert.equal(outcome.changed, true);
+  assert.equal(model.memoryMode(), true);
+  assert.equal(model.meta().ram_backed, true);
+  assert.equal(backend.calls.filter(([cmd]) => cmd === "big_sort_load").length, 0);
+  assert.equal(backend.calls.filter(([cmd]) => cmd === "big_memory_mode_enter").length, 1);
+  assert.equal(backend.calls.at(-1)[0], "big_meta");
+});
+
+test("内存模式 estimate/cancel/exit 参数和最终元数据正确", async () => {
+  const backend = makeSharedBackend({ rows: 2, cols: 1, totalBytes: 64 * 1024 * 1024 });
+  const model = backend.model();
+  await model.open("/x.csv");
+  const estimate = await model.memoryEstimate();
+  assert.equal(estimate.file_bytes, 64 * 1024 * 1024);
+  assert.equal(estimate.limit_bytes, Math.floor(64 * 1024 * 1024 * 1.05));
+  await model.cancelMemoryModeLoad();
+  assert.equal(backend.calls.at(-1)[0], "big_memory_mode_cancel");
+  await model.enterMemoryMode();
+  const outcome = await model.exitMemoryMode({ allowFixedPoint: true, preflightId: 88 });
+  const exit = backend.calls.filter(([cmd]) => cmd === "big_memory_mode_exit").at(-1);
+  assert.deepEqual(exit[1].approval, { allowFixedPoint: true, preflightId: 88 });
+  assert.equal(outcome.changed, true);
+  assert.equal(model.memoryMode(), false);
+  assert.equal(model.meta().ram_backed, false);
+  assert.equal(backend.calls.at(-1)[0], "big_meta");
+});
+
+test("取消内存进入不刷新 meta，也不伪造完成进度", async () => {
+  let refreshes = 0;
+  const outcome = { changed: false, cancelled: true, fixedPoint: null,
+    meta: { memory_mode: false, ram_backed: false } };
+  const model = new BigModel({
+    invoke: async (cmd) => {
+      assert.equal(cmd, "big_memory_mode_enter");
+      return outcome;
+    },
+    listen: async () => () => {},
+  });
+  model._sid = 7;
+  model._lease = 4;
+  model._refreshMeta = async () => { refreshes += 1; };
+  assert.equal(await model.enterMemoryMode(), outcome);
+  assert.equal(refreshes, 0);
+});
+
+test("退出固定点请求按 camelCase 原样返回且不刷新", async () => {
+  let refreshes = 0;
+  const fixedPoint = { kind: "memoryModeExit", operation: "退出内存模式",
+    requiredBytes: 2048, budgetBytes: 1024, preflightId: 91 };
+  const model = new BigModel({
+    invoke: async (cmd, args) => {
+      assert.equal(cmd, "big_memory_mode_exit");
+      assert.deepEqual(args.approval, { allowFixedPoint: false, preflightId: null });
+      return { changed: false, cancelled: false, fixedPoint, meta: {} };
+    },
+    listen: async () => () => {},
+  });
+  model._sid = 7;
+  model._lease = 4;
+  model._refreshMeta = async () => { refreshes += 1; };
+  const outcome = await model.exitMemoryMode();
+  assert.equal(outcome.fixedPoint, fixedPoint);
+  assert.equal(refreshes, 0);
+});
+
+test("onMemoryProgress 只接收本 model 当前 session 和 lease", async () => {
+  const backend = makeSharedBackend({ rows: 2, cols: 1 });
+  const model = backend.model();
+  await model.open("/x.csv");
+  const progress = [];
+  await model.onMemoryProgress((done, total) => progress.push([done, total]));
+  await backend.emit("big-memory-progress", {
+    session: model.sessionId, lease: model.lease + 1, done: 1, total: 2,
+  }, "main");
+  await backend.emit("big-memory-progress", {
+    session: model.sessionId + 1, lease: model.lease, done: 2, total: 3,
+  }, "main");
+  await backend.emit("big-memory-progress", {
+    session: model.sessionId, lease: model.lease, done: 3, total: 4,
+  }, "main");
+  assert.deepEqual(progress, [[3, 4]]);
+});
+
+test("保存和另存为保持持久 RAM 并按新文件大小刷新有效预算", async () => {
+  for (const saveAs of [false, true]) {
+    const backend = makeSharedBackend({ rows: 1, cols: 1, totalBytes: 2 * 1024 * 1024,
+      savedTotalBytes: 8 * 1024 * 1024 });
+    const model = backend.model();
+    await model.open("/x.csv");
+    await model.setUndoBudget(1);
+    await model.enterMemoryMode();
+    assert.equal(model.meta().effective_undo_budget_bytes, 2 * 1024 * 1024);
+    assert.equal(saveAs ? await model.saveAs("/new.csv") : await model.save(), true);
+    assert.equal(model.memoryMode(), true);
+    assert.equal(model.meta().ram_backed, true);
+    assert.equal(model.meta().effective_undo_budget_bytes, 8 * 1024 * 1024);
+  }
+});
+
+test("临时 RAM 保存仍回 mmap，持久内存退出缩容走固定点", async () => {
+  const temporary = makeSharedBackend({ rows: 1, cols: 1, ramBacked: true });
+  const temporaryModel = temporary.model();
+  await temporaryModel.open("/x.csv");
+  assert.equal(await temporaryModel.save(), true);
+  assert.equal(temporaryModel.meta().ram_backed, false);
+
+  const backend = makeSharedBackend({ rows: 1, cols: 1, totalBytes: 64 * 1024 * 1024,
+    historyBytes: 2 * 1024 * 1024 });
+  const model = backend.model();
+  await model.open("/x.csv");
+  await model.setUndoBudget(1);
+  await model.enterMemoryMode();
+  const denied = await model.exitMemoryMode();
+  assert.equal(denied.fixedPoint.kind, "memoryModeExit");
+  assert.equal(model.memoryMode(), true);
+  const exited = await model.exitMemoryMode({
+    allowFixedPoint: true, preflightId: denied.fixedPoint.preflightId,
+  });
+  assert.equal(exited.changed, true);
+  assert.equal(model.memoryMode(), false);
+  assert.equal(model.meta().effective_undo_budget_bytes, 1024 * 1024);
+});
