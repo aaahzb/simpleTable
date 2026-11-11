@@ -10702,6 +10702,9 @@ impl BigFile {
                 fixed_point: None,
             });
         }
+        if self.stale() {
+            return Err("EXTERNAL_CHANGED: 退出内存模式前发现文件发生变化".into());
+        }
         let prepared = self.prepare_undo_policy_for_mode(self.undo_policy, false)?;
         let destructive = prepared.effect.evicted_undo + prepared.effect.evicted_redo > 0
             || prepared.effect.establishes_fixed_point;
@@ -14816,6 +14819,44 @@ mod memory_mode_tests {
         assert!(file.undo());
         assert_eq!(file.rows(0, 1)[0][1], "30");
         assert!(!file.meta().ram_backed);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_mode_exit_external_change_preserves_ram_and_edits() {
+        use std::io::Write as _;
+
+        let path = memory_tmp_csv("exit_external_change", &memory_people_csv());
+        let mut file = BigFile::open(&path).unwrap();
+        let cancel = AtomicBool::new(false);
+        file.enter_memory_mode_for_test(&cancel, |_| {}).unwrap();
+        file.set_cell(0, 1, "kept".into(), Approval::deny()).unwrap();
+        let before = (
+            file.rows(0, 5),
+            file.history_stats(),
+            file.meta().modified,
+            file.revision,
+            file.index_epoch,
+            file.history_generation,
+        );
+        let mut external = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        external.write_all(b"Zoe,9,Nowhere\r\n").unwrap();
+        drop(external);
+
+        let error = file.exit_memory_mode(Approval::deny()).unwrap_err();
+        assert!(error.contains("EXTERNAL_CHANGED"), "{error}");
+        assert!(file.meta().memory_mode && file.meta().ram_backed);
+        assert_eq!((
+            file.rows(0, 5),
+            file.history_stats(),
+            file.meta().modified,
+            file.revision,
+            file.index_epoch,
+            file.history_generation,
+        ), before);
+        assert_eq!(file.meta().rows, 5, "外部追加不得自动重载进当前文档");
+        assert!(file.undo(), "拒绝重载后原有撤销历史仍须可用");
+        assert_eq!(file.rows(0, 1)[0][1], "30");
         fs::remove_file(&path).ok();
     }
 

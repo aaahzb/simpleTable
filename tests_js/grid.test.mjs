@@ -198,6 +198,49 @@ test("取消筛选锚定：选中优先于视口顶，select 联动 currentChang
     `scrollTop=${g.scrollEl.scrollTop}，期望 ${want}（选中行视口位置保持）`);
 });
 
+test("自动清筛在途时重入只发一次请求并保留首个锚点", async () => {
+  const g = Object.create(Grid.prototype);
+  const calls = [];
+  const resolvers = [];
+  const restored = [];
+  let active = true;
+  g.model = {
+    columnCount: () => 1,
+    rowCount: () => 20000,
+    filterActive: () => active,
+    clearFilter: (hitRow) => {
+      calls.push(hitRow);
+      return new Promise((resolve) => resolvers.push((result) => {
+        active = false;
+        resolve(result);
+      }));
+    },
+  };
+  g.filters = new Map();
+  g.multi = { on: false, text: "" };
+  g.visibleRows = [0];
+  g.hooks = { bigFilterStatus: () => {}, countsChanged: () => {} };
+  g.visCount = () => 400;
+  g._captureClearAnchor = () => ({ k: 7, col: null, delta: -0.25 });
+  g._restoreClearAnchor = (cap, target) => restored.push([cap, target]);
+  g._clampSelection = () => {};
+  g._renderRows = () => {};
+  g.resetScroll = () => { throw new Error("有效锚点不得回顶"); };
+  try {
+    g._refilter();
+    g._refilter();
+    g._refilter();
+    assert.deepEqual(calls, [7], "同一自动清筛未落定时不得再次查询和清空引擎");
+    resolvers[0]({ applied: true, target: 487 });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(restored, [[{ k: 7, col: null, delta: -0.25 }, 487]],
+      "重入渲染后仍须使用第一次捕获的筛选坐标锚点");
+  } finally {
+    for (const resolve of resolvers) resolve({ applied: false, target: null });
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+});
+
 test("_rowHeadText：筛选态取原始行号（未缓存空串占位），非筛选连续号", () => {
   const g = Object.create(Grid.prototype);
   g.model = {

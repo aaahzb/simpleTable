@@ -3713,7 +3713,7 @@ x,y
         "A 下发等待期间 B 应完成打开并入签");
       delay.release();
       await waitFor(() => document.getElementById("status-text").textContent
-        .includes("每文档 1 MiB"), "竞态预算下发完成");
+        .includes("撤销/重做预算：每文档 1 MiB"), "竞态预算下发完成");
       configured = true;
 
       await model.setData(0, 0, "c".repeat(600 * 1024));
@@ -3731,7 +3731,7 @@ x,y
         mask.querySelector('input[type="number"]').value = "64";
         clickModalButton("确定");
         await waitFor(() => document.getElementById("status-text").textContent
-          .includes("每文档 64 MiB"), "竞态测试恢复默认预算");
+          .includes("撤销/重做预算：每文档 64 MiB"), "竞态测试恢复默认预算");
       }
     }
   });
@@ -3761,7 +3761,7 @@ x,y
       mask.querySelector('input[type="number"]').value = "1";
       clickModalButton("确定");
       await waitFor(() => document.getElementById("status-text").textContent
-        .includes("每文档 1 MiB"), "在途场景先完成 A 的预算设置");
+        .includes("撤销/重做预算：每文档 1 MiB"), "在途场景先完成 A 的预算设置");
       configured = true;
       delay.release();
       await opening;
@@ -3789,7 +3789,7 @@ x,y
         mask.querySelector('input[type="number"]').value = "64";
         clickModalButton("确定");
         await waitFor(() => document.getElementById("status-text").textContent
-          .includes("每文档 64 MiB"), "在途测试恢复默认预算");
+          .includes("撤销/重做预算：每文档 64 MiB"), "在途测试恢复默认预算");
       }
     }
   });
@@ -3812,7 +3812,7 @@ x,y
       assert(!document.querySelector(".modal-mask"), "下发期间不得打开第二个预算设置框");
       delay.release();
       await waitFor(() => document.getElementById("status-text").textContent
-        .includes("每文档 1 MiB"), "首次预算设置完成");
+        .includes("撤销/重做预算：每文档 1 MiB") && !button.disabled, "首次预算设置完成");
       assert(!button.disabled, "首次设置完成后必须恢复设置按钮");
 
       button.click();
@@ -3821,22 +3821,22 @@ x,y
       mask.querySelector('input[type="number"]').value = "2";
       clickModalButton("确定");
       await waitFor(() => document.getElementById("status-text").textContent
-        .includes("每文档 2 MiB"), "第二次预算设置完成");
-      assert(window.localStorage.getItem("simpletable.undo_budget.v1") === "2",
-        "串行完成后的最新用户选择必须持久生效");
+        .includes("撤销/重做预算：每文档 2 MiB") && !button.disabled, "第二次预算设置完成");
+      const latestPrefs = JSON.parse(window.localStorage.getItem("simpletable.undo_settings.v2"));
+      assert(latestPrefs?.budgetMiB === 2 && latestPrefs?.residentPermille === 1000,
+        `串行完成后的最新双值用户选择必须持久生效：${JSON.stringify(latestPrefs)}`);
     } finally {
       delay.release();
       delay.restore();
       if (started) {
-        await waitFor(() => /每文档 [12] MiB/.test(
-          document.getElementById("status-text").textContent), "重复设置测试等待在途下发");
+        await waitFor(() => !button.disabled, "重复设置测试等待在途下发");
         button.click();
         await waitFor(() => document.querySelector(".modal-mask"), "重复设置测试恢复 64 MiB");
         const mask = document.querySelector(".modal-mask");
         mask.querySelector('input[type="number"]').value = "64";
         clickModalButton("确定");
         await waitFor(() => document.getElementById("status-text").textContent
-          .includes("每文档 64 MiB"), "重复设置测试恢复默认预算");
+          .includes("撤销/重做预算：每文档 64 MiB"), "重复设置测试恢复默认预算");
       }
     }
   });
@@ -3863,7 +3863,7 @@ x,y
       mask.querySelector('input[type="number"]').value = "1";
       assert(clickModalButton("确定"), "应用 1 MiB 预算");
       await waitFor(() => document.getElementById("status-text").textContent
-        .includes("每文档 1 MiB"), "1 MiB 预算下发完成");
+        .includes("撤销/重做预算：每文档 1 MiB"), "1 MiB 预算下发完成");
       configured = true;
       assert(budgetCalls.length === 1 && budgetCalls[0].budgetBytes === 1024 * 1024,
         "预算取消后只应下发一次 1 MiB");
@@ -3908,7 +3908,7 @@ x,y
         mask.querySelector('input[type="number"]').value = "64";
         clickModalButton("确定");
         await waitFor(() => document.getElementById("status-text").textContent
-          .includes("每文档 64 MiB"), "恢复 64 MiB");
+          .includes("撤销/重做预算：每文档 64 MiB"), "恢复 64 MiB");
       }
       restoreBudgetSpy();
     }
@@ -3945,7 +3945,7 @@ x,y
       mask.querySelector('input[type="number"]').value = "1";
       clickModalButton("确定");
       await waitFor(() => document.getElementById("status-text").textContent
-        .includes("每文档 1 MiB"), "双页签 1 MiB 下发完成");
+        .includes("撤销/重做预算：每文档 1 MiB"), "双页签 1 MiB 下发完成");
       configured = true;
       assert(budgetCalls.length === 1
         && budgetCalls[0].budgetBytes === 1024 * 1024
@@ -3970,12 +3970,13 @@ x,y
         mask.querySelector('input[type="number"]').value = "64";
         clickModalButton("确定");
         await waitFor(() => document.getElementById("status-text").textContent
-          .includes("每文档 64 MiB"), "双页签恢复 64 MiB 完成");
+          .includes("撤销/重做预算：每文档 64 MiB"), "双页签恢复 64 MiB 完成");
       }
       restoreBudgetSpy();
     }
-    assert(localStorage.getItem("simpletable.undo_budget.v1") === "64",
-      "测试结束必须恢复默认 64 MiB 偏好");
+    const restoredPrefs = JSON.parse(localStorage.getItem("simpletable.undo_settings.v2"));
+    assert(restoredPrefs?.budgetMiB === 64 && restoredPrefs?.residentPermille === 1000,
+      `测试结束必须恢复默认 64 MiB 与 100% 双值偏好：${JSON.stringify(restoredPrefs)}`);
   });
 
   check("占位空表：保存被婉拒且不弹另存为（无会话守卫）", async () => {
@@ -4743,6 +4744,662 @@ x,y
     }
   });
 
+  // ========== 持久内存模式：独立 64 MiB 真实 WebView2 矩阵 ==========
+  const MEMORY_CSV_BYTES = 64 * 1024 * 1024;
+  const MEMORY_CSV_ROWS = 4194303;
+  const memoryModeButton = () => document.getElementById("btn-memory-mode");
+  const memoryFixedPointMask = () => [...document.querySelectorAll(".modal-mask")]
+    .find((mask) => mask.querySelector(".modal-title")?.textContent === "确认固定点");
+  const clickMemoryFixedPoint = (text) => {
+    const button = [...(memoryFixedPointMask()?.querySelectorAll("button") ?? [])]
+      .find((item) => item.textContent === text);
+    button?.click();
+    return Boolean(button);
+  };
+
+  /** 生成精确 64 MiB 的独立 CSV；固定小缓冲写盘，不经 IPC 传输文件内容。 */
+  async function createMemoryCsv(name) {
+    const path = `${TMP}/memory-mode-${name}-${Date.now()}-${++fixtureSeq}/table.csv`;
+    await invoke("smoke_write_repeat", {
+      path, line: "name,n,note,pad\n", times: 1, append: false,
+    });
+    await invoke("smoke_write_repeat", {
+      path, line: "aaaa,1,bbbb,ccc\n", times: MEMORY_CSV_ROWS, append: true,
+    });
+    assert(await invoke("file_size", { path }) === MEMORY_CSV_BYTES,
+      `${name} 夹具必须精确为 64 MiB`);
+    return path;
+  }
+
+  /** 打开独立 64 MiB 文档；默认等待完整索引，索引禁用场景可显式跳过。 */
+  async function openMemoryCsv(name, { waitIndex = true } = {}) {
+    await window.__app.smokeLoadSmall([], []);
+    const path = await createMemoryCsv(name);
+    assert(await window.__app.openPathsAsTabs([path]) === true, `${name} 应打开大文档`);
+    const operationModel = bigM();
+    assert(operationModel.meta()?.total_bytes === MEMORY_CSV_BYTES,
+      `${name} 引擎文件大小应为 64 MiB`);
+    if (waitIndex) {
+      await waitFor(() => !operationModel.indexing()
+        && operationModel.rowCount() === MEMORY_CSV_ROWS, `${name} 完整索引`, 30000);
+    }
+    return { path, operationModel, session: operationModel.sessionId };
+  }
+
+  /** 关闭可能阻塞 Promise 的模态框，再取消并等待当前内存任务。 */
+  async function cleanupMemoryScenario(pending = null, restoreSettings = false) {
+    for (let i = 0; i < 4 && document.querySelector(".modal-mask"); i += 1) {
+      if (!clickModalButton("取消") && !clickModalButton("否")
+        && !clickModalButton("确定")) break;
+      await sleep(20);
+    }
+    try { await window.__app.settleMemoryOperation(); } catch { /* 保留原场景错误 */ }
+    if (pending) {
+      try { await pending; } catch { /* 保留原场景错误 */ }
+    }
+    if (restoreSettings && bigM().meta()) {
+      await setUndoSettingsThroughUi(64, "100.0");
+    }
+    await window.__app.smokeLoadSmall([], []);
+  }
+
+  /** 等待真实内存确认框并按“是”；调用方持有原命令 Promise。 */
+  async function confirmMemoryEnterDialog(extraCheck = null) {
+    await waitFor(() => document.querySelector(".modal-mask")?.textContent
+      .includes("转换私有内存上限"), "内存模式确认框");
+    const text = document.querySelector(".modal-mask").textContent;
+    if (extraCheck) extraCheck(text);
+    assert(clickModalButton("是"), "内存模式确认框应有“是”");
+  }
+
+  /** 验证成功进入持久内存模式，不接受取消、固定点或错误 null。 */
+  async function awaitMemoryEntered(pending) {
+    const outcome = await pending;
+    assert(outcome?.changed === true && outcome.cancelled === false
+      && outcome.fixedPoint == null, `进入内存模式结果异常：${JSON.stringify(outcome)}`);
+    await waitFor(() => bigM().memoryMode() && bigM().meta().ram_backed,
+      "持久内存模式元数据");
+  }
+
+  /** 通过真实设置页原子应用普通预算和驻留比例。 */
+  async function setUndoSettingsThroughUi(budgetMiB, residentPercent) {
+    const button = document.getElementById("btn-undo-budget");
+    button.click();
+    await waitFor(() => document.querySelector("#undo-budget-mib"), "双值撤销设置框");
+    const mask = document.querySelector(".modal-mask");
+    mask.querySelector("#undo-budget-mib").value = String(budgetMiB);
+    mask.querySelector("#undo-resident-percent").value = residentPercent;
+    assert(clickModalButton("确定"), "双值设置应可确定");
+    await waitFor(() => !button.disabled && !document.querySelector(".modal-mask")
+      && document.getElementById("status-text").textContent
+        .includes(`撤销/重做预算：每文档 ${budgetMiB} MiB`)
+      && document.getElementById("status-text").textContent
+        .includes(`驻留 ${Number(residentPercent)}%`), "双值设置生效");
+  }
+
+  check("内存模式 64 MiB：小档和无路径档隐藏入口，索引与互斥任务禁用", async () => {
+    let pendingSave = null;
+    let gated = null;
+    try {
+      await window.__app.smokeLoadSmall([], []);
+      const small = `${TMP}/memory-small-${Date.now()}-${++fixtureSeq}.csv`;
+      await writeText(small, "a,b\n1,2\n");
+      assert(await window.__app.openPathsAsTabs([small]), "小文件应打开");
+      assert(memoryModeButton().classList.contains("hidden"), "小文件不得显示内存入口");
+
+      await window.__app.smokeLoadSmall(["a"], [["1"]]);
+      assert(window.__app.getPath() === null, "新建夹具必须无路径");
+      assert(memoryModeButton().classList.contains("hidden"), "无路径新建档不得显示入口");
+
+      const { operationModel } = await openMemoryCsv("availability", { waitIndex: false });
+      assert(operationModel.indexing(), "64 MiB 打开后应存在真实渐进索引窗口");
+      assert(!memoryModeButton().classList.contains("hidden")
+        && memoryModeButton().disabled, "索引中入口应显示但禁用");
+      await waitFor(() => !operationModel.indexing()
+        && operationModel.rowCount() === MEMORY_CSV_ROWS, "入口测试完整索引", 30000);
+      await waitFor(() => !memoryModeButton().disabled, "索引完成后入口恢复");
+
+      await operationModel.setData(0, 0, "bbbb");
+      gated = deferProcessCommand("big_save");
+      pendingSave = window.__app.saveFile();
+      await gated.entered;
+      assert(memoryModeButton().disabled, "保存互斥任务中内存入口必须禁用");
+      gated.release();
+      assert(await pendingSave === true, "互斥测试保存应完成");
+      pendingSave = null;
+      await waitFor(() => !memoryModeButton().disabled, "保存后入口恢复");
+    } finally {
+      gated?.release();
+      gated?.restore();
+      await cleanupMemoryScenario(pendingSave);
+    }
+  });
+
+  check("内存模式 64 MiB：确认框展示真实 X、105% 上限和可用内存", async () => {
+    let pending = null;
+    try {
+      await openMemoryCsv("estimate");
+      pending = window.__app.enterMemoryMode();
+      await waitFor(() => document.querySelector(".modal-mask")?.textContent
+        .includes("转换私有内存上限"), "内存估算确认框");
+      const text = document.querySelector(".modal-mask").textContent;
+      assert(text.includes("文件大小：64.00 MiB"), `确认框 X 错误：${text}`);
+      assert(text.includes("转换私有内存上限：67.19 MiB"), `105% 上限错误：${text}`);
+      assert(/当前可用物理内存：[0-9.]+ [KMGT]?iB/.test(text),
+        `缺少真实可用物理内存：${text}`);
+      assert(/Windows 可用 commit：[0-9.]+ [KMGT]?iB/.test(text),
+        `缺少 Windows 可用 commit：${text}`);
+      assert(clickModalButton("否"), "估算场景应可取消");
+      const outcome = await pending;
+      pending = null;
+      assert(outcome?.cancelled === true && !bigM().memoryMode()
+        && !bigM().meta().ram_backed, "取消估算不得改变后备");
+    } finally {
+      await cleanupMemoryScenario(pending);
+    }
+  });
+
+  check("内存模式 64 MiB：开启后编辑撤销重做并区分状态栏", async () => {
+    let pending = null;
+    try {
+      const { operationModel } = await openMemoryCsv("edit-undo");
+      pending = window.__app.enterMemoryMode();
+      await confirmMemoryEnterDialog();
+      await awaitMemoryEntered(pending);
+      pending = null;
+      await operationModel.setData(0, 0, "zzzz");
+      await waitFor(() => operationModel.rawData(0, 0) === "zzzz", "内存编辑落定");
+      assert(window.__app.isDirty() && operationModel.canUndo(), "内存编辑应标脏并可撤销");
+      await window.__app.undo();
+      await waitFor(() => operationModel.rawData(0, 0) === "aaaa", "内存撤销落定");
+      assert(operationModel.canRedo(), "内存撤销后应可重做");
+      await window.__app.redo();
+      await waitFor(() => operationModel.rawData(0, 0) === "zzzz", "内存重做落定");
+      window.__app.refreshStatus();
+      let status = document.getElementById("status-text").textContent;
+      assert(status.includes("内存模式") && !status.includes("临时排序 RAM"),
+        `持久内存状态栏错误：${status}`);
+
+      assert(await window.__app.applyBigSort(
+        [{ col: 0, numeric: false, asc: true }], { confirm: false }) === true,
+      "持久 RAM 上排序应完成且不再次载入");
+      window.__app.refreshStatus();
+      status = document.getElementById("status-text").textContent;
+      assert(status.includes("已排序") && status.includes("内存模式")
+        && !status.includes("临时排序 RAM"), `内存排序状态栏错误：${status}`);
+      assert(operationModel.meta().memory_mode && operationModel.meta().ram_backed,
+        "排序不得退出持久内存模式");
+    } finally {
+      await cleanupMemoryScenario(pending);
+    }
+  });
+
+  check("内存模式 64 MiB：中途取消无伪 100%，内容和历史不变", async () => {
+    let pending = null;
+    let unlisten = null;
+    try {
+      const { operationModel } = await openMemoryCsv("cancel");
+      await operationModel.setData(0, 0, "bbbb");
+      await operationModel.setData(0, 1, "2");
+      await window.__app.undo();
+      await waitFor(() => operationModel.rawData(0, 0) === "bbbb"
+        && operationModel.rawData(0, 1) === "1", "取消前历史现场");
+      const before = {
+        first: operationModel.rawData(0, 0),
+        second: operationModel.rawData(0, 1),
+        dirty: window.__app.isDirty(),
+        canUndo: operationModel.canUndo(),
+        canRedo: operationModel.canRedo(),
+      };
+      assert(before.dirty && before.canUndo && before.canRedo,
+        "取消前必须同时有 dirty、undo 和 redo 现场");
+      const progress = [];
+      let cancelRequested = false;
+      unlisten = await operationModel.onMemoryProgress((done, total) => {
+        progress.push({ done, total });
+        if (done > 0 && done < total && !cancelRequested) {
+          cancelRequested = true;
+          void window.__app.cancelMemoryModeLoad();
+        }
+      });
+      pending = window.__app.enterMemoryMode();
+      await confirmMemoryEnterDialog();
+      const outcome = await pending;
+      pending = null;
+      unlisten();
+      unlisten = null;
+      assert(cancelRequested && progress.some(({ done, total }) => done > 0 && done < total),
+        `必须观察到真实中途进度：${JSON.stringify(progress)}`);
+      assert(outcome?.cancelled === true && !outcome.changed,
+        `中途取消结果异常：${JSON.stringify(outcome)}`);
+      assert(progress.every(({ done, total }) => done < total),
+        `取消不得出现伪 100%：${JSON.stringify(progress)}`);
+      await waitFor(() => window.__app.memoryOperationKind() === null
+        && document.getElementById("memory-progress").classList.contains("hidden"),
+      "取消后进度条收尾");
+      assert(document.getElementById("memory-progress-bar").value < 100,
+        "取消后不得遗留 100% 进度值");
+      const after = {
+        first: operationModel.rawData(0, 0),
+        second: operationModel.rawData(0, 1),
+        dirty: window.__app.isDirty(),
+        canUndo: operationModel.canUndo(),
+        canRedo: operationModel.canRedo(),
+      };
+      assert(JSON.stringify(after) === JSON.stringify(before),
+        `取消前后现场必须不变：${JSON.stringify(before)} -> ${JSON.stringify(after)}`);
+      assert(!operationModel.memoryMode() && !operationModel.meta().ram_backed,
+        "取消后应仍为 mmap");
+    } finally {
+      unlisten?.();
+      await cleanupMemoryScenario(pending);
+    }
+  });
+
+  check("内存模式 64 MiB：临时排序 RAM 原地提升不二次载入或复制", async () => {
+    let pending = null;
+    let restore = () => {};
+    let unlisten = null;
+    try {
+      const { operationModel } = await openMemoryCsv("promote-sort-ram");
+      await operationModel.setData(0, 0, "zzzz");
+      assert(await window.__app.applyBigSort(
+        [{ col: 0, numeric: false, asc: true }], { confirm: false }) === true,
+      "临时排序 RAM 应就绪");
+      assert(operationModel.meta().sorted && operationModel.meta().ram_backed
+        && !operationModel.memoryMode(), "提升前必须是临时排序 RAM");
+      window.__app.refreshStatus();
+      const temporaryStatus = document.getElementById("status-text").textContent;
+      assert(temporaryStatus.includes("临时排序 RAM")
+        && !temporaryStatus.includes("内存模式"), `临时 RAM 状态栏错误：${temporaryStatus}`);
+
+      const commands = [];
+      let progressEvents = 0;
+      restore = interceptProcessInvoke((original, cmd, args, options) => {
+        commands.push(cmd);
+        return original(cmd, args, options);
+      });
+      unlisten = await operationModel.onMemoryProgress(() => { progressEvents += 1; });
+      pending = window.__app.enterMemoryMode();
+      await confirmMemoryEnterDialog((text) => {
+        assert(text.includes("不再复制完整文件"), `纯 RAM 提升提示错误：${text}`);
+      });
+      await awaitMemoryEntered(pending);
+      pending = null;
+      restore();
+      restore = () => {};
+      unlisten();
+      unlisten = null;
+      assert(commands.filter((cmd) => cmd === "big_memory_mode_enter").length === 1,
+        `纯提升应只调用一次 enter：${JSON.stringify(commands)}`);
+      assert(!commands.some((cmd) => cmd === "big_sort_load" || cmd === "big_load_ram"),
+        `纯提升不得第二次载入完整文件：${JSON.stringify(commands)}`);
+      assert(progressEvents === 0, `纯提升不得显示第二次复制进度：${progressEvents}`);
+      assert(document.getElementById("memory-progress").classList.contains("hidden"),
+        "纯提升后复制条必须保持隐藏");
+      assert(operationModel.meta().sorted && operationModel.meta().ram_backed
+        && operationModel.memoryMode(), "提升必须保留排序视图和 RAM");
+    } finally {
+      unlisten?.();
+      restore();
+      await cleanupMemoryScenario(pending);
+    }
+  });
+
+  check("内存模式 64 MiB：排序与退出排序保留 RAM 和持久模式", async () => {
+    let pending = null;
+    try {
+      const { operationModel } = await openMemoryCsv("sort-lifecycle");
+      pending = window.__app.enterMemoryMode();
+      await confirmMemoryEnterDialog();
+      await awaitMemoryEntered(pending);
+      pending = null;
+      await operationModel.setData(0, 0, "zzzz");
+      assert(await window.__app.applyBigSort(
+        [{ col: 0, numeric: false, asc: true }], { confirm: false }) === true,
+      "内存模式排序应完成");
+      assert(operationModel.meta().sorted && operationModel.meta().ram_backed
+        && operationModel.memoryMode(), "排序后必须保留持久 RAM");
+      window.__app.refreshStatus();
+      assert(document.getElementById("status-text").textContent.includes("已排序")
+        && document.getElementById("status-text").textContent.includes("内存模式"),
+      "排序状态栏应同时显示已排序和内存模式");
+
+      assert(await window.__app.exitSortMode() === true, "退出内存模式排序应成功");
+      const status = document.getElementById("status-text").textContent;
+      assert(status.includes("保留内存模式") && !status.includes("释放排序内存"),
+        `持久模式退出排序不得宣称释放：${status}`);
+      assert(!operationModel.meta().sorted && operationModel.meta().ram_backed
+        && operationModel.memoryMode(), "退出排序不得释放持久 RAM");
+      assert(memoryModeButton().textContent === "退出内存模式",
+        "退出排序后按钮仍应提供明确退出内存模式");
+    } finally {
+      await cleanupMemoryScenario(pending);
+    }
+  });
+
+  check("内存模式 64 MiB：保存、另存为和排序保存保持模式并更新预算", async () => {
+    let pending = null;
+    let settingsChanged = false;
+    try {
+      const { path, operationModel } = await openMemoryCsv("save-lifecycle");
+      pending = window.__app.enterMemoryMode();
+      await confirmMemoryEnterDialog();
+      await awaitMemoryEntered(pending);
+      pending = null;
+      await setUndoSettingsThroughUi(1, "100.0");
+      settingsChanged = true;
+      assert(operationModel.meta().effective_undo_budget_bytes === MEMORY_CSV_BYTES,
+        "1 MiB 普通预算下内存文档应按 64 MiB 文件计算有效预算");
+
+      await operationModel.setData(0, 0, "a");
+      assert(await window.__app.saveFile() === true, "内存模式普通保存应成功");
+      // 表头与编辑行重编码为 CRLF，相比原 LF 各增一字节；内容减三字节，净减一字节。
+      const savedBytes = MEMORY_CSV_BYTES - 1;
+      const actualSavedBytes = await invoke("file_size", { path });
+      assert(actualSavedBytes === savedBytes,
+        `普通保存净减一字节（内容 -3、两个 CRLF +2）：期望 ${savedBytes}，实际 ${actualSavedBytes}`);
+      assert(operationModel.meta().memory_mode && operationModel.meta().ram_backed,
+        "普通保存后必须保持持久 RAM");
+      assert(operationModel.meta().effective_undo_budget_bytes === savedBytes,
+        `普通保存后有效预算未按新文件更新：${JSON.stringify(operationModel.meta())}`);
+      assert(!window.__app.isDirty() && operationModel.canUndo(),
+        "普通保存应清 dirty 且保留允许的撤销历史");
+
+      const saveAs = `${TMP}/memory-mode-save-as-${Date.now()}-${++fixtureSeq}.csv`;
+      await operationModel.setData(0, 1, "22");
+      assert(await window.__app.saveFileAs(saveAs) === true, "内存模式另存为应成功");
+      const saveAsBytes = savedBytes + 1;
+      assert(window.__app.getPath() === saveAs
+        && await invoke("file_size", { path: saveAs }) === saveAsBytes,
+      "另存为应切换身份并写入新文件");
+      assert(operationModel.meta().memory_mode && operationModel.meta().ram_backed,
+        "另存为后必须保持持久 RAM");
+      assert(operationModel.meta().effective_undo_budget_bytes === saveAsBytes,
+        "另存为后有效预算应按目标文件大小更新");
+      assert(!window.__app.isDirty() && operationModel.canUndo(),
+        "另存为应清 dirty 且保留允许的历史");
+
+      assert(await window.__app.applyBigSort(
+        [{ col: 1, numeric: true, asc: true }], { confirm: false }) === true,
+      "另存为后的内存排序应完成");
+      pending = window.__app.saveFile();
+      await waitFor(() => memoryFixedPointMask()?.textContent
+        .includes("按当前排序保存会物化当前行序"), "内存排序保存固定点");
+      assert(clickMemoryFixedPoint("继续"), "确认内存排序保存固定点");
+      assert(await pending === true, "内存排序保存应成功");
+      pending = null;
+      assert(operationModel.meta().memory_mode && operationModel.meta().ram_backed
+        && !operationModel.meta().sorted, "排序保存后应保持持久 RAM 并物化行序");
+      assert(operationModel.meta().effective_undo_budget_bytes === saveAsBytes,
+        "排序保存后有效预算应继续匹配当前文件");
+      assert(!window.__app.isDirty() && !operationModel.canUndo()
+        && !operationModel.canRedo(), "排序保存固定点应清 dirty 和此前历史");
+    } finally {
+      if (pending && memoryFixedPointMask()) clickMemoryFixedPoint("取消");
+      await cleanupMemoryScenario(pending, settingsChanged);
+    }
+  });
+
+  check("内存模式 64 MiB：退出缩容取消保现场，确认回 mmap 并保留允许历史", async () => {
+    let pending = null;
+    let settingsChanged = false;
+    try {
+      const { operationModel } = await openMemoryCsv("exit-shrink");
+      await setUndoSettingsThroughUi(1, "1000.0");
+      settingsChanged = true;
+      pending = window.__app.enterMemoryMode();
+      await confirmMemoryEnterDialog();
+      await awaitMemoryEntered(pending);
+      pending = null;
+      const largeValue = "x".repeat(2 * 1024 * 1024);
+      await operationModel.setData(0, 0, largeValue);
+      const before = {
+        dirty: window.__app.isDirty(), canUndo: operationModel.canUndo(),
+        canRedo: operationModel.canRedo(), length: operationModel.rawData(0, 0).length,
+      };
+      assert(before.dirty && before.canUndo && before.length === largeValue.length,
+        "退出缩容前应有大历史编辑现场");
+
+      pending = window.__app.exitMemoryMode();
+      await waitFor(() => memoryFixedPointMask()?.textContent
+        .includes("退出内存模式将恢复普通撤销预算"), "退出缩容固定点取消");
+      assert(clickModalButton("取消"), "取消退出缩容");
+      const cancelled = await pending;
+      pending = null;
+      assert(cancelled?.cancelled === true && operationModel.memoryMode()
+        && operationModel.meta().ram_backed, "取消缩容必须保持持久 RAM");
+      assert(window.__app.isDirty() === before.dirty
+        && operationModel.canUndo() === before.canUndo
+        && operationModel.canRedo() === before.canRedo
+        && operationModel.rawData(0, 0).length === before.length,
+      "取消缩容不得改变 dirty、历史或内容");
+
+      pending = window.__app.exitMemoryMode();
+      await waitFor(() => memoryFixedPointMask()?.textContent
+        .includes("取消则保持内存模式"), "退出缩容固定点确认");
+      assert(clickModalButton("继续"), "确认退出缩容");
+      const approved = await pending;
+      pending = null;
+      assert(approved?.changed === true && !operationModel.memoryMode()
+        && !operationModel.meta().ram_backed, "确认缩容后必须回到 mmap");
+      assert(operationModel.rawData(0, 0).length === largeValue.length
+        && window.__app.isDirty() && !operationModel.canUndo() && !operationModel.canRedo(),
+      "固定点退出应保留内容，只淘汰不被普通预算允许的历史");
+
+      await setUndoSettingsThroughUi(64, "100.0");
+      settingsChanged = false;
+      pending = window.__app.enterMemoryMode();
+      await confirmMemoryEnterDialog();
+      await awaitMemoryEntered(pending);
+      pending = null;
+      await operationModel.setData(0, 1, "2");
+      pending = window.__app.exitMemoryMode();
+      const smallExit = await pending;
+      pending = null;
+      assert(smallExit?.changed === true && !operationModel.memoryMode()
+        && !operationModel.meta().ram_backed && operationModel.canUndo(),
+      "小历史退出不得要求固定点且应保留撤销");
+      await window.__app.undo();
+      await waitFor(() => operationModel.rawData(0, 1) === "1",
+        "回 mmap 后允许的编辑历史仍应可撤销");
+    } finally {
+      await cleanupMemoryScenario(pending, settingsChanged);
+    }
+  });
+
+  check("内存模式 64 MiB：双值设置一次上发并实时试算当前文档", async () => {
+    let pending = null;
+    let restore = () => {};
+    let settingsChanged = false;
+    try {
+      const { operationModel } = await openMemoryCsv("settings-preview");
+      pending = window.__app.enterMemoryMode();
+      await confirmMemoryEnterDialog();
+      await awaitMemoryEntered(pending);
+      pending = null;
+      const calls = [];
+      restore = captureProcessBudgetCalls(calls);
+      document.getElementById("btn-undo-budget").click();
+      await waitFor(() => document.querySelector("#undo-budget-mib"), "内存文档双值设置框");
+      const mask = document.querySelector(".modal-mask");
+      const budget = mask.querySelector("#undo-budget-mib");
+      const resident = mask.querySelector("#undo-resident-percent");
+      assert(mask.textContent.includes(
+        "max（普通预算，当前后备文件总字节数 × 驻留撤销百分比）"),
+      "设置页必须展示有效预算公式");
+      assert(resident.step === "0.1", "驻留比例步长必须为 0.1%");
+      budget.value = "1";
+      budget.dispatchEvent(new Event("input", { bubbles: true }));
+      resident.value = "200.0";
+      resident.dispatchEvent(new Event("input", { bubbles: true }));
+      await waitFor(() => mask.textContent.includes("当前有效预算：128.00 MiB"),
+        "当前 64 MiB 内存文档实时试算");
+      settingsChanged = true;
+      assert(clickModalButton("确定"), "应用双值设置");
+      await waitFor(() => document.getElementById("status-text").textContent
+        .includes("每文档 1 MiB · 驻留 200%"), "双值设置一次生效");
+      restore();
+      restore = () => {};
+      assert(calls.length === 1 && calls[0].budgetBytes === 1024 * 1024
+        && calls[0].residentPermille === 2000,
+      `双值必须只原子会上发一次：${JSON.stringify(calls)}`);
+      assert(operationModel.meta().effective_undo_budget_bytes === 2 * MEMORY_CSV_BYTES,
+        "200% 驻留比例应把当前文档有效预算更新为 128 MiB");
+    } finally {
+      restore();
+      await cleanupMemoryScenario(pending, settingsChanged);
+    }
+  });
+
+  check("内存模式 64 MiB：A 转换时 B 可编辑且 A 完成不刷新错 B", async () => {
+    let pending = null;
+    let restore = () => {};
+    let unlisten = null;
+    try {
+      const { operationModel: a, session: aSession } = await openMemoryCsv("nonmodal-a");
+      const aTab = window.__app.tabs().find((tab) => tab.active);
+      const bPath = `${TMP}/memory-mode-b-${Date.now()}-${++fixtureSeq}.csv`;
+      await writeText(bPath, "name,n\nB,1\n");
+      assert(await window.__app.openPathsAsTabs([bPath]), "B 小档应进入另一页签");
+      const b = bigM();
+      const bTab = window.__app.tabs().find((tab) => tab.active);
+      assert(aTab && bTab && aTab.id !== bTab.id && b.sessionId !== aSession,
+        "A/B 必须是不同文档会话");
+      let notifyEntered;
+      const entered = new Promise((resolve) => { notifyEntered = resolve; });
+      restore = interceptProcessInvoke((original, cmd, args, options) => {
+        if (cmd === "big_memory_mode_enter") notifyEntered();
+        return original(cmd, args, options);
+      });
+      let aProgress = 0;
+      unlisten = await a.onMemoryProgress(() => { aProgress += 1; });
+      assert(await window.__app.activateTab(aTab.id), "切回 A 发起转换");
+      pending = window.__app.enterMemoryMode();
+      await confirmMemoryEnterDialog();
+      await entered;
+      assert(window.__app.memoryOperationKind() === "enter", "A 必须登记真实转换任务");
+      assert(await window.__app.activateTab(bTab.id), "A 在途时应能切换 B");
+      const changed = await b.setData(0, 0, "B 已编辑");
+      assert(changed?.changed && b.rawData(0, 0) === "B 已编辑" && !b.memoryMode(),
+        "A 转换不得阻塞 B 编辑");
+      const aOutcome = await pending;
+      pending = null;
+      assert(aOutcome?.changed === true && aOutcome.cancelled === false && aOutcome.fixedPoint == null,
+        `A 进入内存模式结果异常：${JSON.stringify(aOutcome)}`);
+      await waitFor(() => a.memoryMode() && a.meta().ram_backed, "A 持久内存模式元数据");
+      restore();
+      restore = () => {};
+      unlisten();
+      unlisten = null;
+      assert(aProgress > 0, "A 必须收到自己的真实转换进度");
+      assert(window.__app.smokeSnapshot().active?.session === b.sessionId
+        && bigM().sessionId === b.sessionId && bigM().rawData(0, 0) === "B 已编辑"
+        && window.__app.isDirty(), "A 完成不得切走、刷新或覆盖 B");
+      assert(await window.__app.activateTab(aTab.id) && bigM().memoryMode(),
+        "切回 A 应看到持久内存模式");
+      assert(await window.__app.activateTab(bTab.id) && bigM().rawData(0, 0) === "B 已编辑"
+        && window.__app.isDirty(), "B 编辑和 dirty 必须随签保留");
+    } finally {
+      unlisten?.();
+      restore();
+      await cleanupMemoryScenario(pending);
+    }
+  });
+
+  check("内存模式 64 MiB：外部变化走既有提示且不自动重载或丢修改", async () => {
+    let pending = null;
+    try {
+      const { path, operationModel } = await openMemoryCsv("external-change");
+      pending = window.__app.enterMemoryMode();
+      await confirmMemoryEnterDialog();
+      await awaitMemoryEntered(pending);
+      pending = null;
+      await operationModel.setData(0, 0, "未保存修改");
+      await invoke("smoke_write_repeat", {
+        path, line: "aaaa,1,bbbb,ccc\n", times: 1, append: true,
+      });
+      assert(await invoke("file_size", { path }) === MEMORY_CSV_BYTES + 16,
+        "外部程序追加必须真实改变文件");
+      pending = window.__app.exitMemoryMode();
+      await waitFor(() => document.querySelector(".modal-mask")?.textContent
+        .includes("文件已被外部程序修改"), "内存命令的外部变化提示");
+      assert(clickModalButton("否"), "拒绝自动重载");
+      const outcome = await pending;
+      pending = null;
+      assert(outcome === null, "外部变化取消后不得伪装成成功退出");
+      assert(operationModel.memoryMode() && operationModel.meta().ram_backed
+        && operationModel.rawData(0, 0) === "未保存修改" && window.__app.isDirty()
+        && operationModel.canUndo() && operationModel.rowCount() === MEMORY_CSV_ROWS,
+      "拒绝重载后必须保留持久 RAM、未保存内容、历史和原行数");
+      assert(window.__app.getPath() === path && !document.querySelector(".modal-mask"),
+        "外部变化提示关闭后身份不变且不得连环弹窗");
+    } finally {
+      await cleanupMemoryScenario(pending);
+    }
+  });
+
+  check("内存模式 64 MiB：关签和关窗均先取消等待再关闭后端", async () => {
+    async function verifyCloseOrder(kind) {
+      let pending = null;
+      let release = () => {};
+      let restore = () => {};
+      try {
+        const { operationModel } = await openMemoryCsv(`close-${kind}`);
+        const commands = [];
+        let notifyEntered;
+        let releaseGate;
+        const entered = new Promise((resolve) => { notifyEntered = resolve; });
+        const gate = new Promise((resolve) => { releaseGate = resolve; });
+        release = releaseGate;
+        restore = interceptProcessInvoke(async (original, cmd, args, options) => {
+          commands.push(cmd);
+          if (cmd === "big_memory_mode_enter") {
+            notifyEntered();
+            await gate;
+          }
+          if (cmd === "close_window") return null; // 保留 Diagnostic main，真实关窗由既有 Document 用例覆盖
+          return original(cmd, args, options);
+        });
+        pending = window.__app.enterMemoryMode();
+        await confirmMemoryEnterDialog();
+        await entered;
+        const active = window.__app.tabs().find((tab) => tab.active);
+        assert(active, `${kind} 关闭前应有活动大文档`);
+        let closePromise;
+        if (kind === "tab") closePromise = window.__app.closeTab(active.id);
+        else closePromise = window.__app.smokeAction({ action: "closeWindowDiscard" });
+        await waitFor(() => commands.includes("big_memory_mode_cancel"),
+          `${kind} 先取消内存任务`);
+        assert(!commands.includes("big_close") && !commands.includes("close_window"),
+          `${kind} 在 enter Promise 未落定前不得关闭后端`);
+        release();
+        release = () => {};
+        assert(await closePromise === true || kind === "window", `${kind} 关闭动作应完成`);
+        await pending;
+        pending = null;
+        restore();
+        restore = () => {};
+        const enterAt = commands.indexOf("big_memory_mode_enter");
+        const cancelAt = commands.indexOf("big_memory_mode_cancel");
+        const closeAt = commands.lastIndexOf("big_close");
+        assert(enterAt >= 0 && cancelAt > enterAt && closeAt > cancelAt,
+          `${kind} 顺序必须为 enter → cancel → big_close：${JSON.stringify(commands)}`);
+        if (kind === "window") {
+          assert(commands.indexOf("close_window") > closeAt,
+            `关窗必须在 big_close 之后：${JSON.stringify(commands)}`);
+        }
+        assert(!operationModel.meta(), `${kind} 后原模型会话必须关闭`);
+      } finally {
+        release();
+        restore();
+        await cleanupMemoryScenario(pending);
+      }
+    }
+    await verifyCloseOrder("tab");
+    await verifyCloseOrder("window");
+  });
+
   lines.push("", "MANUAL Windows/RDP 真实鼠标：A→A 换序、A/B 落签、拖出新窗、无效投放、Escape、抓取预览与负坐标/DPI。");
   lines.push("MANUAL 最后一个窗口由用户关闭后退出进程：Task 11 平台验收，不以 finish_smoke 的 process::exit 替代。");
 
@@ -4750,7 +5407,7 @@ x,y
   const watchdog = setTimeout(async () => {
     lines.push("", `[watchdog] 超时未完成，已通过 ${lines.length} 项`);
     await invoke("finish_smoke", { report: lines.join("\n"), code: 1 });
-  }, 120000);
+  }, 300000);
   for (const [name, fn] of checks) {
     window.__smokeCurrent = name;
     try {

@@ -798,13 +798,16 @@ export class Grid {
       ? this._captureClearAnchor()
       : null;
     this.visibleRows = null;
-    if (!hasCond && this.model.filterActive()) {
+    if (!hasCond && this.model.filterActive() && !this._clearFilterPending) {
       // 条件清空 → 自动回全量。锚定路径：先查归位行号再清筛（命中集清后
       // 即失），落定后把选中行/视口顶行送回原来的位置（用户无感）；
       // 被抢断/无锚/越界回落回顶。
       // _suppressIndexAnchor：落定触发的 _onModelData 会把 visCount 增长
       // 误判成索引推进而抢恢复——锚定期间压住它。
       this._suppressIndexAnchor = true;
+      // 清筛 IPC 未落定时 filterActive 仍为 true；重入只能重绘，不能再次查询/清空。
+      // 否则先前请求已清掉命中集，后续请求会拿到 null 锚点并把有效恢复覆盖成回顶。
+      this._clearFilterPending = true;
       Promise.resolve(this.model.clearFilter(cap ? cap.k : null))
         .then((res) => {
           if (!res?.applied) return; // 被新筛选/清筛抢断：锚点作废
@@ -816,7 +819,10 @@ export class Grid {
           }
         })
         .catch(() => {})
-        .finally(() => { this._suppressIndexAnchor = false; });
+        .finally(() => {
+          this._clearFilterPending = false;
+          this._suppressIndexAnchor = false;
+        });
     }
     this.hooks.bigFilterStatus?.(hasCond);
     this._clampSelection();

@@ -124,6 +124,48 @@ test("启动和修改设置均使用同一组双值策略", () => {
   assert.match(app, /applyUndoSettings/);
 });
 
+test("保存开始在途刷新互斥状态并在收尾恢复", async () => {
+  const operations = new Map();
+  let releaseSave;
+  let notifyEntered;
+  const entered = new Promise((resolve) => { notifyEntered = resolve; });
+  const gate = new Promise((resolve) => { releaseSave = resolve; });
+  const states = [];
+  const dialog = { set() {}, close() {}, finish: async () => {} };
+  const context = {
+    model: {
+      filterActive: () => false,
+      onProgress: async () => () => {},
+      rowCount: () => 1,
+      meta: () => ({ rows: 1 }),
+    },
+    progressDialog: () => dialog,
+    refreshBigUi: () => states.push([...operations.values()]
+      .some((operation) => operation.cmd === "big_save")),
+    setDirty: () => {},
+    fgrid: () => ({ clearFilters: () => {} }),
+    onCountsChanged: () => {},
+    statusMsg: () => {},
+    errorDialog: async (message) => { throw new Error(message); },
+  };
+  vm.runInNewContext(
+    extractFunction(app, "runBigWrite") + "\nglobalThis.run = runBigWrite;", context);
+  const write = () => {
+    const key = Symbol("save");
+    const promise = gate.then(() => { operations.delete(key); return true; });
+    operations.set(key, { cmd: "big_save", promise });
+    notifyEntered();
+    return promise;
+  };
+  const pending = context.run(write, "保存", "已保存", "重试");
+  await entered;
+  const during = [...states];
+  releaseSave();
+  assert.equal(await pending, true);
+  assert.deepEqual(during, [true], "保存 IPC 在途时必须立即刷新按钮为互斥禁用");
+  assert.equal(states.at(-1), false, "保存收尾必须刷新并解除互斥禁用");
+});
+
 test("工具栏和状态栏区分持久内存与临时排序 RAM", () => {
   assert.match(app, /btn-memory-mode/);
   assert.match(app, /临时排序 RAM/);

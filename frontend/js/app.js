@@ -2405,7 +2405,9 @@ async function runBigWrite(write, action, okMsg, hint) {
   const dlg = progressDialog("保存大文件…");
   const un = await model.onProgress((done, total, phase, rows) => dlg.set(done, total, phase, rows));
   try {
-    const saved = await write();
+    const pendingWrite = write();
+    refreshBigUi(); // IPC 已登记到模型在途表，立即禁用互斥的内存模式入口
+    const saved = await pendingWrite;
     if (!saved) {
       un();
       dlg.close();
@@ -2416,6 +2418,8 @@ async function runBigWrite(write, action, okMsg, hint) {
     dlg.close();
     await errorDialog(`${action}失败`, `${err?.message ?? err}\n${hint}`);
     return false;
+  } finally {
+    refreshBigUi(); // 成功、取消和失败都在在途表清理后恢复入口
   }
   un();
   // 完成帧短暂停留再关闭：重写期间磁盘 IO 可能饿死渲染管线，屏幕停在
