@@ -25,13 +25,15 @@ use crate::clipboard::{ClipboardStore, CopyBuilder};
 #[cfg(test)]
 use crate::clipboard::ClipboardEntry;
 use crate::history::{
-    Approval, BudgetChange, Cost, EditOutcome, FixedPointKind, FixedPointRequest,
-    HistoryEntry, HistoryError, HistoryLedger, HistoryStats, Prepared, PreparedHistory,
-    SharedCharge,
+    effective_undo_budget_bytes, Approval, BudgetChange, BudgetEffect, Cost, EditOutcome,
+    FixedPointKind, FixedPointRequest, HistoryEntry, HistoryError, HistoryLedger, HistoryStats,
+    Prepared, PreparedBudget, PreparedHistory, SharedCharge, UndoPolicy,
     DEFAULT_HISTORY_BUDGET_BYTES,
 };
 use crate::order::{project_filter, Perm, RowOrder};
-use crate::ram_load::{prepare_load, run_prepared_load, LoadEvent, LoadOptions, LoadResult};
+use crate::ram_load::{
+    conversion_limit_bytes, prepare_load, run_prepared_load, LoadEvent, LoadOptions, LoadResult,
+};
 use crate::ram_region::FinishedRam;
 use crate::schema::{ColumnId, ColumnStorage, Schema};
 use crate::spool::{history_text_bytes, PasteImport, RowSnapshot, SessionSpool};
@@ -7736,6 +7738,35 @@ pub struct SaveOutcome {
     pub cancelled: bool,
 }
 
+pub const MEMORY_MODE_MIN_BYTES: u64 = 50 * 1024 * 1024;
+
+pub struct PreparedUndoPolicy {
+    policy: UndoPolicy,
+    effective_budget_bytes: u64,
+    ledger: PreparedBudget<Op>,
+    pub effect: BudgetEffect,
+    fixed_point: bool,
+    savepoint_detached: bool,
+    next_history_generation: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MemoryEstimate {
+    pub file_bytes: u64,
+    pub limit_bytes: u64,
+    pub available_physical_bytes: u64,
+    pub available_commit_bytes: Option<u64>,
+    pub already_ram: bool,
+    pub can_enter: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct MemoryExitOutcome {
+    pub exited: bool,
+    pub fixed_point: Option<FixedPointRequest>,
+}
+
 /// 打开后的元数据。
 #[derive(Clone, serde::Serialize)]
 pub struct BigMeta {
@@ -7754,6 +7785,8 @@ pub struct BigMeta {
     pub indexing: bool,
     /// 是否已载入私有内存缓冲（排序模式或新建内存档）。
     pub ram_backed: bool,
+    /// 是否由用户明确开启持久内存模式，与临时 RAM 状态分离。
+    pub memory_mode: bool,
     /// 会话是否已关联磁盘路径（新建内存档为 false；前端据此决定保存走另存为）。
     pub has_path: bool,
     /// 当前是否处于排序视图（显示行按 `order` 映射）。
@@ -7765,6 +7798,10 @@ pub struct BigMeta {
     /// 已建立索引的字节数 / 文件总字节数。
     pub indexed_bytes: u64,
     pub total_bytes: u64,
+    pub effective_undo_budget_bytes: u64,
+    pub undo_budget_bytes: u64,
+    pub resident_permille: u32,
+    pub backing_file_bytes: u64,
     /// 首屏同步索引耗时（毫秒，从打开文件到返回前端）。
     pub open_ms: u64,
     /// 全量索引耗时（毫秒）；未完成时为 0。
@@ -8837,6 +8874,10 @@ pub struct BigFile {
     last_spec: Option<FilterSpec>,
     filter_stats: FilterStats,
     history: HistoryLedger<Op>,
+    /// 用户明确开启的持久内存模式；不等同于临时 RAM 后备。
+    memory_mode: bool,
+    /// 普通预算与驻留撤销比例共同决定当前有效预算。
+    undo_policy: UndoPolicy,
     /// 删除快照和后续固定点 generation 的会话独占临时目录。
     spool: SessionSpool,
     imports: HashMap<String, PasteImport>,
@@ -9012,6 +9053,8 @@ impl BigFile {
             last_spec: None,
             filter_stats: FilterStats::default(),
             history: HistoryLedger::new(DEFAULT_HISTORY_BUDGET_BYTES),
+            memory_mode: false,
+            undo_policy: UndoPolicy::default(),
             spool,
             imports: HashMap::new(),
             next_import_id: 0,
@@ -9218,6 +9261,8 @@ impl BigFile {
             last_spec: None,
             filter_stats: FilterStats::default(),
             history: HistoryLedger::new(DEFAULT_HISTORY_BUDGET_BYTES),
+            memory_mode: false,
+            undo_policy: UndoPolicy::default(),
             spool,
             imports: HashMap::new(),
             next_import_id: 0,
@@ -9549,7 +9594,7 @@ impl BigFile {
             HistoryDecision::FixedPoint(prepared) => (prepared, true),
             HistoryDecision::Confirm(outcome) => return Ok(outcome),
         };
-        if release_ram && self.is_ram_backed() && self.has_path() {
+        if release_ram && self.is_ram_backed() && self.has_path() && !self.memory_mode {
             self.remap()?;
         }
         self.apply(&mut prepared.entry_mut().op);
@@ -9769,12 +9814,17 @@ impl BigFile {
             can_redo: self.history_stats().redo_count > 0,
             indexing,
             ram_backed: self.is_ram_backed(),
+            memory_mode: self.memory_mode,
             has_path: self.has_path(),
             sorted: self.is_sorted(),
             filtered: self.has_filter(),
             modified: self.modified(),
             indexed_bytes,
             total_bytes: self.total_bytes,
+            effective_undo_budget_bytes: self.history.stats().budget_bytes,
+            undo_budget_bytes: self.undo_policy.budget_bytes,
+            resident_permille: self.undo_policy.resident_permille,
+            backing_file_bytes: self.total_bytes,
             open_ms: self.open_ms,
             index_ms,
             index_sync: self.index_sync,
@@ -10385,20 +10435,233 @@ impl BigFile {
         self.history.stats()
     }
 
-    pub fn set_history_budget(&mut self, budget_bytes: u64) -> Result<BudgetChange, String> {
-        let next_generation = self.next_history_generation()?;
-        let change = self.history.set_budget(budget_bytes);
-        if change.fixed_point {
-            self.fixed_point = true;
-            if self.revision != 0 {
-                self.savepoint_detached = true;
-            }
-        }
-        self.history_generation = next_generation;
-        if change.evicted > 0 {
+    pub fn undo_policy(&self) -> UndoPolicy {
+        self.undo_policy
+    }
+
+    pub fn prepare_undo_policy(
+        &self,
+        policy: UndoPolicy,
+    ) -> Result<PreparedUndoPolicy, String> {
+        self.prepare_undo_policy_for_mode(policy, self.memory_mode)
+    }
+
+    fn prepare_undo_policy_for_mode(
+        &self,
+        policy: UndoPolicy,
+        memory_mode: bool,
+    ) -> Result<PreparedUndoPolicy, String> {
+        let effective = effective_undo_budget_bytes(self.total_bytes, memory_mode, policy)?;
+        let ledger = self
+            .history
+            .prepare_budget_change(effective)
+            .map_err(history_cost_error)?;
+        let next_history_generation = self.next_history_generation()?;
+        let fixed_point = self.fixed_point || ledger.effect.establishes_fixed_point;
+        let savepoint_detached = self.savepoint_detached
+            || (ledger.effect.establishes_fixed_point && self.revision != 0);
+        Ok(PreparedUndoPolicy {
+            policy,
+            effective_budget_bytes: effective,
+            effect: ledger.effect,
+            ledger,
+            fixed_point,
+            savepoint_detached,
+            next_history_generation,
+        })
+    }
+
+    pub fn commit_undo_policy(&mut self, prepared: PreparedUndoPolicy) {
+        self.history.commit_budget_change(prepared.ledger);
+        debug_assert_eq!(
+            self.history.stats().budget_bytes,
+            prepared.effective_budget_bytes
+        );
+        self.undo_policy = prepared.policy;
+        self.fixed_point = prepared.fixed_point;
+        self.savepoint_detached = prepared.savepoint_detached;
+        self.history_generation = prepared.next_history_generation;
+        if prepared.effect.evicted_undo + prepared.effect.evicted_redo > 0 {
             self.reclaim_unreferenced_columns();
         }
-        Ok(change)
+    }
+
+    fn set_undo_policy(&mut self, policy: UndoPolicy) -> Result<BudgetEffect, String> {
+        let prepared = self.prepare_undo_policy(policy)?;
+        let effect = prepared.effect;
+        self.commit_undo_policy(prepared);
+        Ok(effect)
+    }
+
+    pub fn set_history_budget(&mut self, budget_bytes: u64) -> Result<BudgetChange, String> {
+        let mut policy = self.undo_policy;
+        policy.budget_bytes = budget_bytes;
+        let effect = self.set_undo_policy(policy)?;
+        Ok(BudgetChange {
+            evicted: effect.evicted_undo + effect.evicted_redo,
+            fixed_point: effect.establishes_fixed_point,
+        })
+    }
+
+    pub fn memory_estimate(&self) -> Result<MemoryEstimate, String> {
+        self.memory_estimate_for_minimum(MEMORY_MODE_MIN_BYTES)
+    }
+
+    fn memory_estimate_for_minimum(
+        &self,
+        minimum_bytes: u64,
+    ) -> Result<MemoryEstimate, String> {
+        let system = crate::process_memory::available_system_memory()?;
+        let file_bytes = if self.has_path() {
+            FileStamp::read(&self.backing_path)?.len
+        } else {
+            0
+        };
+        let reason = if !self.has_path() {
+            Some("新建且从未保存的文档没有可靠磁盘后备".to_string())
+        } else if file_bytes < minimum_bytes {
+            Some(if minimum_bytes == MEMORY_MODE_MIN_BYTES {
+                "内存模式只用于至少 50 MiB 的大文件".to_string()
+            } else {
+                format!("文件小于本入口允许的 {minimum_bytes} 字节")
+            })
+        } else if self.is_indexing() {
+            Some("文件仍在索引中".to_string())
+        } else if system
+            .available_commit_bytes
+            .is_some_and(|available| available < file_bytes)
+        {
+            Some("Windows 可用 commit 不足以支持目标私有内存".to_string())
+        } else {
+            None
+        };
+        Ok(MemoryEstimate {
+            file_bytes,
+            limit_bytes: conversion_limit_bytes(file_bytes)?,
+            available_physical_bytes: system.available_physical_bytes,
+            available_commit_bytes: system.available_commit_bytes,
+            already_ram: self.is_ram_backed(),
+            can_enter: reason.is_none(),
+            reason,
+        })
+    }
+
+    pub fn enter_memory_mode<O>(
+        &mut self,
+        cancel: &AtomicBool,
+        observer: O,
+    ) -> Result<bool, String>
+    where
+        O: Fn(LoadEvent) + Sync,
+    {
+        self.enter_memory_mode_with_options(
+            cancel,
+            MEMORY_MODE_MIN_BYTES,
+            LoadOptions::default(),
+            observer,
+        )
+    }
+
+    #[cfg(test)]
+    fn enter_memory_mode_for_test<O>(
+        &mut self,
+        cancel: &AtomicBool,
+        observer: O,
+    ) -> Result<bool, String>
+    where
+        O: Fn(LoadEvent) + Sync,
+    {
+        self.enter_memory_mode_with_options(cancel, 1, LoadOptions::default(), observer)
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn enter_memory_mode_with_options<O>(
+        &mut self,
+        cancel: &AtomicBool,
+        minimum_bytes: u64,
+        options: LoadOptions,
+        observer: O,
+    ) -> Result<bool, String>
+    where
+        O: Fn(LoadEvent) + Sync,
+    {
+        if self.memory_mode {
+            return Ok(false);
+        }
+        if !self.has_path() {
+            return Err("没有可靠磁盘后备，不能开启内存模式".into());
+        }
+        let estimate = self.memory_estimate_for_minimum(minimum_bytes)?;
+        if estimate.file_bytes < minimum_bytes || !estimate.can_enter {
+            return Err(estimate
+                .reason
+                .unwrap_or_else(|| "文件小于本入口允许的尺寸".into()));
+        }
+        // 预算溢出必须在释放 mmap 或启动任何复制之前失败。
+        let prepared = self.prepare_undo_policy_for_mode(self.undo_policy, true)?;
+        if !self.is_ram_backed() {
+            match self.convert_mmap_to_ram(cancel, options, observer)? {
+                ConvertStatus::Converted => {}
+                ConvertStatus::Cancelled => return Ok(false),
+            }
+        }
+        self.commit_undo_policy(prepared);
+        self.memory_mode = true;
+        Ok(true)
+    }
+
+    /// 先准备新映射和索引；任一步失败都仍由旧 RAM 后备提供服务。
+    fn prepare_memory_mode_remap(&self) -> Result<(Backing, RawIndex), String> {
+        let backing = self.map_current_backing()?;
+        let idx = build_index_with_format(backing.bytes(), self.format);
+        if idx.n_records() != self.idx.n_records() {
+            return Err("退出内存模式时后备文件记录数已变化".into());
+        }
+        Ok((backing, idx))
+    }
+
+    pub fn exit_memory_mode(
+        &mut self,
+        approval: Approval,
+    ) -> Result<MemoryExitOutcome, String> {
+        if approval.allow_fixed_point
+            && approval.preflight_id != Some(self.history_generation)
+        {
+            return Err("固定点预检已过期，请重试".into());
+        }
+        if !self.memory_mode {
+            return Ok(MemoryExitOutcome {
+                exited: false,
+                fixed_point: None,
+            });
+        }
+        let prepared = self.prepare_undo_policy_for_mode(self.undo_policy, false)?;
+        let destructive = prepared.effect.evicted_undo + prepared.effect.evicted_redo > 0
+            || prepared.effect.establishes_fixed_point;
+        if destructive && !approval.allow_fixed_point {
+            return Ok(MemoryExitOutcome {
+                exited: false,
+                fixed_point: Some(FixedPointRequest {
+                    kind: FixedPointKind::MemoryModeExit,
+                    operation: "退出内存模式".into(),
+                    required_bytes: self.history.stats().bytes,
+                    budget_bytes: prepared.effective_budget_bytes,
+                    preflight_id: self.history_generation,
+                }),
+            });
+        }
+        let (backing, idx) = self.prepare_memory_mode_remap()?;
+        // 后续只做无失败移动；保留 Segment、覆盖层、历史与 index_epoch。
+        self.backing = backing;
+        self.idx = idx;
+        self.partial = None;
+        self.index_sync = true;
+        self.commit_undo_policy(prepared);
+        self.memory_mode = false;
+        Ok(MemoryExitOutcome {
+            exited: true,
+            fixed_point: None,
+        })
     }
 
     fn next_history_generation(&self) -> Result<u64, String> {
@@ -14036,4 +14299,298 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     let mut tmp = name;
     tmp.push(".simpletable-tmp");
     dir.join(tmp)
+}
+
+#[cfg(test)]
+mod memory_mode_tests {
+    use super::*;
+    use crate::history::UndoPolicy;
+    use crate::ram_load::conversion_limit_bytes;
+    use std::sync::atomic::AtomicUsize;
+
+    fn memory_tmp_csv(name: &str, bytes: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "st_engine_memory_{name}_{}.csv",
+            std::process::id()
+        ));
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn memory_people_csv() -> Vec<u8> {
+        b"name,age,city\r\nAlice,30,Beijing\r\nbob,25,Shanghai\r\nCarol,35,Beijing\r\ndave,28,Guangzhou\r\nEve,22,Shanghai\r\n".to_vec()
+    }
+
+    #[test]
+    fn memory_mode_state_matrix_separates_ram_and_persistence() {
+        let path = memory_tmp_csv("state_matrix", &memory_people_csv());
+        let file_bytes = fs::metadata(&path).unwrap().len();
+        let mut file = BigFile::open(&path).unwrap();
+        let meta = file.meta();
+        assert!(!meta.ram_backed && !meta.memory_mode && meta.has_path);
+        assert_eq!(meta.undo_budget_bytes, DEFAULT_HISTORY_BUDGET_BYTES);
+        assert_eq!(meta.resident_permille, 1000);
+        assert_eq!(meta.backing_file_bytes, file_bytes);
+        assert_eq!(meta.effective_undo_budget_bytes, DEFAULT_HISTORY_BUDGET_BYTES);
+
+        let cancel = AtomicBool::new(false);
+        file.load_into_ram(&cancel, &mut |_, _| {}).unwrap();
+        let meta = file.meta();
+        assert!(meta.ram_backed && !meta.memory_mode && meta.has_path);
+
+        let unsaved = BigFile::from_bytes(memory_people_csv(), false).unwrap();
+        let meta = unsaved.meta();
+        assert!(meta.ram_backed && !meta.memory_mode && !meta.has_path);
+
+        assert!(file.enter_memory_mode_for_test(&cancel, |_| {}).unwrap());
+        let meta = file.meta();
+        assert!(meta.ram_backed && meta.memory_mode && meta.has_path);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn temporary_ram_promotion_does_not_copy_or_change_history() {
+        let path = memory_tmp_csv("promote", &memory_people_csv());
+        let mut file = BigFile::open(&path).unwrap();
+        let cancel = AtomicBool::new(false);
+        file.load_into_ram(&cancel, &mut |_, _| {}).unwrap();
+        file.set_cell(0, 0, "kept".into(), Approval::deny()).unwrap();
+        let before = (file.history_stats(), file.index_epoch, file.revision);
+        let events = AtomicUsize::new(0);
+        assert!(file.enter_memory_mode_for_test(&cancel, |_| {
+            events.fetch_add(1, Ordering::Relaxed);
+        }).unwrap());
+        assert!(file.meta().memory_mode && file.meta().ram_backed);
+        assert_eq!((file.history_stats(), file.index_epoch, file.revision), before);
+        assert_eq!(events.load(Ordering::Relaxed), 0, "已有 RAM 提升不得产生复制事件");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn resident_budget_applies_only_after_persistent_promotion() {
+        let path = memory_tmp_csv("resident_scope", &memory_people_csv());
+        let file_bytes = fs::metadata(&path).unwrap().len();
+        let policy = UndoPolicy { budget_bytes: 64, resident_permille: 10_000 };
+        let mut temporary = BigFile::open(&path).unwrap();
+        let cancel = AtomicBool::new(false);
+        temporary.load_into_ram(&cancel, &mut |_, _| {}).unwrap();
+        temporary.set_undo_policy(policy).unwrap();
+        assert_eq!(temporary.history_stats().budget_bytes, 64);
+
+        let mut unsaved = BigFile::from_bytes(memory_people_csv(), false).unwrap();
+        unsaved.set_undo_policy(policy).unwrap();
+        assert_eq!(unsaved.history_stats().budget_bytes, 64);
+
+        assert!(temporary.enter_memory_mode_for_test(&cancel, |_| {}).unwrap());
+        let expected = (file_bytes * 10_000 + 999) / 1000;
+        assert_eq!(temporary.history_stats().budget_bytes, expected);
+        assert_eq!(temporary.meta().effective_undo_budget_bytes, expected);
+        assert_eq!(temporary.meta().backing_file_bytes, file_bytes);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_mode_rejects_unsaved_and_small_production_entry() {
+        let mut unsaved = BigFile::from_bytes(memory_people_csv(), false).unwrap();
+        let cancel = AtomicBool::new(false);
+        let error = unsaved.enter_memory_mode_for_test(&cancel, |_| {}).unwrap_err();
+        assert!(error.contains("后备"), "{error}");
+        assert!(unsaved.meta().ram_backed && !unsaved.meta().memory_mode);
+
+        let path = memory_tmp_csv("too_small", &memory_people_csv());
+        let mut file = BigFile::open(&path).unwrap();
+        let estimate = file.memory_estimate().unwrap();
+        assert_eq!(estimate.file_bytes, fs::metadata(&path).unwrap().len());
+        assert_eq!(estimate.limit_bytes, conversion_limit_bytes(estimate.file_bytes).unwrap());
+        assert!(!estimate.can_enter);
+        assert!(estimate.reason.unwrap().contains("50 MiB"));
+        let events = AtomicUsize::new(0);
+        let error = file.enter_memory_mode(&cancel, |_| {
+            events.fetch_add(1, Ordering::Relaxed);
+        }).unwrap_err();
+        assert!(error.contains("50 MiB"), "{error}");
+        assert_eq!(events.load(Ordering::Relaxed), 0);
+        assert!(!file.meta().ram_backed && !file.meta().memory_mode);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_mode_cancel_keeps_mmap_and_undo_policy() {
+        let path = memory_tmp_csv("enter_cancel", &memory_people_csv());
+        let mut file = BigFile::open(&path).unwrap();
+        let before = (
+            file.rows(0, 5),
+            file.history_stats(),
+            file.revision,
+            file.index_epoch,
+            file.history_generation,
+        );
+        let cancel = AtomicBool::new(true);
+        assert!(!file.enter_memory_mode_for_test(&cancel, |_| {}).unwrap());
+        assert!(!file.meta().ram_backed && !file.meta().memory_mode);
+        assert_eq!((
+            file.rows(0, 5),
+            file.history_stats(),
+            file.revision,
+            file.index_epoch,
+            file.history_generation,
+        ), before);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_mode_successful_exit_preserves_document_and_history() {
+        let path = memory_tmp_csv("exit_success", &memory_people_csv());
+        let mut file = BigFile::open(&path).unwrap();
+        let cancel = AtomicBool::new(false);
+        file.enter_memory_mode_for_test(&cancel, |_| {}).unwrap();
+        file.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+        let before = (file.rows(0, 5), file.history_stats(), file.revision, file.index_epoch);
+        let outcome = file.exit_memory_mode(Approval::deny()).unwrap();
+        assert!(outcome.exited && outcome.fixed_point.is_none());
+        assert!(!file.meta().ram_backed && !file.meta().memory_mode);
+        assert_eq!((file.rows(0, 5), file.history_stats(), file.revision, file.index_epoch), before);
+        assert!(file.undo());
+        assert_eq!(file.rows(0, 1)[0][1], "30");
+        assert!(!file.meta().ram_backed);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_mode_exit_sort_keeps_persistent_ram() {
+        let path = memory_tmp_csv("sort_stays_ram", &memory_people_csv());
+        let mut file = BigFile::open(&path).unwrap();
+        let cancel = AtomicBool::new(false);
+        file.enter_memory_mode_for_test(&cancel, |_| {}).unwrap();
+        file.sort_by_levels(
+            &[SortLevel { col: 0, numeric: false, asc: false }],
+            Approval::deny(),
+        ).unwrap();
+        file.exit_sort_mode(true, Approval::deny()).unwrap();
+        assert!(!file.meta().sorted);
+        assert!(file.meta().ram_backed && file.meta().memory_mode);
+        assert_eq!(file.rows(0, 1)[0][0], "Alice");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_mode_exit_shrink_cancel_keeps_ram_mode_history_and_dirty_state() {
+        let path = memory_tmp_csv("exit_shrink", &memory_people_csv());
+        let mut file = BigFile::open(&path).unwrap();
+        let cancel = AtomicBool::new(false);
+        file.enter_memory_mode_for_test(&cancel, |_| {}).unwrap();
+        file.set_cell(0, 0, "x".repeat(512), Approval::deny()).unwrap();
+        let effect = file.set_undo_policy(UndoPolicy {
+            budget_bytes: 1,
+            resident_permille: 10_000,
+        }).unwrap();
+        assert_eq!(effect.evicted_undo + effect.evicted_redo, 0);
+        assert!(!effect.establishes_fixed_point);
+        let before = (
+            file.history_stats(),
+            file.meta().modified,
+            file.rows(0, 5),
+            file.revision,
+            file.index_epoch,
+            file.history_generation,
+        );
+        let outcome = file.exit_memory_mode(Approval::deny()).unwrap();
+        assert!(!outcome.exited);
+        let request = outcome.fixed_point.unwrap();
+        assert_eq!(request.kind, FixedPointKind::MemoryModeExit);
+        assert!(file.meta().memory_mode && file.meta().ram_backed);
+        assert_eq!((
+            file.history_stats(),
+            file.meta().modified,
+            file.rows(0, 5),
+            file.revision,
+            file.index_epoch,
+            file.history_generation,
+        ), before);
+
+        let rows = file.rows(0, 5);
+        let approved = file.exit_memory_mode(Approval::allow(request.preflight_id)).unwrap();
+        assert!(approved.exited && approved.fixed_point.is_none());
+        assert!(!file.meta().memory_mode && !file.meta().ram_backed);
+        assert_eq!(file.rows(0, 5), rows);
+        assert_eq!(file.history_stats().undo_count, 0);
+        assert_eq!(file.history_stats().redo_count, 0);
+        assert_eq!(file.history_stats().budget_bytes, 1);
+        assert!(file.meta().modified, "固定点退出后保存点仍不可达");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_mode_exit_rejects_stale_approval_without_side_effects() {
+        let path = memory_tmp_csv("exit_stale", &memory_people_csv());
+        let mut file = BigFile::open(&path).unwrap();
+        let cancel = AtomicBool::new(false);
+        file.enter_memory_mode_for_test(&cancel, |_| {}).unwrap();
+        file.set_cell(0, 0, "x".repeat(512), Approval::deny()).unwrap();
+        file.set_undo_policy(UndoPolicy {
+            budget_bytes: 1,
+            resident_permille: 10_000,
+        }).unwrap();
+        let denied = file.exit_memory_mode(Approval::deny()).unwrap();
+        let request = denied.fixed_point.unwrap();
+        file.set_undo_policy(file.undo_policy()).unwrap();
+        let before = (file.history_stats(), file.rows(0, 5), file.history_generation);
+        let error = file.exit_memory_mode(Approval::allow(request.preflight_id)).unwrap_err();
+        assert!(error.contains("过期"), "{error}");
+        assert!(file.meta().memory_mode && file.meta().ram_backed);
+        assert_eq!((file.history_stats(), file.rows(0, 5), file.history_generation), before);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_mode_exit_remap_failure_preserves_ram_and_budget() {
+        let path = memory_tmp_csv("exit_remap_failure", &memory_people_csv());
+        let mut file = BigFile::open(&path).unwrap();
+        let cancel = AtomicBool::new(false);
+        file.enter_memory_mode_for_test(&cancel, |_| {}).unwrap();
+        file.set_cell(0, 1, "kept".into(), Approval::deny()).unwrap();
+        file.backing_path = path.with_file_name(format!(
+            "st_engine_memory_missing_{}.csv",
+            std::process::id()
+        ));
+        let before = (
+            file.history_stats(),
+            file.rows(0, 5),
+            file.revision,
+            file.index_epoch,
+            file.history_generation,
+        );
+        assert!(file.exit_memory_mode(Approval::deny()).is_err());
+        assert!(file.meta().memory_mode && file.meta().ram_backed);
+        assert_eq!((
+            file.history_stats(),
+            file.rows(0, 5),
+            file.revision,
+            file.index_epoch,
+            file.history_generation,
+        ), before);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_mode_enter_policy_failure_does_not_start_copy() {
+        let path = memory_tmp_csv("enter_policy_overflow", &memory_people_csv());
+        let mut file = BigFile::open(&path).unwrap();
+        file.set_undo_policy(UndoPolicy {
+            budget_bytes: 1,
+            resident_permille: 10_000,
+        }).unwrap();
+        file.total_bytes = u64::MAX;
+        let before = file.history_stats();
+        let events = AtomicUsize::new(0);
+        let cancel = AtomicBool::new(false);
+        let error = file.enter_memory_mode_for_test(&cancel, |_| {
+            events.fetch_add(1, Ordering::Relaxed);
+        }).unwrap_err();
+        assert!(error.contains("溢出"), "{error}");
+        assert_eq!(events.load(Ordering::Relaxed), 0);
+        assert_eq!(file.history_stats(), before);
+        assert!(!file.meta().ram_backed && !file.meta().memory_mode);
+        fs::remove_file(&path).ok();
+    }
 }

@@ -3,6 +3,43 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 pub const DEFAULT_HISTORY_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_RESIDENT_PERMILLE: u32 = 1000;
+pub const MAX_RESIDENT_PERMILLE: u32 = 10_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UndoPolicy {
+    pub budget_bytes: u64,
+    pub resident_permille: u32,
+}
+
+impl Default for UndoPolicy {
+    fn default() -> Self {
+        Self {
+            budget_bytes: DEFAULT_HISTORY_BUDGET_BYTES,
+            resident_permille: DEFAULT_RESIDENT_PERMILLE,
+        }
+    }
+}
+
+/// 内存模式有效预算 = max(普通预算, ceil(file_bytes × permille / 1000))。
+pub fn effective_undo_budget_bytes(
+    file_bytes: u64,
+    memory_mode: bool,
+    policy: UndoPolicy,
+) -> Result<u64, String> {
+    if policy.resident_permille > MAX_RESIDENT_PERMILLE {
+        return Err("驻留撤销比例超出 0%–1000% 范围".into());
+    }
+    if !memory_mode {
+        return Ok(policy.budget_bytes);
+    }
+    let scaled = file_bytes
+        .checked_mul(policy.resident_permille as u64)
+        .and_then(|value| value.checked_add(999))
+        .map(|value| value / 1000)
+        .ok_or_else(|| "驻留撤销预算计算溢出".to_string())?;
+    Ok(policy.budget_bytes.max(scaled))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistoryError {
@@ -69,6 +106,7 @@ pub enum FixedPointKind {
     StepOverBudget,
     SaveTransform,
     SortMaterialization,
+    MemoryModeExit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -98,7 +136,7 @@ impl EditOutcome {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct HistoryEntry<T> {
     pub op: T,
     pub own_bytes: u64,
@@ -138,11 +176,23 @@ pub struct CommitStats { pub evicted_undo: usize, pub cleared_redo: usize }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BudgetChange { pub evicted: usize, pub fixed_point: bool }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BudgetEffect {
+    pub evicted_undo: usize,
+    pub evicted_redo: usize,
+    pub establishes_fixed_point: bool,
+}
+
+pub struct PreparedBudget<T> {
+    pub(crate) ledger: HistoryLedger<T>,
+    pub effect: BudgetEffect,
+}
 
 pub struct PreparedHistory<T> {
     ledger: HistoryLedger<T>,
 }
 
+#[derive(Clone)]
 pub struct HistoryLedger<T> {
     undo: VecDeque<HistoryEntry<T>>,
     redo: VecDeque<HistoryEntry<T>>,
@@ -346,23 +396,62 @@ impl<T> HistoryLedger<T> {
         expected + refs.values().map(|(bytes, _)| *bytes).sum::<u64>()
     }
 
-    pub fn set_budget(&mut self, budget_bytes: u64) -> BudgetChange {
-    self.budget_bytes = budget_bytes;
-    let mut change = BudgetChange::default();
-    while self.total_bytes > self.budget_bytes {
-        if self.undo.len() + self.redo.len() == 1 {
-            self.clear();
-            change.fixed_point = true;
-            break;
+    /// 在指定账本上执行预算淘汰；preview 与实际提交共用这一份规则。
+    fn apply_budget_for_preview(
+        &mut self,
+        budget_bytes: u64,
+    ) -> Result<BudgetEffect, HistoryError> {
+        self.budget_bytes = budget_bytes;
+        let mut effect = BudgetEffect::default();
+        while self.total_bytes > self.budget_bytes {
+            if self.undo.len() + self.redo.len() == 1 {
+                self.clear();
+                effect.establishes_fixed_point = true;
+                break;
+            }
+            let from_undo = !self.undo.is_empty();
+            let entry = if from_undo {
+                self.undo.pop_front()
+            } else {
+                self.redo.pop_front()
+            };
+            let Some(entry) = entry else { break };
+            self.release(&entry);
+            if from_undo {
+                effect.evicted_undo += 1;
+            } else {
+                effect.evicted_redo += 1;
+            }
         }
-        let entry = if self.undo.is_empty() { self.redo.pop_front() }
-            else { self.undo.pop_front() };
-        let Some(entry) = entry else { break };
-        self.release(&entry);
-        change.evicted += 1;
+        Ok(effect)
     }
-    change
+
+    pub fn set_budget(&mut self, budget_bytes: u64) -> BudgetChange {
+        let effect = self
+            .apply_budget_for_preview(budget_bytes)
+            .expect("预算淘汰只移动现有账本条目");
+        BudgetChange {
+            evicted: effect.evicted_undo + effect.evicted_redo,
+            fixed_point: effect.establishes_fixed_point,
+        }
+    }
 }
+
+impl<T: Clone> HistoryLedger<T> {
+    /// 在克隆账本上执行现有 set_budget 规则，原账本和文档现场不变。
+    pub fn prepare_budget_change(
+        &self,
+        budget_bytes: u64,
+    ) -> Result<PreparedBudget<T>, HistoryError> {
+        let mut ledger = self.clone();
+        let effect = ledger.apply_budget_for_preview(budget_bytes)?;
+        Ok(PreparedBudget { ledger, effect })
+    }
+
+    /// 提交只移动已准备账本，不再分配、IO 或返回错误。
+    pub fn commit_budget_change(&mut self, prepared: PreparedBudget<T>) {
+        *self = prepared.ledger;
+    }
 }
 
 #[cfg(test)]
@@ -490,5 +579,89 @@ mod tests {
         let mut cost = Cost::new();
         cost.add(u64::MAX).unwrap();
         assert_eq!(cost.add(1), Err(HistoryError::CostOverflow));
+    }
+}
+
+#[cfg(test)]
+mod memory_mode_tests {
+    use super::*;
+
+    #[test]
+    fn resident_budget_uses_ceiling_checked_integer_math() {
+        let policy = UndoPolicy { budget_bytes: 64, resident_permille: 1 };
+        assert_eq!(effective_undo_budget_bytes(0, false, policy).unwrap(), 64);
+        assert_eq!(effective_undo_budget_bytes(1, true, policy).unwrap(), 64);
+        assert_eq!(effective_undo_budget_bytes(
+            1001,
+            true,
+            UndoPolicy { budget_bytes: 0, resident_permille: 1 },
+        ).unwrap(), 2);
+        assert_eq!(effective_undo_budget_bytes(
+            1000,
+            true,
+            UndoPolicy { budget_bytes: 64, resident_permille: 1000 },
+        ).unwrap(), 1000);
+        assert_eq!(effective_undo_budget_bytes(
+            1000,
+            true,
+            UndoPolicy { budget_bytes: 64, resident_permille: 0 },
+        ).unwrap(), 64);
+        assert!(effective_undo_budget_bytes(
+            u64::MAX,
+            true,
+            UndoPolicy { budget_bytes: 1, resident_permille: 10_000 },
+        ).is_err());
+    }
+
+    #[test]
+    fn resident_budget_defaults_and_range_are_explicit() {
+        let policy = UndoPolicy::default();
+        assert_eq!(policy.budget_bytes, DEFAULT_HISTORY_BUDGET_BYTES);
+        assert_eq!(policy.resident_permille, DEFAULT_RESIDENT_PERMILLE);
+        assert!(effective_undo_budget_bytes(
+            1000,
+            true,
+            UndoPolicy {
+                budget_bytes: 64,
+                resident_permille: MAX_RESIDENT_PERMILLE + 1,
+            },
+        ).is_err());
+    }
+
+    #[test]
+    fn budget_preview_matches_legacy_commit_without_mutating_source() {
+        fn ledger_with_redo() -> HistoryLedger<&'static str> {
+            let mut ledger = HistoryLedger::new(1_000);
+            for name in ["a", "b", "c"] {
+                let entry = HistoryEntry::new(name, 100, Vec::new(), 1);
+                ledger.commit_prepared(ledger.prepare(entry).unwrap());
+            }
+            let entry = ledger.take_undo().unwrap();
+            ledger.finish_undo(entry);
+            let entry = ledger.take_undo().unwrap();
+            ledger.finish_undo(entry);
+            ledger
+        }
+
+        let mut original = ledger_with_redo();
+        let before = original.stats();
+        let prepared = original.prepare_budget_change(150).unwrap();
+        assert_eq!(original.stats(), before, "预检不得改变原账本");
+        assert_eq!(prepared.effect.evicted_undo, 1);
+        assert_eq!(prepared.effect.evicted_redo, 1);
+        assert!(!prepared.effect.establishes_fixed_point);
+
+        let fixed = original.prepare_budget_change(50).unwrap();
+        assert!(fixed.effect.establishes_fixed_point);
+        assert_eq!(original.stats(), before, "固定点预检同样不得提交");
+
+        let mut expected = ledger_with_redo();
+        let legacy = expected.set_budget(150);
+        assert_eq!(legacy.evicted, 2);
+        assert!(!legacy.fixed_point);
+        original.commit_budget_change(prepared);
+        assert_eq!(original.stats(), expected.stats());
+        assert_eq!(original.redo_op(), Some(&"b"));
+        assert_eq!(original.audited_bytes(), original.stats().bytes);
     }
 }
