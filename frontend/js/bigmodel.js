@@ -46,6 +46,18 @@ const TRANSFER_BLOCK_COMMANDS = new Set([
 ]);
 
 
+/** 内存后备任务期间拒绝同文档写入；读取、取消和关闭不被阻塞。 */
+const MEMORY_BUSY_BLOCK_COMMANDS = new Set([
+  "big_set_undo_budget", "big_set_headerless", "big_set_cell", "big_set_cells",
+  "big_paste", "big_paste_import_begin", "big_paste_import_chunk",
+  "big_paste_import_finish", "big_paste_clipboard", "big_clear",
+  "big_insert_rows", "big_remove_rows", "big_undo", "big_redo",
+  "big_filter", "big_clear_filter", "big_col_push", "big_col_pop",
+  "big_col_clear", "big_col_apply", "big_save", "big_save_as",
+  "big_sort_load", "big_sort_apply", "big_sort_exit", "big_clipboard_clear",
+  "big_memory_mode_enter", "big_memory_mode_exit",
+]);
+
 /**
  * 大文件模型。
  */
@@ -115,6 +127,8 @@ export class BigModel {
     this._resetCbs = new Set();
     /** @type {Map<symbol, {cmd: string, promise: Promise<any>}>} 在途 IPC；迁移屏障等待其落定 */
     this._operations = new Map();
+    /** @type {"enter" | "exit" | null} 当前文档的内存后备任务 */
+    this._memoryOperationKind = null;
     /** @type {"idle" | "sealing" | "accepted"} 文档迁移状态 */
     this._transferState = "idle";
     /** 固定点确认等待期间禁止开始迁移 */
@@ -162,6 +176,11 @@ export class BigModel {
     if (this._transferState === "accepted"
       && !TRANSFER_READ_COMMANDS.has(cmd) && !transferCancel) {
       return Promise.reject(new Error("迁移接管中，文档当前只读"));
+    }
+    const ownMemoryCommand = (cmd === "big_memory_mode_enter" && this._memoryOperationKind === "enter")
+      || (cmd === "big_memory_mode_exit" && this._memoryOperationKind === "exit");
+    if (this._memoryOperationKind && MEMORY_BUSY_BLOCK_COMMANDS.has(cmd) && !ownMemoryCommand) {
+      return Promise.reject(new Error("内存模式任务正在执行，请等待或取消"));
     }
     const key = Symbol(cmd);
     const promise = Promise.resolve(this._rawInvoke(cmd, {

@@ -1576,49 +1576,61 @@ test("open/create 由后端套用进程预算，前端不再逐会话下发", as
 
 test("changeUndoBudget 只调用一次进程级命令且不改已迁移源模型", async () => {
   const app = readFileSync(new URL("../frontend/js/app.js", import.meta.url), "utf8");
-  const start = app.indexOf("async function changeUndoBudget(");
-  const end = app.indexOf("\n/**", start + 1);
-  assert.ok(start >= 0 && end > start, "应提取真实 changeUndoBudget");
+  const changeStart = app.indexOf("async function changeUndoBudget(");
+  const changeEnd = app.indexOf("\n/**", changeStart + 1);
+  const applyStart = app.indexOf("async function applyUndoSettings(");
+  const applyEnd = app.indexOf("\n/**", applyStart + 1);
+  assert.ok(changeStart >= 0 && changeEnd > changeStart, "应提取真实 changeUndoBudget");
+  assert.ok(applyStart >= 0 && applyEnd > applyStart, "应提取真实 applyUndoSettings");
   const calls = [];
   const perModel = [];
   const errors = [];
   const persisted = [];
+  const refreshed = [];
   const sourceModel = {
-    meta: () => ({}),
+    meta: () => ({ has_path: true, total_bytes: 64 * 1024 * 1024 }),
+    memoryMode: () => false,
     setUndoBudget: async (value) => { perModel.push(value); },
+    _refreshMeta: async () => { refreshed.push("meta"); },
   };
+  const value = { budgetMiB: 128, residentPermille: 2000 };
   const context = {
-    undoBudgetDialog: async () => 128,
-    undoBudgetMiB: 64,
+    undoBudgetDialog: async () => value,
+    undoSettings: { budgetMiB: 64, residentPermille: 1000 },
     undoBudgetBytes,
     model: sourceModel,
     tabs: [{ model: sourceModel }],
-    gridB: { model: null },
     btnUndoBudget: { disabled: false },
-    setDefaultUndoBudgetMiB: () => {},
-    syncModelDirty: () => { perModel.push("dirty"); },
-    undoPrefs: { set: (value) => { persisted.push(value); } },
+    syncModelDirty: () => {},
+    updateUndoButtons: () => {},
+    updateStatusText: () => {},
+    undoPrefs: { set: (next) => { persisted.push(next); return next; } },
     statusMsg: () => {},
     errorDialog: async (title, error) => { errors.push([title, error]); },
     invoke: async (cmd, args) => { calls.push([cmd, args]); },
   };
-  vm.runInNewContext(app.slice(start, end) + "\nglobalThis.change = changeUndoBudget;", context);
+  vm.runInNewContext(
+    app.slice(applyStart, applyEnd) + "\n" + app.slice(changeStart, changeEnd)
+      + "\nglobalThis.change = changeUndoBudget;",
+    context,
+  );
   await context.change();
   assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
-    ["set_undo_budget", { budgetBytes: 128 * 1024 * 1024 }],
+    ["set_undo_budget", { budgetBytes: 128 * 1024 * 1024, residentPermille: 2000 }],
   ]);
   assert.equal(perModel.length, 0, "不得遍历本窗或已迁移源模型逐一下发");
+  assert.equal(refreshed.length, 1, "同一模型只刷新一次元数据");
   assert.deepEqual(errors, []);
-  assert.deepEqual(persisted, [128]);
-  assert.equal(context.undoBudgetMiB, 128);
+  assert.deepEqual(persisted, [value]);
+  assert.deepEqual(context.undoSettings, value);
   assert.equal(context.btnUndoBudget.disabled, false);
 });
 
 test("冷启动在打开队列 ready 前同步持久化的进程预算", () => {
   const app = readFileSync(new URL("../frontend/js/app.js", import.meta.url), "utf8");
-  const sync = app.indexOf('await invoke("set_undo_budget", { budgetBytes: undoBudgetBytes(undoBudgetMiB) });');
+  const sync = app.indexOf("await applyUndoSettings(undoSettings);");
   const ready = app.indexOf("await openPump.start();");
-  assert.ok(sync >= 0, "启动必须同步 localStorage 中的非默认预算");
+  assert.ok(sync >= 0, "启动必须同步 localStorage 中的非默认双值预算");
   assert.ok(ready > sync, "预算必须先于启动文件注册，避免在途 open 使用旧值");
   assert.ok(app.includes("undo-budget-changed") && app.includes("getCurrentWindow().listen"),
     "定向预算事件必须按当前窗口监听");

@@ -129,6 +129,18 @@ body.split #vsplit { display: block; }
 }
 #splitter:hover { background: var(--accent); }
 
+#grid-area, #grid-area2 { position: relative; }
+.memory-progress {
+  position: absolute; z-index: 40; top: 8px; left: 50%;
+  transform: translateX(-50%); display: flex; align-items: center; gap: 8px;
+  max-width: calc(100% - 24px); padding: 7px 10px;
+  color: var(--text); background: #fff; border: 1px solid var(--border);
+  box-shadow: 0 2px 8px rgba(0,0,0,.16); font-size: 12px;
+}
+.memory-progress.hidden { display: none; }
+.memory-progress progress { width: 180px; }
+.memory-progress button { flex: none; }
+
 /* ---- 网格滚动区 ---- */
 #grid-scroll, #grid-scroll2 {
   flex: 1 1 auto; overflow: auto; position: relative; outline: none;
@@ -399,6 +411,11 @@ body.split #vsplit { display: block; }
   <div id="toolbar"></div>
   <div id="main-row">
     <div id="grid-area">
+      <div id="memory-progress" class="memory-progress hidden" role="status" aria-live="polite">
+        <span id="memory-progress-text">准备内存模式</span>
+        <progress id="memory-progress-bar" max="100" value="0"></progress>
+        <button id="btn-memory-cancel" type="button">取消</button>
+      </div>
       <div id="grid-scroll" tabindex="0">
         <div id="grid-canvas">
           <div id="col-header"><div id="corner" class="corner"></div></div>

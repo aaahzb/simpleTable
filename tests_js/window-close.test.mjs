@@ -8,6 +8,7 @@ function closeHarness(confirmed) {
     tabs: () => [{ id: 1, dirty: true }],
     activateTab: async (id) => calls.push(["activate", id]),
     confirmDiscard: async () => confirmed,
+    settleDocumentTasks: async () => calls.push(["settle"]),
     closeWindow: async () => calls.push(["close_window"]),
   });
   return { calls, coordinator };
@@ -19,8 +20,21 @@ test("cancel keeps the window and never quits the process", async () => {
   assert.deepEqual(calls, [["activate", 1]]);
 });
 
-test("confirm closes only this window and never quits the process", async () => {
+test("confirm settles document tasks before closing only this window", async () => {
   const { calls, coordinator } = closeHarness(true);
   assert.equal(await coordinator.requestClose(), true);
-  assert.deepEqual(calls, [["activate", 1], ["close_window"]]);
+  assert.deepEqual(calls, [["activate", 1], ["settle"], ["close_window"]]);
+});
+
+test("window close settles every tab in order even when none is dirty", async () => {
+  const calls = [];
+  const coordinator = createWindowCloseCoordinator({
+    tabs: () => [{ id: 1, dirty: false }, { id: 2, dirty: false }],
+    activateTab: async (id) => calls.push(["activate", id]),
+    confirmDiscard: async () => true,
+    settleDocumentTasks: async (tab) => calls.push(["settle", tab.id]),
+    closeWindow: async () => calls.push(["close_window"]),
+  });
+  assert.equal(await coordinator.requestClose(), true);
+  assert.deepEqual(calls, [["settle", 1], ["settle", 2], ["close_window"]]);
 });

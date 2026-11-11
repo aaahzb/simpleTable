@@ -252,7 +252,8 @@ function createEngine({
           return {
             file_bytes: totalBytes,
             limit_bytes: Math.floor(totalBytes * 105 / 100),
-            available_bytes: 1 << 30,
+            available_physical_bytes: 1 << 30,
+            available_commit_bytes: 1 << 30,
             already_ram: ramBacked,
             can_enter: hasPath,
             reason: hasPath ? null : "当前文档无磁盘后备",

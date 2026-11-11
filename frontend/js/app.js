@@ -6,7 +6,7 @@
  */
 
 import { serializeCsv, serializeRecords } from "./csv.js";
-import { BigModel } from "./bigmodel.js";
+import { BIG_THRESHOLD, BigModel } from "./bigmodel.js";
 import { Grid } from "./grid.js";
 import { EditPane } from "./pane.js";
 import { showMenu } from "./menu.js";
@@ -15,9 +15,9 @@ import {
   errorDialog, fmtBytes, infoDialog, intDialog, newTableDialog, progressDialog,
   shortcutsDialog, sortDialog, undoBudgetDialog,
 } from "./dialogs.js";
-import { createUndoBudgetPrefs, undoBudgetBytes } from "./prefs.js";
+import { createUndoSettingsPrefs, formatByteQuantity, undoBudgetBytes } from "./prefs.js";
 import { createOpenRequestPump } from "./openrequests.js";
-import { createWindowCloseCoordinator } from "./windowlifecycle.js";
+import { createMemoryOperationRegistry, createWindowCloseCoordinator } from "./windowlifecycle.js";
 import { createTransferCoordinator } from "./transfer.js";
 import { createTabMenuItems } from "./tabmenu.js";
 import { isSupportedDocumentPath } from "./filetypes.js";
@@ -26,8 +26,17 @@ import { isSupportedDocumentPath } from "./filetypes.js";
 const tauri = window.__TAURI__;
 const invoke = (cmd, args) => tauri.core.invoke(cmd, args);
 
-const undoPrefs = createUndoBudgetPrefs(window.localStorage);
-let undoBudgetMiB = undoPrefs.get();
+const undoPrefs = createUndoSettingsPrefs(window.localStorage);
+let undoSettings = undoPrefs.get();
+
+// 每个文档独立的内存任务与进度；WeakMap 不延长已关闭模型的生命周期。
+const memoryOperations = new WeakMap();
+const memoryTaskRegistry = createMemoryOperationRegistry(memoryOperations);
+const memoryProgress = new WeakMap();
+const memoryProgressEl = document.getElementById("memory-progress");
+const memoryProgressText = document.getElementById("memory-progress-text");
+const memoryProgressBar = document.getElementById("memory-progress-bar");
+const memoryCancelButton = document.getElementById("btn-memory-cancel");
 
 /**
  * 创建带统一固定点确认的文档模型。
@@ -151,18 +160,23 @@ function updateStatusText() {
       ` · 已用 ${fmtDuration(meta.elapsed_ms)}（筛选/跳转稍后可用）`;
     return;
   }
-  // 排序视图：明确提示数据在内存、尚未落盘（保存时才按当前顺序重写）。
-  const sortSuffix = meta?.sorted
-    ? ` · 已排序（内存 ${fmtBytes(meta.total_bytes)}，未保存）`
-    : "";
+  // 排序 RAM 与持久内存模式是不同生命周期；新建无路径 RAM 不贴这些标签。
+  const sortSuffix = meta?.sorted ? " · 已排序（未保存）" : "";
+  const hasPath = meta?.has_path === true;
+  const memorySuffix = hasPath && meta?.memory_mode === true ? " · 内存模式"
+    : hasPath && meta?.sorted && meta?.ram_backed === true
+      ? ` · 临时排序 RAM（${fmtBytes(meta.total_bytes)}）` : "";
+  const viewSuffix = sortSuffix + memorySuffix;
+  const undoPolicySuffix = ` · 撤销每文档 ${undoSettings.budgetMiB} MiB` +
+    ` · 驻留 ${undoSettings.residentPermille / 10}%`;
   if (model.filterActive()) {
     statusText.textContent = `匹配 ${lastCounts[0]} / 共 ${meta?.rows ?? lastCounts[1]} 行` +
       (lastFilterMs ? ` · 用时 ${fmtDuration(lastFilterMs)}` : "") +
-      sortSuffix;
+      viewSuffix + undoPolicySuffix;
     return;
   }
   statusText.textContent =
-    `显示 ${lastCounts[0]} / 共 ${lastCounts[1]} 行${bigTimingSuffix(model)}${sortSuffix}`;
+    `显示 ${lastCounts[0]} / 共 ${lastCounts[1]} 行${bigTimingSuffix(model)}${viewSuffix}${undoPolicySuffix}`;
 }
 
 /**
@@ -1088,6 +1102,7 @@ async function detachTab(id, { closeEngine = false } = {}) {
   const group = groupTabs(wasSide);
   const neighbor = group[group.indexOf(t) + 1] ?? group[group.indexOf(t) - 1] ?? null;
   if (closeEngine) {
+    await settleMemoryOperation(t.model);
     try { await t.model?.close?.(); } catch { /* 会话已关闭 */ }
   }
   tabs.splice(tabs.indexOf(t), 1);
@@ -1524,22 +1539,186 @@ function showTabMenu(t, x, y) {
   showMenu(x, y, items);
 }
 
+/** 关闭页签或窗口前，先取消并等待指定文档的内存任务。 */
+async function settleMemoryOperation(operationModel) {
+  if (!operationModel) return;
+  await memoryTaskRegistry.settle(operationModel);
+  if (operationModel === model) refreshBigUi();
+}
+
+/** 在指定模型上登记内存任务，进度与完成通知只回到发起页签。 */
+function runMemoryOperation(operationModel, kind, action) {
+  const tab = tabs.find((item) => item.model === operationModel) ?? null;
+  return memoryTaskRegistry.run(operationModel, kind, async () => {
+    let unlisten = null;
+    try {
+      unlisten = await operationModel.onMemoryProgress((done, total) => {
+        memoryProgress.set(operationModel, { done, total });
+        refreshTabMemoryUi(tab);
+      });
+      return await action();
+    } finally {
+      unlisten?.();
+      memoryProgress.delete(operationModel);
+    }
+  }, {
+    tabId: tab?.id,
+    onChange: () => {
+      refreshTabMemoryUi(tab);
+      refreshBigUi();
+    },
+  });
+}
+
+/** 内存命令错误沿用外部变化确认；其他错误只报告，不自动重载。 */
+async function reportMemoryModeError(operationModel, error) {
+  const message = String(error?.message ?? error);
+  if (message.includes("EXTERNAL_CHANGED") && operationModel === model && path) {
+    const reload = await confirmDialog(
+      "文件已被外部程序修改。重新加载将丢失当前未保存的修改，是否重载？");
+    if (reload) await openPath(path, { replace: true, noConfirm: true });
+    return;
+  }
+  await errorDialog("内存模式操作失败", message);
+}
+
+/** 执行当前文档的进入或退出命令；所有 await 后仍使用发起时的模型。 */
+async function runMemoryModeCommand(operationModel, requestedKind = null) {
+  if (!operationModel?.meta()) return null;
+  const kind = requestedKind ?? (operationModel.memoryMode() ? "exit" : "enter");
+  try {
+    if (hasMemoryExclusiveOperation(operationModel)) {
+      throw new Error("当前文档有保存、排序或列操作正在执行，请等待完成后再操作内存模式");
+    }
+    const outcome = await runMemoryOperation(operationModel, kind, async () => {
+      if (kind === "exit") {
+        const first = await operationModel.exitMemoryMode();
+        if (!first.fixedPoint) return first;
+        if (!(await confirmFixedPointDialog(first.fixedPoint))) {
+          return { ...first, cancelled: true };
+        }
+        const retry = await operationModel.exitMemoryMode({
+          allowFixedPoint: true,
+          preflightId: first.fixedPoint.preflightId,
+        });
+        if (retry.fixedPoint) throw new Error("固定点预检已过期，请重试");
+        return retry;
+      }
+      const estimate = await operationModel.memoryEstimate();
+      if (!estimate.can_enter) {
+        throw new Error(estimate.reason || "当前文档不能开启内存模式");
+      }
+      const text = [
+        "文件大小：" + formatByteQuantity(estimate.file_bytes),
+        "转换私有内存上限：" + formatByteQuantity(estimate.limit_bytes),
+        "当前可用物理内存：" + formatByteQuantity(estimate.available_physical_bytes),
+        estimate.available_commit_bytes == null ? null
+          : "Windows 可用 commit：" + formatByteQuantity(estimate.available_commit_bytes),
+        estimate.already_ram
+          ? "当前已是 RAM 后备：只提升为持久内存模式，不再复制完整文件。" : null,
+        estimate.available_physical_bytes < estimate.file_bytes
+          ? "可用物理内存不足，可能发生换页。仍要继续吗？" : "是否继续？",
+      ].filter((line) => line !== null).join("\n");
+      if (!(await confirmDialog(text))) return { changed: false, cancelled: true };
+      return operationModel.enterMemoryMode();
+    });
+    if (!outcome?.cancelled && !outcome?.fixedPoint) {
+      syncModelDirty(operationModel, false);
+      if (operationModel === model) {
+        updateUndoButtons();
+        updateStatusText();
+        statusMsg(kind === "enter"
+          ? (outcome?.changed ? "已开启内存模式" : "当前已处于内存模式")
+          : (outcome?.changed ? "已退出内存模式" : "当前未处于内存模式"), 3000);
+      }
+    } else if (operationModel === model) {
+      statusMsg(kind === "enter" ? "已取消内存模式转换" : "已取消退出内存模式", 2500);
+    }
+    return outcome;
+  } catch (error) {
+    await reportMemoryModeError(operationModel, error);
+    return null;
+  }
+}
+
+memoryCancelButton.addEventListener("click", () => {
+  const operationModel = model;
+  if (memoryTaskRegistry.kind(operationModel) !== "enter") return;
+  void operationModel.cancelMemoryModeLoad().catch((error) => {
+    errorDialog("取消内存模式失败", String(error?.message ?? error));
+  });
+});
+
 // ============ 大文件模式 UI（按钮显隐/筛选执行/列操作 pending） ============
 
 // 注：大模式工具按钮在下方工具栏段（tb 初始化后）创建；此处仅函数定义。
 
+const MEMORY_EXCLUSIVE_COMMANDS = new Set([
+  "big_save", "big_save_as", "big_sort_load", "big_sort_apply", "big_sort_exit",
+  "big_col_apply", "big_col_clear",
+]);
+
+/** 当前文档是否有与纯后备转换互斥的引擎命令。 */
+function hasMemoryExclusiveOperation(operationModel) {
+  return [...(operationModel._operations?.values() ?? [])]
+    .some((operation) => MEMORY_EXCLUSIVE_COMMANDS.has(operation.cmd));
+}
+
+/** 只刷新发起任务的活动文档；后台任务不得改写其他页签的进度。 */
+function refreshTabMemoryUi(tab) {
+  if (tab && tab.model !== model) return;
+  const kind = memoryTaskRegistry.kind(model);
+  const waitingForProgress = kind === "enter" && !memoryProgress.has(model);
+  memoryProgressEl.classList.toggle("hidden", kind === null || waitingForProgress);
+  if (kind === null || waitingForProgress) return;
+  const current = activeTab();
+  const secondary = splitOn && current?.side === "B";
+  const area = document.getElementById(secondary ? "grid-area2" : "grid-area");
+  const scroll = document.getElementById(secondary ? "grid-scroll2" : "grid-scroll");
+  if (memoryProgressEl.parentElement !== area || memoryProgressEl.nextElementSibling !== scroll) {
+    area.insertBefore(memoryProgressEl, scroll);
+  }
+  const progress = memoryProgress.get(model) ?? {
+    done: 0, total: Number(model.meta()?.total_bytes ?? 0),
+  };
+  const done = Number(progress.done) || 0;
+  const total = Number(progress.total) || 0;
+  memoryProgressText.textContent = kind === "enter"
+    ? `转为内存模式：${formatByteQuantity(done)} / ${formatByteQuantity(total)}`
+    : "正在退出内存模式…";
+  memoryProgressBar.value = total > 0 ? Math.min(100, done * 100 / total) : 0;
+  memoryCancelButton.disabled = kind !== "enter";
+}
+
 /** 按引擎状态刷新专属按钮显隐与可用态（占位空表无会话：按钮恒隐藏） */
 function refreshBigUi() {
   if (!tbReady) return; // 工具栏创建前（gridA 构造期）的钩子触发静默忽略
-  // 排序需载入内存；索引完成前不可点。列操作两按钮仅 pending 时出现。
-  // 「执行筛选」按钮已移除：筛选框键入即筛，回车立即执行。
-  tb.sort.classList.remove("hidden");
-  tb.sort.disabled = model.indexing?.() === true;
+  const meta = model.meta?.() ?? {};
+  const memoryKind = memoryTaskRegistry.kind(model);
   const pending = model.colOpsPending?.() === true;
-  const sorted = model.meta?.()?.sorted === true;
+  const sorted = meta.sorted === true;
+  const persistent = meta.memory_mode === true;
+  const mutuallyBusy = hasMemoryExclusiveOperation(model);
+  tb.sort.classList.remove("hidden");
+  tb.sort.disabled = meta.indexing === true || memoryKind !== null;
   tb.exitSort?.classList.toggle("hidden", !sorted);
+  if (tb.exitSort) {
+    tb.exitSort.disabled = memoryKind !== null;
+    tb.exitSort.title = persistent
+      ? "恢复排序前的行顺序，保留内存模式；未保存的单元格修改保留"
+      : "恢复排序前的行顺序并释放排序内存；未保存的单元格修改保留";
+  }
   tb.execColOps.classList.toggle("hidden", !pending);
   tb.cancelColOps.classList.toggle("hidden", !pending);
+  const eligible = meta.has_path === true && Number(meta.total_bytes) >= BIG_THRESHOLD;
+  tb.memoryMode.classList.toggle("hidden", !eligible);
+  tb.memoryMode.textContent = persistent ? "退出内存模式" : "转为内存模式…";
+  tb.memoryMode.title = persistent
+    ? "退出持久内存模式，恢复普通撤销预算和磁盘映射后备"
+    : "把当前大文件转换为连续私有 RAM，保存后继续保持内存模式";
+  tb.memoryMode.disabled = !eligible || meta.indexing === true || pending || mutuallyBusy
+    || memoryKind !== null || model._transferState !== "idle";
+  refreshTabMemoryUi(activeTab());
   refreshHeaderlessUi();
 }
 
@@ -1819,10 +1998,15 @@ for (const spec of [
 // 大模式工具按钮：执行/撤销列操作（pending 时出现）
 for (const [key, text, fn, title] of [
   ["exitSort", "退出排序", () => void exitSortMode(), "恢复排序前的行顺序并释放排序内存；未保存的单元格修改保留"],
+  ["memoryMode", "转为内存模式…", () => {
+    const operationModel = model;
+    void runMemoryModeCommand(operationModel);
+  }, "把当前大文件转换为连续私有 RAM"],
   ["execColOps", "执行列操作", () => applyColOps(), "应用列操作（可撤销）"],
   ["cancelColOps", "撤销列操作预览", () => cancelColOps(), "放弃待执行的列操作，恢复原结构"],
 ]) {
   const b = document.createElement("button");
+  if (key === "memoryMode") b.id = "btn-memory-mode";
   b.textContent = text;
   b.title = title;
   b.classList.add("hidden");
@@ -1903,17 +2087,36 @@ function syncModelDirty(m, refreshStatus = true) {
   renderTabbar();
 }
 
+/** 原子应用普通预算和驻留比例，并刷新当前及未来文档的元数据。 */
+async function applyUndoSettings(value) {
+  await invoke("set_undo_budget", {
+    budgetBytes: undoBudgetBytes(value.budgetMiB),
+    residentPermille: value.residentPermille,
+  });
+  undoSettings = undoPrefs.set(value);
+  const models = new Set(tabs.map((tab) => tab.model).filter(Boolean));
+  if (model.meta()) models.add(model);
+  await Promise.all([...models].map((item) => item._refreshMeta?.()));
+  for (const item of models) syncModelDirty(item, false);
+  updateUndoButtons();
+  updateStatusText();
+}
+
 /** 一次设置进程内所有文档及之后在途 open/create 的历史预算。 */
 async function changeUndoBudget() {
-  const value = await undoBudgetDialog(undoBudgetMiB);
+  const operationModel = model;
+  const meta = operationModel.meta() ?? {};
+  const value = await undoBudgetDialog(undoSettings, {
+    hasPath: meta.has_path === true,
+    totalBytes: meta.total_bytes ?? 0,
+    memoryMode: operationModel.memoryMode(),
+  });
   if (value === null) return;
   // 进程命令在途时禁止重复发起，成功后才更新并持久化共享偏好。
   btnUndoBudget.disabled = true;
   try {
-    await invoke("set_undo_budget", { budgetBytes: undoBudgetBytes(value) });
-    undoBudgetMiB = value;
-    undoPrefs.set(value);
-    statusMsg(`撤销/重做预算已设为每文档 ${value} MiB`, 3000);
+    await applyUndoSettings(value);
+    statusMsg(`撤销/重做预算：每文档 ${undoSettings.budgetMiB} MiB · 驻留 ${undoSettings.residentPermille / 10}%`, 3000);
   } catch (err) {
     await errorDialog("设置撤销内存失败", String(err?.message ?? err));
   } finally {
@@ -2345,6 +2548,9 @@ const windowCloseCoordinator = createWindowCloseCoordinator({
   tabs: () => tabs,
   activateTab,
   confirmDiscard,
+  settleDocumentTasks: async (tab) => {
+    await settleMemoryOperation(tab.model);
+  },
   closeWindow: () => invoke("close_window"),
 });
 tauri.window.getCurrentWindow().listen("close-request", async () => {
@@ -2466,7 +2672,9 @@ async function exitSortMode() {
     // 排序本身不算修改：引擎仍有内容修改时才保留脏点。
     setDirty(meta.modified === true);
     refreshBigUi();
-    statusMsg(`已退出排序并释放排序内存（文件 ${fmtBytes(meta.total_bytes)} 回到磁盘映射视图）`, 4000);
+    statusMsg(meta.memory_mode === true
+      ? "已退出排序：恢复排序前行序，保留内存模式"
+      : `已退出排序并释放排序内存（文件 ${fmtBytes(meta.total_bytes)} 回到磁盘映射视图）`, 4000);
     return true;
   } catch (err) {
     await errorDialog("退出排序失败", String(err?.message ?? err));
@@ -2813,7 +3021,7 @@ const gridLive = new Proxy(/** @type {any} */ ({}), {
   await undoBudgetListenerReady;
   try {
     // 在 open queue 注册启动文件前恢复持久化预算，覆盖之后在途 open/create。
-    await invoke("set_undo_budget", { budgetBytes: undoBudgetBytes(undoBudgetMiB) });
+    await applyUndoSettings(undoSettings);
   } catch (err) {
     await errorDialog("恢复撤销内存失败", String(err?.message ?? err));
   }
@@ -2882,6 +3090,11 @@ function smokeSnapshot() {
         multiText: m._filterView?.multiText ?? "",
       } : null,
       sort: { sorted: meta.sorted === true },
+      memoryMode: meta.memory_mode === true,
+      ramBacked: meta.ram_backed === true,
+      memoryOperationKind: memoryTaskRegistry.kind(m),
+      memoryProgress: memoryProgress.has(m) ? { ...memoryProgress.get(m) } : null,
+      effectiveUndoBudgetBytes: meta.effective_undo_budget_bytes ?? 0,
       pendingCols: meta.pending_cols === true,
       headerless: m.isHeaderless?.() === true,
       columnCount: m.columnCount(),
@@ -2976,6 +3189,11 @@ window.__app = {
   refreshStatus: updateStatusText,
   newFile, openPath, saveFile, saveFileAs, undo, redo,
   openSortDialog, exitSortMode, applyBigSort,
+  enterMemoryMode: () => runMemoryModeCommand(model, "enter"),
+  exitMemoryMode: () => runMemoryModeCommand(model, "exit"),
+  cancelMemoryModeLoad: () => model.cancelMemoryModeLoad(),
+  settleMemoryOperation: () => settleMemoryOperation(model),
+  memoryOperationKind: () => memoryTaskRegistry.kind(model),
   applyColOps, cancelColOps, runBigFilter, gotoRow, gotoRowDialog,
   isDirty: () => dirty, getPath: () => path,
   isBigMode: () => model.isBig === true,
