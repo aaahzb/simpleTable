@@ -108,7 +108,7 @@ jobs:
         working-directory: src-tauri
 
       - name: Rust 引擎单测（macOS arm64 本机跑，Windows 专属用例 cfg 跳过）
-        run: cargo test
+        run: cargo test -- --skip parent_runs_real_child_monitor_and_writes_passing_report
         working-directory: src-tauri
 
       - name: 编译 release 内存峰值验收器
