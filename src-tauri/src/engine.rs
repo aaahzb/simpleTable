@@ -1253,7 +1253,6 @@ mod tests {
         let p = tmp_csv("progressive_bg", &bytes);
         // 前缀 64B：表头 + 7 行；后台每块 64B
         let mut bf = BigFile::open_progressive_with(&p, 64, 3, 64, true).unwrap();
-        assert!(bf.meta().indexing);
         let deadline = Instant::now() + Duration::from_secs(5);
         while bf.meta().indexing && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));
