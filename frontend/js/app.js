@@ -1890,13 +1890,56 @@ async function runBigFilter(opts = {}) {
   }
 }
 
-/** 执行 pending 列操作；成功后可撤销，固定点确认由模型统一处理。 */
+/** 正在执行的列操作整体（含完成后元数据刷新）；保存必须等它落定。 */
+let columnApplyTask = null;
+
+/**
+ * 等待进行中的列操作完成后再继续保存。
+ *
+ * 列操作应用后还要刷新元数据；若保存抢先写盘，列操作的完成回调会在
+ * 保存成功后把界面重新标脏，表现为“已保存却仍显示未保存”。
+ *
+ * @returns {Promise<void>}
+ */
+async function waitForColumnApply() {
+  const task = columnApplyTask;
+  if (!task) return;
+  statusMsg("正在完成列操作，稍后保存…", 2500);
+  try {
+    await task;
+  } catch {
+    // 列操作失败已由它自己的对话框报告；用户仍可保存当前可见数据。
+  }
+}
+
+/**
+ * 执行 pending 列操作，并登记整个动作供保存等待。
+ *
+ * @returns {Promise<object|undefined>} 引擎列操作结果。
+ */
 async function applyColOps() {
+  const task = applyColOpsNow();
+  columnApplyTask = task;
+  try {
+    return await task;
+  } finally {
+    if (columnApplyTask === task) columnApplyTask = null;
+  }
+}
+
+/** 执行 pending 列操作；内存模式只物化 RAM，成功后仍保持未保存。 */
+async function applyColOpsNow() {
   if (!model.colOpsPending()) return;
   if (model.indexing?.()) {
     statusMsg("文件仍在索引中，暂不支持列操作", 2500);
     return;
   }
+  const memoryMode = model.meta()?.memoryMode === true;
+  const dlg = memoryMode ? progressDialog("整理内存正文…") : null;
+  const un = memoryMode
+    ? await model.onProgress((done, total, phase, rows) => dlg.set(done, total, phase, rows))
+    : null;
+  let applied = false;
   try {
     const outcome = await model.applyColOps();
     if (outcome?.cancelled) {
@@ -1904,11 +1947,17 @@ async function applyColOps() {
       return;
     }
     if (!outcome?.changed) return;
+    applied = true;
     setDirty(true);
-    statusMsg("列操作已应用，可撤销", 3000);
+    statusMsg(memoryMode ? "列操作已应用到内存，尚未保存" : "列操作已应用，可撤销", 3000);
   } catch (err) {
     await errorDialog("列操作失败", String(err?.message ?? err));
   } finally {
+    un?.();
+    // 成功走完成帧（进度映射只到整理阶段，不能停在中途直接消失）；
+    // 取消或失败不得伪造 100%。
+    if (applied) await dlg?.finish();
+    else dlg?.close();
     refreshBigUi();
   }
 }
@@ -2416,7 +2465,15 @@ async function runBigWrite(write, action, okMsg, hint) {
   } catch (err) {
     un();
     dlg.close();
-    await errorDialog(`${action}失败`, `${err?.message ?? err}\n${hint}`);
+    const message = String(err?.message ?? err);
+    // RAM 提交与磁盘提交分离：失败后按引擎权威 dirty 状态同步界面。
+    setDirty(model.meta()?.modified === true);
+    if (message.startsWith("RAM_COMMITTED:")) {
+      if (hadFilter) fgrid().clearFilters({ anchor: false });
+      onCountsChanged(model.rowCount(), model.meta()?.rows ?? model.rowCount());
+    }
+    refreshBigUi();
+    await errorDialog(`${action}失败`, `${message}\n${hint}`);
     return false;
   } finally {
     refreshBigUi(); // 成功、取消和失败都在在途表清理后恢复入口
@@ -2452,6 +2509,8 @@ async function saveFile() {
     statusMsg("文件仍在索引中，请稍候再保存", 2500);
     return false;
   }
+  // 列操作在途时先等它完成（含元数据刷新），避免保存对话框抢跑和脏标记倒序。
+  await waitForColumnApply();
   if (path === null) {
     // 未命名内存档：直存无目标，走另存为
     return saveFileAs();
@@ -2483,6 +2542,8 @@ async function saveFileAs(target = null) {
     statusMsg("文件仍在索引中，请稍候再另存为", 2500);
     return false;
   }
+  // 与保存相同：先等列操作的整体动作落定，再打开目标选择与进度对话框。
+  await waitForColumnApply();
   let p = target;
   const textLines = model.isTextLines();
   if (!p) {

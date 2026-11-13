@@ -67,8 +67,13 @@ jobs:
           }
           run_case convert
           run_case cancel
+          run_case cancel-loop
           run_case read-fail
+          run_case commit-fail
           run_case save
+          run_case column-apply
+          run_case column-save
+          run_case save-retry
 
       - name: 上传真实内存峰值发布报告（无论成败）
         if: always()

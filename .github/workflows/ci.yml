@@ -64,6 +64,9 @@ jobs:
           run_case commit-fail 4 false
           run_case read-fail 4 false
           run_case save 4 false
+          run_case column-apply 4 false
+          run_case column-save 4 false
+          run_case save-retry 4 false
 
       - name: 上传真实内存峰值报告（无论成败）
         if: always()
@@ -138,6 +141,9 @@ jobs:
           run_case commit-fail 4 false
           run_case read-fail 4 false
           run_case save 4 false
+          run_case column-apply 4 false
+          run_case column-save 4 false
+          run_case save-retry 4 false
 
       - name: 上传真实内存峰值报告（无论成败）
         if: always()

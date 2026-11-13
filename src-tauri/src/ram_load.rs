@@ -98,7 +98,62 @@ impl PositionedRead for File {
     }
 }
 
-/// 已预留目标区域但仍持有源句柄的待执行载入。
+/// 整块复制数据源；成功返回时 out 必须全部填满。
+pub trait ChunkCopy: Sync {
+    /// 返回源长度，失败时保留平台错误。
+    fn len(&self) -> Result<u64, String>;
+    /// 把 offset 对应的完整目标块复制到 out，失败时返回中文错误。
+    fn copy_chunk(&self, offset: u64, out: &mut [u8]) -> Result<(), String>;
+}
+
+impl<T: PositionedRead> ChunkCopy for T {
+    fn len(&self) -> Result<u64, String> {
+        PositionedRead::len(self)
+    }
+
+    fn copy_chunk(&self, offset: u64, out: &mut [u8]) -> Result<(), String> {
+        let mut read = 0usize;
+        while read < out.len() {
+            let current = offset.checked_add(read as u64).ok_or("读取偏移溢出")?;
+            let count = self.read_at(current, &mut out[read..])?;
+            if count == 0 {
+                return Err(format!("文件读取提前结束，偏移 {current}"));
+            }
+            read += count;
+        }
+        Ok(())
+    }
+}
+
+/// 借用首次转换前的完整 M0；调用方保证整个复制期间原映射保持有效。
+pub(crate) struct MmapSource<'a> {
+    mmap: &'a memmap2::Mmap,
+}
+
+impl<'a> MmapSource<'a> {
+    pub(crate) fn new(mmap: &'a memmap2::Mmap) -> Self {
+        Self { mmap }
+    }
+}
+
+impl ChunkCopy for MmapSource<'_> {
+    fn len(&self) -> Result<u64, String> {
+        Ok(self.mmap.len() as u64)
+    }
+
+    fn copy_chunk(&self, offset: u64, out: &mut [u8]) -> Result<(), String> {
+        let start = usize::try_from(offset).map_err(|_| "M0 复制偏移溢出")?;
+        let end = start.checked_add(out.len()).ok_or("M0 复制长度溢出")?;
+        let source = self
+            .mmap
+            .get(start..end)
+            .ok_or_else(|| format!("M0 复制范围超出源长度：{start}..{end}"))?;
+        out.copy_from_slice(source);
+        Ok(())
+    }
+}
+
+/// 已预留目标区域但仍持有来源的待执行载入。
 pub struct PreparedLoad<R> {
     source: R,
     region: RamRegion,
@@ -113,7 +168,7 @@ pub fn prepare_load<R, O>(
     observer: &O,
 ) -> Result<PreparedLoad<R>, String>
 where
-    R: PositionedRead,
+    R: ChunkCopy,
     O: Fn(LoadEvent) + Sync,
 {
     let total =
@@ -141,14 +196,15 @@ where
     })
 }
 
-/// 第二阶段直接读入最终区域；调用此函数前必须已解除完整源映射。
+/// 第二阶段从 PreparedLoad 持有的来源直接复制到最终区域。
+/// 对 MmapSource，原 M0 由调用方保留到本函数返回并完成外部状态检查之后。
 pub fn run_prepared_load<R, O>(
     prepared: PreparedLoad<R>,
     cancel: &AtomicBool,
     observer: O,
 ) -> Result<LoadResult, String>
 where
-    R: PositionedRead,
+    R: ChunkCopy,
     O: Fn(LoadEvent) + Sync,
 {
     let PreparedLoad {
@@ -180,20 +236,17 @@ where
             })
         },
         |start, out| {
-            let mut read = 0usize;
-            while read < out.len() {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err("用户取消载入".into());
-                }
-                let offset = start.checked_add(read).ok_or("读取偏移溢出")?;
-                if matches!(options.fault, LoadFault::ReadAfter(limit) if offset as u64 >= limit) {
-                    return Err(format!("注入读取失败，偏移 {offset}"));
-                }
-                let count = source.read_at(offset as u64, &mut out[read..])?;
-                if count == 0 {
-                    return Err(format!("文件读取提前结束，偏移 {offset}"));
-                }
-                read += count;
+            if cancel.load(Ordering::Relaxed) {
+                return Err("用户取消载入".into());
+            }
+            let offset = start as u64;
+            if matches!(options.fault, LoadFault::ReadAfter(limit) if offset >= limit) {
+                return Err(format!("注入读取失败，偏移 {offset}"));
+            }
+            source.copy_chunk(offset, out)?;
+            // 先确定取消结果再发布进度；最终进度发出后不再因同一标志回滚成取消。
+            if cancel.load(Ordering::Relaxed) {
+                return Err("用户取消载入".into());
             }
             let mut done = progress.lock().unwrap();
             *done = done.checked_add(out.len() as u64).ok_or("读取进度溢出")?;
@@ -201,9 +254,6 @@ where
                 done: *done,
                 total: total as u64,
             });
-            if cancel.load(Ordering::Relaxed) {
-                return Err("用户取消载入".into());
-            }
             Ok(())
         },
     );
@@ -228,7 +278,7 @@ pub fn load_file<R, O>(
     observer: O,
 ) -> Result<LoadResult, String>
 where
-    R: PositionedRead,
+    R: ChunkCopy,
     O: Fn(LoadEvent) + Sync,
 {
     let prepared = prepare_load(source, options, &observer)?;
@@ -237,7 +287,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{conversion_limit_bytes, load_file, LoadEvent, LoadFault, LoadOptions, LoadResult};
+    use super::{
+        conversion_limit_bytes, load_file, ChunkCopy, LoadEvent, LoadFault, LoadOptions,
+        LoadResult, MmapSource,
+    };
     use std::fs::File;
     use std::io::Write;
     use std::path::PathBuf;
@@ -287,6 +340,55 @@ mod tests {
             (20 << 30) + (1 << 30)
         );
         assert!(conversion_limit_bytes(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn mmap_source_copies_single_multi_and_tail_chunks() {
+        let (file, _cleanup) = temp_pattern_file("mmap_source_ranges", 70_000);
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let source = MmapSource::new(&mmap);
+        assert_eq!(source.len().unwrap(), 70_000);
+
+        for (start, count) in [(0usize, 1000usize), (999, 1001), (69_999, 1)] {
+            let mut out = vec![0u8; count];
+            source.copy_chunk(start as u64, &mut out).unwrap();
+            assert!(out.iter().enumerate().all(|(index, byte)| {
+                *byte == ((start + index) % 251) as u8
+            }));
+        }
+    }
+
+    #[test]
+    fn mmap_source_parallel_copy_matches_original_bytes() {
+        let (file, _cleanup) = temp_pattern_file("mmap_source_parallel", 3 * 1024 * 1024 + 17);
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let cancel = AtomicBool::new(false);
+        let result = load_file(
+            MmapSource::new(&mmap),
+            &cancel,
+            LoadOptions {
+                chunk_bytes: 64 * 1024,
+                workers: 4,
+                fault: LoadFault::None,
+            },
+            |_| {},
+        )
+        .unwrap();
+        let LoadResult::Complete(ram) = result else {
+            panic!("unexpected cancel")
+        };
+        assert_eq!(ram.as_slice(), mmap.as_ref());
+    }
+
+    #[test]
+    fn mmap_source_rejects_out_of_bounds_copy() {
+        let (file, _cleanup) = temp_pattern_file("mmap_source_bounds", 257);
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let source = MmapSource::new(&mmap);
+        let mut out = [0u8; 2];
+        let error = source.copy_chunk(256, &mut out).unwrap_err();
+        assert!(error.contains("超出"), "{error}");
+        assert_eq!(out, [0, 0], "越界时不得写入部分目标块");
     }
 
     #[test]
@@ -364,6 +466,57 @@ mod tests {
     }
 
     #[test]
+    fn cancel_after_final_copy_does_not_emit_fake_hundred_percent() {
+        struct CancelAfterCopy<'a> {
+            file: File,
+            cancel: &'a AtomicBool,
+        }
+
+        impl ChunkCopy for CancelAfterCopy<'_> {
+            fn len(&self) -> Result<u64, String> {
+                Ok(self
+                    .file
+                    .metadata()
+                    .map_err(|error| error.to_string())?
+                    .len())
+            }
+
+            fn copy_chunk(&self, offset: u64, out: &mut [u8]) -> Result<(), String> {
+                <File as ChunkCopy>::copy_chunk(&self.file, offset, out)?;
+                // 模拟取消在最后复制期间生效，早于任何最终进度事件。
+                self.cancel.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let (file, _cleanup) = temp_pattern_file("ram_load_final_cancel", 64 * 1024);
+        let cancel = AtomicBool::new(false);
+        let events = Mutex::new(Vec::new());
+        let result = load_file(
+            CancelAfterCopy {
+                file,
+                cancel: &cancel,
+            },
+            &cancel,
+            LoadOptions {
+                chunk_bytes: 64 * 1024,
+                workers: 1,
+                fault: LoadFault::None,
+            },
+            |event| events.lock().unwrap().push(event),
+        )
+        .unwrap();
+        assert!(matches!(result, LoadResult::Cancelled));
+        let events = events.into_inner().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, LoadEvent::Progress { done, total } if done == total)),
+            "取消结果不得先发送 100%：{events:?}"
+        );
+    }
+
+    #[test]
     fn commit_and_short_read_faults_are_real_errors() {
         for (name, fault, expected) in [
             ("commit", LoadFault::CommitAt(128 * 1024), "提交"),
@@ -385,4 +538,5 @@ mod tests {
             assert!(error.contains(expected), "{name}: {error}");
         }
     }
+
 }

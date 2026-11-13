@@ -1,4 +1,4 @@
-use crate::engine::{BigFile, MEMORY_MODE_MIN_BYTES};
+use crate::engine::{BigFile, ColOp, MEMORY_MODE_MIN_BYTES};
 use crate::history::Approval;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -70,7 +70,41 @@ impl DiagnosticDocument {
             .map(|_| ())
     }
 
-    /// 通过生产保存入口写盘，并转发全部真实 RAM 阶段和载入事件。
+    /// 通过生产列操作入口插入一个空列并提交 Schema。
+    pub fn insert_column(&mut self, pos: u32, name: String) -> Result<(), String> {
+        self.insert_column_with_ram_observer(pos, name, |_| {})
+    }
+
+    /// 插入空列并转发列操作期间真实的 RAM 物化阶段。
+    pub fn insert_column_with_ram_observer<O>(
+        &mut self,
+        pos: u32,
+        name: String,
+        observer: O,
+    ) -> Result<(), String>
+    where
+        O: Fn(SaveRamEvent) + Sync,
+    {
+        self.inner.push_col_op(ColOp::Insert { pos, name })?;
+        let outcome = self.inner.apply_col_ops_observed(
+            Approval {
+                allow_fixed_point: false,
+                preflight_id: None,
+            },
+            &observer,
+        )?;
+        if outcome.changed {
+            Ok(())
+        } else {
+            Err("真实插列未产生变化".into())
+        }
+    }
+
+    /// 通过生产保存入口写盘，并转发全部真实 RAM 与磁盘提交阶段。
+    ///
+    /// 诊断目标与源文件不同，必须使用另存为语义（`switch_path = true`）：
+    /// 否则会话保存点会指向目标文件而 `path` 仍是源文件，第二次保存会被
+    /// `stale()` 误判为外部变化，无法验证同一 RAM 的重试路径。
     pub fn save_with_ram_observer<O>(
         &mut self,
         dest: &Path,
@@ -83,7 +117,7 @@ impl DiagnosticDocument {
         self.inner
             .save_to_observed(
                 dest,
-                false,
+                true,
                 Approval {
                     allow_fixed_point: false,
                     preflight_id: None,

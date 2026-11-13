@@ -166,6 +166,169 @@ test("保存开始在途刷新互斥状态并在收尾恢复", async () => {
   assert.equal(states.at(-1), false, "保存收尾必须刷新并解除互斥禁用");
 });
 
+test("RAM 提交后磁盘失败保留 dirty 并同步筛选和行数", async () => {
+  const dirtySyncs = [];
+  const filterClears = [];
+  const counts = [];
+  const errors = [];
+  let finishes = 0;
+  const context = {
+    model: {
+      filterActive: () => true,
+      onProgress: async () => () => {},
+      rowCount: () => 2,
+      meta: () => ({ rows: 5, modified: true }),
+    },
+    progressDialog: () => ({
+      set() {}, close() {}, finish: async () => { finishes += 1; },
+    }),
+    refreshBigUi: () => {},
+    setDirty: (value) => dirtySyncs.push(value),
+    fgrid: () => ({ clearFilters: (opts) => filterClears.push(opts) }),
+    onCountsChanged: (visible, total) => counts.push([visible, total]),
+    statusMsg: () => {},
+    errorDialog: async (title, message) => errors.push([title, message]),
+  };
+  vm.runInNewContext(
+    extractFunction(app, "runBigWrite") + "\nglobalThis.run = runBigWrite;", context);
+  const saved = await context.run(
+    async () => { throw new Error("RAM_COMMITTED:写入临时文件失败"); },
+    "保存", "已保存", "请重试",
+  );
+  assert.equal(saved, false);
+  assert.deepEqual(dirtySyncs, [true]);
+  assert.equal(filterClears.length, 1);
+  assert.equal(filterClears[0].anchor, false);
+  assert.deepEqual(counts, [[2, 5]]);
+  assert.equal(finishes, 0, "失败不得显示最终 100% 完成帧");
+  assert.match(errors[0][1], /RAM_COMMITTED:写入临时文件失败/);
+  assert.match(errors[0][1], /请重试/);
+});
+
+test("内存模式列操作复用进度通道并保留未保存提示", async () => {
+  const dialogSets = [];
+  const statuses = [];
+  const dirtySyncs = [];
+  let subscriptions = 0;
+  let unsubscriptions = 0;
+  let closes = 0;
+  let finishes = 0;
+  const context = {
+    model: {
+      colOpsPending: () => true,
+      indexing: () => false,
+      meta: () => ({ memoryMode: true }),
+      onProgress: async (listener) => {
+        subscriptions += 1;
+        listener(5, 10, 1, 0);
+        return () => { unsubscriptions += 1; };
+      },
+      applyColOps: async () => ({ changed: true, cancelled: false }),
+    },
+    progressDialog: (title) => {
+      assert.equal(title, "整理内存正文…");
+      return {
+        set: (...args) => dialogSets.push(args),
+        finish: async () => { finishes += 1; },
+        close: () => { closes += 1; },
+      };
+    },
+    setDirty: (value) => dirtySyncs.push(value),
+    statusMsg: (text) => statuses.push(text),
+    errorDialog: async (title, message) => { throw new Error(`${title}:${message}`); },
+    refreshBigUi: () => {},
+  };
+  vm.runInNewContext(
+    extractFunction(app, "applyColOpsNow") + "\nglobalThis.apply = applyColOpsNow;", context);
+  await context.apply();
+  assert.equal(subscriptions, 1);
+  assert.equal(unsubscriptions, 1);
+  assert.equal(finishes, 1, "成功后必须走完成帧，不能停在整理阶段的进度");
+  assert.equal(closes, 0);
+  assert.deepEqual(dialogSets, [[5, 10, 1, 0]]);
+  assert.deepEqual(dirtySyncs, [true]);
+  assert.deepEqual(statuses, ["列操作已应用到内存，尚未保存"]);
+});
+
+test("内存模式列操作取消或未变更时关闭对话框且不显示完成帧", async () => {
+  for (const outcome of [{ changed: false, cancelled: true }, { changed: false, cancelled: false }]) {
+    let finishes = 0;
+    let closes = 0;
+    const context = {
+      model: {
+        colOpsPending: () => true,
+        indexing: () => false,
+        meta: () => ({ memoryMode: true }),
+        onProgress: async () => () => {},
+        applyColOps: async () => outcome,
+      },
+      progressDialog: () => ({
+        set: () => {},
+        finish: async () => { finishes += 1; },
+        close: () => { closes += 1; },
+      }),
+      setDirty: () => { throw new Error("取消/未变更不得标脏"); },
+      statusMsg: () => {},
+      errorDialog: async (title, message) => { throw new Error(`${title}:${message}`); },
+      refreshBigUi: () => {},
+    };
+    vm.runInNewContext(
+      extractFunction(app, "applyColOpsNow") + "\nglobalThis.apply = applyColOpsNow;", context);
+    await context.apply();
+    assert.equal(finishes, 0, "取消/未变更不得伪造 100%");
+    assert.equal(closes, 1);
+  }
+});
+
+test("列操作在途时保存必须等它落定再开始，避免保存成功后被重新标脏", async () => {
+  const events = [];
+  let releaseApply;
+  const applyGate = new Promise((resolve) => { releaseApply = resolve; });
+  const context = {
+    model: {
+      colOpsPending: () => true,
+      indexing: () => false,
+      meta: () => ({ memoryMode: false }),
+    },
+    applyColOpsNow: async () => {
+      const outcome = await applyGate;
+      // 真实 applyColOpsNow 在返回前完成 UI 收尾（标脏）；用事件模拟同一顺序。
+      events.push("dirty:true");
+      return outcome;
+    },
+    progressDialog: () => ({ set() {}, close() {}, finish: async () => {} }),
+    setDirty: (value) => events.push(`dirty:${value}`),
+    statusMsg: () => {},
+    errorDialog: async (title, message) => { throw new Error(`${title}:${message}`); },
+    refreshBigUi: () => {},
+    path: "/a.csv",
+    saveFileAs: async () => true,
+    runBigWrite: async () => {
+      events.push("save-start");
+      events.push("dirty:false");
+      return true;
+    },
+  };
+  vm.runInNewContext(
+    `let columnApplyTask = null;
+${extractFunction(app, "waitForColumnApply")}
+${extractFunction(app, "applyColOps")}
+${extractFunction(app, "saveFile")}
+globalThis.apply = applyColOps;
+globalThis.save = saveFile;`,
+    context,
+  );
+  const applying = context.apply();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const saving = context.save();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(events, [], "列操作未落定时保存不得开始，也不得提前标脏/清脏");
+  releaseApply({ changed: true, cancelled: false });
+  await applying;
+  assert.equal(await saving, true);
+  assert.deepEqual(events, ["dirty:true", "save-start", "dirty:false"]);
+});
+
 test("工具栏和状态栏区分持久内存与临时排序 RAM", () => {
   assert.match(app, /btn-memory-mode/);
   assert.match(app, /临时排序 RAM/);

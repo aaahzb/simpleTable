@@ -33,6 +33,7 @@ use crate::history::{
 use crate::order::{project_filter, Perm, RowOrder};
 use crate::ram_load::{
     conversion_limit_bytes, prepare_load, run_prepared_load, LoadEvent, LoadOptions, LoadResult,
+    MmapSource,
 };
 use crate::ram_region::FinishedRam;
 use crate::schema::{ColumnId, ColumnStorage, Schema};
@@ -40,6 +41,7 @@ use crate::spool::{history_text_bytes, PasteImport, RowSnapshot, SessionSpool};
 use memchr::{memchr, memchr_iter};
 use rayon::prelude::*;
 use regex::Regex;
+use serialize::{serialize_document, IoSink, SerializationView};
 use std::time::{Duration, Instant};
 
 // ============================================================
@@ -84,6 +86,8 @@ pub const PHASE_STREAM: u8 = 0;
 pub const PHASE_FLUSH: u8 = 1;
 /// 进度阶段：重建行索引（收尾，事件本身即"索引完成"）。
 pub const PHASE_REINDEX: u8 = 2;
+/// 进度阶段：持久 RAM 已完成磁盘换名并建立干净保存点。
+pub const PHASE_COMMIT: u8 = 3;
 
 /// 流式阶段的加权进度：done 行 → 总体 0..70%。
 fn stream_weighted(done: u64) -> u64 {
@@ -98,6 +102,30 @@ fn flushed_weighted(total: u64) -> u64 {
 /// 换名完成点（总体 78%，之后进入重建索引阶段）。
 fn renamed_weighted(total: u64) -> u64 {
     total * 78 / 100
+}
+
+/// 持久内存保存的全局进度总量：物化与写盘共用同一刻度，进度条不再归零。
+const MEMORY_SAVE_PROGRESS_TOTAL: u64 = 1000;
+
+/// 持久内存保存的阶段配平：需要重新物化时计数 0-100、RAM 生成 100-700、
+/// 写盘 700-990；无需物化时写盘 0-990；提交固定为 1000（100%）。
+fn memory_save_weight(done: u64, total: u64, phase: u8, materializes: bool) -> (u64, u64) {
+    if phase == PHASE_COMMIT {
+        return (MEMORY_SAVE_PROGRESS_TOTAL, MEMORY_SAVE_PROGRESS_TOTAL);
+    }
+    let (base, span) = match (phase, materializes) {
+        (PHASE_STREAM, true) => (0, 100),
+        (PHASE_FLUSH, true) => (100, 600),
+        (PHASE_REINDEX, true) => (700, 290),
+        (PHASE_REINDEX, false) => (0, 990),
+        _ => (0, 0),
+    };
+    let offset = if total == 0 {
+        0
+    } else {
+        done.saturating_mul(span).saturating_div(total).min(span)
+    };
+    (base + offset, MEMORY_SAVE_PROGRESS_TOTAL)
 }
 
 /// 整表重写（保存/执行列操作）期间的低优先级守卫：把**当前线程**降到
@@ -533,6 +561,7 @@ const BAND_LINES: usize = 1 << 16;
 
 /// 索引结果：`line_off` 为每个候选行的字节偏移（'\n' 之后，首元素恒 0）；
 /// `rec_lines` 为记录起始行的下标（升序）。空行与引号续行不在其中。
+#[derive(Default)]
 pub struct RawIndex {
     pub line_off: Vec<u64>,
     pub rec_lines: Vec<u32>,
@@ -5097,6 +5126,21 @@ keep,old,target
     }
 
     #[test]
+    fn big_headerless_edited_promoted_header_is_saved() {
+        let p = tmp_csv("hleditedsave", b"a,b\r\n1,2\r\n");
+        let mut bf = BigFile::open(&p).unwrap();
+        bf.set_headerless(true, Approval::deny()).unwrap();
+        bf.set_cell(0, 0, "X".into(), Approval::deny()).unwrap();
+        bf.set_headerless(false, Approval::deny()).unwrap();
+        assert_eq!(bf.meta().headers, vec!["X", "b"]);
+        bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        let bf2 = BigFile::open(&p).unwrap();
+        assert_eq!(bf2.meta().headers, vec!["X", "b"]);
+        assert_eq!(bf2.rows(0, 1), vec![vec!["1", "2"]]);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
     fn big_headerless_filter_hits_first_row_without_cache() {
         let p = tmp_csv("hlfilter", b"alpha,1\r\nbeta,2\r\ngamma,3\r\n");
         let mut bf = BigFile::open_with(&p, true).unwrap();
@@ -5501,7 +5545,6 @@ keep,old,target
 
     thread_local! {
         static CONVERT_RESERVE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        static CONVERT_RESTORE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// 父模块在 cfg(test) 下查询线程本地预留故障，避免并行测试互相影响。
@@ -5509,23 +5552,16 @@ keep,old,target
         CONVERT_RESERVE_FAULT.with(std::cell::Cell::get)
     }
 
-    /// 父模块在 cfg(test) 下查询线程本地恢复映射故障。
-    pub(super) fn conversion_restore_fault() -> bool {
-        CONVERT_RESTORE_FAULT.with(std::cell::Cell::get)
-    }
-
     struct ConversionFaultGuard;
 
     impl Drop for ConversionFaultGuard {
         fn drop(&mut self) {
             CONVERT_RESERVE_FAULT.with(|flag| flag.set(false));
-            CONVERT_RESTORE_FAULT.with(|flag| flag.set(false));
         }
     }
 
-    fn conversion_fault_guard(reserve: bool, restore: bool) -> ConversionFaultGuard {
+    fn conversion_fault_guard(reserve: bool) -> ConversionFaultGuard {
         CONVERT_RESERVE_FAULT.with(|flag| flag.set(reserve));
-        CONVERT_RESTORE_FAULT.with(|flag| flag.set(restore));
         ConversionFaultGuard
     }
 
@@ -5559,6 +5595,53 @@ keep,old,target
             },
             |_| {},
         )
+    }
+
+    fn original_mmap(bf: &BigFile) -> Arc<memmap2::Mmap> {
+        match &bf.backing {
+            Backing::Mmap(m) => Arc::clone(m),
+            _ => panic!("预期原始 mmap"),
+        }
+    }
+
+    fn assert_same_original_mmap(bf: &BigFile, original: &Arc<memmap2::Mmap>) {
+        match &bf.backing {
+            Backing::Mmap(current) => assert!(Arc::ptr_eq(original, current)),
+            _ => panic!("失败后必须保留原 mmap"),
+        }
+    }
+
+    #[test]
+    fn backing_conversion_borrows_original_mmap_until_successful_install() {
+        let p = tmp_csv("convert_m0_lifetime", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = conversion_snapshot(&bf);
+        let weak = match &bf.backing {
+            Backing::Mmap(m) => Arc::downgrade(m),
+            _ => panic!("预期 mmap"),
+        };
+        let observations = std::sync::Mutex::new(Vec::new());
+        let cancel = AtomicBool::new(false);
+        let status = bf
+            .convert_mmap_to_ram(
+                &cancel,
+                LoadOptions {
+                    chunk_bytes: 16,
+                    workers: 2,
+                    fault: LoadFault::None,
+                },
+                |event| observations.lock().unwrap().push((event, weak.upgrade().is_some())),
+            )
+            .unwrap();
+        assert_eq!(status, ConvertStatus::Converted);
+        let events = observations.into_inner().unwrap();
+        assert!(events.iter().any(|(event, _)| matches!(event, LoadEvent::Reserved { .. })));
+        assert!(events.iter().any(|(event, _)| matches!(event, LoadEvent::ChunkBegin { .. })));
+        assert!(events.iter().any(|(event, _)| matches!(event, LoadEvent::Finished { .. })));
+        assert!(events.iter().all(|(_, old_live)| *old_live), "{events:?}");
+        assert!(weak.upgrade().is_none(), "安装 RAM 后不得遗留其他 M0 Arc");
+        assert_eq!(conversion_snapshot(&bf), before);
+        fs::remove_file(&p).ok();
     }
 
     #[test]
@@ -5605,15 +5688,16 @@ keep,old,target
     }
 
     #[test]
-    fn conversion_read_fault_restores_mmap_without_changing_revision_or_history() {
+    fn conversion_read_fault_keeps_original_mmap_without_changing_revision_or_history() {
         let p = tmp_csv("convert_fault", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         bf.set_cell(0, 0, "unsaved".into(), Approval::deny()).unwrap();
         bf.run_filter(&spec_one(0, "unsaved")).unwrap();
         let before = conversion_snapshot(&bf);
+        let original = original_mmap(&bf);
         let error = convert_for_test(&mut bf, LoadFault::ReadAfter(32)).unwrap_err();
         assert!(error.contains("读取"));
-        assert!(!bf.is_ram_backed());
+        assert_same_original_mmap(&bf, &original);
         assert_eq!(conversion_snapshot(&bf), before);
         fs::remove_file(&p).ok();
     }
@@ -5704,45 +5788,54 @@ keep,old,target
         let mut bf = BigFile::open(&p).unwrap();
         bf.run_filter(&spec_one(0, "Alice")).unwrap();
         let before = conversion_snapshot(&bf);
-        let weak = match &bf.backing {
-            Backing::Mmap(m) => Arc::downgrade(m),
-            _ => panic!("预期 mmap"),
-        };
-        let _guard = conversion_fault_guard(true, false);
-        let error = convert_for_test(&mut bf, LoadFault::None).unwrap_err();
+        let original = original_mmap(&bf);
+        let _guard = conversion_fault_guard(true);
+        let cancel = AtomicBool::new(false);
+        let error = bf
+            .convert_mmap_to_ram(
+                &cancel,
+                LoadOptions {
+                    chunk_bytes: 16,
+                    workers: 2,
+                    fault: LoadFault::None,
+                },
+                |_| {},
+            )
+            .unwrap_err();
         assert!(error.contains("预留"));
-        assert!(!bf.is_ram_backed());
-        assert!(weak.upgrade().is_some(), "预留失败不得解除原 mmap");
+        assert_same_original_mmap(&bf, &original);
         assert_eq!(conversion_snapshot(&bf), before);
         fs::remove_file(&p).ok();
     }
 
     #[test]
-    fn backing_conversion_commit_and_read_faults_restore_state() {
+    fn backing_conversion_commit_and_read_faults_keep_original_mmap_without_remap() {
         for (name, fault, expected) in [
             ("commit", LoadFault::CommitAt(32), "提交"),
             ("read", LoadFault::ReadAfter(32), "读取"),
         ] {
-            let p = tmp_csv(&format!("convert_{name}_fault"), &people_csv());
+            let p = tmp_csv(&format!("convert_{name}_keeps_m0"), &people_csv());
             let mut bf = BigFile::open(&p).unwrap();
             bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
             bf.run_filter(&spec_one(0, "Alice")).unwrap();
             let before = conversion_snapshot(&bf);
+            let original = original_mmap(&bf);
             let error = convert_for_test(&mut bf, fault).unwrap_err();
             assert!(error.contains(expected), "{name}: {error}");
-            assert!(!bf.is_ram_backed());
+            assert_same_original_mmap(&bf, &original);
             assert_eq!(conversion_snapshot(&bf), before);
             fs::remove_file(&p).ok();
         }
     }
 
     #[test]
-    fn backing_conversion_file_stamp_change_restores_without_reloading_edits() {
+    fn backing_conversion_file_stamp_change_keeps_original_mmap_without_reloading_edits() {
         let p = tmp_csv("convert_stamp_fault", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
         bf.run_filter(&spec_one(0, "Alice")).unwrap();
         let before = conversion_snapshot(&bf);
+        let original = original_mmap(&bf);
         let changed = AtomicBool::new(false);
         let modified = fs::metadata(&p).unwrap().modified().unwrap() + Duration::from_secs(5);
         let cancel = AtomicBool::new(false);
@@ -5765,35 +5858,18 @@ keep,old,target
             .unwrap_err();
         assert!(changed.load(Ordering::Relaxed));
         assert!(error.contains("EXTERNAL_CHANGED"), "{error}");
-        assert!(!bf.is_ram_backed());
+        assert_same_original_mmap(&bf, &original);
         assert_eq!(conversion_snapshot(&bf), before);
         fs::remove_file(&p).ok();
     }
 
     #[test]
-    fn backing_conversion_restore_fault_reports_both_errors() {
-        let p = tmp_csv("convert_restore_fault", &people_csv());
+    fn backing_conversion_cancel_after_progress_keeps_original_mmap_without_finish() {
+        let p = tmp_csv("convert_partial_cancel_keeps_m0", &people_csv());
         let mut bf = BigFile::open(&p).unwrap();
         bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
-        bf.run_filter(&spec_one(0, "Alice")).unwrap();
         let before = conversion_snapshot(&bf);
-        let guard = conversion_fault_guard(false, true);
-        let error = convert_for_test(&mut bf, LoadFault::ReadAfter(32)).unwrap_err();
-        assert!(error.contains("读取"), "{error}");
-        assert!(error.contains("恢复 mmap 也失败"), "{error}");
-        drop(guard);
-        bf.backing = bf.map_current_backing().unwrap();
-        assert_eq!(conversion_snapshot(&bf), before);
-        fs::remove_file(&p).ok();
-    }
-
-    #[test]
-    fn backing_conversion_cancel_after_progress_restores_state_without_finish() {
-        let p = tmp_csv("convert_partial_cancel", &people_csv());
-        let mut bf = BigFile::open(&p).unwrap();
-        bf.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
-        bf.run_filter(&spec_one(0, "Alice")).unwrap();
-        let before = conversion_snapshot(&bf);
+        let original = original_mmap(&bf);
         let cancel = AtomicBool::new(false);
         let finished = AtomicBool::new(false);
         let status = bf
@@ -5817,8 +5893,60 @@ keep,old,target
             .unwrap();
         assert_eq!(status, ConvertStatus::Cancelled);
         assert!(!finished.load(Ordering::Relaxed));
-        assert!(!bf.is_ram_backed());
+        assert_same_original_mmap(&bf, &original);
         assert_eq!(conversion_snapshot(&bf), before);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn backing_conversion_repeated_cancel_keeps_same_original_mmap() {
+        let p = tmp_csv("convert_repeated_cancel_same_m0", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let before = conversion_snapshot(&bf);
+        let original = original_mmap(&bf);
+        for _ in 0..3 {
+            let cancel = AtomicBool::new(false);
+            let status = bf
+                .convert_mmap_to_ram(
+                    &cancel,
+                    LoadOptions { chunk_bytes: 16, workers: 2, fault: LoadFault::None },
+                    |event| {
+                        if matches!(event, LoadEvent::Progress { done, .. } if done > 0) {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                    },
+                )
+                .unwrap();
+            assert_eq!(status, ConvertStatus::Cancelled);
+            assert_same_original_mmap(&bf, &original);
+            assert_eq!(conversion_snapshot(&bf), before);
+        }
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn backing_conversion_cancel_after_finished_does_not_roll_back() {
+        let p = tmp_csv("convert_finished_no_rollback", &people_csv());
+        let mut bf = BigFile::open(&p).unwrap();
+        let weak = match &bf.backing {
+            Backing::Mmap(m) => Arc::downgrade(m),
+            _ => panic!("预期 mmap"),
+        };
+        let cancel = AtomicBool::new(false);
+        let status = bf
+            .convert_mmap_to_ram(
+                &cancel,
+                LoadOptions { chunk_bytes: 16, workers: 2, fault: LoadFault::None },
+                |event| {
+                    if matches!(event, LoadEvent::Finished { .. }) {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(status, ConvertStatus::Converted);
+        assert!(bf.is_ram_backed());
+        assert!(weak.upgrade().is_none());
         fs::remove_file(&p).ok();
     }
 
@@ -7769,6 +7897,9 @@ pub struct FilterStats {
     pub scanned_rows: u64,
 }
 
+/// RAM 已成为权威正文、但磁盘提交尚未成功的错误前缀。
+pub const RAM_COMMITTED_ERROR: &str = "RAM_COMMITTED:";
+
 /// 保存是否落盘，或需要用户确认的固定点请求。
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -7782,19 +7913,30 @@ pub struct SaveOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum SaveRamPhase {
+    CountBegin,
+    CountFinished {
+        new_bytes: u64,
+        line_capacity: usize,
+        record_capacity: usize,
+    },
+    HistoryPrepared,
+    IndexPrepared {
+        line_capacity: usize,
+        record_capacity: usize,
+    },
     OldRamReleased { old_bytes: u64 },
     NewReserveBegin { new_bytes: u64 },
     NewRamReady { new_bytes: u64 },
-    OldRamRestored { old_bytes: u64 },
-    EmergencyMmapFallback,
+    DiskWriteBegin { new_bytes: u64 },
+    DiskWriteFinished { new_bytes: u64 },
+    DiskCommitted { new_bytes: u64 },
 }
 
-/// 保存阶段事件与原样包装的两阶段载入事件。
+/// 内存物化与磁盘提交阶段事件。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum SaveRamEvent {
     Phase(SaveRamPhase),
-    Load(LoadEvent),
 }
 
 pub const MEMORY_MODE_MIN_BYTES: u64 = 50 * 1024 * 1024;
@@ -8959,6 +9101,10 @@ pub struct BigFile {
     /// 内容修改计数：每次单元格/行结构变化递增，保存后归零。
     /// 排序只改变视图，不递增。
     revision: i64,
+    /// 当前 RAM 正文对应的逻辑内容键；未物化或普通 mmap 为 None。
+    ram_content_key: Option<materialize::RamContentKey>,
+    /// RAM 已包含尚未成功写盘的正文，独立于 revision 保存点。
+    disk_body_dirty: bool,
 }
 
 impl Drop for BigFile {
@@ -9128,6 +9274,8 @@ impl BigFile {
             format,
             order: RowOrder::Identity,
             revision: 0,
+            ram_content_key: None,
+            disk_body_dirty: false,
         })
     }
 
@@ -9336,6 +9484,8 @@ impl BigFile {
             format,
             order: RowOrder::Identity,
             revision: 0,
+            ram_content_key: None,
+            disk_body_dirty: false,
         })
     }
 
@@ -9693,7 +9843,8 @@ impl BigFile {
             .saturating_add(scratch);
         let margin = base / 10 + 32 * 1024 * 1024;
         let new_bytes = base.saturating_add(margin);
-        // 载入瞬间私有缓冲与文件页缓存并存，物理峰值约 2×（页缓存可回收）。
+        // 保守物理重叠提示：源文件页与匿名 RAM 在复制期可短时接近 2X。
+        // 复制期间保留完整 M0；工作集可能短时重叠，但不锁页；105% 仅约束私有内存。
         let peak_bytes = if self.is_ram_backed() {
             new_bytes
         } else {
@@ -9727,77 +9878,35 @@ impl BigFile {
         }
         self.join_index_worker()?;
         let before = FileStamp::read(&self.backing_path)?;
-        let file = fs::File::open(&self.backing_path).map_err(|e| e.to_string())?;
-        // 原 mmap 在预留期间保持有效；预留失败直接返回，现场不变。
+        let Backing::Mmap(m0) = &self.backing else {
+            return Ok(ConvertStatus::Cancelled);
+        };
         #[cfg(test)]
         if self::tests::conversion_reserve_fault() {
             return Err("注入预留失败".into());
         }
-        let prepared = prepare_load(file, options, &observer)?;
-        let previous = std::mem::replace(
-            &mut self.backing,
-            Backing::Ram(RamBuffer::Vec(Vec::new())),
-        );
-        debug_assert!(matches!(previous, Backing::Mmap(_)));
-        drop(previous); // 读取开始前释放最后一个完整源 Arc<Mmap>。
+        let prepared = prepare_load(MmapSource::new(m0), options, &observer)?;
+
         match run_prepared_load(prepared, cancel, &observer) {
             Ok(LoadResult::Complete(ram)) => match FileStamp::read(&self.backing_path) {
                 Ok(after) if after == before => {
+                    // PreparedLoad 已消费并结束借用；此处是唯一正常释放 M0 的位置。
                     self.backing = Backing::Ram(RamBuffer::Region(ram));
                     Ok(ConvertStatus::Converted)
                 }
-                Ok(_) => {
-                    drop(ram);
-                    self.restore_after_conversion(
-                        "EXTERNAL_CHANGED: 转换期间后备文件发生变化".into(),
-                        false,
-                    )
-                }
-                Err(error) => {
-                    drop(ram);
-                    self.restore_after_conversion(error, false)
-                }
+                Ok(_) => Err("EXTERNAL_CHANGED: 转换期间后备文件发生变化".into()),
+                Err(error) => Err(error),
             },
             Ok(LoadResult::Cancelled) => match FileStamp::read(&self.backing_path) {
-                Ok(after) if after == before => {
-                    self.restore_after_conversion("用户取消".into(), true)
-                }
-                Ok(_) => self.restore_after_conversion(
-                    "EXTERNAL_CHANGED: 取消时发现后备文件发生变化".into(),
-                    false,
-                ),
-                Err(error) => self.restore_after_conversion(error, false),
+                Ok(after) if after == before => Ok(ConvertStatus::Cancelled),
+                Ok(_) => Err("EXTERNAL_CHANGED: 取消时发现后备文件发生变化".into()),
+                Err(error) => Err(error),
             },
-            Err(error) => self.restore_after_conversion(error, false),
-        }
-    }
-
-    /// 取消/失败统一按 backing_path 重建 mmap，不改索引代际或历史。
-    fn restore_after_conversion(
-        &mut self,
-        error: String,
-        cancelled: bool,
-    ) -> Result<ConvertStatus, String> {
-        match self.map_current_backing() {
-            Ok(backing) => {
-                self.backing = backing;
-                if cancelled {
-                    Ok(ConvertStatus::Cancelled)
-                } else {
-                    Err(error)
-                }
-            }
-            Err(recovery) => Err(format!(
-                "转换失败：{error}\n恢复 mmap 也失败：{recovery}"
-            )),
+            Err(error) => Err(error),
         }
     }
 
     fn map_current_backing(&self) -> Result<Backing, String> {
-        #[cfg(test)]
-        if self::tests::conversion_restore_fault() {
-            return Err("注入恢复 mmap 失败".into());
-        }
         let file = fs::File::open(&self.backing_path).map_err(|e| e.to_string())?;
         let mmap = unsafe {
             memmap2::MmapOptions::new()
@@ -10022,24 +10131,6 @@ impl BigFile {
     // ---- 读路径 ----
 
     /// 读取源记录字段（解码 + 解析 + pad/truncate + 覆盖层）。
-    /// 把物理记录区间 [first, end) 的原始字节整段写入（透传不重编码）。
-    /// 端点取记录首行偏移；区间末尾即文件末时用 mmap 长度。
-    /// 仅在 save() 透传路径使用：调用方保证行未删除（段已剔除被删行）、无覆盖层。
-    fn write_raw_range(&self, w: &mut impl Write, first: u32, end: u32) -> Result<(), String> {
-        let mut s = self.idx.record_span(self.bytes().len(), first as usize).0;
-        let e = if (end as usize) < self.idx.n_records() {
-            self.idx.record_span(self.bytes().len(), end as usize).0
-        } else {
-            self.bytes().len()
-        };
-        // BOM 已单独写在文件开头：仅当记录 0 正好从文件字节 0 起才跳过，
-        // 有前导空行时记录 0 起点在 BOM 之后，不能盲跳。
-        if first == 0 && self.has_bom && s == 0 {
-            s = 3;
-        }
-        w.write_all(&self.bytes()[s..e]).map_err(|e| e.to_string())
-    }
-
     /// 物理记录 rec 的可见字节范围；记录 0 统一剥掉文件头 BOM。
     fn src_span(&self, rec: u32) -> Option<(usize, usize)> {
         let (mut s, e) = self.record_span_visible(rec as usize)?;
@@ -10069,12 +10160,17 @@ impl BigFile {
 
     /// 按 committed Schema 读取源记录；Source 读物理槽，Inserted 只读覆盖层。
     fn src_fields(&self, rec: u32) -> Vec<String> {
+        self.src_fields_with_schema(rec, &self.schema)
+    }
+
+    /// 按指定冻结 Schema 读取源记录，供保存和两遍物化共用。
+    fn src_fields_with_schema(&self, rec: u32, schema: &Schema) -> Vec<String> {
         let raw = self.raw_src_fields(rec);
-        self.schema
+        schema
             .visible()
             .iter()
             .map(|id| {
-                let mut value = match self.schema.storage(*id) {
+                let mut value = match schema.storage(*id) {
                     Some(ColumnStorage::Source(slot)) => {
                         raw.get(slot as usize).cloned().unwrap_or_default()
                     }
@@ -10090,17 +10186,22 @@ impl BigFile {
 
     /// 按 committed Schema 读取插入行；扩展槽缺值保持稀疏，不逐行补齐。
     fn ins_fields(&self, block: u32, row: u32) -> Vec<String> {
+        self.ins_fields_with_schema(block, row, &self.schema)
+    }
+
+    /// 按指定冻结 Schema 读取插入行，缺值仍保持稀疏语义。
+    fn ins_fields_with_schema(&self, block: u32, row: u32, schema: &Schema) -> Vec<String> {
         let cells = self
             .seg
             .blocks
             .get(block as usize)
             .and_then(|block| block.as_ref())
             .and_then(|rows| rows.rows.get(row as usize));
-        self.schema
+        schema
             .visible()
             .iter()
             .map(|id| {
-                self.schema
+                schema
                     .storage(*id)
                     .and_then(|storage| self.inserted_slot(storage))
                     .and_then(|slot| cells.and_then(|cells| cells.get(slot)))
@@ -10494,7 +10595,7 @@ impl BigFile {
     pub fn spool_root(&self) -> &Path { self.spool.root() }
 
     pub fn modified(&self) -> bool {
-        self.savepoint_detached || self.revision != 0
+        self.savepoint_detached || self.revision != 0 || self.disk_body_dirty
     }
 
     pub fn history_stats(&self) -> HistoryStats {
@@ -10673,6 +10774,12 @@ impl BigFile {
         }
         self.commit_undo_policy(prepared);
         self.memory_mode = true;
+        // 未编辑的物理恒等正文可直接写盘；编辑后的旧键会因代际不同自动失效。
+        self.ram_content_key = if self.revision == 0 {
+            Some(self.current_ram_content_key())
+        } else {
+            None
+        };
         Ok(true)
     }
 
@@ -10700,6 +10807,11 @@ impl BigFile {
                 exited: false,
                 fixed_point: None,
             });
+        }
+        if self.disk_body_dirty {
+            return Err(
+                "UNSAVED_RAM: 当前正文只存在于内存中，请先保存后再退出内存模式".into(),
+            );
         }
         if self.stale() {
             return Err("EXTERNAL_CHANGED: 退出内存模式前发现文件发生变化".into());
@@ -13431,11 +13543,14 @@ impl BigFile {
         self.save_to(target, true, approval, progress)
     }
 
-    /// 当前逻辑行序对应的普通保存基线映射。
-    fn build_baseline_transform(&self) -> Result<(BaselineTransform, usize), String> {
+    /// 为指定候选 Schema 建立保存基线；准备列物化时不改写 live Schema。
+    fn build_baseline_transform_for_schema(
+        &self,
+        schema: &Schema,
+    ) -> Result<(BaselineTransform, usize), String> {
         let mut transform = BaselineTransform::default();
         transform.deleted_sources = self.seg.tombstones.clone();
-        for (id, column) in self.schema.columns() {
+        for (id, column) in schema.columns() {
             let mapped = match column.storage {
                 ColumnStorage::Source(slot) => transform.source_columns.insert(slot, id),
                 ColumnStorage::Inserted(slot) => transform.inserted_columns.insert(slot, id),
@@ -13444,7 +13559,7 @@ impl BigFile {
                 return Err("物理列槽对应多个稳定身份".into());
             }
         }
-        for (index, id) in self.schema.visible().iter().enumerate() {
+        for (index, id) in schema.visible().iter().enumerate() {
             let index = u32::try_from(index).map_err(|_| "保存列号溢出")?;
             transform.columns.insert(*id, index);
         }
@@ -13827,23 +13942,51 @@ impl BigFile {
 
     /// 在旧数据仍有效时转换全部历史寻址；预算重建留到新文件大小已知后。
     fn transform_history_for_save(&self) -> Result<TransformedSaveHistory, String> {
-        let (transform, block_slots) = self.build_baseline_transform()?;
+        self.transform_history_for_materialization(&self.schema, None)
+    }
+
+    /// 为物化候选 Schema 转换历史，并可追加一个尚未应用到 live 状态的列操作。
+    /// 所有 Source 值仍在旧正文上读取，候选 Schema 只作为映射输入。
+    fn transform_history_for_materialization(
+        &self,
+        schema: &Arc<Schema>,
+        extra: Option<Op>,
+    ) -> Result<TransformedSaveHistory, String> {
+        let (transform, block_slots) = self.build_baseline_transform_for_schema(schema)?;
         let mut schema_cache = HashMap::new();
         // 当前结构只保留实际保存的可见列；历史仍引用的隐藏列在转换该历史时触发固定点。
-        let schema = Arc::new(Schema::from_headers(self.view_headers())?);
+        let saved_headers = schema
+            .visible()
+            .iter()
+            .map(|id| {
+                schema
+                    .resolve(*id)
+                    .map(|column| column.header.clone())
+                    .ok_or_else(|| "保存候选 Schema 缺少可见列".to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let saved_schema = Arc::new(Schema::from_headers(saved_headers)?);
         // 当前 Arc 若也出现在历史中，继续复用同一新 Arc 和共享计费身份。
-        schema_cache.insert(Arc::as_ptr(&self.schema) as usize, Arc::clone(&schema));
-        let undo = self.transform_entries_for_save(
+        schema_cache.insert(Arc::as_ptr(schema) as usize, Arc::clone(&saved_schema));
+        let mut undo = self.transform_entries_for_save(
             self.history.iter_undo(), &transform, &mut schema_cache,
         )?;
-        let redo = self.transform_entries_for_save(
+        let mut redo = self.transform_entries_for_save(
             self.history.iter_redo(), &transform, &mut schema_cache,
         )?;
+        if let Some(op) = extra {
+            let operation = self.transform_op_for_save(&op, &transform, &mut schema_cache)
+                .map_err(|error| format!("执行列操作：{error}"))?;
+            let entry = operation.history_entry().map_err(history_cost_error)?;
+            undo.push_back(entry);
+            // 新列操作是新的编辑分支，既有 redo 不得跨过它继续复用。
+            redo.clear();
+        }
         let mut blocks = Vec::new();
         blocks.try_reserve_exact(block_slots)
             .map_err(|_| "保存历史块槽内存不足".to_string())?;
         blocks.resize(block_slots, None);
-        Ok(TransformedSaveHistory { undo, redo, blocks, schema })
+        Ok(TransformedSaveHistory { undo, redo, blocks, schema: saved_schema })
     }
 
     /// 普通保存保持在写盘前以当前预算严格重建历史。
@@ -13882,7 +14025,7 @@ impl BigFile {
         dest: &Path,
         switch_path: bool,
         approval: Approval,
-        load_options: LoadOptions,
+        _load_options: LoadOptions,
         mut progress: F,
         observer: O,
     ) -> Result<SaveOutcome, String>
@@ -13909,6 +14052,38 @@ impl BigFile {
                 return Err("无列名模式需至少保留一列".into());
             }
         }
+        if self.memory_mode {
+            let materializes = !self.persistent_ram_is_current();
+            // 物化与写盘共用固定总量：计数/RAM 生成/写盘/提交只在各自区间推进，
+            // 任何阶段都不提前到 100%，写盘时条仍在走。
+            let mut weighted = |done: u64, total: u64, phase: u8, rows: u64| {
+                let (done, total) = memory_save_weight(done, total, phase, materializes);
+                progress(done, total, phase, rows);
+            };
+            if materializes {
+                let input = materialize::MaterializationInput::save_current(self, approval)?
+                    .with_progress(&mut weighted);
+                match self.prepare_materialization(input, &observer)? {
+                    materialize::PrepareMaterialization::Ready(prepared) => {
+                        self.commit_ram(prepared, &observer);
+                    }
+                    materialize::PrepareMaterialization::FixedPoint(request) => {
+                        return Ok(SaveOutcome {
+                            saved: false,
+                            fixed_point: Some(request),
+                            cancelled: false,
+                        });
+                    }
+                }
+            }
+            debug_assert!(self.persistent_ram_is_current());
+            if !switch_path && self.stale() {
+                return Err(format!(
+                    "{RAM_COMMITTED_ERROR}EXTERNAL_CHANGED: 写盘前发现文件发生变化"
+                ));
+            }
+            return self.commit_persistent_ram_to_disk(dest, switch_path, &mut weighted, observer);
+        }
         let saved_headers = self.view_headers();
         let saved_schema = Arc::new(Schema::from_headers(saved_headers.clone())?);
         let next_history_generation = self.next_history_generation()?;
@@ -13933,29 +14108,8 @@ impl BigFile {
                 cancelled: false,
             });
         }
-        let mut transformed_history = None;
-        let mut prepared_history = if sorted_order.is_some() {
+        let prepared_history = if sorted_order.is_some() {
             None
-        } else if self.memory_mode {
-            match self.transform_history_for_save() {
-                Ok(prepared) => {
-                    transformed_history = Some(prepared);
-                    None
-                }
-                Err(operation) => {
-                    if !approval.allow_fixed_point {
-                        return Ok(SaveOutcome {
-                            saved: false,
-                            fixed_point: Some(self.save_fixed_point_request(
-                                FixedPointKind::SaveTransform,
-                                operation,
-                            )),
-                            cancelled: false,
-                        });
-                    }
-                    None
-                }
-            }
         } else {
             match self.prepare_history_for_save() {
                 Ok(prepared) => Some(prepared),
@@ -13978,89 +14132,32 @@ impl BigFile {
         let tmp = tmp_path_for(dest);
         let out = fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
         let mut w = BufWriter::new(out);
-        if self.has_bom {
-            w.write_all(&[0xEF, 0xBB, 0xBF]).map_err(|e| e.to_string())?;
-        }
-        // 表头模式先写列名；无列名模式段表第一行就是数据第一行。
-        if !self.headerless && !self.format.is_text_lines() {
-            w.write_all(&encode_document_record(&saved_headers, b',', self.format, self.output_encoding)?)
-                .map_err(|e| e.to_string())?;
-        }
         let total = self.seg.vrow_count();
-        // 有覆盖层编辑的源行（透传判定的"不洁净"集；覆盖层通常极小）
-        let edited: std::collections::HashSet<u32> =
-            self.overlay.keys().map(|k| k.0).collect();
-        // 列槽不是原始恒等布局时，旧 Source 字节不再代表当前逻辑行，必须逐行重编码。
-        let source_layout_changed = self.schema.visible().len() != self.base_ncols
-            || self.schema.visible().iter().enumerate().any(|(slot, id)| {
-                match u32::try_from(slot) {
-                    Ok(slot) => self.schema.storage(*id) != Some(ColumnStorage::Source(slot)),
-                    Err(_) => true,
-                }
-            });
-        let mut done = 0u64;
+        let done: u64;
         let mut last_emit: Option<Instant> = None;
-        if let Some(order) = &sorted_order {
-            // 排序保存：按当前视图顺序逐行写出；物理顺序即所得。
-            for &orig in order.as_slice() {
-                match self.seg.resolve(orig as u64) {
-                    Some(ResolvedRow::Src(rec)) => {
-                        if source_layout_changed || edited.contains(&rec) {
-                            let f = self.src_fields(rec);
-                            w.write_all(&encode_document_record(&f, b',', self.format, self.output_encoding)?)
-                                .map_err(|e| e.to_string())?;
-                        } else {
-                            let (s, e) = self.src_span(rec).unwrap_or((0, 0));
-                            w.write_all(&self.bytes()[s..e]).map_err(|e| e.to_string())?;
-                            // 原末行可能没有换行；排到中间时必须补行尾。
-                            if !self.bytes()[s..e].ends_with(b"\n") {
-                                w.write_all(b"\r\n").map_err(|e| e.to_string())?;
-                            }
-                        }
+        if sorted_order.is_some() {
+            let mut io = IoSink { inner: &mut w };
+            let stats = serialize_document(
+                SerializationView {
+                    document: self,
+                    schema: self.schema.as_ref(),
+                    saved_headers: &saved_headers,
+                    sorted: sorted_order.as_deref(),
+                },
+                &mut io,
+                |done, total| {
+                    if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
+                        progress(stream_weighted(done), total, PHASE_STREAM, done);
                     }
-                    Some(ResolvedRow::Ins { block, row }) => {
-                        let f = self.ins_fields(block, row);
-                        w.write_all(&encode_document_record(&f, b',', self.format, self.output_encoding)?)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    None => {}
-                }
-                done += 1;
-                if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
-                    progress(stream_weighted(done), total, PHASE_STREAM, done);
-                }
-            }
+                },
+            )?;
+            done = stats.rows;
             progress(stream_weighted(done), total, PHASE_STREAM, done);
             w.flush().map_err(|e| e.to_string())?;
             drop(w);
             progress(flushed_weighted(total), total, PHASE_FLUSH, done);
-            let memory_budget = if self.memory_mode {
-                let total_bytes = fs::metadata(&tmp).map_err(|e| e.to_string())?.len();
-                Some(effective_undo_budget_bytes(
-                    total_bytes,
-                    true,
-                    self.undo_policy,
-                )?)
-            } else {
-                None
-            };
-            let prepared_reopen = if self.memory_mode {
-                let emergency_budget = self.prepare_undo_policy_for_mode(
-                    self.undo_policy,
-                    false,
-                )?;
-                self.save_to_memory_impl(
-                    &tmp,
-                    dest,
-                    load_options,
-                    emergency_budget,
-                    &observer,
-                )?
-            } else {
-                let prepared_reopen = self.prepare_reopen(&tmp)?;
-                self.replace_with_retry(&tmp, dest)?;
-                prepared_reopen
-            };
+            let prepared_reopen = self.prepare_reopen(&tmp)?;
+            self.replace_with_retry(&tmp, dest)?;
             if switch_path {
                 self.path = dest.to_path_buf();
             }
@@ -14073,9 +14170,6 @@ impl BigFile {
             // 排序物化仍是固定点；成功保存本身重新建立干净保存点。
             self.order = RowOrder::Identity;
             self.history.clear();
-            if let Some(budget) = memory_budget {
-                self.history.set_budget(budget);
-            }
             self.reclaim_unreferenced_columns();
             self.fixed_point = true;
             self.revision = 0;
@@ -14088,92 +14182,29 @@ impl BigFile {
                 cancelled: false,
             });
         }
-        for s in &self.seg.segs {
-            match s.kind {
-                SegKind::Src { start, len } => {
-                    // 字节透传：无覆盖层编辑的连续行整段照抄原文件字节
-                    // （引号风格/空格/末行无换行全部原样，且是顺序拷贝不重编码，
-                    // 删行保存从"逐行解析重编码"变"按洞拷贝"）；遇编辑行落编码。
-                    let seg_end = start + len;
-                    let mut run: Option<u32> = None;
-                    for rec in start..seg_end {
-                        if source_layout_changed || edited.contains(&rec) {
-                            if let Some(rs) = run.take() {
-                                self.write_raw_range(&mut w, rs, rec)?;
-                            }
-                            let f = self.src_fields(rec);
-                            w.write_all(&encode_document_record(&f, b',', self.format, self.output_encoding)?)
-                                .map_err(|e| e.to_string())?;
-                        } else if run.is_none() {
-                            run = Some(rec);
-                        }
-                        done += 1;
-                        // 16 行粒度过闸：磁盘拖慢时进度仍按 80ms 节拍更新
-                        // （旧 65536 行粒度在龟速段可能十分钟不刷新）。
-                        if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
-                            progress(stream_weighted(done), total, PHASE_STREAM, done);
-                        }
-                    }
-                    if let Some(rs) = run.take() {
-                        self.write_raw_range(&mut w, rs, seg_end)?;
-                    }
+        let mut io = IoSink { inner: &mut w };
+        let stats = serialize_document(
+            SerializationView {
+                document: self,
+                schema: self.schema.as_ref(),
+                saved_headers: &saved_headers,
+                sorted: None,
+            },
+            &mut io,
+            |done, total| {
+                if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
+                    progress(stream_weighted(done), total, PHASE_STREAM, done);
                 }
-                SegKind::Ins { block } => {
-                    if let Some(Some(rows)) = self.seg.blocks.get(block as usize) {
-                        for (row_index, _) in rows.rows.iter().enumerate() {
-                            let row = u32::try_from(row_index).map_err(|_| "插入行号越界")?;
-                            let f = self.ins_fields(block, row);
-                            w.write_all(&encode_document_record(&f, b',', self.format, self.output_encoding)?)
-                                .map_err(|e| e.to_string())?;
-                            done += 1;
-                            if done & 0xF == 0 && progress_gate(&mut last_emit, PROGRESS_MIN_GAP) {
-                                progress(stream_weighted(done), total, PHASE_STREAM, done);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+            },
+        )?;
+        done = stats.rows;
         // 阶段交接无条件各发一次：小文件也保证契约完整（有阶段 0/1 事件）。
         progress(stream_weighted(done), total, PHASE_STREAM, done);
         w.flush().map_err(|e| e.to_string())?;
         drop(w);
         progress(flushed_weighted(total), total, PHASE_FLUSH, done);
-        let memory_budget = if self.memory_mode {
-            let total_bytes = fs::metadata(&tmp).map_err(|e| e.to_string())?.len();
-            Some(effective_undo_budget_bytes(
-                total_bytes,
-                true,
-                self.undo_policy,
-            )?)
-        } else {
-            None
-        };
-        if let Some(budget) = memory_budget {
-            if let Some(transformed) = transformed_history {
-                prepared_history = Some(transformed.prepare_rebuild(
-                    budget,
-                    SaveRebuildPolicy::EvictOldest,
-                )?);
-            }
-        }
-        let prepared_reopen = if self.memory_mode {
-            let emergency_budget = self.prepare_undo_policy_for_mode(
-                self.undo_policy,
-                false,
-            )?;
-            self.save_to_memory_impl(
-                &tmp,
-                dest,
-                load_options,
-                emergency_budget,
-                &observer,
-            )?
-        } else {
-            let prepared_reopen = self.prepare_reopen(&tmp)?;
-            self.replace_with_retry(&tmp, dest)?;
-            prepared_reopen
-        };
+        let prepared_reopen = self.prepare_reopen(&tmp)?;
+        self.replace_with_retry(&tmp, dest)?;
         if switch_path {
             self.path = dest.to_path_buf();
         }
@@ -14182,23 +14213,13 @@ impl BigFile {
         self.index_epoch = next_index_epoch;
         self.base_ncols = saved_headers.len();
         self.base_headers = saved_headers;
-        let had_history = self.history.stats().undo_count + self.history.stats().redo_count > 0;
         if let Some(prepared) = prepared_history {
             self.seg.blocks = prepared.blocks;
             self.history.commit_rebuild(prepared.history);
-            if self.memory_mode
-                && had_history
-                && self.history.stats().undo_count + self.history.stats().redo_count == 0
-            {
-                self.fixed_point = true;
-            }
             self.reclaim_unreferenced_columns();
             self.schema = prepared.schema;
         } else {
             self.history.clear();
-            if let Some(budget) = memory_budget {
-                self.history.set_budget(budget);
-            }
             self.reclaim_unreferenced_columns();
             self.fixed_point = true;
             self.schema = saved_schema;
@@ -14214,8 +14235,20 @@ impl BigFile {
         })
     }
 
-    /// 执行待执行列操作：只提交共享 Schema，不改写源文件或行索引。
+    /// 执行待执行列操作；非观察调用沿用空事件回调。
     pub fn apply_col_ops(&mut self, approval: Approval) -> Result<EditOutcome, String> {
+        self.apply_col_ops_observed(approval, &|_: SaveRamEvent| {})
+    }
+
+    /// 执行待执行列操作；普通文档只提交 Schema，持久内存文档原子物化新 RAM。
+    pub fn apply_col_ops_observed<O>(
+        &mut self,
+        approval: Approval,
+        observer: &O,
+    ) -> Result<EditOutcome, String>
+    where
+        O: Fn(SaveRamEvent) + Sync,
+    {
         if self.format.is_text_lines() {
             return Err("纯文本逐行文档固定一列，不支持列结构或列名修改".into());
         }
@@ -14241,6 +14274,30 @@ impl BigFile {
         } else if ncols == 0 {
             return Err("没有列：无法执行列操作".into());
         }
+        if self.memory_mode {
+            let input = materialize::MaterializationInput::columns(self, approval)?;
+            return match self.prepare_materialization(input, observer)? {
+                materialize::PrepareMaterialization::FixedPoint(request) => {
+                    let mut outcome = EditOutcome::unchanged();
+                    outcome.fixed_point = Some(request);
+                    Ok(outcome)
+                }
+                materialize::PrepareMaterialization::Ready(prepared) => {
+                    self.commit_ram(prepared, observer);
+                    // 提交后只做无失败清理；准备失败时 pending 预览始终保留。
+                    self.pending_cols.clear();
+                    self.pending_schema = None;
+                    self.last_spec = None;
+                    Ok(EditOutcome {
+                        changed: true,
+                        inserted_rows: 0,
+                        removed_rows: 0,
+                        fixed_point: None,
+                        cancelled: false,
+                    })
+                }
+            };
+        }
         let before = Arc::clone(&self.schema);
         let (mut prepared, fixed_point) = match self.preflight_history(
             Op::Columns { change: SchemaChange { before, after } },
@@ -14258,181 +14315,6 @@ impl BigFile {
         self.finish_history(prepared, fixed_point, 0, 0)
     }
 
-    /// 临时文件已通过 mmap 和索引校验后，复用两阶段核心生成新的 RAM 后备。
-    fn prepare_memory_reopen<O>(
-        tmp: &Path,
-        prepared: PreparedReopen,
-        options: LoadOptions,
-        observer: &O,
-    ) -> Result<PreparedReopen, String>
-    where
-        O: Fn(SaveRamEvent) + Sync,
-    {
-        let PreparedReopen {
-            backing,
-            idx,
-            index_ms,
-            total_bytes,
-            modified,
-            offset,
-            n_data,
-        } = prepared;
-        let before = FileStamp::read(tmp)?;
-        let file = fs::File::open(tmp).map_err(|e| e.to_string())?;
-        observer(SaveRamEvent::Phase(SaveRamPhase::NewReserveBegin {
-            new_bytes: total_bytes,
-        }));
-        let load_observer = |event| observer(SaveRamEvent::Load(event));
-        // 临时 mmap 在新地址预留成功前保持有效，读取开始前必须解除。
-        let prepared_load = prepare_load(file, options, &load_observer)?;
-        drop(backing);
-        let cancel = AtomicBool::new(false);
-        let ram = match run_prepared_load(prepared_load, &cancel, &load_observer)? {
-            LoadResult::Complete(ram) => ram,
-            LoadResult::Cancelled => return Err("用户取消".into()),
-        };
-        let after = FileStamp::read(tmp)?;
-        if after != before {
-            return Err("EXTERNAL_CHANGED: 保存转换期间临时文件发生变化".into());
-        }
-        observer(SaveRamEvent::Phase(SaveRamPhase::NewRamReady {
-            new_bytes: total_bytes,
-        }));
-        Ok(PreparedReopen {
-            backing: Backing::Ram(RamBuffer::Region(ram)),
-            idx,
-            index_ms,
-            total_bytes,
-            modified,
-            offset,
-            n_data,
-        })
-    }
-
-    /// 从旧 backing_path 重建 RAM；旧索引、段表、覆盖层和历史保持原样。
-    fn reload_old_ram_for_save_recovery(&mut self) -> Result<(), String> {
-        // 换名前可能用空 RAM 占位摘除旧 mmap，因此这里总是先恢复真实映射。
-        let recovery = self.map_current_backing()?;
-        self.backing = recovery;
-        if self.idx.n_records() == 0 {
-            // 新 RAM 预留前已释放旧索引；任何降级读取前都先恢复其行定位能力。
-            let t0 = Instant::now();
-            self.idx = build_index_with_format(self.backing.bytes(), self.format);
-            self.index_ms = t0.elapsed().as_millis() as u64;
-        }
-        #[cfg(test)]
-        if self::memory_save_tests::old_ram_recovery_fault() {
-            return Err("注入旧 RAM 恢复失败".into());
-        }
-        let cancel = AtomicBool::new(false);
-        match self.convert_mmap_to_ram(&cancel, LoadOptions::default(), |_| {})? {
-            ConvertStatus::Converted => Ok(()),
-            ConvertStatus::Cancelled => Err("旧 RAM 恢复被意外取消".into()),
-        }
-    }
-
-    /// 保存失败先恢复旧 RAM；仅双失败提交预准备的普通预算并明确降级。
-    fn restore_old_ram_after_save_failure(
-        &mut self,
-        save_error: String,
-        emergency_budget: PreparedUndoPolicy,
-    ) -> String {
-        match self.reload_old_ram_for_save_recovery() {
-            Ok(()) => save_error,
-            Err(recovery_error) => {
-                let effect = emergency_budget.effect;
-                self.commit_undo_policy(emergency_budget);
-                self.memory_mode = false;
-                let fallback = if matches!(self.backing, Backing::Mmap(_)) {
-                    format!(
-                        "已退出内存模式并恢复普通 mmap；撤销淘汰 undo={}、redo={}，固定点：{}",
-                        effect.evicted_undo,
-                        effect.evicted_redo,
-                        effect.establishes_fixed_point,
-                    )
-                } else {
-                    "已退出内存模式，但恢复 mmap 也不可用，当前文档不能安全读取".into()
-                };
-                format!(
-                    "{save_error}\n恢复旧内存后备也失败：{recovery_error}\n{fallback}"
-                )
-            }
-        }
-    }
-
-    /// 内存保存先释放旧 RAM 再建新索引和新后备，失败仍恢复旧 RAM。
-    fn save_to_memory_impl<O>(
-        &mut self,
-        tmp: &Path,
-        dest: &Path,
-        options: LoadOptions,
-        emergency_budget: PreparedUndoPolicy,
-        observer: &O,
-    ) -> Result<PreparedReopen, String>
-    where
-        O: Fn(SaveRamEvent) + Sync,
-    {
-        // 恢复映射必须在旧匿名区域释放前建立，否则换名失败时没有可靠回退身份。
-        let recovery = self.map_current_backing()?;
-        let old_bytes = self.total_bytes;
-        let old_ram = std::mem::replace(&mut self.backing, recovery);
-        debug_assert!(matches!(old_ram, Backing::Ram(RamBuffer::Region(_))));
-        drop(old_ram);
-        observer(SaveRamEvent::Phase(SaveRamPhase::OldRamReleased { old_bytes }));
-
-        // 第二套索引及其并行构建缓冲不得与旧完整 RAM 同时存在。
-        let prepared = match self.prepare_reopen(tmp).and_then(|prepared| {
-            // 新索引已验证，旧索引必须在完整新 RAM 提交前让出；失败时从旧后备重建。
-            self.idx = RawIndex {
-                line_off: Vec::new(),
-                rec_lines: Vec::new(),
-            };
-            Self::prepare_memory_reopen(tmp, prepared, options, observer)
-        }) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let error = format!(
-                    "建立新内存后备失败：{error}\n临时文件保留在：{}",
-                    tmp.display(),
-                );
-                let error = self.restore_old_ram_after_save_failure(error, emergency_budget);
-                if self.memory_mode {
-                    observer(SaveRamEvent::Phase(SaveRamPhase::OldRamRestored { old_bytes }));
-                } else if matches!(self.backing, Backing::Mmap(_)) {
-                    observer(SaveRamEvent::Phase(SaveRamPhase::EmergencyMmapFallback));
-                }
-                return Err(error);
-            }
-        };
-
-        // Windows 换名前摘除旧恢复映射；新 RAM 由 prepared 独立持有。
-        self.backing = Backing::Ram(RamBuffer::Vec(Vec::new()));
-        let mut last = None;
-        for _ in 0..5 {
-            match fs::rename(tmp, dest) {
-                Ok(()) => return Ok(prepared),
-                Err(error) => {
-                    last = Some(error);
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-            }
-        }
-        // 先释放失败的新匿名区域，再重建旧匿名区域，避免双份完整 RAM 峰值。
-        drop(prepared);
-        let save_error = format!(
-            "写入目标文件失败：{}\n新文件已完整写在临时文件里（数据未丢失）：{}\n\
-             可关闭占用目标文件的程序后重试保存，或手动把该临时文件改名为目标文件。",
-            last.map(|error| error.to_string()).unwrap_or_default(),
-            tmp.display(),
-        );
-        let error = self.restore_old_ram_after_save_failure(save_error, emergency_budget);
-        if self.memory_mode {
-            observer(SaveRamEvent::Phase(SaveRamPhase::OldRamRestored { old_bytes }));
-        } else if matches!(self.backing, Backing::Mmap(_)) {
-            observer(SaveRamEvent::Phase(SaveRamPhase::EmergencyMmapFallback));
-        }
-        Err(error)
-    }
 
     /// 重新映射原文件并重建行索引（不动 Segment/覆盖层/撤销栈）。
     /// 用于保存换名失败后的读路径恢复。
@@ -15000,34 +14882,45 @@ mod memory_mode_tests {
 
 #[cfg(test)]
 mod memory_save_tests {
+    use super::materialize::{MaterializationInput, MaterializeFault};
     use super::*;
     use crate::history::UndoPolicy;
-    use crate::ram_load::{LoadFault, LoadOptions};
+    use crate::ram_load::LoadOptions;
     use crate::ram_region::live_reserved_bytes;
     use std::cell::Cell;
     use std::process::Command;
     use std::sync::Mutex;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum DiskWriteFault {
+        None,
+        Create,
+        WriteAfter(u64),
+        Flush,
+        Sync,
+    }
+
     thread_local! {
-        static OLD_RAM_RECOVERY_FAULT: Cell<bool> = const { Cell::new(false) };
+        static DISK_WRITE_FAULT: Cell<DiskWriteFault> = const { Cell::new(DiskWriteFault::None) };
     }
 
-    /// 只让保存后的旧 RAM 恢复失败，保留恢复 mmap 以验证紧急降级。
-    pub(super) fn old_ram_recovery_fault() -> bool {
-        OLD_RAM_RECOVERY_FAULT.with(Cell::get)
+    /// 读取当前测试线程的磁盘故障配置。
+    pub(super) fn disk_write_fault() -> DiskWriteFault {
+        DISK_WRITE_FAULT.with(Cell::get)
     }
 
-    struct OldRamRecoveryFaultGuard;
+    struct DiskWriteFaultGuard;
 
-    impl Drop for OldRamRecoveryFaultGuard {
+    impl Drop for DiskWriteFaultGuard {
         fn drop(&mut self) {
-            OLD_RAM_RECOVERY_FAULT.with(|flag| flag.set(false));
+            DISK_WRITE_FAULT.with(|flag| flag.set(DiskWriteFault::None));
         }
     }
 
-    fn old_ram_recovery_fault_guard() -> OldRamRecoveryFaultGuard {
-        OLD_RAM_RECOVERY_FAULT.with(|flag| flag.set(true));
-        OldRamRecoveryFaultGuard
+    /// 在当前测试线程启用一次磁盘故障，离开作用域自动恢复。
+    fn disk_write_fault_guard(fault: DiskWriteFault) -> DiskWriteFaultGuard {
+        DISK_WRITE_FAULT.with(|flag| flag.set(fault));
+        DiskWriteFaultGuard
     }
 
     fn save_tmp_csv(name: &str, bytes: &[u8]) -> PathBuf {
@@ -15216,117 +15109,142 @@ mod memory_save_tests {
     }
 
     #[test]
-    fn memory_save_read_fault_restores_old_ram_and_history() {
-        let (path, mut file) = persistent_file("read_fault", &save_people_csv(), UndoPolicy::default());
+    fn memory_save_second_pass_fault_preserves_old_ram_and_history() {
+        let (path, mut file) = persistent_file("second_pass_fault", &save_people_csv(), UndoPolicy::default());
         let original = fs::read(&path).unwrap();
         file.set_cell(0, 0, "kept".into(), Approval::deny()).unwrap();
         file.set_cell(1, 0, "redo-me".into(), Approval::deny()).unwrap();
         assert!(file.undo());
         let before = save_snapshot(&file);
+        let identity = file.backing_identity();
         assert!(before.history.undo_count > 0 && before.history.redo_count > 0);
-        let error = file.save_to_observed(
-            &path,
-            false,
-            Approval::deny(),
-            LoadOptions { chunk_bytes: 16, workers: 2, fault: LoadFault::ReadAfter(0) },
-            |_, _, _, _| {},
-            |_| {},
-        ).unwrap_err();
-        assert!(error.contains("读取"), "{error}");
+        let input = MaterializationInput::save_current(&file, Approval::deny())
+            .unwrap()
+            .with_fault(MaterializeFault::CommitAt(0));
+        let error = match file.prepare_materialization_for_test(input, |_| {}) {
+            Ok(_) => panic!("第二遍提交故障必须使准备失败"),
+            Err(error) => error,
+        };
+        assert!(error.contains("提交"), "{error}");
         assert_persistent_region(&file);
+        assert_eq!(file.backing_identity(), identity);
         assert_eq!(save_snapshot(&file), before);
         assert_eq!(fs::read(&path).unwrap(), original);
-        assert!(tmp_path_for(&path).exists());
+        assert!(!tmp_path_for(&path).exists(), "RAM 准备失败前不得创建临时文件");
         assert!(file.undo());
         assert_eq!(file.rows(0, 1)[0][0], "Alice");
         assert!(file.redo());
         assert_eq!(file.rows(0, 1)[0][0], "kept");
         assert!(file.redo());
         assert_eq!(file.rows(1, 1)[0][0], "redo-me");
-        fs::remove_file(tmp_path_for(&path)).ok();
         fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn memory_save_rename_fault_restores_old_ram_and_history() {
-        let (path, mut file) = persistent_file("rename_fault", &save_people_csv(), UndoPolicy::default());
-        let original = fs::read(&path).unwrap();
-        file.set_cell(0, 0, "kept".into(), Approval::deny()).unwrap();
-        file.set_cell(1, 0, "redo-me".into(), Approval::deny()).unwrap();
-        assert!(file.undo());
-        let before = save_snapshot(&file);
+    fn memory_save_rename_fault_keeps_new_ram_dirty_and_original_path() {
+        let (path, mut file) = persistent_file(
+            "rename_keeps_new_ram",
+            &save_people_csv(),
+            UndoPolicy::default(),
+        );
+        file.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+        let old_disk = fs::read(&path).unwrap();
+        let old_base_size = file.base_size;
+        let old_base_mtime = file.base_mtime;
         let target = std::env::temp_dir().join(format!(
             "st_engine_memory_save_rename_target_{}.csv",
-            std::process::id()
+            std::process::id(),
         ));
         fs::create_dir(&target).unwrap();
+        let events = Mutex::new(Vec::new());
         let error = file.save_to_observed(
             &target,
             true,
             Approval::deny(),
             LoadOptions::default(),
             |_, _, _, _| {},
-            |_| {},
+            |event| events.lock().unwrap().push(event),
         ).unwrap_err();
-        assert!(error.contains("临时文件"), "{error}");
-        assert_persistent_region(&file);
-        assert_eq!(save_snapshot(&file), before);
-        assert_eq!(fs::read(&path).unwrap(), original);
-        assert!(tmp_path_for(&target).exists());
-        assert!(file.undo());
-        assert_eq!(file.rows(0, 1)[0][0], "Alice");
-        assert!(file.redo());
-        assert_eq!(file.rows(0, 1)[0][0], "kept");
-        assert!(file.redo());
-        assert_eq!(file.rows(1, 1)[0][0], "redo-me");
+        assert!(error.starts_with(RAM_COMMITTED_ERROR), "{error}");
+        assert!(file.modified() && file.disk_body_dirty);
+        assert_eq!(file.path, path);
+        assert_eq!(file.backing_path, path);
+        assert_eq!(file.base_size, old_base_size);
+        assert_eq!(file.base_mtime, old_base_mtime);
+        assert_eq!(file.rows(0, 1)[0][1], "31");
+        assert_eq!(fs::read(&path).unwrap(), old_disk);
+        let events = events.into_inner().unwrap();
+        let ready = events.iter().position(|event| matches!(event,
+            SaveRamEvent::Phase(SaveRamPhase::NewRamReady { .. }))).unwrap();
+        let released = events.iter().position(|event| matches!(event,
+            SaveRamEvent::Phase(SaveRamPhase::OldRamReleased { .. }))).unwrap();
+        assert!(ready < released, "{events:?}");
+        assert!(!events.iter().any(|event| matches!(event,
+            SaveRamEvent::Phase(SaveRamPhase::DiskCommitted { .. }))));
         fs::remove_file(tmp_path_for(&target)).ok();
         fs::remove_dir(&target).ok();
         fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn memory_save_double_failure_reports_both_and_degrades_explicitly() {
-        let policy = UndoPolicy { budget_bytes: 1, resident_permille: 10_000 };
-        let (path, mut file) = persistent_file("double_fault", &save_people_csv(), policy);
-        file.set_cell(0, 0, "x".repeat(512), Approval::deny()).unwrap();
-        let before_rows = file.rows(0, 5);
-        let _guard = old_ram_recovery_fault_guard();
+    fn memory_save_unchanged_retry_writes_same_ram_without_materializing() {
+        let (path, mut file) = persistent_file(
+            "unchanged_retry",
+            &save_people_csv(),
+            UndoPolicy::default(),
+        );
+        file.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+        let target = std::env::temp_dir().join(format!(
+            "st_engine_memory_save_retry_target_{}.csv",
+            std::process::id(),
+        ));
+        fs::create_dir(&target).unwrap();
         let events = Mutex::new(Vec::new());
         let error = file.save_to_observed(
-            &path,
-            false,
+            &target,
+            true,
             Approval::deny(),
-            LoadOptions { chunk_bytes: 16, workers: 2, fault: LoadFault::ReadAfter(0) },
+            LoadOptions::default(),
             |_, _, _, _| {},
             |event| events.lock().unwrap().push(event),
         ).unwrap_err();
-        assert!(error.contains("读取"), "{error}");
-        assert!(error.contains("恢复旧内存后备也失败"), "{error}");
-        assert!(error.contains("退出内存模式"), "{error}");
-        assert!(error.contains("固定点：true"), "{error}");
-        let meta = file.meta();
-        assert!(!meta.memory_mode && !meta.ram_backed && meta.modified);
-        assert_eq!(meta.effective_undo_budget_bytes, 1);
-        assert!(!meta.can_undo && !meta.can_redo);
-        assert_eq!(file.rows(0, 5), before_rows);
-        assert!(matches!(file.backing, Backing::Mmap(_)));
-        assert!(events.lock().unwrap().contains(&SaveRamEvent::Phase(
-            SaveRamPhase::EmergencyMmapFallback,
-        )));
-        fs::remove_file(tmp_path_for(&path)).ok();
+        assert!(error.starts_with(RAM_COMMITTED_ERROR), "{error}");
+        let identity = file.backing_identity();
+        let first_materializations = events.lock().unwrap().iter().filter(|event| matches!(event,
+            SaveRamEvent::Phase(SaveRamPhase::NewRamReady { .. }))).count();
+
+        // 只移除外部的换名障碍；第二次保存不重写文档正文。
+        fs::remove_dir(&target).unwrap();
+        let outcome = file.save_to_observed(
+            &target,
+            true,
+            Approval::deny(),
+            LoadOptions::default(),
+            |_, _, _, _| {},
+            |event| events.lock().unwrap().push(event),
+        ).unwrap();
+        assert!(outcome.saved && !file.modified());
+        assert_eq!(file.backing_identity(), identity);
+        let events = events.into_inner().unwrap();
+        let total_materializations = events.iter().filter(|event| matches!(event,
+            SaveRamEvent::Phase(SaveRamPhase::NewRamReady { .. }))).count();
+        assert_eq!(total_materializations, first_materializations, "{events:?}");
+        assert_eq!(fs::read(&target).unwrap(), file.backing.bytes());
+        fs::remove_file(&target).ok();
         fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn memory_save_releases_old_region_before_new_reservation() {
+    fn memory_save_releases_old_region_after_new_ram_ready() {
         let (path, mut file) = persistent_file("release_order", &save_people_csv(), UndoPolicy::default());
+        file.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
         let file_bytes = fs::metadata(&path).unwrap().len();
         let events = Mutex::new(Vec::new());
         assert!(file.save_to_observed(
             &path,
             false,
             Approval::deny(),
-            LoadOptions { chunk_bytes: 16, workers: 2, fault: LoadFault::None },
+            LoadOptions::default(),
             |_, _, _, _| {},
             |event| events.lock().unwrap().push(event),
         ).unwrap().saved);
@@ -15340,23 +15258,285 @@ mod memory_save_tests {
         let ready = events.iter().position(|event| *event == SaveRamEvent::Phase(
             SaveRamPhase::NewRamReady { new_bytes: file_bytes },
         )).unwrap();
-        assert!(released < reserve && reserve < ready, "事件顺序：{events:?}");
-        assert!(events[..ready].iter().any(|event| matches!(
-            event,
-            SaveRamEvent::Load(LoadEvent::ReserveBegin { total }) if *total == file_bytes,
-        )));
+        assert!(reserve < ready && ready < released, "事件顺序：{events:?}");
         assert_persistent_region(&file);
         fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn memory_save_repeated_cancel_recovery_has_no_region_growth() {
+    fn memory_save_progress_uses_one_monotonic_scale_across_materialize_and_disk() {
+        let (path, mut file) = persistent_file("progress_scale", &save_people_csv(), UndoPolicy::default());
+        file.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+        let progress = Mutex::new(Vec::new());
+        assert!(file.save_to_observed(
+            &path,
+            false,
+            Approval::deny(),
+            LoadOptions::default(),
+            |done, total, phase, rows| {
+                progress.lock().unwrap().push((done, total, phase, rows));
+            },
+            |_| {},
+        ).unwrap().saved);
+        let events = progress.into_inner().unwrap();
+        assert!(!events.is_empty(), "保存必须报告进度");
+        let total = events[0].1;
+        assert!(total > 0, "进度总量必须为正：{events:?}");
+        assert!(
+            events.iter().all(|event| event.1 == total),
+            "物化与写盘必须共用同一总量，否则进度条会归零：{events:?}",
+        );
+        assert!(
+            events.windows(2).all(|pair| pair[1].0 >= pair[0].0),
+            "进度不得回退：{events:?}",
+        );
+        assert!(
+            events.iter().filter(|event| event.2 <= PHASE_FLUSH).all(|event| event.0 < total),
+            "物化阶段不得提前到达 100%：{events:?}",
+        );
+        let disk = events.iter().filter(|event| event.2 == PHASE_REINDEX).collect::<Vec<_>>();
+        assert!(!disk.is_empty(), "必须报告写盘进度：{events:?}");
+        assert!(
+            disk.iter().all(|event| event.0 < total),
+            "写盘阶段不得提前到达 100%：{events:?}",
+        );
+        let (done, phase) = (events.last().unwrap().0, events.last().unwrap().2);
+        assert_eq!((done, phase), (total, PHASE_COMMIT), "提交后才允许 100%：{events:?}");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_save_without_materialization_starts_at_disk_phase() {
+        let (path, mut file) = persistent_file("progress_reuse", &save_people_csv(), UndoPolicy::default());
+        file.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+        assert!(file.save(Approval::deny(), |_, _, _, _| {}).unwrap().saved);
+        assert!(file.persistent_ram_is_current());
+        let progress = Mutex::new(Vec::new());
+        assert!(file.save_to_observed(
+            &path,
+            false,
+            Approval::deny(),
+            LoadOptions::default(),
+            |done, total, phase, rows| {
+                progress.lock().unwrap().push((done, total, phase, rows));
+            },
+            |_| {},
+        ).unwrap().saved);
+        let events = progress.into_inner().unwrap();
+        assert!(!events.is_empty());
+        let total = events[0].1;
+        assert!(
+            events.iter().all(|event| event.2 >= PHASE_REINDEX),
+            "无需重新物化时不得再报物化阶段：{events:?}",
+        );
+        assert!(
+            events.iter().all(|event| event.1 == total),
+            "写盘与提交必须共用同一总量：{events:?}",
+        );
+        assert!(
+            events.windows(2).all(|pair| pair[1].0 >= pair[0].0),
+            "进度不得回退：{events:?}",
+        );
+        assert!(
+            events.iter().filter(|event| event.2 == PHASE_REINDEX).all(|event| event.0 < total),
+            "写盘阶段不得提前到达 100%：{events:?}",
+        );
+        assert_eq!(
+            (events.last().unwrap().0, events.last().unwrap().2),
+            (total, PHASE_COMMIT),
+            "{events:?}",
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_save_write_and_flush_faults_keep_new_ram_and_temp_error() {
+        for (name, fault) in [
+            ("create", DiskWriteFault::Create),
+            ("write", DiskWriteFault::WriteAfter(1)),
+            ("flush", DiskWriteFault::Flush),
+            ("sync", DiskWriteFault::Sync),
+        ] {
+            let (path, mut file) = persistent_file(name, &save_people_csv(), UndoPolicy::default());
+            file.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+            let old_identity = file.backing_identity();
+            let old_disk = fs::read(&path).unwrap();
+            let old_size = file.base_size;
+            let old_mtime = file.base_mtime;
+            let events = Mutex::new(Vec::new());
+            let progress = Mutex::new(Vec::new());
+            let _guard = disk_write_fault_guard(fault);
+            let error = file.save_to_observed(
+                &path,
+                false,
+                Approval::deny(),
+                LoadOptions::default(),
+                |done, total, phase, rows| {
+                    progress.lock().unwrap().push((done, total, phase, rows));
+                },
+                |event| events.lock().unwrap().push(event),
+            ).unwrap_err();
+            assert!(error.starts_with(RAM_COMMITTED_ERROR), "{name}: {error}");
+            assert_ne!(file.backing_identity(), old_identity, "{name} 必须先提交新 RAM");
+            assert!(file.modified() && file.disk_body_dirty, "{name}");
+            assert_eq!(file.path, path);
+            assert_eq!(file.backing_path, path);
+            assert_eq!(file.base_size, old_size);
+            assert_eq!(file.base_mtime, old_mtime);
+            assert_eq!(file.rows(0, 1)[0][1], "31");
+            assert_eq!(fs::read(&path).unwrap(), old_disk, "{name} 不得替换原目标");
+            assert!(!events.lock().unwrap().iter().any(|event| matches!(event,
+                SaveRamEvent::Phase(SaveRamPhase::DiskCommitted { .. }))), "{name}");
+            assert!(!progress.lock().unwrap().iter().any(|(done, total, phase, _)| {
+                *total > 0 && *done == *total && *phase == 3
+            }), "{name} 不得发送最终 100%");
+            fs::remove_file(tmp_path_for(&path)).ok();
+            fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn memory_sorted_save_failure_keeps_sorted_ram_fixed_point_and_dirty() {
+        let pad = "p".repeat(128);
+        let bytes = format!("id,value,note\r\na,1,{pad}\r\nc,3,{pad}\r\nb,2,{pad}\r\n").into_bytes();
+        let (path, mut file) = persistent_file(
+            "sorted_failure_new_ram",
+            &bytes,
+            UndoPolicy { budget_bytes: 1, resident_permille: 1000 },
+        );
+        assert!(file.sort_by_levels(
+            &[SortLevel { col: 0, numeric: false, asc: false }],
+            Approval::deny(),
+        ).unwrap().changed);
+        file.set_cell(0, 1, "9".into(), Approval::deny()).unwrap();
+        let denied = file.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+        let request = denied.fixed_point.unwrap();
+        assert_eq!(request.kind, FixedPointKind::SortMaterialization);
+        // commit_ram 按契约不修改 revision；显式构造 revision=0，隔离验证磁盘 dirty。
+        file.revision = 0;
+        file.savepoint_detached = false;
+        let old_disk = fs::read(&path).unwrap();
+        let target = std::env::temp_dir().join(format!(
+            "st_sorted_ram_rename_directory_{}", std::process::id()));
+        fs::create_dir(&target).unwrap();
+        let error = file.save_to_observed(
+            &target,
+            true,
+            Approval::allow(request.preflight_id),
+            LoadOptions::default(),
+            |_, _, _, _| {},
+            |_| {},
+        ).unwrap_err();
+        assert!(error.starts_with(RAM_COMMITTED_ERROR), "{error}");
+        assert_eq!(file.order, RowOrder::Identity);
+        assert!(file.fixed_point && file.disk_body_dirty && file.modified());
+        assert_eq!(file.revision, 0, "disk_body_dirty 必须独立于 revision");
+        assert_eq!(file.history_stats().undo_count, 0);
+        assert_eq!(file.history_stats().redo_count, 0);
+        assert_eq!(file.rows(0, 3).iter().map(|row| row[0].clone()).collect::<Vec<_>>(), ["c", "b", "a"]);
+        assert_eq!(file.path, path);
+        assert_eq!(file.backing_path, path);
+        assert_eq!(fs::read(&path).unwrap(), old_disk);
+        fs::remove_file(tmp_path_for(&target)).ok();
+        fs::remove_dir(&target).ok();
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_save_external_change_cancels_disk_and_keeps_new_ram() {
+        let (path, mut file) = persistent_file(
+            "external_after_ram_commit",
+            &save_people_csv(),
+            UndoPolicy::default(),
+        );
+        file.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+        let old_identity = file.backing_identity();
+        let old_disk = fs::read(&path).unwrap();
+        let touched = AtomicBool::new(false);
+        let events = Mutex::new(Vec::new());
+        let error = file.save_to_observed(
+            &path,
+            false,
+            Approval::deny(),
+            LoadOptions::default(),
+            |_, _, _, _| {},
+            |event| {
+                let released = matches!(event,
+                    SaveRamEvent::Phase(SaveRamPhase::OldRamReleased { .. }));
+                if released && !touched.swap(true, Ordering::SeqCst) {
+                    let handle = fs::OpenOptions::new().write(true).open(&path).unwrap();
+                    handle.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+                        .unwrap();
+                }
+                events.lock().unwrap().push(event);
+            },
+        ).unwrap_err();
+        assert!(error.starts_with(RAM_COMMITTED_ERROR) && error.contains("EXTERNAL_CHANGED"), "{error}");
+        assert_ne!(file.backing_identity(), old_identity);
+        assert!(file.modified() && file.disk_body_dirty);
+        assert_eq!(file.rows(0, 1)[0][1], "31");
+        assert_eq!(file.path, path);
+        assert_eq!(fs::read(&path).unwrap(), old_disk, "只改 mtime，不得重写或重载正文");
+        assert!(!events.into_inner().unwrap().iter().any(|event| matches!(event,
+            SaveRamEvent::Phase(SaveRamPhase::DiskWriteBegin { .. }))));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_save_success_uses_same_ram_and_never_reloads_temp() {
+        let (path, mut file) = persistent_file(
+            "success_same_ram",
+            &save_people_csv(),
+            UndoPolicy::default(),
+        );
+        file.set_cell(0, 1, "31".into(), Approval::deny()).unwrap();
+        let events = Mutex::new(Vec::new());
+        let first = file.save_to_observed(
+            &path,
+            false,
+            Approval::deny(),
+            LoadOptions::default(),
+            |_, _, _, _| {},
+            |event| events.lock().unwrap().push(event),
+        ).unwrap();
+        assert!(first.saved && !file.modified());
+        let identity = file.backing_identity();
+        assert_eq!(fs::read(&path).unwrap(), file.backing.bytes());
+
+        let second = file.save_to_observed(
+            &path,
+            false,
+            Approval::deny(),
+            LoadOptions::default(),
+            |_, _, _, _| {},
+            |event| events.lock().unwrap().push(event),
+        ).unwrap();
+        assert!(second.saved && file.backing_identity() == identity);
+        assert_eq!(fs::read(&path).unwrap(), file.backing.bytes());
+        let events = events.into_inner().unwrap();
+        let position = |predicate: &dyn Fn(&SaveRamPhase) -> bool| {
+            events.iter().position(|event| matches!(event, SaveRamEvent::Phase(phase) if predicate(phase)))
+                .unwrap()
+        };
+        let ready = position(&|phase| matches!(phase, SaveRamPhase::NewRamReady { .. }));
+        let released = position(&|phase| matches!(phase, SaveRamPhase::OldRamReleased { .. }));
+        let disk = position(&|phase| matches!(phase, SaveRamPhase::DiskWriteBegin { .. }));
+        let committed = position(&|phase| matches!(phase, SaveRamPhase::DiskCommitted { .. }));
+        assert!(ready < released && released < disk && disk < committed, "{events:?}");
+        assert_eq!(events.iter().filter(|event| matches!(event,
+            SaveRamEvent::Phase(SaveRamPhase::NewRamReady { .. }))).count(), 1,
+            "第二次保存必须直接复用同一 RAM");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_save_repeated_second_pass_fault_has_no_region_growth() {
         const CHILD_ENV: &str = "SIMPLETABLE_MEMORY_SAVE_RECOVERY_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "engine::memory_save_tests::memory_save_repeated_cancel_recovery_has_no_region_growth",
+                    "engine::memory_save_tests::memory_save_repeated_second_pass_fault_has_no_region_growth",
                     "--nocapture",
                     "--test-threads=1",
                 ])
@@ -15376,22 +15556,31 @@ mod memory_save_tests {
         let (path, mut file) = persistent_file("repeat_fault", &save_people_csv(), UndoPolicy::default());
         file.set_cell(0, 0, "kept".into(), Approval::deny()).unwrap();
         let before = save_snapshot(&file);
+        let identity = file.backing_identity();
         let reserved = live_reserved_bytes();
         for iteration in 0..5 {
-            let error = file.save_to_observed(
-                &path,
-                false,
-                Approval::deny(),
-                LoadOptions { chunk_bytes: 16, workers: 2, fault: LoadFault::ReadAfter(0) },
-                |_, _, _, _| {},
-                |_| {},
-            ).unwrap_err();
-            assert!(error.contains("读取"), "第 {iteration} 次：{error}");
+            let input = MaterializationInput::save_current(&file, Approval::deny())
+                .unwrap()
+                .with_fault(MaterializeFault::CommitAt(0));
+            let error = match file.prepare_materialization_for_test(input, |_| {}) {
+                Ok(_) => panic!("第 {iteration} 次故障应使准备失败"),
+                Err(error) => error,
+            };
+            assert!(error.contains("提交"), "第 {iteration} 次：{error}");
             assert_persistent_region(&file);
-            assert_eq!(save_snapshot(&file), before, "第 {iteration} 次恢复改变了文档");
-            assert_eq!(live_reserved_bytes(), reserved, "第 {iteration} 次恢复遗留区域");
+            assert_eq!(file.backing_identity(), identity);
+            assert_eq!(save_snapshot(&file), before, "第 {iteration} 次准备改变了文档");
+            assert_eq!(live_reserved_bytes(), reserved, "第 {iteration} 次准备遗留区域");
         }
-        fs::remove_file(tmp_path_for(&path)).ok();
         fs::remove_file(&path).ok();
     }
 }
+
+#[cfg(test)]
+mod serialize_tests;
+
+#[cfg(test)]
+mod materialize_tests;
+
+mod materialize;
+mod serialize;

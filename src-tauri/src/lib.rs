@@ -147,6 +147,32 @@ fn smoke_write_bytes(path: String, bytes: Vec<u8>) -> Result<(), String> {
     fs::write(&path, bytes).map_err(|e| io_err(&path, &e))
 }
 
+#[derive(Serialize)]
+struct SmokeFileProbe {
+    size: u64,
+    mtime_nanos: String,
+    prefix: Vec<u8>,
+}
+
+/// 冒烟辅助：返回文件大小、精确 mtime 和有限前缀，避免大夹具整份经过 IPC。
+#[tauri::command]
+fn smoke_file_probe(path: String) -> Result<SmokeFileProbe, String> {
+    let metadata = fs::metadata(&path).map_err(|error| io_err(&path, &error))?;
+    let mtime_nanos = metadata
+        .modified()
+        .map_err(|error| io_err(&path, &error))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos()
+        .to_string();
+    let mut file = fs::File::open(&path).map_err(|error| io_err(&path, &error))?;
+    let mut prefix = vec![0u8; 4096];
+    let read = std::io::Read::read(&mut file, &mut prefix)
+        .map_err(|error| io_err(&path, &error))?;
+    prefix.truncate(read);
+    Ok(SmokeFileProbe { size: metadata.len(), mtime_nanos, prefix })
+}
+
 /// 冒烟自检辅助：把一行文本重复写入文件若干次（大文件夹具用；
 /// 避免巨量字节经 IPC 传输）。UTF-8 编码，调用方自行带 \r\n。
 ///
@@ -779,11 +805,52 @@ fn with_big<T>(
     access: Access,
     f: impl FnOnce(&mut BigFile) -> Result<T, String>,
 ) -> Result<T, String> {
-    let entry = authorize_big(runtime, window.label(), session, lease, access)?;
+    with_big_owned(runtime, window.label(), session, lease, access, f)
+}
+
+/// 与 [`with_big`] 相同，但以 owner 标签而非窗口句柄定位文档。
+///
+/// 供后台工作线程使用：闭包和返回值都必须可跨线程移动，文件锁等待
+/// 发生在调用线程，因此调用方必须保证不在主线程上直接执行。
+fn with_big_owned<T>(
+    runtime: &SharedRuntime,
+    owner: &str,
+    session: u64,
+    lease: u64,
+    access: Access,
+    f: impl FnOnce(&mut BigFile) -> Result<T, String>,
+) -> Result<T, String> {
+    let entry = authorize_big(runtime, owner, session, lease, access)?;
     let mut file = entry.file.lock().map_err(|e| e.to_string())?;
-    authorize_big(runtime, window.label(), session, lease, access)?;
+    authorize_big(runtime, owner, session, lease, access)?;
     file.refresh_indexed();
     f(&mut file)
+}
+
+/// 把需要等待文档锁的命令体放到阻塞线程池，避免占用主线程。
+///
+/// 参数与 [`with_big_owned`] 相同；闭包和返回值都要求 `Send + 'static`。
+///
+/// # 返回值
+/// 文档操作结果；后台任务 panic 或取消时返回错误字符串。
+async fn run_big_offthread<T, F>(
+    runtime: SharedRuntime,
+    owner: String,
+    session: u64,
+    lease: u64,
+    access: Access,
+    f: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut BigFile) -> Result<T, String> + Send + 'static,
+{
+    // 锁等待与文档操作全部留在阻塞线程池；调用线程只 await 句柄。
+    tauri::async_runtime::spawn_blocking(move || {
+        with_big_owned(&runtime, &owner, session, lease, access, f)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// 只有当前 owner/lease 仍能读文档时才发送定向事件。
@@ -847,9 +914,14 @@ fn register_new_document(
     };
     let prepared = file.prepare_undo_policy(policy)?;
     file.commit_undo_policy(prepared);
+    // 打开队列需要新文档路径，insert_new 会消费 path，先留一份。
+    let queue_path = path.clone();
     let registered = guard.docs.insert_new(file, owner, path);
     if let Some((session, lease, _)) = &old {
         guard.docs.close(*session, owner, *lease)?;
+        guard.opens.replace_session(
+            *session, registered.session, owner, queue_path.as_deref(),
+        );
     }
     drop(guard);
     if let Some((_, _, old)) = old {
@@ -1043,23 +1115,46 @@ async fn big_new(
 }
 
 /// 关闭大文件会话。
+///
+/// 等待在途写盘结束的动作放在阻塞线程池，关闭窗口时主线程不再被卡住。
+/// 关闭文档会话并同步遗忘打开队列中的路径归属。
+///
+/// 只关文档而不清理 `opens` 会让同一路径再次拖入时被误判为“已打开”，
+/// 队列只发 `Activate` 指向已关闭的会话，前端找不到标签而无法打开。
+fn close_document(
+    runtime: &mut RuntimeState,
+    session: u64,
+    owner: &str,
+    lease: u64,
+) -> Result<BigEntry, String> {
+    let entry = runtime.docs.authorize(session, owner, lease, Access::Read)?;
+    runtime.docs.close(session, owner, lease)?;
+    runtime.opens.remove_session(session);
+    Ok(entry)
+}
+
 #[tauri::command]
-fn big_close(
+async fn big_close(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
 ) -> Result<(), String> {
-    let entry = {
-        let mut guard = state.lock().map_err(|e| e.to_string())?;
-        let entry = guard.docs.authorize(session, window.label(), lease, Access::Read)?;
-        guard.docs.close(session, window.label(), lease)?;
-        entry
-    };
-    entry.bump_gate();
-    entry.load_cancel.store(true, Ordering::Relaxed);
-    drop(entry.file.lock());
-    Ok(())
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let entry = {
+            let mut guard = runtime.lock().map_err(|e| e.to_string())?;
+            close_document(&mut guard, session, &owner, lease)?
+        };
+        entry.bump_gate();
+        entry.load_cancel.store(true, Ordering::Relaxed);
+        // 等正在进行的物化或写盘结束后再释放句柄。
+        drop(entry.file.lock());
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("关闭任务被取消：{e}"))?
 }
 
 /// 排序模式内存估算：文件缓冲 + 排列 + 键 + 安全余量，并附系统可用内存。
@@ -1068,16 +1163,18 @@ fn big_close(
 /// - `session`: 大文件会话号。
 /// - `levels`: 排序级别数（缺省 1）。
 #[tauri::command]
-fn big_sort_estimate(
+async fn big_sort_estimate(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     levels: Option<u32>,
 ) -> Result<SortEstimate, String> {
-    with_big(&state, &window, session, lease, Access::Read, |bf| {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Read, move |bf| {
         Ok(bf.sort_estimate(levels.unwrap_or(1)))
-    })
+    }).await
 }
 
 /// 排序模式：把文件分块载入私有内存缓冲（非阻塞，进度经
@@ -1265,15 +1362,17 @@ fn exit_memory_document(
 
 /// 返回当前后备大小、105% 转换上限和真实系统可用内存。
 #[tauri::command]
-fn big_memory_mode_estimate(
+async fn big_memory_mode_estimate(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
 ) -> Result<engine::MemoryEstimate, String> {
-    with_big(&state, &window, session, lease, Access::Read, |file| {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Read, |file| {
         file.memory_estimate()
-    })
+    }).await
 }
 
 /// 分块转换为持久内存模式，进度只发给发起操作的 owner/lease。
@@ -1408,27 +1507,33 @@ async fn big_sort_exit(
 
 /// 元数据（行/列/表头/编码/待执行列操作/撤销栈状态）。
 #[tauri::command]
-fn big_meta(window: tauri::Window, state: tauri::State<SharedRuntime>, session: u64, lease: u64,) -> Result<BigMeta, String> {
-    with_big(&state, &window, session, lease, Access::Read, |bf| Ok(bf.meta()))
+async fn big_meta(window: tauri::Window, state: tauri::State<'_, SharedRuntime>, session: u64, lease: u64,) -> Result<BigMeta, String> {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Read, move |bf| Ok(bf.meta())).await
 }
 
 /// 外部程序是否改动过文件（focus 时前端拉取）。
 #[tauri::command]
-fn big_stale(window: tauri::Window, state: tauri::State<SharedRuntime>, session: u64, lease: u64,) -> Result<bool, String> {
-    with_big(&state, &window, session, lease, Access::Read, |bf| Ok(bf.stale()))
+async fn big_stale(window: tauri::Window, state: tauri::State<'_, SharedRuntime>, session: u64, lease: u64,) -> Result<bool, String> {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Read, move |bf| Ok(bf.stale())).await
 }
 
 /// 窗口取行（含覆盖层/插入块/删除位图的视图行）。
 #[tauri::command]
-fn big_rows(
+async fn big_rows(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     from: u64,
     count: u32,
 ) -> Result<Vec<Vec<String>>, String> {
-    with_big(&state, &window, session, lease, Access::Read, |bf| Ok(bf.rows(from, count)))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Read, move |bf| Ok(bf.rows(from, count))).await
 }
 
 /// Excel 风格纵向数据边缘查找（Ctrl+↑/↓）。
@@ -1442,9 +1547,9 @@ fn big_rows(
 /// # Returns
 /// 目标视图行号；空表/无命中时为 None。
 #[tauri::command]
-fn big_find_edge(
+async fn big_find_edge(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     from: u64,
@@ -1452,16 +1557,18 @@ fn big_find_edge(
     down: bool,
     filtered: bool,
 ) -> Result<Option<u64>, String> {
-    with_big(&state, &window, session, lease, Access::Read, |bf| {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Read, move |bf| {
         bf.find_vertical_edge(from, col, down, filtered)
-    })
+    }).await
 }
 
 /// 编辑单元格（源行进覆盖层，插入行直写）。
 #[tauri::command]
-fn big_set_cell(
+async fn big_set_cell(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     vrow: u64,
@@ -1469,40 +1576,46 @@ fn big_set_cell(
     value: String,
     approval: Approval,
 ) -> Result<EditOutcome, String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| bf.set_cell(vrow, col, value, approval))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| bf.set_cell(vrow, col, value, approval)).await
 }
 
 /// 将一组单元格修改作为一次用户操作写入。
 #[tauri::command]
-fn big_set_cells(
+async fn big_set_cells(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     cells: Vec<(u64, u32, String)>,
     approval: Approval,
 ) -> Result<EditOutcome, String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| bf.set_cells(cells, approval))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| bf.set_cells(cells, approval)).await
 }
 
 /// 按结构化单元格、行、列或矩形目标清除内容。
 #[tauri::command]
-fn big_clear(
+async fn big_clear(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     target: ClearTarget,
     approval: Approval,
 ) -> Result<EditOutcome, String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| bf.clear(target, approval))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| bf.clear(target, approval)).await
 }
 
 /// 粘贴不规则行块；既有格与自动扩行合并为一次用户操作。
 #[tauri::command]
-fn big_paste(
+async fn big_paste(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     vrow: u64,
@@ -1510,14 +1623,16 @@ fn big_paste(
     rows: Vec<Vec<String>>,
     approval: Approval,
 ) -> Result<EditOutcome, String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| bf.paste_rows(vrow, col, rows, approval))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| bf.paste_rows(vrow, col, rows, approval)).await
 }
 
 /// 在 vpos 处插入行（rows 为 null 时插 count 行空行）。
 #[tauri::command]
-fn big_insert_rows(
+async fn big_insert_rows(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     vpos: u64,
@@ -1525,45 +1640,55 @@ fn big_insert_rows(
     count: u64,
     approval: Approval,
 ) -> Result<EditOutcome, String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| bf.insert_rows(vpos, rows, count, approval))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| bf.insert_rows(vpos, rows, count, approval)).await
 }
 
 /// 删除一组 vrow（升序传入），返回删除行数。
 #[tauri::command]
-fn big_remove_rows(
+async fn big_remove_rows(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     vrows: Vec<u64>,
     approval: Approval,
 ) -> Result<EditOutcome, String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| bf.remove_rows(vrows, approval))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| bf.remove_rows(vrows, approval)).await
 }
 
 /// 设置单个文档的撤销/重做历史字节预算，并返回最新元数据。
 #[tauri::command]
-fn big_set_undo_budget(
+async fn big_set_undo_budget(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     budget_bytes: u64,
 ) -> Result<BigMeta, String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| {
         bf.set_history_budget(budget_bytes)?;
         Ok(bf.meta())
-    })
+    }).await
 }
 
 #[tauri::command]
-fn big_undo(window: tauri::Window, state: tauri::State<SharedRuntime>, session: u64, lease: u64,) -> Result<bool, String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| Ok(bf.undo()))
+async fn big_undo(window: tauri::Window, state: tauri::State<'_, SharedRuntime>, session: u64, lease: u64,) -> Result<bool, String> {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| Ok(bf.undo())).await
 }
 
 #[tauri::command]
-fn big_redo(window: tauri::Window, state: tauri::State<SharedRuntime>, session: u64, lease: u64,) -> Result<bool, String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| Ok(bf.redo()))
+async fn big_redo(window: tauri::Window, state: tauri::State<'_, SharedRuntime>, session: u64, lease: u64,) -> Result<bool, String> {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| Ok(bf.redo())).await
 }
 
 /// 一次设置进程内所有文档及之后在途 open/create 的完整撤销策略。
@@ -1650,42 +1775,50 @@ async fn big_filter(
 }
 
 #[tauri::command]
-fn big_filter_count(window: tauri::Window, state: tauri::State<SharedRuntime>, session: u64, lease: u64,) -> Result<u32, String> {
-    with_big(&state, &window, session, lease, Access::Read, |bf| Ok(if bf.has_filter() { bf.filter_len() } else { 0 }))
+async fn big_filter_count(window: tauri::Window, state: tauri::State<'_, SharedRuntime>, session: u64, lease: u64,) -> Result<u32, String> {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Read, move |bf| Ok(if bf.has_filter() { bf.filter_len() } else { 0 })).await
 }
 
 #[tauri::command]
-fn big_filter_page(
+async fn big_filter_page(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     from: u32,
     count: u32,
 ) -> Result<FilterPage, String> {
-    with_big(&state, &window, session, lease, Access::Read, |bf| Ok(bf.filter_page(from, count)))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Read, move |bf| Ok(bf.filter_page(from, count))).await
 }
 
 /// 命中序号 → 清筛后全量视图行号（取消筛选锚定查询；无筛选/越界返回 None）。
 #[tauri::command]
-fn big_filter_hit_view_row(
+async fn big_filter_hit_view_row(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     idx: u32,
 ) -> Result<Option<u32>, String> {
-    with_big(&state, &window, session, lease, Access::Read, |bf| Ok(bf.filter_hit_view_row(idx)))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Read, move |bf| Ok(bf.filter_hit_view_row(idx))).await
 }
 
 #[tauri::command]
-fn big_clear_filter(window: tauri::Window, state: tauri::State<SharedRuntime>, session: u64, lease: u64,) -> Result<(), String> {
+async fn big_clear_filter(window: tauri::Window, state: tauri::State<'_, SharedRuntime>, session: u64, lease: u64,) -> Result<(), String> {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
     // 清空是全量视图：还在跑的筛选结果不应再落库
-    authorize_big(&state, window.label(), session, lease, Access::Write)?.bump_gate();
-    with_big(&state, &window, session, lease, Access::Write, |bf| {
+    authorize_big(&runtime, &owner, session, lease, Access::Write)?.bump_gate();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| {
         bf.clear_filter();
         Ok(())
-    })
+    }).await
 }
 
 /// 切换「首行非列名」并返回统一 EditOutcome。
@@ -1693,24 +1826,26 @@ fn big_clear_filter(window: tauri::Window, state: tauri::State<SharedRuntime>, s
 /// 切换记录 HeaderMode 历史且不改文件；实际变化后清空筛选结果。
 /// 先 bump 代数让在跑的筛选扫描退出，取消和空改动不写数据。
 #[tauri::command]
-fn big_set_headerless(
+async fn big_set_headerless(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     on: bool,
     approval: Approval,
 ) -> Result<EditOutcome, String> {
-    authorize_big(&state, window.label(), session, lease, Access::Write)?.bump_gate();
-    with_big(&state, &window, session, lease, Access::Write, |bf| bf.set_headerless(on, approval))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    authorize_big(&runtime, &owner, session, lease, Access::Write)?.bump_gate();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| bf.set_headerless(on, approval)).await
 }
 
 /// 完整矩形复制：小结果返回 Text，大结果返回应用内 token。
 #[tauri::command]
-fn big_copy(
+async fn big_copy(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
-    clipboard: tauri::State<ClipboardStore>,
+    state: tauri::State<'_, SharedRuntime>,
+    app: tauri::AppHandle,
     session: u64,
     lease: u64,
     r0: u64,
@@ -1718,34 +1853,46 @@ fn big_copy(
     c0: u32,
     c1: u32,
 ) -> Result<CopyOutcome, String> {
-    with_big(&state, &window, session, lease, Access::Read, |bf| bf.copy_tsv(r0, r1, c0, c1, clipboard.inner()))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Read, move |bf| {
+        let clipboard = app.state::<ClipboardStore>();
+        bf.copy_tsv(r0, r1, c0, c1, clipboard.inner())
+    })
+    .await
 }
 
 #[tauri::command]
-fn big_clipboard_meta(
+async fn big_clipboard_meta(
     window: tauri::Window,
-    runtime: tauri::State<SharedRuntime>,
-    clipboard: tauri::State<ClipboardStore>,
+    state: tauri::State<'_, SharedRuntime>,
+    app: tauri::AppHandle,
     session: u64,
     lease: u64,
 ) -> Result<Option<ClipboardMeta>, String> {
-    with_big(&runtime, &window, session, lease, Access::Read, |_| {
-        Ok(clipboard.current_meta())
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Read, move |_| {
+        Ok(app.state::<ClipboardStore>().current_meta())
     })
+    .await
 }
 
 #[tauri::command]
-fn big_clipboard_clear(
+async fn big_clipboard_clear(
     window: tauri::Window,
-    runtime: tauri::State<SharedRuntime>,
-    clipboard: tauri::State<ClipboardStore>,
+    state: tauri::State<'_, SharedRuntime>,
+    app: tauri::AppHandle,
     session: u64,
     lease: u64,
 ) -> Result<(), String> {
-    with_big(&runtime, &window, session, lease, Access::Read, |_| {
-        clipboard.clear_current();
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Read, move |_| {
+        app.state::<ClipboardStore>().clear_current();
         Ok(())
     })
+    .await
 }
 
 /// 保存（流式重写 + 原子换名），进度经 "big-progress" 事件推送。
@@ -1923,42 +2070,113 @@ async fn run_big_save(
 // ---- 列操作：pending 预览 → 执行物理重写 ----
 
 #[tauri::command]
-fn big_col_push(
+async fn big_col_push(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     op: ColOp,
 ) -> Result<(), String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| bf.push_col_op(op))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| bf.push_col_op(op)).await
 }
 
 #[tauri::command]
-fn big_col_pop(window: tauri::Window, state: tauri::State<SharedRuntime>, session: u64, lease: u64,) -> Result<(), String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| {
+async fn big_col_pop(window: tauri::Window, state: tauri::State<'_, SharedRuntime>, session: u64, lease: u64,) -> Result<(), String> {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| {
         bf.pop_col_op();
         Ok(())
-    })
+    }).await
 }
 
 #[tauri::command]
-fn big_col_clear(window: tauri::Window, state: tauri::State<SharedRuntime>, session: u64, lease: u64,) -> Result<(), String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| {
+async fn big_col_clear(window: tauri::Window, state: tauri::State<'_, SharedRuntime>, session: u64, lease: u64,) -> Result<(), String> {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| {
         bf.clear_col_ops();
         Ok(())
-    })
+    }).await
 }
 
-/// 执行待处理列操作；只提交可撤销 Schema，不做物理重写。
+/// 将 RAM 保存阶段映射到统一的 `big-progress` 四阶段协议。
+///
+/// 所有边界共用千分比总量：计数 0-100、整理 RAM 100-990、写盘 700-990、
+/// 提交 1000。阶段只前进不归零，进度条不会在写盘前显示 100%。
+fn save_ram_progress(event: engine::SaveRamEvent) -> Option<(u64, u64, u8, u64)> {
+    use engine::{SaveRamEvent, SaveRamPhase};
+
+    let SaveRamEvent::Phase(phase) = event;
+    let mapped = match phase {
+        SaveRamPhase::CountBegin => (0, 1000, 0, 0),
+        SaveRamPhase::CountFinished { .. } => (100, 1000, 0, 0),
+        SaveRamPhase::HistoryPrepared => (100, 1000, 1, 0),
+        SaveRamPhase::IndexPrepared { .. } => (100, 1000, 1, 0),
+        SaveRamPhase::NewReserveBegin { .. } => (100, 1000, 1, 0),
+        SaveRamPhase::NewRamReady { .. } => (700, 1000, 1, 0),
+        SaveRamPhase::OldRamReleased { .. } => (700, 1000, 1, 0),
+        SaveRamPhase::DiskWriteBegin { .. } => (700, 1000, 2, 0),
+        SaveRamPhase::DiskWriteFinished { .. } => (990, 1000, 2, 0),
+        SaveRamPhase::DiskCommitted { .. } => (1000, 1000, 3, 0),
+    };
+    Some(mapped)
+}
+
+/// 执行待处理列操作；持久内存模式在后台线程原子物化 RAM，不写硬盘。
 #[tauri::command]
-fn big_col_apply(
+async fn big_col_apply(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     approval: Approval,
 ) -> Result<EditOutcome, String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| bf.apply_col_ops(approval))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, u64, u8, u64)>();
+        let emit_owner = owner.clone();
+        let emitter = std::thread::spawn(move || {
+            while let Ok((done, total, phase, rows)) = rx.recv() {
+                emit_big_event(
+                    &app,
+                    &emit_owner,
+                    session,
+                    lease,
+                    "big-progress",
+                    serde_json::json!({
+                        "session": session,
+                        "lease": lease,
+                        "done": done,
+                        "total": total,
+                        "phase": phase,
+                        "rows": rows,
+                    }),
+                );
+            }
+        });
+        let result = (|| {
+            let entry = authorize_big(&runtime, &owner, session, lease, Access::Write)?;
+            entry.bump_gate();
+            let mut file = entry.file.lock().map_err(|error| error.to_string())?;
+            // 文件锁可能与关闭或迁移竞争，取得后必须重新授权。
+            authorize_big(&runtime, &owner, session, lease, Access::Write)?;
+            file.apply_col_ops_observed(approval, &|event| {
+                if let Some(update) = save_ram_progress(event) {
+                    let _ = tx.send(update);
+                }
+            })
+        })();
+        drop(tx);
+        emitter.join().map_err(|error| format!("进度转发线程异常：{error:?}"))?;
+        result
+    })
+    .await
+    .map_err(|error| format!("列操作任务被取消：{error}"))?
 }
 
 /// 截屏诊断模式：启动参数 `--park <mode>` 时返回 mode 字符串，否则 None。
@@ -2828,6 +3046,7 @@ pub fn run() {
             smoke_set_force_big,
             finish_smoke,
             smoke_write_bytes,
+            smoke_file_probe,
             smoke_write_repeat,
             smoke_tmp_dir,
             smoke_spool_path,
@@ -2937,45 +3156,51 @@ struct PasteImportChunk {
 
 /// 开始一个会话级外部文本导入。
 #[tauri::command]
-fn big_paste_import_begin(
+async fn big_paste_import_begin(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
 ) -> Result<PasteImportBegin, String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| {
         bf.begin_paste_import().map(|import_id| PasteImportBegin { import_id })
-    })
+    }).await
 }
 
 /// 上传一个 UTF-8 字节的十六进制分块。
 #[tauri::command]
-fn big_paste_import_chunk(
+async fn big_paste_import_chunk(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     import_id: String,
     hex: String,
     last: bool,
 ) -> Result<PasteImportChunk, String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| {
         bf.append_paste_import(&import_id, &hex, last).map(|bytes| PasteImportChunk { bytes })
-    })
+    }).await
 }
 
 /// 流式完成外部文本导入，固定点预检沿用统一编辑协议。
 #[tauri::command]
-fn big_paste_import_finish(
+async fn big_paste_import_finish(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     import_id: String,
     destination: engine::PasteDestination,
     approval: Approval,
 ) -> Result<EditOutcome, String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| bf.finish_paste_import(&import_id, destination, approval))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| bf.finish_paste_import(&import_id, destination, approval)).await
 }
 
 /// 使用当前进程的大复制 token 粘贴；失效 token 不回退系统剪贴板。
@@ -2997,14 +3222,16 @@ fn big_paste_clipboard(
 
 /// 取消并清理一个尚未消费的导入。
 #[tauri::command]
-fn big_paste_import_cancel(
+async fn big_paste_import_cancel(
     window: tauri::Window,
-    state: tauri::State<SharedRuntime>,
+    state: tauri::State<'_, SharedRuntime>,
     session: u64,
     lease: u64,
     import_id: String,
 ) -> Result<(), String> {
-    with_big(&state, &window, session, lease, Access::Write, |bf| bf.cancel_paste_import(&import_id))
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| bf.cancel_paste_import(&import_id)).await
 }
 
 /// 最后一个窗口退出进程后清理所有文档和进程级临时目录。
@@ -3353,6 +3580,75 @@ mod task9_tests {
         )
         .unwrap();
         assert_eq!(entry.path.as_deref(), Some(new_path.as_path()));
+    }
+
+    /// 文档命令让出调用线程：等待文件锁期间首次轮询必须立刻返回 Pending。
+    ///
+    /// 主线程上的同步命令若直接等锁，整个窗口会随长保存一起卡住。
+    #[test]
+    fn document_commands_do_not_block_the_calling_thread_on_the_file_lock() {
+        use std::future::Future;
+        use std::sync::mpsc;
+        use std::task::{Context, Poll, Waker};
+        use std::time::{Duration, Instant};
+
+        let runtime = SharedRuntime::default();
+        let session = register_memory(&runtime, "probe-window");
+        let entry = authorize_big(
+            &runtime,
+            "probe-window",
+            session.session,
+            session.lease,
+            Access::Read,
+        )
+        .unwrap();
+        let file = entry.file.clone();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        // 辅助线程持锁 800ms，模拟一次正在进行的物化或写盘。
+        let holder = std::thread::spawn(move || {
+            let guard = file.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(800));
+            drop(guard);
+        });
+        locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let mut future = Box::pin(run_big_offthread(
+            Arc::clone(&runtime),
+            "probe-window".to_string(),
+            session.session,
+            session.lease,
+            Access::Read,
+            |file| Ok(file.meta().rows),
+        ));
+        let started = Instant::now();
+        let first = {
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            future.as_mut().poll(&mut cx)
+        };
+        let first_ms = started.elapsed().as_millis();
+        holder.join().unwrap();
+        assert!(
+            matches!(first, Poll::Pending),
+            "等待文件锁时首次轮询应让出调用线程，实际已就绪（耗时 {first_ms}ms）"
+        );
+        assert!(
+            first_ms < 300,
+            "等待文件锁时调用线程被阻塞了 {first_ms}ms"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = loop {
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+                break result;
+            }
+            assert!(Instant::now() < deadline, "后台文档任务未在 5 秒内完成");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(result.unwrap(), 1);
     }
 }
 

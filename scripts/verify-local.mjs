@@ -83,7 +83,9 @@ try {
     const report = path.join(tauri, "target", `smoke-${kind}-${Date.now()}.txt`);
     const status = run(exe, ["--smoke"], {
       env: { ...process.env, SMOKE_REPORT_PATH: report },
-      timeout: 180_000,
+      // debug 冒烟在内存模式场景下实测约 162 s，接近旧的 180 s 上限；
+      // 必须大于前端 300 s 看门狗，让真挂死时还能写出带卡点的报告。
+      timeout: 360_000,
     });
     if (!fs.existsSync(report)) throw new Error(`${kind} smoke report missing: ${report}`);
     const text = fs.readFileSync(report, "utf8");

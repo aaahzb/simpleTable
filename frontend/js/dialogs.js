@@ -276,6 +276,10 @@ export async function confirmRamSortDialog(est) {
   return v === true;
 }
 
+export const BIG_WRITE_PHASES = [
+  "正在计算正文…", "正在整理内存…", "正在写入磁盘…", "正在完成原子换名…",
+];
+
 /**
  * 进度条模态（大文件保存/列操作物理重写/排序载入）。
  * 非阻塞：返回句柄由调用方驱动 set/close（进度经事件推送）。
@@ -289,8 +293,8 @@ export async function confirmRamSortDialog(est) {
  *            finish: () => Promise<void>, close: () => void}}
  */
 export function progressDialog(title, opts = {}) {
-  /** 阶段文字（与引擎 PHASE_* 常量对应）。 */
-  const PHASES = opts.phases ?? ["正在重写文件…", "正在落盘替换原文件…", "正在重建行索引…"];
+  /** 阶段文字（与统一 big-progress 四阶段协议对应）。 */
+  const PHASES = opts.phases ?? BIG_WRITE_PHASES;
   const mask = document.createElement("div");
   mask.className = "modal-mask";
   const box = document.createElement("div");
@@ -347,8 +351,8 @@ export function progressDialog(title, opts = {}) {
      *
      * @param {number} done - 已完成加权单位（总体进度的分子）。
      * @param {number} total - 总单位（分母不变，加权后仍等于总行数）。
-     * @param {number} [ph] - 阶段（0 流式重写 / 1 落盘换名 / 2 重建索引）。
-     * @param {number} [rowCount] - 已处理行数（流式阶段显示用）。
+     * @param {number} [ph] - 阶段（0 计算正文 / 1 内存整理 / 2 写入磁盘 / 3 原子换名）。
+     * @param {number} [rowCount] - 已处理行数（正文计算阶段显示用）。
      */
     set(done, total, ph = 0, rowCount = 0) {
       const t = Math.max(1, total);

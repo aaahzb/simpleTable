@@ -704,8 +704,8 @@ export class BigModel {
 
   /**
    * 订阅引擎进度事件（保存/列操作重写）。
-   * 事件载荷 `(加权done, total, 阶段, 行数)`：阶段 0 流式重写 / 1 落盘换名 /
-   * 2 重建索引；加权把总体进度切为 流式 0-70% / 落盘 70-78% / 索引至 100%。
+   * 事件载荷 `(done, total, 阶段, 行数)`：阶段固定为
+   * 0 计算正文 / 1 内存整理 / 2 写入磁盘 / 3 原子换名完成。
    *
    * @param {(done: number, total: number, phase: number, rows: number) => void} cb - 回调。
    * @returns {Promise<Function>} 取消监听函数。
@@ -1706,6 +1706,8 @@ export class BigModel {
    */
   async popColOp() {
     await this._invoke("big_col_pop");
+    // pending 列操作改变视图列映射：旧页按旧列号缓存，必须失效后重取
+    this._invalidate();
     await this._refreshMeta();
     this._emitData(true);
   }
@@ -1717,6 +1719,8 @@ export class BigModel {
    */
   async clearColOps() {
     await this._invoke("big_col_clear");
+    // pending 列操作改变视图列映射：旧页按旧列号缓存，必须失效后重取
+    this._invalidate();
     await this._refreshMeta();
     this._emitData(true);
   }
@@ -1730,6 +1734,8 @@ export class BigModel {
   async _pushColOp(op) {
     this._requireNotIndexing("文件仍在索引中，暂不支持列操作");
     await this._invoke("big_col_push", { op });
+    // pending 列操作改变视图列映射：旧页按旧列号缓存，必须失效后重取
+    this._invalidate();
     await this._refreshMeta();
     this._emitData(true);
   }
@@ -1753,23 +1759,30 @@ export class BigModel {
    * @returns {Promise<boolean>} 仅引擎 saved=true 时返回 true。
    */
   async _invokeSave(cmd, args = {}) {
-    const first = await this._invoke(cmd, {
-      ...args,
-      approval: { allowFixedPoint: false, preflightId: null },
-    });
-    if (first.saved) return true;
-    if (!first.fixedPoint) return false;
-    const confirmed = await this._confirmFixedPoint(first.fixedPoint);
-    if (!confirmed) return false;
-    const retry = await this._invoke(cmd, {
-      ...args,
-      approval: {
-        allowFixedPoint: true,
-        preflightId: first.fixedPoint.preflightId,
-      },
-    });
-    if (retry.fixedPoint) throw new Error("固定点预检已过期，请重试");
-    return retry.saved === true;
+    try {
+      const first = await this._invoke(cmd, {
+        ...args,
+        approval: { allowFixedPoint: false, preflightId: null },
+      });
+      if (first.saved) return true;
+      if (!first.fixedPoint) return false;
+      const confirmed = await this._confirmFixedPoint(first.fixedPoint);
+      if (!confirmed) return false;
+      const retry = await this._invoke(cmd, {
+        ...args,
+        approval: {
+          allowFixedPoint: true,
+          preflightId: first.fixedPoint.preflightId,
+        },
+      });
+      if (retry.fixedPoint) throw new Error("固定点预检已过期，请重试");
+      return retry.saved === true;
+    } catch (error) {
+      const message = String(error?.message ?? error);
+      // RAM 已提交时新正文就是唯一权威后备；即使磁盘失败也必须刷新视图。
+      if (message.startsWith("RAM_COMMITTED:")) await this._afterWrite();
+      throw error;
+    }
   }
 
   // ---- 保存 ----

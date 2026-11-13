@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 fn main() {
     let code = match run_cli(std::env::args().skip(1)) {
@@ -56,6 +57,9 @@ enum Scenario {
     CommitFail,
     ReadFail,
     Save,
+    ColumnApply,
+    ColumnSave,
+    SaveRetry,
     CancelLoop,
 }
 
@@ -67,6 +71,9 @@ impl Scenario {
             "commit-fail" => Ok(Self::CommitFail),
             "read-fail" => Ok(Self::ReadFail),
             "save" => Ok(Self::Save),
+            "column-apply" => Ok(Self::ColumnApply),
+            "column-save" => Ok(Self::ColumnSave),
+            "save-retry" => Ok(Self::SaveRetry),
             "cancel-loop" => Ok(Self::CancelLoop),
             _ => Err(format!("未知场景：{value}")),
         }
@@ -79,9 +86,28 @@ impl Scenario {
             Self::CommitFail => "commit-fail",
             Self::ReadFail => "read-fail",
             Self::Save => "save",
+            Self::ColumnApply => "column-apply",
+            Self::ColumnSave => "column-save",
+            Self::SaveRetry => "save-retry",
             Self::CancelLoop => "cancel-loop",
         }
     }
+}
+
+/// 场景是否属于持久内存矩阵：READY 前必须先进入内存模式。
+fn requires_memory_mode(scenario: Scenario) -> bool {
+    matches!(
+        scenario,
+        Scenario::Save | Scenario::ColumnApply | Scenario::ColumnSave | Scenario::SaveRetry
+    )
+}
+
+/// 场景是否必须产生真实磁盘写盘与提交事件；纯列操作只整理 RAM。
+fn requires_disk_save(scenario: Scenario) -> bool {
+    matches!(
+        scenario,
+        Scenario::Save | Scenario::ColumnSave | Scenario::SaveRetry
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -219,7 +245,8 @@ fn ensure_fixture(path: &Path, expected_bytes: u64) -> Result<(), String> {
 }
 
 use simpletable_lib::diagnostics::{
-    sample_current_process, sample_process, DiagnosticDocument, LoadEvent, LoadOptions,
+    sample_current_process, sample_process, DiagnosticDocument, LoadEvent, LoadFault, LoadOptions,
+    SaveRamEvent, SaveRamPhase,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -383,28 +410,73 @@ struct ChildResult {
     self_samples: SampleSummary,
 }
 
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct OperationOutcome {
     x_bytes: u64,
     iterations: u64,
-    old_ram_released_before_new_reserve: bool,
+    commit_order_verified: bool,
+    phase_timings: PhaseTimings,
 }
 
+/// 各阶段真实耗时（毫秒）；未发生的阶段保持 0。
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct PhaseTimings {
+    pub convert_ms: u128,
+    pub count_ms: u128,
+    pub ram_generation_ms: u128,
+    pub index_prepare_ms: u128,
+    pub index_commit_ms: u128,
+    pub disk_write_ms: u128,
+    pub total_ms: u128,
+}
+
+/// 保存阶段中尚未闭合的计时起点；重复出现时由 `+=` 累加。
+#[derive(Default)]
+struct PhaseClock {
+    count_started: Option<Instant>,
+    new_reserve_started: Option<Instant>,
+    history_started: Option<Instant>,
+    ready_started: Option<Instant>,
+    disk_started: Option<Instant>,
+}
+
+/// 执行一次真实转换（可取消/注入故障），并把转换耗时写入共享计时。
+///
+/// 参数：
+/// - `timings`：跨多次转换累加的阶段计时；`convert_ms` 取 `ReserveBegin→Finished`，
+///   取消或失败没有 `Finished`，在调用返回处闭合；`total_ms` 累加整个调用耗时。
+///
+/// 返回：是否真正进入内存模式；转换本身失败时返回原有错误。
 fn enter_with_optional_cancel(
     document: &mut DiagnosticDocument,
     config: &ChildConfig,
     cancel_after_quarter: bool,
     fault: simpletable_lib::diagnostics::LoadFault,
     sampler: &SelfSampler,
+    timings: &Mutex<PhaseTimings>,
 ) -> Result<bool, String> {
+    let call_started = Instant::now();
+    let convert_started = Mutex::new(None::<Instant>);
     let cancel = AtomicBool::new(false);
     let options = LoadOptions {
         workers: config.workers,
         fault,
         ..LoadOptions::default()
     };
-    document.enter_memory_mode(&cancel, options, |event| {
+    let result = document.enter_memory_mode(&cancel, options, |event| {
         sampler.sample();
+        match event {
+            LoadEvent::ReserveBegin { .. } => {
+                *convert_started.lock().unwrap() = Some(Instant::now());
+            }
+            LoadEvent::Finished { .. } => {
+                let started = convert_started.lock().unwrap().take();
+                if let Some(started) = started {
+                    timings.lock().unwrap().convert_ms += started.elapsed().as_millis();
+                }
+            }
+            _ => {}
+        }
         if cancel_after_quarter {
             if let LoadEvent::Progress { done, total } = event {
                 if total > 0 && done > total / 4 {
@@ -412,7 +484,14 @@ fn enter_with_optional_cancel(
                 }
             }
         }
-    })
+    });
+    // 取消或失败没有 Finished：在转换调用返回处闭合未闭合区间。
+    let open = convert_started.into_inner().unwrap_or(None);
+    if let Some(started) = open {
+        timings.lock().unwrap().convert_ms += started.elapsed().as_millis();
+    }
+    timings.lock().unwrap().total_ms += call_started.elapsed().as_millis();
+    result
 }
 
 fn expected_fault_recovers(
@@ -421,9 +500,10 @@ fn expected_fault_recovers(
     sampler: &SelfSampler,
     fault: simpletable_lib::diagnostics::LoadFault,
     expected_error: &str,
+    timings: &Mutex<PhaseTimings>,
 ) -> Result<(), String> {
     let reserved_before = DiagnosticDocument::live_reserved_bytes();
-    let error = match enter_with_optional_cancel(document, config, false, fault, sampler) {
+    let error = match enter_with_optional_cancel(document, config, false, fault, sampler, timings) {
         Ok(_) => return Err("故障场景意外完成转换".into()),
         Err(error) => error,
     };
@@ -441,54 +521,223 @@ fn expected_fault_recovers(
     Ok(())
 }
 
-fn execute_save(
+/// 转换类场景在各分支检查全部通过后构造结果。
+///
+/// `commit_order_verified` 表示该分支自己的真实断言（进入/取消/故障恢复/区域无遗留）
+/// 已全部通过，而不是把未检查的 `false` 机械改成 `true`。
+fn checked_conversion_outcome(
+    x_bytes: u64,
+    iterations: u64,
+    phase_timings: PhaseTimings,
+) -> OperationOutcome {
+    OperationOutcome {
+        x_bytes,
+        iterations,
+        commit_order_verified: true,
+        phase_timings,
+    }
+}
+
+/// 验证一次持久内存操作的阶段顺序。
+///
+/// 参数：
+/// - `phases`：真实 observer 收集到的 `SaveRamPhase` 序列。
+/// - `expected_materializations`：允许出现的 `NewRamReady` 次数；正文未变化的重试必须仍为 1。
+/// - `require_disk_save`：是否要求磁盘写入与提交事件；只整理 RAM 的列操作必须为 `false`。
+///
+/// 返回：物化次数精确、`NewRamReady` 先于 `OldRamReleased`，且磁盘事件符合要求时为 `true`。
+fn commit_order_verified(
+    phases: &[SaveRamPhase],
+    expected_materializations: usize,
+    require_disk_save: bool,
+) -> bool {
+    let position = |predicate: &dyn Fn(&SaveRamPhase) -> bool| phases.iter().position(predicate);
+    let ready = position(&|phase| matches!(phase, SaveRamPhase::NewRamReady { .. }));
+    let released = position(&|phase| matches!(phase, SaveRamPhase::OldRamReleased { .. }));
+    let disk = position(&|phase| matches!(phase, SaveRamPhase::DiskWriteBegin { .. }));
+    let committed = position(&|phase| matches!(phase, SaveRamPhase::DiskCommitted { .. }));
+    let materializations = phases
+        .iter()
+        .filter(|phase| matches!(phase, SaveRamPhase::NewRamReady { .. }))
+        .count();
+    if materializations != expected_materializations
+        || !matches!((ready, released), (Some(a), Some(b)) if a < b)
+    {
+        return false;
+    }
+    if require_disk_save {
+        matches!((ready, released, disk, committed),
+            (Some(a), Some(b), Some(c), Some(d)) if a < b && b < c && c < d)
+    } else {
+        disk.is_none() && committed.is_none()
+    }
+}
+
+/// 执行四个真实持久内存场景，并验证 RAM/磁盘提交顺序与内容。
+///
+/// 参数：
+/// - `document`：已进入内存模式的真实文档。
+/// - `config`：场景、源文件与并发配置。
+/// - `sampler`：阶段事件到达时的自身内存采样器。
+///
+/// 返回：包含验证结果与阶段计时的操作结果。
+fn execute_persistent_operation(
     document: &mut DiagnosticDocument,
     config: &ChildConfig,
     sampler: &SelfSampler,
-    source_bytes: u64,
 ) -> Result<OperationOutcome, String> {
-    use simpletable_lib::diagnostics::{LoadFault, SaveRamEvent, SaveRamPhase};
-
     let destination = config.file.with_extension("save.csv");
-    let phases = Mutex::new(Vec::with_capacity(16));
-    document.set_cell(0, 0, "9".into())?;
-    document.save_with_ram_observer(
-        &destination,
-        LoadOptions {
-            workers: config.workers,
-            fault: LoadFault::None,
-            ..LoadOptions::default()
-        },
-        |event| {
-            sampler.sample();
-            if let SaveRamEvent::Phase(phase) = event {
-                phases.lock().unwrap().push(phase);
+    let source_metadata = std::fs::metadata(&config.file)
+        .map_err(|error| format!("读取操作前源文件失败：{error}"))?;
+    let source_bytes = source_metadata.len();
+    let source_modified = source_metadata
+        .modified()
+        .map_err(|error| format!("读取操作前源文件 mtime 失败：{error}"))?;
+    let original_first = document
+        .rows(0, 1)
+        .into_iter()
+        .next()
+        .and_then(|row| row.first().cloned())
+        .ok_or("持久内存峰值夹具缺少首行首列")?;
+    let load_options = LoadOptions {
+        workers: config.workers,
+        fault: LoadFault::None,
+        ..LoadOptions::default()
+    };
+    let phases = Mutex::new(Vec::with_capacity(32));
+    let phase_timings = Mutex::new(PhaseTimings::default());
+    let clock = Mutex::new(PhaseClock::default());
+    let observe = |event| {
+        sampler.sample();
+        let SaveRamEvent::Phase(phase) = event;
+        let now = Instant::now();
+        phases.lock().unwrap().push(phase);
+        // 每个区间单独闭合；同一相位重复出现时累加，不把总耗时填进每个字段。
+        let mut clock = clock.lock().unwrap();
+        let mut timings = phase_timings.lock().unwrap();
+        match phase {
+            SaveRamPhase::CountBegin => clock.count_started = Some(now),
+            SaveRamPhase::CountFinished { .. } => {
+                if let Some(started) = clock.count_started.take() {
+                    timings.count_ms += now.duration_since(started).as_millis();
+                }
             }
-        },
-    )?;
+            SaveRamPhase::HistoryPrepared => clock.history_started = Some(now),
+            SaveRamPhase::IndexPrepared { .. } => {
+                if let Some(started) = clock.history_started.take() {
+                    timings.index_prepare_ms += now.duration_since(started).as_millis();
+                }
+            }
+            SaveRamPhase::NewReserveBegin { .. } => clock.new_reserve_started = Some(now),
+            SaveRamPhase::NewRamReady { .. } => {
+                if let Some(started) = clock.new_reserve_started.take() {
+                    timings.ram_generation_ms += now.duration_since(started).as_millis();
+                }
+                clock.ready_started = Some(now);
+            }
+            SaveRamPhase::OldRamReleased { .. } => {
+                if let Some(started) = clock.ready_started.take() {
+                    timings.index_commit_ms += now.duration_since(started).as_millis();
+                }
+            }
+            SaveRamPhase::DiskWriteBegin { .. } => clock.disk_started = Some(now),
+            SaveRamPhase::DiskWriteFinished { .. } => {
+                if let Some(started) = clock.disk_started.take() {
+                    timings.disk_write_ms += now.duration_since(started).as_millis();
+                }
+            }
+            _ => {}
+        }
+    };
+    let operation_started = Instant::now();
+    match config.scenario {
+        Scenario::Save => {
+            document.set_cell(0, 0, "edited".into())?;
+            document.save_with_ram_observer(&destination, load_options, &observe)?;
+        }
+        Scenario::ColumnApply => {
+            document.insert_column_with_ram_observer(1, "note".into(), &observe)?;
+        }
+        Scenario::ColumnSave => {
+            document.insert_column_with_ram_observer(1, "note".into(), &observe)?;
+            document.save_with_ram_observer(&destination, load_options, &observe)?;
+        }
+        Scenario::SaveRetry => {
+            document.set_cell(0, 0, "edited".into())?;
+            document.save_with_ram_observer(&destination, load_options, &observe)?;
+            let first_bytes = std::fs::metadata(&destination)
+                .map_err(|error| format!("读取第一次保存失败：{error}"))?
+                .len();
+            document.save_with_ram_observer(&destination, load_options, &observe)?;
+            let second_bytes = std::fs::metadata(&destination)
+                .map_err(|error| format!("读取第二次保存失败：{error}"))?
+                .len();
+            if first_bytes != second_bytes {
+                return Err(format!(
+                    "同 RAM 重试文件长度变化：{first_bytes} != {second_bytes}"
+                ));
+            }
+        }
+        _ => unreachable!("只有四个持久内存场景进入此函数"),
+    }
+    // 结束 observer 对阶段容器的借用后才能取回真实事件序列。
+    let _ = observe;
     let phases = phases
         .into_inner()
         .map_err(|_| "保存事件锁已中毒".to_string())?;
-    let released = phases
-        .iter()
-        .position(|phase| matches!(phase, SaveRamPhase::OldRamReleased { .. }));
-    let reserve = phases
-        .iter()
-        .position(|phase| matches!(phase, SaveRamPhase::NewReserveBegin { .. }));
-    let old_ram_released_before_new_reserve = match (released, reserve) {
-        (Some(released), Some(reserve)) => released < reserve,
-        _ => false,
-    };
-    if !old_ram_released_before_new_reserve {
-        return Err(format!("保存 RAM 释放顺序错误：{phases:?}"));
+    let mut phase_timings = phase_timings
+        .into_inner()
+        .map_err(|_| "阶段计时锁已中毒".to_string())?;
+    phase_timings.total_ms = operation_started.elapsed().as_millis();
+    let verified = commit_order_verified(&phases, 1, requires_disk_save(config.scenario));
+    if !verified {
+        return Err(format!("RAM/磁盘提交顺序不符：{phases:?}"));
     }
-    let destination_bytes = std::fs::metadata(&destination)
-        .map_err(|error| format!("读取保存后文件大小失败：{error}"))?
-        .len();
+    let new_ram_bytes = phases
+        .iter()
+        .find_map(|phase| match phase {
+            SaveRamPhase::NewRamReady { new_bytes } => Some(*new_bytes),
+            _ => None,
+        })
+        .ok_or("缺少 NewRamReady 字节数")?;
+    let output_bytes = if requires_disk_save(config.scenario) {
+        std::fs::metadata(&destination)
+            .map_err(|error| format!("读取磁盘提交后的目标失败：{error}"))?
+            .len()
+    } else {
+        let after = std::fs::metadata(&config.file)
+            .map_err(|error| format!("读取列物化后的源文件失败：{error}"))?;
+        let after_modified = after
+            .modified()
+            .map_err(|error| format!("读取列物化后的源文件 mtime 失败：{error}"))?;
+        if after.len() != source_bytes || after_modified != source_modified {
+            return Err("执行列操作改变了源文件大小或 mtime".into());
+        }
+        new_ram_bytes
+    };
+    if config.scenario == Scenario::ColumnSave && output_bytes <= source_bytes {
+        return Err("真实插列保存后文件未增大".into());
+    }
+    let rows = document.rows(0, 1);
+    let first = rows.first().ok_or("操作后首行消失")?;
+    match config.scenario {
+        Scenario::Save | Scenario::SaveRetry => {
+            if first.first().map(String::as_str) != Some("edited") {
+                return Err(format!("单元格保存内容错误：{rows:?}"));
+            }
+        }
+        Scenario::ColumnApply | Scenario::ColumnSave => {
+            if first.get(..2) != Some(&[original_first, String::new()][..]) {
+                return Err(format!("插列后的内容错误：{rows:?}"));
+            }
+        }
+        _ => unreachable!(),
+    }
     Ok(OperationOutcome {
-        x_bytes: source_bytes.max(destination_bytes),
+        x_bytes: source_bytes.max(new_ram_bytes).max(output_bytes),
         iterations: 1,
-        old_ram_released_before_new_reserve,
+        commit_order_verified: verified,
+        phase_timings,
     })
 }
 
@@ -502,29 +751,32 @@ fn execute_operation(
         .len();
     match config.scenario {
         Scenario::Convert => {
+            let timings = Mutex::new(PhaseTimings::default());
             if !enter_with_optional_cancel(
                 document,
                 config,
                 false,
                 simpletable_lib::diagnostics::LoadFault::None,
                 sampler,
+                &timings,
             )? {
                 return Err("普通转换未进入内存模式".into());
             }
-            Ok(OperationOutcome {
-                x_bytes,
-                iterations: 1,
-                old_ram_released_before_new_reserve: false,
-            })
+            let phase_timings = timings
+                .into_inner()
+                .map_err(|_| "阶段计时锁已中毒".to_string())?;
+            Ok(checked_conversion_outcome(x_bytes, 1, phase_timings))
         }
         Scenario::Cancel => {
             let reserved_before = DiagnosticDocument::live_reserved_bytes();
+            let timings = Mutex::new(PhaseTimings::default());
             if enter_with_optional_cancel(
                 document,
                 config,
                 true,
                 simpletable_lib::diagnostics::LoadFault::None,
                 sampler,
+                &timings,
             )? {
                 return Err("取消场景意外进入内存模式".into());
             }
@@ -534,14 +786,15 @@ fn execute_operation(
                     "取消恢复遗留区域：之前 {reserved_before}，之后 {reserved_after}"
                 ));
             }
-            Ok(OperationOutcome {
-                x_bytes,
-                iterations: 1,
-                old_ram_released_before_new_reserve: false,
-            })
+            let phase_timings = timings
+                .into_inner()
+                .map_err(|_| "阶段计时锁已中毒".to_string())?;
+            Ok(checked_conversion_outcome(x_bytes, 1, phase_timings))
         }
         Scenario::CancelLoop => {
             let reserved_before = DiagnosticDocument::live_reserved_bytes();
+            // 三次取消共用同一份计时：convert_ms 与 total_ms 都累加。
+            let timings = Mutex::new(PhaseTimings::default());
             for iteration in 0..3 {
                 if enter_with_optional_cancel(
                     document,
@@ -549,6 +802,7 @@ fn execute_operation(
                     true,
                     simpletable_lib::diagnostics::LoadFault::None,
                     sampler,
+                    &timings,
                 )? {
                     return Err(format!("第 {} 次取消意外进入内存模式", iteration + 1));
                 }
@@ -560,41 +814,44 @@ fn execute_operation(
                     ));
                 }
             }
-            Ok(OperationOutcome {
-                x_bytes,
-                iterations: 3,
-                old_ram_released_before_new_reserve: false,
-            })
+            let phase_timings = timings
+                .into_inner()
+                .map_err(|_| "阶段计时锁已中毒".to_string())?;
+            Ok(checked_conversion_outcome(x_bytes, 3, phase_timings))
         }
         Scenario::CommitFail => {
+            let timings = Mutex::new(PhaseTimings::default());
             expected_fault_recovers(
                 document,
                 config,
                 sampler,
                 simpletable_lib::diagnostics::LoadFault::CommitAt(0),
                 "注入提交失败",
+                &timings,
             )?;
-            Ok(OperationOutcome {
-                x_bytes,
-                iterations: 1,
-                old_ram_released_before_new_reserve: false,
-            })
+            let phase_timings = timings
+                .into_inner()
+                .map_err(|_| "阶段计时锁已中毒".to_string())?;
+            Ok(checked_conversion_outcome(x_bytes, 1, phase_timings))
         }
         Scenario::ReadFail => {
+            let timings = Mutex::new(PhaseTimings::default());
             expected_fault_recovers(
                 document,
                 config,
                 sampler,
                 simpletable_lib::diagnostics::LoadFault::ReadAfter(0),
                 "注入读取失败",
+                &timings,
             )?;
-            Ok(OperationOutcome {
-                x_bytes,
-                iterations: 1,
-                old_ram_released_before_new_reserve: false,
-            })
+            let phase_timings = timings
+                .into_inner()
+                .map_err(|_| "阶段计时锁已中毒".to_string())?;
+            Ok(checked_conversion_outcome(x_bytes, 1, phase_timings))
         }
-        Scenario::Save => execute_save(document, config, sampler, x_bytes),
+        Scenario::Save | Scenario::ColumnApply | Scenario::ColumnSave | Scenario::SaveRetry => {
+            execute_persistent_operation(document, config, sampler)
+        }
     }
 }
 
@@ -649,16 +906,19 @@ fn run_child_with_io(
     drop(progress_prewarm);
     drop(report_prewarm);
 
-    if config.scenario == Scenario::Save {
+    if requires_memory_mode(config.scenario) {
         let warmup_sampler = SelfSampler::default();
+        // READY 前的预进入不计入保存场景的阶段性计时。
+        let warmup_timings = Mutex::new(PhaseTimings::default());
         if !enter_with_optional_cancel(
             &mut document,
             config,
             false,
             simpletable_lib::diagnostics::LoadFault::None,
             &warmup_sampler,
+            &warmup_timings,
         )? {
-            return Err("保存场景未能预先进入内存模式".into());
+            return Err("持久内存场景未能预先进入内存模式".into());
         }
         std::hint::black_box(warmup_sampler.finish()?);
     }
@@ -699,6 +959,8 @@ pub struct PeakInput {
     pub self_sample_count: u64,
     pub external_sample_count: u64,
     pub external_max_interval_ms: u64,
+    pub commit_order_verified: bool,
+    pub phase_timings: PhaseTimings,
 }
 
 #[cfg(test)]
@@ -715,6 +977,8 @@ impl PeakInput {
             self_sample_count: 2,
             external_sample_count: 2,
             external_max_interval_ms: 5,
+            commit_order_verified: true,
+            phase_timings: PhaseTimings::default(),
         }
     }
 }
@@ -738,8 +1002,15 @@ pub struct PeakReport {
     pub external_sample_count: u64,
     pub monitor_interval_ms: u32,
     pub monitor_max_interval_ms: u64,
+    pub commit_order_verified: bool,
+    pub phase_timings: PhaseTimings,
+    pub system_cache_note: String,
     pub pass: bool,
 }
+
+/// 固定的内存口径说明：系统缓存不计入进程私有匿名 RAM。
+const SYSTEM_CACHE_NOTE: &str =
+    "系统文件缓存和备用列表不计入进程私有匿名 RAM；本报告未将其作为应用泄漏";
 
 pub fn evaluate_peak(input: PeakInput) -> Result<PeakReport, String> {
     if input.self_sample_count == 0 {
@@ -779,7 +1050,11 @@ pub fn evaluate_peak(input: PeakInput) -> Result<PeakReport, String> {
         external_sample_count: input.external_sample_count,
         monitor_interval_ms: 5,
         monitor_max_interval_ms: input.external_max_interval_ms,
-        pass: actual <= allowed,
+        commit_order_verified: input.commit_order_verified,
+        phase_timings: input.phase_timings,
+        system_cache_note: SYSTEM_CACHE_NOTE.into(),
+        // 字节达标但提交顺序未验证时整体判失败。
+        pass: actual <= allowed && input.commit_order_verified,
     })
 }
 
@@ -961,6 +1236,8 @@ fn run_parent_with_command(
         self_sample_count: result.self_samples.count,
         external_sample_count: external.count,
         external_max_interval_ms: external.max_interval_ms,
+        commit_order_verified: result.outcome.commit_order_verified,
+        phase_timings: result.outcome.phase_timings,
     })?;
     write_report(&report, report_path, output)?;
     Ok(report)
@@ -971,6 +1248,82 @@ mod tests {
     pub(super) static REAL_MEMORY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     use super::{evaluate_peak, PeakInput};
+    use simpletable_lib::diagnostics::SaveRamPhase;
+
+    /// 构造一次“物化 → 释放旧 RAM → 写盘 → 提交”的合法阶段序列。
+    fn ordered_save_phases() -> Vec<SaveRamPhase> {
+        vec![
+            SaveRamPhase::NewRamReady { new_bytes: 8 },
+            SaveRamPhase::OldRamReleased { old_bytes: 8 },
+            SaveRamPhase::DiskWriteBegin { new_bytes: 8 },
+            SaveRamPhase::DiskCommitted { new_bytes: 8 },
+        ]
+    }
+
+    #[test]
+    fn commit_order_requires_ram_before_disk_and_exact_materialization_count() {
+        let valid = ordered_save_phases();
+        assert!(super::commit_order_verified(&valid, 1, true));
+        assert!(
+            !super::commit_order_verified(&valid, 2, true),
+            "重试不得再次物化"
+        );
+
+        let mut early_release = ordered_save_phases();
+        early_release.swap(0, 1);
+        assert!(!super::commit_order_verified(&early_release, 1, true));
+        assert!(
+            !super::commit_order_verified(&valid[..3], 1, true),
+            "缺 DiskCommitted"
+        );
+    }
+
+    #[test]
+    fn column_apply_commit_order_forbids_all_disk_events() {
+        let ram_only = ordered_save_phases()[..2].to_vec();
+        assert!(super::commit_order_verified(&ram_only, 1, false));
+        assert!(!super::commit_order_verified(
+            &ordered_save_phases(),
+            1,
+            false
+        ));
+    }
+
+    #[test]
+    fn peak_gate_uses_floor_105_percent_and_separates_absolute_values() {
+        let mut input = PeakInput::test_defaults();
+        input.x_bytes = 101;
+        input.baseline_private_bytes = 1_000;
+        input.self_peak_private_bytes = 1_106;
+        input.external_peak_private_bytes = 1_105;
+        input.working_set_peak_bytes = Some(9_999);
+        let report = evaluate_peak(input).unwrap();
+        // floor(101 × 1.05) = 106，不能向上取整成 107。
+        assert_eq!(report.allowed_peak_increment_bytes, 106);
+        assert_eq!(report.observed_peak_private_bytes, 1_106);
+        assert_eq!(report.actual_peak_increment_bytes, 106);
+        assert_eq!(report.working_set_peak_bytes, Some(9_999));
+        assert!(report.pass);
+
+        let mut over = PeakInput::test_defaults();
+        over.x_bytes = 101;
+        over.baseline_private_bytes = 1_000;
+        over.self_peak_private_bytes = 1_107;
+        over.external_peak_private_bytes = 1_000;
+        let report = evaluate_peak(over).unwrap();
+        assert_eq!(report.excess_bytes, 1);
+        assert!(!report.pass);
+    }
+
+    #[test]
+    fn peak_gate_rejects_bytes_that_pass_without_verified_commit_order() {
+        let mut input = PeakInput::test_defaults();
+        input.commit_order_verified = false;
+        let report = evaluate_peak(input).unwrap();
+        assert!(report.actual_peak_increment_bytes <= report.allowed_peak_increment_bytes as i128);
+        assert!(!report.commit_order_verified);
+        assert!(!report.pass);
+    }
 
     #[test]
     fn peak_hard_limit_rejects_one_byte_excess() {
@@ -1054,7 +1407,8 @@ mod tests {
             .enter_memory_mode(&AtomicBool::new(false), LoadOptions::default(), |_| {})
             .unwrap_err();
         assert!(error.contains("50 MiB"));
-        document.set_cell(0, 0, "9".into()).unwrap();
+        let original_first = document.rows(0, 1)[0][0].clone();
+        document.insert_column(1, "note".into()).unwrap();
         let events = Mutex::new(Vec::new());
         document
             .save_with_ram_observer(&destination, LoadOptions::default(), |event| {
@@ -1062,6 +1416,7 @@ mod tests {
             })
             .unwrap();
         assert!(destination.exists());
+        assert_eq!(document.rows(0, 1)[0][..2], [original_first, String::new()]);
         assert!(sample_current_process().unwrap().private_bytes > 0);
         assert_eq!(
             DiagnosticDocument::live_reserved_bytes(),
@@ -1175,6 +1530,9 @@ mod tests {
         let outcome = execute_operation(&mut document, &config, &sampler).unwrap();
         assert_eq!(outcome.x_bytes, file_bytes);
         assert_eq!(outcome.iterations, 1);
+        // 转换计时来自 ReserveBegin→Finished，必须真实非零。
+        assert!(outcome.phase_timings.convert_ms > 0);
+        assert!(outcome.phase_timings.total_ms >= outcome.phase_timings.convert_ms);
         let samples = sampler.finish().unwrap();
         assert!(samples.count > 4);
         assert!(samples.private_peak_bytes > 0);
@@ -1284,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn save_releases_old_ram_before_new_reserve_and_uses_larger_x() {
+    fn save_materializes_ram_once_before_disk_commit_and_uses_larger_x() {
         let _serial = REAL_MEMORY_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -1305,15 +1663,88 @@ mod tests {
         let sampler = super::SelfSampler::default();
         let outcome = super::execute_operation(&mut document, &config, &sampler).unwrap();
         assert_eq!(outcome.iterations, 1);
-        assert!(outcome.old_ram_released_before_new_reserve);
+        assert!(outcome.commit_order_verified);
+        // 50 MiB 真实两遍物化与写盘：各阶段计时必须来自真实区间而不是全零。
+        assert!(outcome.phase_timings.count_ms > 0);
+        assert!(outcome.phase_timings.ram_generation_ms > 0);
+        assert!(outcome.phase_timings.disk_write_ms > 0);
+        assert!(outcome.phase_timings.total_ms > 0);
         let destination = config.file.with_extension("save.csv");
         let expected_x = std::fs::metadata(&config.file)
             .unwrap()
             .len()
-            .max(std::fs::metadata(destination).unwrap().len());
+            .max(std::fs::metadata(&destination).unwrap().len());
         assert_eq!(outcome.x_bytes, expected_x);
+        let destination_bytes = std::fs::metadata(&destination).unwrap().len();
+        // `save` 只编辑单元格：夹具首行是表头（原样保留），首个数据行
+        // `0000000`+LF 与 `edited`+CRLF 等长，因此这里不断言文件增大；
+        // 插列导致的增大由 `column-save` 场景单独验证。
+        assert!(destination_bytes >= std::fs::metadata(&config.file).unwrap().len());
         assert!(sampler.finish().unwrap().count > 0);
-        assert_eq!(document.rows(0, 1)[0][0], "9");
+        // 新 `save` 场景只编辑单元格，不插列：首行首列必须变成编辑后的值。
+        assert_eq!(document.rows(0, 1)[0][0], "edited");
+    }
+
+    /// 与 `run_child_with_io` 一致，在场景前进入内存模式，只测量持久操作本身。
+    fn enter_memory_mode_for_test(document: &mut simpletable_lib::diagnostics::DiagnosticDocument) {
+        use simpletable_lib::diagnostics::LoadOptions;
+        use std::sync::atomic::AtomicBool;
+
+        assert!(document
+            .enter_memory_mode(
+                &AtomicBool::new(false),
+                LoadOptions {
+                    workers: 2,
+                    ..LoadOptions::default()
+                },
+                |_| {},
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn save_retry_reuses_ram_without_second_materialization() {
+        let _serial = REAL_MEMORY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        let (mut document, config) = make_real_document("save-retry", super::Scenario::SaveRetry);
+        enter_memory_mode_for_test(&mut document);
+        let sampler = super::SelfSampler::default();
+        // 内部按 expected_materializations == 1 校验：第二次保存若重新物化会直接报错。
+        let outcome = super::execute_operation(&mut document, &config, &sampler).unwrap();
+        assert!(outcome.commit_order_verified);
+        assert_eq!(outcome.iterations, 1);
+        assert_eq!(document.rows(0, 1)[0][0], "edited");
+        let destination = config.file.with_extension("save.csv");
+        assert!(std::fs::metadata(&destination).unwrap().len() > 0);
+        assert!(sampler.finish().unwrap().count > 0);
+    }
+
+    #[test]
+    fn column_apply_materializes_ram_without_touching_source_file() {
+        let _serial = REAL_MEMORY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        let (mut document, config) =
+            make_real_document("column-apply", super::Scenario::ColumnApply);
+        enter_memory_mode_for_test(&mut document);
+        let before = std::fs::metadata(&config.file).unwrap();
+        let before_modified = before.modified().unwrap();
+        let sampler = super::SelfSampler::default();
+        // 内部校验零个磁盘事件、恰好一次 RAM 物化，且源文件大小与 mtime 不变。
+        let outcome = super::execute_operation(&mut document, &config, &sampler).unwrap();
+        assert!(outcome.commit_order_verified);
+        assert!(outcome.phase_timings.count_ms > 0);
+        assert!(outcome.phase_timings.ram_generation_ms > 0);
+        // 只整理 RAM 的场景不得出现磁盘写入耗时。
+        assert_eq!(outcome.phase_timings.disk_write_ms, 0);
+        let after = std::fs::metadata(&config.file).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().unwrap(), before_modified);
+        assert_eq!(document.rows(0, 1)[0][..2], ["0000000", ""]);
+        assert!(sampler.finish().unwrap().count > 0);
     }
 }
 
@@ -1409,7 +1840,7 @@ mod protocol_tests {
         assert!(ready.reserved_bytes >= file_bytes as usize);
         let result: super::ChildResult =
             serde_json::from_str(lines.next().unwrap().strip_prefix("RESULT ").unwrap()).unwrap();
-        assert!(result.outcome.old_ram_released_before_new_reserve);
+        assert!(result.outcome.commit_order_verified);
         assert!(result.self_samples.count > 0);
         assert!(lines.next().is_none());
     }

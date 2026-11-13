@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  BIG_WRITE_PHASES,
   DEFAULT_NEW_COLS,
   DEFAULT_NEW_ROWS,
   MAX_NEW_COLS,
@@ -10,6 +11,13 @@ import {
   fixedPointMessage,
   normalizeNewTableSize,
 } from "../frontend/js/dialogs.js";
+
+test("大文件写入阶段区分正文计算、RAM、磁盘和原子换名", () => {
+  assert.deepEqual(BIG_WRITE_PHASES, [
+    "正在计算正文…", "正在整理内存…", "正在写入磁盘…", "正在完成原子换名…",
+  ]);
+  assert.equal(BIG_WRITE_PHASES.some((text) => text.includes("重建行索引")), false);
+});
 
 test("新建表格：默认 5 列 × 60 行", () => {
   assert.equal(DEFAULT_NEW_COLS, 5);

@@ -337,6 +337,41 @@ test("saveAs 把目标路径交给引擎，并按保存语义复位视图", asyn
 });
 
 
+function makeSaveErrorModel(message) {
+  const calls = [];
+  const counts = { refreshes: 0, dataEvents: 0 };
+  const model = new BigModel({
+    invoke: async (cmd) => {
+      calls.push(cmd);
+      if (cmd === "big_save") throw new Error(message);
+      throw new Error("unexpected " + cmd);
+    },
+    listen: async () => () => {},
+  });
+  model._sid = 1;
+  model._lease = 1;
+  model._filterOn = true;
+  model._filterCount = 1;
+  model._refreshMeta = async () => { counts.refreshes += 1; };
+  model._emitData = () => { counts.dataEvents += 1; };
+  return { model, calls, counts };
+}
+
+test("RAM 提交后磁盘失败刷新新正文视图并保留错误", async () => {
+  const { model, counts } = makeSaveErrorModel("RAM_COMMITTED:写入临时文件失败");
+  await assert.rejects(model.save(), /RAM_COMMITTED:写入临时文件失败/);
+  assert.deepEqual(counts, { refreshes: 1, dataEvents: 1 });
+  assert.equal(model.filterActive(), false);
+});
+
+test("RAM 提交前保存错误不刷新旧现场", async () => {
+  const { model, counts } = makeSaveErrorModel("第二遍正文长度不一致");
+  await assert.rejects(model.save(), /第二遍正文长度不一致/);
+  assert.deepEqual(counts, { refreshes: 0, dataEvents: 0 });
+  assert.equal(model.filterActive(), true);
+});
+
+
 function makeFixedPointSaveModel(confirm, first, retry) {
   const calls = [];
   let refreshes = 0;
@@ -511,6 +546,98 @@ test("列操作 pending 后元数据刷新由引擎视图映射（mock 不映射
   assert.equal(outcome?.changed, true);
   const apply = calls.find(([c]) => c === "big_col_apply");
   assert.deepEqual(apply[1].approval, { allowFixedPoint: false, preflightId: null });
+});
+
+/**
+ * 造一个真正按 pending 列映射返回数据的引擎：插入后视图行多一个空列。
+ *
+ * @returns {{model: BigModel, state: {pending: boolean, calls: Array}}} 模型与可变状态。
+ */
+function makePendingColumnEngine() {
+  const source = Array.from({ length: 10 }, (_, r) => [`r${r}c0`, `r${r}c1`]);
+  const state = { pending: false, calls: [] };
+  const meta = () => ({
+    rows: source.length,
+    cols: state.pending ? 3 : 2,
+    headers: state.pending ? ["h0", "列3", "h1"] : ["h0", "h1"],
+    encoding: "utf-8",
+    pending_cols: state.pending,
+    can_undo: false, can_redo: false, modified: false, headerless: false,
+    indexing: false, indexed_bytes: 1024, total_bytes: 1024,
+    open_ms: 1, index_ms: 1, elapsed_ms: 1,
+  });
+  const model = new BigModel({
+    invoke: async (cmd, args = {}) => {
+      state.calls.push([cmd, args]);
+      switch (cmd) {
+        case "big_open":
+          return { session: 1, lease: 1, meta: meta() };
+        case "big_set_undo_budget":
+        case "big_meta":
+          return meta();
+        case "big_rows": {
+          const from = Number(args.from);
+          const count = Number(args.count);
+          return source.slice(from, from + count).map((row) =>
+            state.pending ? ["", ...row] : [...row]);
+        }
+        case "big_col_push":
+          state.pending = true;
+          return null;
+        case "big_col_pop":
+        case "big_col_clear":
+          state.pending = false;
+          return null;
+        default:
+          return null;
+      }
+    },
+    listen: async () => () => {},
+  });
+  return { model, state };
+}
+
+test("插入列 pending 后行缓存失效并按新列映射重新取页", async () => {
+  const { model } = makePendingColumnEngine();
+  await model.open("/x.csv");
+  model.prefetchRange(0, 0);
+  await waitFor(() => model.hasData(0, 0), "首屏取页");
+  assert.equal(model.displayData(0, 1), "r0c1");
+
+  await model.insertColumns(0, 1);
+  assert.deepEqual(model.headers(), ["h0", "列3", "h1"]);
+  await waitFor(() => model.displayData(0, 1) === "r0c0", "按视图映射重新取页");
+  assert.equal(model.displayData(0, 0), "", "新插入列应立即显示为空列");
+  assert.equal(model.displayData(0, 1), "r0c0", "原首列应右移到视图第 2 列");
+  assert.equal(model.displayData(0, 2), "r0c1");
+});
+
+test("撤销 pending 列操作后行缓存失效并回到原列映射", async () => {
+  const { model } = makePendingColumnEngine();
+  await model.open("/x.csv");
+  await model.insertColumns(0, 1);
+  model.prefetchRange(0, 0);
+  await waitFor(() => model.hasData(0, 0), "插入后取页");
+  assert.equal(model.displayData(0, 1), "r0c0");
+
+  await model.popColOp();
+  assert.deepEqual(model.headers(), ["h0", "h1"]);
+  await waitFor(() => model.displayData(0, 1) === "r0c1", "撤销后重新取页");
+  assert.equal(model.displayData(0, 1), "r0c1", "撤销后第 2 列应回到原第 2 列");
+});
+
+test("清空 pending 列操作后行缓存失效并回到原列映射", async () => {
+  const { model } = makePendingColumnEngine();
+  await model.open("/x.csv");
+  await model.insertColumns(0, 1);
+  model.prefetchRange(0, 0);
+  await waitFor(() => model.hasData(0, 0), "插入后取页");
+  assert.equal(model.displayData(0, 1), "r0c0");
+
+  await model.clearColOps();
+  assert.deepEqual(model.headers(), ["h0", "h1"]);
+  await waitFor(() => model.displayData(0, 1) === "r0c1", "清空后重新取页");
+  assert.equal(model.displayData(0, 1), "r0c1", "清空后第 2 列应回到原第 2 列");
 });
 
 function makeFixedPointColumnModel(confirm, first, retry) {

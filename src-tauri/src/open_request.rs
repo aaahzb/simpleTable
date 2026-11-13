@@ -485,6 +485,30 @@ impl OpenRequestQueue {
         }
     }
 
+    /// 同路径会话替换（重载）时把打开归属转移到新会话。
+    ///
+    /// 旧会话先按 `remove_session` 遗忘；若旧会话原本被追踪且新文档有路径，
+    /// 则以新会话重新登记该路径，避免外部窗口误判“未打开”而创建第二份会话。
+    pub fn replace_session(
+        &mut self,
+        old: u64,
+        session: u64,
+        owner: &str,
+        path: Option<&Path>,
+    ) {
+        let tracked = self.opened.values().any(|opened| opened.session == old);
+        self.remove_session(old);
+        if let (true, Some(path)) = (tracked, path) {
+            self.opened.insert(PathKey::new(path), Opened {
+                session,
+                owner: owner.to_string(),
+                path: path.to_path_buf(),
+                transferring: false,
+                waiters: 0,
+            });
+        }
+    }
+
     pub fn remove_session(&mut self, session: u64) {
         let removed: HashSet<PathKey> = self.opened.iter()
             .filter(|(_, opened)| opened.session == session)

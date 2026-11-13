@@ -14,6 +14,13 @@ pub enum RegionEvent {
     Enabled { offset: usize, len: usize },
 }
 
+/// 一段预计算的绝对字节区间，用于并行直写新正文。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeSpan {
+    pub offset: usize,
+    pub len: usize,
+}
+
 /// 已预留但尚未完整写入的连续私有内存区域。
 pub struct RamRegion {
     base: NonNull<u8>,
@@ -21,6 +28,8 @@ pub struct RamRegion {
     enabled_bytes: AtomicUsize,
     written_bytes: AtomicUsize,
     started: bool,
+    /// 已进入预计算区间并行写入模式；两种写入方式互斥。
+    range_mode: bool,
     enable_fault_at: Option<usize>,
 }
 
@@ -46,6 +55,18 @@ pub fn live_reserved_bytes() -> usize {
     LIVE_RESERVED_BYTES.load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// 本线程创建且尚未释放的预留字节数；并发测试之间互不干扰。
+    static THREAD_RESERVED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 返回本线程当前持有的预留字节数，仅供内存记账测试使用。
+#[cfg(test)]
+pub fn thread_reserved_bytes() -> usize {
+    THREAD_RESERVED_BYTES.with(|bytes| bytes.get())
+}
+
 impl RamRegion {
     /// 预留 `len` 字节的连续地址；失败时不影响调用方现有后备。
     pub fn reserve(len: usize) -> Result<Self, String> {
@@ -63,12 +84,15 @@ impl RamRegion {
         }
         let base = os::reserve(len)?;
         LIVE_RESERVED_BYTES.fetch_add(len, Ordering::Relaxed);
+        #[cfg(test)]
+        THREAD_RESERVED_BYTES.with(|bytes| bytes.set(bytes.get() + len));
         Ok(Self {
             base,
             len,
             enabled_bytes: AtomicUsize::new(0),
             written_bytes: AtomicUsize::new(0),
             started: false,
+            range_mode: false,
             enable_fault_at,
         })
     }
@@ -173,6 +197,166 @@ impl RamRegion {
         }
     }
 
+    /// 用有界 scoped threads 并行写入预计算的不相交区间。
+    ///
+    /// 区间必须从偏移 0 起精确铺满整个区域：相邻区间无间隙、无重叠，
+    /// 最后一个区间恰好结束于区域长度。所有校验都在标记 `started` 之前完成，
+    /// 失败时区域仍可走顺序 [`RamRegion::append`]。
+    ///
+    /// 调用线程在等待工作线程期间反复调用 `poll`，使进度回调无需跨线程。
+    ///
+    /// # Parameters
+    /// - `ranges`: 覆盖整个区域的预计算区间表。
+    /// - `workers`: 并行度；大于区间数时按区间数截断。
+    /// - `observer`: 区域阶段事件回调，可从多个线程调用。
+    /// - `writer`: 接收区间下标与独占切片；仅在返回 `Ok` 时累计写入字节。
+    /// - `poll`: 调用线程等待期的轮询钩子。
+    ///
+    /// # Returns
+    /// 所有区间都成功写入时返回 `Ok(())`。
+    ///
+    /// # Errors
+    /// 区间校验失败、平台提交失败、故障注入或任一 writer 失败时返回首个错误。
+    pub fn for_each_range_mut<F, O, P>(
+        &mut self,
+        ranges: &[RangeSpan],
+        workers: usize,
+        observer: O,
+        writer: F,
+        mut poll: P,
+    ) -> Result<(), String>
+    where
+        F: Fn(usize, &mut [u8]) -> Result<(), String> + Sync,
+        O: Fn(RegionEvent) + Sync,
+        P: FnMut(),
+    {
+        if self.started {
+            return Err("内存区域已经开始写入".into());
+        }
+        if workers == 0 {
+            return Err("并行度必须大于 0".into());
+        }
+        if ranges.is_empty() {
+            return Err("范围表不能为空".into());
+        }
+        let mut cursor = 0usize;
+        for range in ranges {
+            if range.len == 0 {
+                return Err("范围长度必须大于 0".into());
+            }
+            let end = range
+                .offset
+                .checked_add(range.len)
+                .ok_or_else(|| "范围偏移溢出".to_string())?;
+            if range.offset != cursor {
+                return Err("范围表必须无间隙、无重叠且按偏移升序".into());
+            }
+            if end > self.len {
+                return Err("范围超出预留区域".into());
+            }
+            cursor = end;
+        }
+        if cursor != self.len {
+            return Err("范围表必须恰好覆盖整个内存区域".into());
+        }
+        self.started = true;
+        self.range_mode = true;
+        let shared = &*self;
+        let next = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        let error = Mutex::new(None::<String>);
+        let finished = AtomicUsize::new(0);
+        let count = workers.min(ranges.len()).max(1);
+        let record = |text: String| {
+            stop.store(true, Ordering::Relaxed);
+            let mut slot = error.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(text);
+            }
+        };
+        std::thread::scope(|scope| {
+            for worker in 0..count {
+                let writer = &writer;
+                let observer = &observer;
+                let record = &record;
+                let next = &next;
+                let stop = &stop;
+                let finished = &finished;
+                let spawned = std::thread::Builder::new()
+                    // 物化期间线程栈计入私有内存，64 MiB 门禁余量有限。
+                    .stack_size(512 * 1024)
+                    .spawn_scoped(scope, move || {
+                        observer(RegionEvent::WorkerBegin { worker });
+                        loop {
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            if index >= ranges.len() {
+                                break;
+                            }
+                            let range = ranges[index];
+                            observer(RegionEvent::BeforeEnable {
+                                offset: range.offset,
+                                len: range.len,
+                            });
+                            if let Some(fault) = shared.enable_fault_at {
+                                // 故障偏移落在区间内即注入，覆盖任意变长区间。
+                                if fault >= range.offset
+                                    && fault < range.offset + range.len
+                                {
+                                    record(format!("注入提交失败，偏移 {fault}"));
+                                    break;
+                                }
+                            }
+                            if let Err(text) =
+                                os::enable(shared.base, range.offset, range.len)
+                            {
+                                record(text);
+                                break;
+                            }
+                            shared
+                                .enabled_bytes
+                                .fetch_add(range.len, Ordering::Relaxed);
+                            observer(RegionEvent::Enabled {
+                                offset: range.offset,
+                                len: range.len,
+                            });
+                            // SAFETY: index 只发放一次，区间已校验互不相交且在预留区域内。
+                            let out = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    shared.base.as_ptr().add(range.offset),
+                                    range.len,
+                                )
+                            };
+                            if let Err(text) = writer(index, out) {
+                                record(text);
+                                break;
+                            }
+                            shared.written_bytes.fetch_add(range.len, Ordering::Relaxed);
+                            finished.fetch_add(1, Ordering::Relaxed);
+                        }
+                        observer(RegionEvent::WorkerEnd { worker });
+                    });
+                if spawned.is_err() {
+                    record("创建并行写入线程失败".into());
+                }
+            }
+            // 调用线程等待期间轮询进度；回调不会跨线程。
+            while finished.load(Ordering::Relaxed) < ranges.len()
+                && error.lock().unwrap().is_none()
+            {
+                poll();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+        if let Some(text) = error.into_inner().unwrap() {
+            Err(text)
+        } else {
+            Ok(())
+        }
+    }
+
     /// 只有完整写入才产生只读完成态；失败会消耗区域并由 Drop 释放。
     pub fn finish(self) -> Result<FinishedRam, String> {
         if self.written_bytes.load(Ordering::Relaxed) != self.len {
@@ -200,11 +384,73 @@ impl FinishedRam {
     }
 }
 
+impl RamRegion {
+    /// 顺序追加字节，按需以 64 KiB 为粒度提交目标私有页。
+    ///
+    /// # Parameters
+    /// - `bytes`: 待复制到当前写入末尾的连续字节。
+    ///
+    /// # Returns
+    /// 成功时完整复制输入；失败时不保证本次输入已部分复制，但既有写入保持有效。
+    ///
+    /// # Errors
+    /// 输入越过预留长度、偏移溢出或平台提交失败时返回错误。
+    pub fn append(&mut self, bytes: &[u8]) -> Result<(), String> {
+        const COMMIT_BYTES: usize = 64 * 1024;
+        if self.range_mode {
+            return Err("内存区域已经开始写入".into());
+        }
+        let initial = self.written_bytes.load(Ordering::Relaxed);
+        let end = initial
+            .checked_add(bytes.len())
+            .ok_or_else(|| "顺序写入长度溢出".to_string())?;
+        if end > self.len {
+            return Err("顺序写入超出预留区域".into());
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.started = true;
+        let mut written = initial;
+        let mut input_offset = 0usize;
+        while written < end {
+            let mut enabled = self.enabled_bytes.load(Ordering::Relaxed);
+            if written == enabled {
+                let commit_len = COMMIT_BYTES.min(self.len - written);
+                if self.enable_fault_at == Some(written) {
+                    return Err(format!("注入提交失败，偏移 {written}"));
+                }
+                os::enable(self.base, written, commit_len)?;
+                enabled = written + commit_len;
+                self.enabled_bytes.store(enabled, Ordering::Relaxed);
+            }
+            if written > enabled {
+                return Err("顺序写入提交水位异常".into());
+            }
+            let count = (end - written).min(enabled - written);
+            // SAFETY: &mut self 保证唯一写入，目标区间已提交且不越过预留长度。
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr().add(input_offset),
+                    self.base.as_ptr().add(written),
+                    count,
+                );
+            }
+            written += count;
+            input_offset += count;
+            self.written_bytes.store(written, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
 impl Drop for RamRegion {
     /// 释放整段平台区域并扣减隔离诊断计数。
     fn drop(&mut self) {
         os::free(self.base, self.len);
         LIVE_RESERVED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+        #[cfg(test)]
+        THREAD_RESERVED_BYTES.with(|bytes| bytes.set(bytes.get().saturating_sub(self.len)));
     }
 }
 
@@ -310,7 +556,7 @@ mod os {
 
 #[cfg(test)]
 mod tests {
-    use super::{FinishedRam, RamRegion, RegionEvent};
+    use super::{FinishedRam, RamRegion, RangeSpan, RegionEvent};
 
     #[test]
     fn parallel_chunks_cover_every_byte_and_finish() {
@@ -357,6 +603,196 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("injected write"));
         assert!(region.finish().unwrap_err().contains("尚未完整写入"));
+    }
+
+    #[test]
+    fn range_writer_fills_exact_ranges_and_finish_checks_total() {
+        let len = 13usize;
+        let ranges = [
+            RangeSpan { offset: 0, len: 5 },
+            RangeSpan { offset: 5, len: 7 },
+            RangeSpan { offset: 12, len: 1 },
+        ];
+        let mut expected = vec![0u8; len];
+        for (index, range) in ranges.iter().enumerate() {
+            for byte in &mut expected[range.offset..range.offset + range.len] {
+                *byte = (index * 10) as u8;
+            }
+        }
+        let events = std::sync::Mutex::new(Vec::new());
+        let mut region = RamRegion::reserve(len).unwrap();
+        region
+            .for_each_range_mut(
+                &ranges,
+                3,
+                |event| events.lock().unwrap().push(event),
+                |index, out| {
+                    out.fill((index * 10) as u8);
+                    Ok(())
+                },
+                || {},
+            )
+            .unwrap();
+        assert_eq!(region.enabled_bytes(), len);
+        let finished: FinishedRam = region.finish().unwrap();
+        assert_eq!(finished.as_slice(), expected.as_slice());
+        let events = events.into_inner().unwrap();
+        let begins = events
+            .iter()
+            .filter(|event| matches!(event, RegionEvent::WorkerBegin { .. }))
+            .count();
+        let ends = events
+            .iter()
+            .filter(|event| matches!(event, RegionEvent::WorkerEnd { .. }))
+            .count();
+        assert_eq!(begins, 3);
+        assert_eq!(ends, 3);
+        let enabled = events
+            .iter()
+            .filter(|event| matches!(event, RegionEvent::Enabled { .. }))
+            .count();
+        assert_eq!(enabled, ranges.len());
+    }
+
+    #[test]
+    fn range_writer_rejects_overlap_and_out_of_bounds() {
+        let len = 13usize;
+        let invalid: Vec<Vec<RangeSpan>> = vec![
+            vec![],
+            vec![RangeSpan { offset: 0, len: 0 }],
+            vec![RangeSpan { offset: 1, len: 12 }],
+            vec![
+                RangeSpan { offset: 0, len: 5 },
+                RangeSpan { offset: 6, len: 7 },
+            ],
+            vec![
+                RangeSpan { offset: 0, len: 5 },
+                RangeSpan { offset: 4, len: 9 },
+            ],
+            vec![RangeSpan { offset: 0, len: 12 }],
+            vec![
+                RangeSpan { offset: 0, len: 13 },
+                RangeSpan {
+                    offset: 13,
+                    len: 1,
+                },
+            ],
+            vec![RangeSpan {
+                offset: usize::MAX - 1,
+                len: 4,
+            }],
+        ];
+        for ranges in invalid {
+            let mut region = RamRegion::reserve(len).unwrap();
+            let error = region
+                .for_each_range_mut(&ranges, 1, |_| {}, |_, _| Ok(()), || {})
+                .unwrap_err();
+            assert!(
+                error.contains("范围") || error.contains("覆盖") || error.contains("溢出"),
+                "{ranges:?} -> {error}",
+            );
+            // 校验失败不得把区域标记为已开始写入。
+            region.append(&[0u8; 13]).unwrap();
+        }
+    }
+
+    #[test]
+    fn range_writer_injects_enable_fault_inside_range() {
+        let ranges = [
+            RangeSpan { offset: 0, len: 8 },
+            RangeSpan { offset: 8, len: 8 },
+        ];
+        let mut region = RamRegion::reserve_with_enable_fault(16, Some(8)).unwrap();
+        let error = region
+            .for_each_range_mut(&ranges, 2, |_| {}, |_, out| {
+                out.fill(1);
+                Ok(())
+            }, || {})
+            .unwrap_err();
+        assert!(error.contains("注入提交失败，偏移 8"), "{error}");
+        assert!(region.finish().unwrap_err().contains("尚未完整写入"));
+    }
+
+    #[test]
+    fn range_writer_credits_only_successful_ranges() {
+        let ranges = [
+            RangeSpan { offset: 0, len: 8 },
+            RangeSpan { offset: 8, len: 8 },
+        ];
+        let mut region = RamRegion::reserve(16).unwrap();
+        let error = region
+            .for_each_range_mut(
+                &ranges,
+                1,
+                |_| {},
+                |index, out| {
+                    if index == 1 {
+                        out[..4].fill(9);
+                        return Err("injected range".into());
+                    }
+                    out.fill(1);
+                    Ok(())
+                },
+                || {},
+            )
+            .unwrap_err();
+        assert!(error.contains("injected range"), "{error}");
+        assert_eq!(region.enabled_bytes(), 16);
+        assert!(region.finish().unwrap_err().contains("尚未完整写入"));
+    }
+
+    #[test]
+    fn range_writer_is_exclusive_with_append_and_chunk_api() {
+        let ranges = [RangeSpan {
+            offset: 0,
+            len: 16,
+        }];
+        let mut region = RamRegion::reserve(16).unwrap();
+        region
+            .for_each_range_mut(&ranges, 1, |_| {}, |_, out| {
+                out.fill(3);
+                Ok(())
+            }, || {})
+            .unwrap();
+        assert!(region.append(&[0]).unwrap_err().contains("已经开始写入"));
+        let error = region
+            .for_each_chunk_mut(8, 1, |_| {}, |_, out| {
+                out.fill(4);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.contains("已经开始写入"), "{error}");
+    }
+
+    #[test]
+    fn range_writer_handles_unaligned_boundaries() {
+        for _ in 0..20 {
+            let ranges = [
+                RangeSpan {
+                    offset: 0,
+                    len: 1000,
+                },
+                RangeSpan {
+                    offset: 1000,
+                    len: 1000,
+                },
+                RangeSpan {
+                    offset: 2000,
+                    len: 1000,
+                },
+            ];
+            let mut region = RamRegion::reserve(3000).unwrap();
+            region
+                .for_each_range_mut(&ranges, 3, |_| {}, |index, out| {
+                    out.fill(index as u8);
+                    Ok(())
+                }, || {})
+                .unwrap();
+            let finished = region.finish().unwrap();
+            assert_eq!(finished.as_slice().len(), 3000);
+            assert!(finished.as_slice()[1500] == 1);
+            assert!(finished.as_slice()[2999] == 2);
+        }
     }
 
     #[cfg(windows)]

@@ -74,6 +74,67 @@ fn enter_for_test(
 }
 
 #[test]
+fn save_ram_progress_covers_count_ram_disk_and_rename_phases() {
+    use engine::{SaveRamEvent, SaveRamPhase};
+
+    // 统一千分比刻度：阶段边界只前进不归零，整理 RAM 时进度条不会先到 100%。
+    let cases = vec![
+        (SaveRamPhase::CountBegin, (0, 1000, 0, 0)),
+        (
+            SaveRamPhase::CountFinished {
+                new_bytes: 10,
+                line_capacity: 4,
+                record_capacity: 3,
+            },
+            (100, 1000, 0, 0),
+        ),
+        (SaveRamPhase::HistoryPrepared, (100, 1000, 1, 0)),
+        (
+            SaveRamPhase::IndexPrepared {
+                line_capacity: 4,
+                record_capacity: 9,
+            },
+            (100, 1000, 1, 0),
+        ),
+        (SaveRamPhase::NewReserveBegin { new_bytes: 10 }, (100, 1000, 1, 0)),
+        (SaveRamPhase::NewRamReady { new_bytes: 10 }, (700, 1000, 1, 0)),
+        (SaveRamPhase::OldRamReleased { old_bytes: 8 }, (700, 1000, 1, 0)),
+        (SaveRamPhase::DiskWriteBegin { new_bytes: 10 }, (700, 1000, 2, 0)),
+        (
+            SaveRamPhase::DiskWriteFinished { new_bytes: 10 },
+            (990, 1000, 2, 0),
+        ),
+        (SaveRamPhase::DiskCommitted { new_bytes: 10 }, (1000, 1000, 3, 0)),
+    ];
+    let mut previous = 0;
+    for (phase, expected) in cases {
+        let mapped = save_ram_progress(SaveRamEvent::Phase(phase)).unwrap();
+        assert_eq!(mapped, expected);
+        assert!(mapped.0 >= previous, "阶段边界不得回退：{mapped:?}");
+        previous = mapped.0;
+    }
+}
+
+#[test]
+fn smoke_file_probe_returns_exact_metadata_and_bounded_prefix() {
+    let bytes = vec![b'x'; 5000];
+    let path = fixture("file-probe", &bytes);
+    let probe = smoke_file_probe(path.to_string_lossy().into_owned()).unwrap();
+    let expected_mtime = fs::metadata(&path)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .to_string();
+    assert_eq!(probe.size, 5000);
+    assert_eq!(probe.mtime_nanos, expected_mtime);
+    assert_eq!(probe.prefix.len(), 4096);
+    assert!(probe.prefix.iter().all(|byte| *byte == b'x'));
+}
+
+#[test]
 fn process_policy_prepare_failure_changes_no_document_or_future_default() {
     let runtime = SharedRuntime::default();
     let healthy = register_memory(&runtime, "main");
@@ -417,4 +478,131 @@ fn memory_mode_command_progress_event_uses_current_owner_and_lease() {
             assert_eq!((progress.done, progress.total), (1, 2));
         },
     ));
+}
+
+#[test]
+fn memory_mode_exit_rejects_materialized_unsaved_ram_until_disk_commit() {
+    let path = fixture("exit-unsaved-ram", b"name,age\r\nAlice,30\r\n");
+    let mut file = BigFile::open(&path).unwrap();
+    assert!(file
+        .enter_memory_mode_with_options(
+            &AtomicBool::new(false),
+            1,
+            LoadOptions::default(),
+            |_| {},
+        )
+        .unwrap());
+    file.push_col_op(ColOp::Insert { pos: 1, name: "empty".into() })
+        .unwrap();
+    assert!(file.apply_col_ops(Approval::deny()).unwrap().changed);
+    let rows_before = file.rows(0, 1);
+    let error = file.exit_memory_mode(Approval::deny()).unwrap_err();
+    assert!(error.starts_with("UNSAVED_RAM:"), "{error}");
+    assert_eq!(file.rows(0, 1), rows_before);
+    assert!(file.meta().memory_mode && file.meta().ram_backed && file.meta().modified);
+    assert!(file.save(Approval::deny(), |_, _, _, _| {}).unwrap().saved);
+    assert!(!file.modified());
+    let first = file.exit_memory_mode(Approval::deny()).unwrap();
+    if let Some(request) = first.fixed_point {
+        assert!(file
+            .exit_memory_mode(Approval::allow(request.preflight_id))
+            .unwrap()
+            .exited);
+    } else {
+        assert!(first.exited);
+    }
+    drop(file);
+    fs::remove_file(&path).ok();
+}
+
+/// 关闭文档会话必须同步忘记打开队列中的路径归属。
+///
+/// 回归：关掉标签后再次拖入同一文件，队列若仍发 `Activate` 指向已关闭的
+/// 会话，前端找不到对应标签，界面表现为“无法打开”。
+#[test]
+fn closing_document_forgets_open_path_so_same_file_reopens() {
+    let runtime = SharedRuntime::default();
+    let path = fixture("reopen-after-close", b"a,b\nx,y\n");
+    let doc = register_disk(&runtime, "main", &path);
+    let mut guard = runtime.lock().unwrap();
+    guard.opens.mark_ready("main");
+    let batch = guard.opens.enqueue(vec![path.clone()], "main").remove(0);
+    let crate::open_request::OpenItem::Open { request_id, .. } = batch.items[0] else {
+        panic!("首次打开必须生成 Open");
+    };
+    guard.opens.ack("main", batch.batch_id).unwrap();
+    guard
+        .opens
+        .complete_open(request_id, &path, doc.session, "main")
+        .unwrap();
+
+    close_document(&mut guard, doc.session, "main", doc.lease).unwrap();
+
+    let reopened = guard.opens.enqueue(vec![path.clone()], "main");
+    assert_eq!(reopened.len(), 1);
+    assert!(
+        matches!(
+            reopened[0].items[0],
+            crate::open_request::OpenItem::Open { .. }
+        ),
+        "关闭后拖入同一文件必须重新 Open，不得激活已关闭的会话"
+    );
+    fs::remove_file(&path).ok();
+}
+
+/// 同路径重载会替换文档会话，打开队列中的归属必须转移到新会话。
+///
+/// 否则重载后关签，队列仍指向更早的已关闭会话，同一文件再次拖入无法打开；
+/// 未转移时外部窗口也会误判“未打开”而创建第二份会话。
+#[test]
+fn replacing_document_session_rebinds_open_path_to_new_session() {
+    let runtime = SharedRuntime::default();
+    let path = fixture("reload-rebind", b"a,b\nx,y\n");
+    let first = register_disk(&runtime, "main", &path);
+    let mut guard = runtime.lock().unwrap();
+    guard.opens.mark_ready("main");
+    let batch = guard.opens.enqueue(vec![path.clone()], "main").remove(0);
+    let crate::open_request::OpenItem::Open { request_id, .. } = batch.items[0] else {
+        panic!("首次打开必须生成 Open");
+    };
+    guard.opens.ack("main", batch.batch_id).unwrap();
+    guard
+        .opens
+        .complete_open(request_id, &path, first.session, "main")
+        .unwrap();
+    drop(guard);
+
+    let second = register_new_document(
+        &runtime,
+        "main",
+        BigFile::open(&path).unwrap(),
+        Some(path.clone()),
+        Some(first.session),
+        Some(first.lease),
+    )
+    .unwrap();
+
+    let mut guard = runtime.lock().unwrap();
+    let rebound = guard.opens.enqueue(vec![path.clone()], "main");
+    assert_eq!(rebound.len(), 1);
+    assert!(
+        matches!(
+            rebound[0].items[0],
+            crate::open_request::OpenItem::Activate { session, .. } if session == second.session
+        ),
+        "重载后打开归属必须指向新会话"
+    );
+    guard.opens.ack("main", rebound[0].batch_id).unwrap();
+
+    close_document(&mut guard, second.session, "main", second.lease).unwrap();
+    let reopened = guard.opens.enqueue(vec![path.clone()], "main");
+    assert_eq!(reopened.len(), 1);
+    assert!(
+        matches!(
+            reopened[0].items[0],
+            crate::open_request::OpenItem::Open { .. }
+        ),
+        "重载并关签后同一文件必须重新 Open"
+    );
+    fs::remove_file(&path).ok();
 }

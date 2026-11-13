@@ -160,8 +160,22 @@ export async function runSmoke({ model: _model, grid, pane, invoke }) {
       sc.clientWidth, sc.clientHeight, sc.scrollWidth, sc.scrollHeight,
       cv.style.width, cv.style.height,
     ].join("|");
-    // 统一大引擎后启动渲染链全异步（RO/版本号/事件），先等空闲落定再测不动点
-    await sleep(80);
+    // 统一大引擎后启动渲染链全异步（RO/版本号/事件）。固定 sleep(80) 在
+    // 高负载启动时可能仍落在首帧收敛过程中（实测 release 偶发 940/747 →
+    // 955/762），所以改为按时间采样等待收敛：启动期允许短暂过渡，但
+    // 滚动条/画布若逐帧翻转则永远不会出现连续两次相同快照。
+    let previous = snap();
+    let stable = false;
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      await sleep(50);
+      grid.renderAll();
+      const current = snap();
+      if (current === previous) { stable = true; break; }
+      previous = current;
+    }
+    assert(stable, `空闲布局 2 s 内未收敛到不动点：${previous}`);
+    // 收敛后再验证同一轮渲染内的两次布局仍是不动点（原防翻转判据）。
     grid.renderAll();
     const first = snap();
     grid.renderAll();
@@ -5094,8 +5108,9 @@ x,y
 
       await operationModel.setData(0, 0, "a");
       assert(await window.__app.saveFile() === true, "内存模式普通保存应成功");
-      // 表头与编辑行重编码为 CRLF，相比原 LF 各增一字节；内容减三字节，净减一字节。
-      const savedBytes = MEMORY_CSV_BYTES - 1;
+      // 表头原始字节透传，保持 LF 不变；只有编辑行重编码为 CRLF
+      // （"aaaa"→"a" 减三字节、LF→CRLF 增一字节），净减两字节。
+      const savedBytes = MEMORY_CSV_BYTES - 2;
       const actualSavedBytes = await invoke("file_size", { path });
       assert(actualSavedBytes === savedBytes,
         `普通保存净减一字节（内容 -3、两个 CRLF +2）：期望 ${savedBytes}，实际 ${actualSavedBytes}`);
@@ -5138,6 +5153,41 @@ x,y
     } finally {
       if (pending && memoryFixedPointMask()) clickMemoryFixedPoint("取消");
       await cleanupMemoryScenario(pending, settingsChanged);
+    }
+  });
+
+  check("内存模式 64 MiB：列操作只物化 RAM，保存复用新正文", async () => {
+    let pending = null;
+    try {
+      const { path, operationModel } = await openMemoryCsv("columns-ram-only");
+      pending = window.__app.enterMemoryMode();
+      await confirmMemoryEnterDialog();
+      await awaitMemoryEntered(pending);
+      pending = null;
+      const diskBefore = await invoke("smoke_file_probe", { path });
+
+      await operationModel.insertColumns(1, 1);
+      const insertedHeader = operationModel.headers()[1];
+      await window.__app.applyColOps();
+      await waitFor(() => !operationModel.colOpsPending()
+        && operationModel.headers()[1] === insertedHeader
+        && operationModel.rawData(0, 1) === "", "列操作后的新 RAM 视图");
+      assert(window.__app.isDirty() === true, "列物化后必须保持未保存");
+      assert(operationModel.meta()?.modified === true, "引擎也必须报告未保存");
+      assert(operationModel.meta()?.ram_backed === true, "列物化不得退回 mmap");
+      const diskAfterApply = await invoke("smoke_file_probe", { path });
+      assert(JSON.stringify(diskAfterApply) === JSON.stringify(diskBefore),
+        "列物化不得改变源文件大小、mtime 或前缀");
+
+      assert(await window.__app.saveFile() === true, "新 RAM 应能直接保存");
+      await waitFor(() => !window.__app.isDirty()
+        && operationModel.meta()?.modified === false, "保存成功后的干净状态");
+      const diskAfterSave = await invoke("smoke_file_probe", { path });
+      assert(diskAfterSave.size > diskBefore.size, "插入空列后磁盘正文应增长");
+      assert(new TextDecoder().decode(new Uint8Array(diskAfterSave.prefix))
+        .includes(insertedHeader), "保存后的磁盘前缀必须包含新列表头");
+    } finally {
+      await cleanupMemoryScenario(pending);
     }
   });
 
