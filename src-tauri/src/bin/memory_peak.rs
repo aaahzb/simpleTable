@@ -1945,6 +1945,10 @@ mod parent_tests {
         use std::process::Command;
         use std::time::{SystemTime, UNIX_EPOCH};
 
+        // 与其余真实内存用例串行，避免并行争抢 CPU 把外部监测线程饿到只剩一次采样。
+        let _serial = super::tests::REAL_MEMORY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1995,7 +1999,13 @@ mod parent_tests {
         assert_eq!(report.file_bytes_x, 50 * 1024 * 1024);
         assert!(report.self_sample_count > 0);
         assert!(report.external_sample_count > 0);
-        assert!(report.monitor_max_interval_ms > 0);
+        // 子进程可能在监测线程完成第二次采样前结束；单次采样没有“间隔”可记录，
+        // 此时 0 是合法值。多次采样仍必须记录正间隔；周期采样本身由
+        // external_monitor_samples_real_pid_and_tracks_interval 覆盖。
+        assert!(
+            report.external_sample_count == 1 || report.monitor_max_interval_ms > 0,
+            "多次外部采样却未记录正间隔：{report:?}",
+        );
         assert!(String::from_utf8(console)
             .unwrap()
             .starts_with("PEAK PASS "));
