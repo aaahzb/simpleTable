@@ -103,7 +103,7 @@ CI 和 release 必须执行真实 release 硬断言并上传 JSON。Windows/macO
 - 进度：各块独占 `AtomicU64`，调用线程每 10 ms 汇总并经 80 ms 门限发事件；阶段终态无条件补发 `done == total`。
 - 测试：Rust lib 403 通过 / 0 失败 / 3 忽略（含并行物化与打开队列回归）；Node 277 通过 / 0 失败。既有字节精确测试全部保留通过，证明非内存路径零改动。
 
-64 MiB release `memory_peak`（workers=4，preload=false）三场景均 `pass=true`、`commit_order_verified=true`：
+64 MiB release `memory_peak`（workers=4，preload=false）三场景均 `pass=true`、`commit_order_verified=true`（下表中的 `column-apply` 与“第一次/第二次 apply”是 Task 17 的历史数据；方案 A 后内存模式列操作不再物化，新口径见下一节）：
 
 | 场景 | X | 105% 上限 | 采用峰值增量 | 余量 | count / generation / index |
 | --- | ---: | ---: | ---: | ---: | --- |
@@ -124,12 +124,45 @@ CI 和 release 必须执行真实 release 硬断言并上传 JSON。Windows/macO
 
 两版 exe 均由同一工作区源码构建，唯一差异是本次并行物化改动；两次运行使用同一份夹具副本，操作序列相同。`CHECK_FLOW {savedClean:true, waitedForApply:true, pathUnchanged:true}` 两版均通过。新版第二次 apply 的墙钟包含自动点击“确认固定点”对话框前的等待，顺序版同样包含。
 
+## 2026-11-14 内存模式列操作立即生效（方案 A）
+
+- 范围：只在持久内存模式改变列操作语义。插入/删除/重命名/追加列一次用户手势只调用一次 `big_col_commit`，后台 `commit_col_ops(ops, approval)` 在文档锁内按序 `push_col_op` 后提交一条 `Op::Columns`；`pending_cols` 始终为空，工具栏不再出现「执行列操作」「撤销列操作预览」。普通模式保持 pending 预览 + 手动执行列操作完全不变。
+- 正文不变：列提交只递增 revision/history_generation，`backing_identity()`、`ram_content_key`、`live_reserved_bytes` 和 `disk_body_dirty` 均不变；因此 2 GB 档列手势也是毫秒级。`apply_col_ops` 统一走 Schema-only 路径，删除原先的内存物化分支；`MaterializationOperation::Columns`/`MaterializationInput::columns` 仅保留给物化机制测试，标记为 dead_code 允许。
+- 保存才物化：Ctrl+S 时 `persistent_ram_is_current()` 因内容键不匹配而走 `MaterializationInput::save_current`，恰好一次 `NewRamReady`/`OldRamReleased`，随后顺序写盘；第二次保存内容键已当前，0 次物化。删除 Source 列的保存仍需固定点确认；退出内存模式只拒绝 `disk_body_dirty` 的已物化未写盘正文，纯 Schema 变更允许退出并保留视图与历史。
+- 保存时序：前端 `BigModel` 新增模型级列任务链 `_columnTask/_columnPending`，列手势按点击顺序串行；`save()`/`saveAs()` 仅在 `columnOpsBusy()` 时等待队列，空闲时不额外 `await`，避免把 `big_save` 登记推迟一个微任务而让互斥按钮短暂可用。`waitForColumnApply()` 同时等待旧普通模式任务与模型列任务。
+- headerless 修复：虚拟插列/删列后切换首行模式，`set_headerless(true)` 改为按 `before.visible()` 构造首行数据（`Source(col)→base_headers[col]`、`Inserted→""`），长度恒等于可见列数；全 Source 顺序路径输出字节不变。
+- 诊断：`memory_peak` 的 `column-apply` 期望改为 0 次物化、0 阶段事件、源文件 size/mtime 不变；`commit_order_verified` 支持 `expected_materializations == 0`。64 MiB release（workers=4，preload=false）三场景均 `pass=true`、`commit_order_verified=true`：
+
+| 场景 | X | 105% 上限 | 采用峰值增量 | 余量 | count / generation / disk |
+| --- | ---: | ---: | ---: | ---: | --- |
+| column-apply | 67108864 | 70464307 | 4096 | 70460211 | 0 / 0 / 0 ms |
+| column-save | 75496455 | 79271277 | 76263424 | 3007853 | 89 / 88 / 41 ms |
+| save | 67108864 | 70464307 | 67891200 | 2573107 | 14 / 24 / 36 ms |
+
+- 验证：Rust lib 407 通过 / 0 失败 / 3 忽略；memory_peak 21 通过 / 0 失败 / 1 忽略；Node 282 通过 / 0 失败；canonical `node scripts/verify-local.mjs` 重编 debug+release 后双 smoke 各 192 项通过、0 失败。内存模式四个列方法在成功时返回 `EditOutcome`，`columnOp` 因而能执行 `setDirty` 与“列操作已生效，可撤销；保存时整理正文”提示；新增 Node 回归覆盖四个手势的返回值。
+- 真实界面探针（Windows release exe，`src-tauri/target/ui-col-insert-probe/probe-scheme-a.mjs`）：在内存模式下删列后立即调 `saveFile()`，保存期间每 100 ms 心跳并采样 `file_size`（不碰文档锁）：
+
+| 夹具 | 操作 | 列手势墙钟 | 保存墙钟 | `file_size` 响应（列/保存） | 列手势前后源文件 | 输出 |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| 1.44 GB / 3200 万行 / 6 列 | 删“单价”→立即保存 | 7 ms | 15.4 s | 2 ms / 1 ms | size 与 mtime 不变 | 1,294,453,746 字节，与独立逐行计算一致 |
+| 1.17 GB / 3200 万行 / 5 列（上一行输出） | 再删“数量”→立即保存 | 5 ms | 12.6 s | 2 ms / 1 ms | size 与 mtime 不变 | 与既有 4 列参考 `probe-flow-ref.csv` `cmp` 逐字节一致（`cmpStatus=0`） |
+| 2.29 GB / 1550 万行 / 8 列 | 删“user”→立即保存 | 6 ms | 11.4 s | 2 ms / 1 ms | size 与 mtime 不变 | 2,146,750,036 字节，与独立逐行计算一致 |
+
+三次保存都在删列后的第一次 Ctrl+S 完成固定点确认并恰好物化一次；界面心跳最大间隔分别为 115 / 115 / 113 ms，没有卡死。2.29 GB 夹具是授权文件 `E:\simpletable_hdd_test\bench_22gb.csv` 的独立副本，`price_j8888.csv` 未被读取或修改。探针日志与 `expected-sizes.mjs` 同目录保留。
+
 ## 打开队列的会话归属（2026-11-13 修复）
 
 - `OpenRequestQueue.opened` 记录“路径 → 会话”，重复拖入/打开同一路径时只发 `Activate`，避免创建第二个会话。
 - `big_close` 关闭文档会话时必须同步调用 `opens.remove_session(session)`（现由 `close_document` 统一完成）。只关文档不清理队列会让路径仍被判定为“已打开”，再次拖入时只发 `Activate` 指向已关闭会话；前端按会话/路径都找不到标签，界面表现为同一文件无法再打开。
 - 同路径重载会替换会话（`register_new_document` 的 replace 分支），旧会话关闭后必须让 `opens.replace_session` 把打开归属转移到新会话；否则重载再关签会留下更早的已关闭会话，同一文件仍然无法打开，外部窗口也会误判“未打开”而创建第二份会话。
 - 回归测试：`closing_document_forgets_open_path_so_same_file_reopens` 断言关闭后重新入队必须生成 `Open`；`replacing_document_session_rebinds_open_path_to_new_session` 断言重载后归属指向新会话且再关签后可重新 `Open`。真实界面探针 `probe-reopen-after-close.mjs` 执行“打开 → 点标签 × → 重新提交同一路径”，修复前超时失败、修复后新签打开。
+
+## macOS 打包找不到主程序（2026-11-14 修复）
+
+- 现象：`v2026.11.13.1` 的 macOS CD 在 `npx --yes @tauri-apps/cli@2 build --target aarch64-apple-darwin` 阶段直接失败：`failed to find main binary, make sure you have a package > default-run in the Cargo.toml file`。Windows 发布走 `cargo build --release`，所以只有 macOS 打包任务暴露。
+- 根因：`src/bin/memory_peak.rs` 让包拥有两个二进制（`simpletable` 和 `memory_peak`），而 `src-tauri/Cargo.toml` 没有声明主程序。Tauri CLI 2 在 cargo 元数据里无法判定哪个是应用主 binary，就在编译前退出。
+- 修复：在 `[package]` 增加 `default-run = "simpletable"`；不改二进制名、不改产物路径。`bundle identifier` 结尾 `.app` 只是警告，非本次失败原因；它同时决定 macOS bundle ID 与各平台应用数据目录，改动会迁移用户数据，未一并修改。
+- 验证：修复前用同一条 `npx --yes @tauri-apps/cli@2 build --debug --no-bundle` 复现原始错误；修复后在仓库根和 `src-tauri` 两个工作目录都能找到主程序并成功构建 `simpletable.exe`。`cargo build --release` 与 Rust lib 407 通过 / 3 忽略保持全绿。`aarch64-apple-darwin` 产物仍需 macOS runner 实际打包验证。
 
 ## 项目结构
 

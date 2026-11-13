@@ -542,8 +542,9 @@ fn checked_conversion_outcome(
 ///
 /// 参数：
 /// - `phases`：真实 observer 收集到的 `SaveRamPhase` 序列。
-/// - `expected_materializations`：允许出现的 `NewRamReady` 次数；正文未变化的重试必须仍为 1。
-/// - `require_disk_save`：是否要求磁盘写入与提交事件；只整理 RAM 的列操作必须为 `false`。
+/// - `expected_materializations`：允许出现的 `NewRamReady` 次数；正文未变化的重试必须仍为 1，
+///   方案 A 的纯列提交必须为 0（此时不得出现任何 RAM 或磁盘事件）。
+/// - `require_disk_save`：是否要求磁盘写入与提交事件；纯列提交必须为 `false`。
 ///
 /// 返回：物化次数精确、`NewRamReady` 先于 `OldRamReleased`，且磁盘事件符合要求时为 `true`。
 fn commit_order_verified(
@@ -560,6 +561,14 @@ fn commit_order_verified(
         .iter()
         .filter(|phase| matches!(phase, SaveRamPhase::NewRamReady { .. }))
         .count();
+    if expected_materializations == 0 {
+        // 列操作不再物化正文：不得出现任何 RAM 或磁盘阶段事件。
+        return materializations == 0
+            && ready.is_none()
+            && released.is_none()
+            && disk.is_none()
+            && committed.is_none();
+    }
     if materializations != expected_materializations
         || !matches!((ready, released), (Some(a), Some(b)) if a < b)
     {
@@ -650,16 +659,20 @@ fn execute_persistent_operation(
         }
     };
     let operation_started = Instant::now();
+    // 方案 A 的纯列提交没有任何保存阶段事件，observer 不会触发采样；
+    // 在操作起止各做一次真实进程采样，保证零事件场景仍有内存证据。
+    sampler.sample();
     match config.scenario {
         Scenario::Save => {
             document.set_cell(0, 0, "edited".into())?;
             document.save_with_ram_observer(&destination, load_options, &observe)?;
         }
         Scenario::ColumnApply => {
-            document.insert_column_with_ram_observer(1, "note".into(), &observe)?;
+            // 方案 A：列手势只提交 Schema，不物化正文、不产生 RAM 阶段事件。
+            document.insert_column(1, "note".into())?;
         }
         Scenario::ColumnSave => {
-            document.insert_column_with_ram_observer(1, "note".into(), &observe)?;
+            document.insert_column(1, "note".into())?;
             document.save_with_ram_observer(&destination, load_options, &observe)?;
         }
         Scenario::SaveRetry => {
@@ -680,6 +693,8 @@ fn execute_persistent_operation(
         }
         _ => unreachable!("只有四个持久内存场景进入此函数"),
     }
+    // 操作结束边界同样采样，覆盖零事件场景的峰值。
+    sampler.sample();
     // 结束 observer 对阶段容器的借用后才能取回真实事件序列。
     let _ = observe;
     let phases = phases
@@ -689,7 +704,13 @@ fn execute_persistent_operation(
         .into_inner()
         .map_err(|_| "阶段计时锁已中毒".to_string())?;
     phase_timings.total_ms = operation_started.elapsed().as_millis();
-    let verified = commit_order_verified(&phases, 1, requires_disk_save(config.scenario));
+    // 方案 A：column-apply 只提交 Schema，期望零次物化；保存场景各一次。
+    let expected_materializations = usize::from(config.scenario != Scenario::ColumnApply);
+    let verified = commit_order_verified(
+        &phases,
+        expected_materializations,
+        requires_disk_save(config.scenario),
+    );
     if !verified {
         return Err(format!("RAM/磁盘提交顺序不符：{phases:?}"));
     }
@@ -699,21 +720,22 @@ fn execute_persistent_operation(
             SaveRamPhase::NewRamReady { new_bytes } => Some(*new_bytes),
             _ => None,
         })
-        .ok_or("缺少 NewRamReady 字节数")?;
+        // 纯列提交没有新正文：以源文件字节作为基准规模。
+        .unwrap_or(source_bytes);
     let output_bytes = if requires_disk_save(config.scenario) {
         std::fs::metadata(&destination)
             .map_err(|error| format!("读取磁盘提交后的目标失败：{error}"))?
             .len()
     } else {
         let after = std::fs::metadata(&config.file)
-            .map_err(|error| format!("读取列物化后的源文件失败：{error}"))?;
+            .map_err(|error| format!("读取列提交后的源文件失败：{error}"))?;
         let after_modified = after
             .modified()
-            .map_err(|error| format!("读取列物化后的源文件 mtime 失败：{error}"))?;
+            .map_err(|error| format!("读取列提交后的源文件 mtime 失败：{error}"))?;
         if after.len() != source_bytes || after_modified != source_modified {
             return Err("执行列操作改变了源文件大小或 mtime".into());
         }
-        new_ram_bytes
+        source_bytes
     };
     if config.scenario == Scenario::ColumnSave && output_bytes <= source_bytes {
         return Err("真实插列保存后文件未增大".into());
@@ -1279,12 +1301,17 @@ mod tests {
     }
 
     #[test]
-    fn column_apply_commit_order_forbids_all_disk_events() {
+    fn column_apply_commit_order_requires_zero_events() {
+        // 方案 A：列操作只提交 Schema，不产生任何 RAM/磁盘阶段。
+        assert!(super::commit_order_verified(&[], 0, false));
         let ram_only = ordered_save_phases()[..2].to_vec();
-        assert!(super::commit_order_verified(&ram_only, 1, false));
+        assert!(
+            !super::commit_order_verified(&ram_only, 0, false),
+            "列操作不得再物化正文"
+        );
         assert!(!super::commit_order_verified(
             &ordered_save_phases(),
-            1,
+            0,
             false
         ));
     }
@@ -1722,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn column_apply_materializes_ram_without_touching_source_file() {
+    fn column_apply_is_schema_only_without_touching_source_file() {
         let _serial = REAL_MEMORY_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -1733,12 +1760,11 @@ mod tests {
         let before = std::fs::metadata(&config.file).unwrap();
         let before_modified = before.modified().unwrap();
         let sampler = super::SelfSampler::default();
-        // 内部校验零个磁盘事件、恰好一次 RAM 物化，且源文件大小与 mtime 不变。
+        // 方案 A：内部校验零次物化、零个磁盘事件，且源文件大小与 mtime 不变。
         let outcome = super::execute_operation(&mut document, &config, &sampler).unwrap();
         assert!(outcome.commit_order_verified);
-        assert!(outcome.phase_timings.count_ms > 0);
-        assert!(outcome.phase_timings.ram_generation_ms > 0);
-        // 只整理 RAM 的场景不得出现磁盘写入耗时。
+        assert_eq!(outcome.phase_timings.count_ms, 0);
+        assert_eq!(outcome.phase_timings.ram_generation_ms, 0);
         assert_eq!(outcome.phase_timings.disk_write_ms, 0);
         let after = std::fs::metadata(&config.file).unwrap();
         assert_eq!(after.len(), before.len());

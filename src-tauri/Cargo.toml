@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "simpleTable - 极速 CSV 表格工具（Tauri 版）"
 authors = ["aaahzb"]
 edition = "2021"
+default-run = "simpletable"
 
 [lib]
 name = "simpletable_lib"

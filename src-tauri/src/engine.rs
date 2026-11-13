@@ -12461,7 +12461,21 @@ impl BigFile {
         let next_base_headers = if target {
             generic_headers(headerless_schema.visible().len())
         } else {
-            cells.clone()
+            // base_headers 始终按 Source 存储槽保存；cells 按可见顺序。
+            // 关闭无列名时只更新可见 Source 列名，虚拟插入列没有物理槽，
+            // 不写入 base_headers，避免后续 Source(col) 取到错位的列名。
+            let mut next = self.base_headers.clone();
+            if next.len() < self.base_ncols {
+                next.resize(self.base_ncols, String::new());
+            }
+            for (id, value) in headerless_schema.visible().iter().zip(cells.iter()) {
+                if let Some(ColumnStorage::Source(slot)) = headerless_schema.storage(*id) {
+                    if let Some(entry) = next.get_mut(slot as usize) {
+                        *entry = value.clone();
+                    }
+                }
+            }
+            next
         };
 
         if self.partial.is_some() {
@@ -13446,7 +13460,21 @@ impl BigFile {
                 return Err("没有列可作为列名".into());
             }
             let block = u32::try_from(self.seg.blocks.len()).map_err(|_| "顶部块号溢出")?;
-            (RowId::Inserted { block, row: 0 }, self.base_headers.clone())
+            // base_headers 按 Source 存储槽保存；虚拟插入列没有顶部物理表头，
+            // 补空串，保证顶部数据行长度始终等于可见列数。
+            let cells = before
+                .visible()
+                .iter()
+                .map(|id| match before.storage(*id) {
+                    Some(ColumnStorage::Source(col)) => self
+                        .base_headers
+                        .get(col as usize)
+                        .cloned()
+                        .unwrap_or_default(),
+                    Some(ColumnStorage::Inserted(_)) | None => String::new(),
+                })
+                .collect::<Vec<_>>();
+            (RowId::Inserted { block, row: 0 }, cells)
         } else {
             if self.seg.vrow_count() == 0 {
                 return Err("没有数据行可作为列名".into());
@@ -14235,20 +14263,12 @@ impl BigFile {
         })
     }
 
-    /// 执行待执行列操作；非观察调用沿用空事件回调。
+    /// 执行待执行列操作：只提交 Schema 并写入撤销历史，不物化正文。
+    ///
+    /// 普通模式保留 pending 预览；内存模式的立即提交入口是
+    /// [`Self::commit_col_ops`]。两者最终都走这里，保证列操作永远只改
+    /// Schema——正文在保存时按内容键统一物化。
     pub fn apply_col_ops(&mut self, approval: Approval) -> Result<EditOutcome, String> {
-        self.apply_col_ops_observed(approval, &|_: SaveRamEvent| {})
-    }
-
-    /// 执行待执行列操作；普通文档只提交 Schema，持久内存文档原子物化新 RAM。
-    pub fn apply_col_ops_observed<O>(
-        &mut self,
-        approval: Approval,
-        observer: &O,
-    ) -> Result<EditOutcome, String>
-    where
-        O: Fn(SaveRamEvent) + Sync,
-    {
         if self.format.is_text_lines() {
             return Err("纯文本逐行文档固定一列，不支持列结构或列名修改".into());
         }
@@ -14274,30 +14294,6 @@ impl BigFile {
         } else if ncols == 0 {
             return Err("没有列：无法执行列操作".into());
         }
-        if self.memory_mode {
-            let input = materialize::MaterializationInput::columns(self, approval)?;
-            return match self.prepare_materialization(input, observer)? {
-                materialize::PrepareMaterialization::FixedPoint(request) => {
-                    let mut outcome = EditOutcome::unchanged();
-                    outcome.fixed_point = Some(request);
-                    Ok(outcome)
-                }
-                materialize::PrepareMaterialization::Ready(prepared) => {
-                    self.commit_ram(prepared, observer);
-                    // 提交后只做无失败清理；准备失败时 pending 预览始终保留。
-                    self.pending_cols.clear();
-                    self.pending_schema = None;
-                    self.last_spec = None;
-                    Ok(EditOutcome {
-                        changed: true,
-                        inserted_rows: 0,
-                        removed_rows: 0,
-                        fixed_point: None,
-                        cancelled: false,
-                    })
-                }
-            };
-        }
         let before = Arc::clone(&self.schema);
         let (mut prepared, fixed_point) = match self.preflight_history(
             Op::Columns { change: SchemaChange { before, after } },
@@ -14313,6 +14309,37 @@ impl BigFile {
         self.pending_schema = None;
         self.last_spec = None;
         self.finish_history(prepared, fixed_point, 0, 0)
+    }
+
+    /// 内存模式列手势：一次调用原子提交一批列操作并进入撤销历史。
+    ///
+    /// 与 pending 预览不同，提交成功时视图立即生效；正文、内容键与私有
+    /// 内存均保持不变，保存时再按当前 Schema 物化。任一 push/apply 失败
+    /// （包括固定点确认）都清空隐藏 pending，调用方可携带同一 preflight id
+    /// 重试整批操作。
+    ///
+    /// # Errors
+    /// 非内存模式、纯文本/排序/索引中或非法列操作时返回错误字符串。
+    pub fn commit_col_ops(
+        &mut self,
+        ops: Vec<ColOp>,
+        approval: Approval,
+    ) -> Result<EditOutcome, String> {
+        if !self.memory_mode {
+            return Err("列操作立即提交仅在内存模式下可用".into());
+        }
+        for op in ops {
+            if let Err(error) = self.push_col_op(op) {
+                self.clear_col_ops();
+                self.last_spec = None;
+                return Err(error);
+            }
+        }
+        let outcome = self.apply_col_ops(approval);
+        // 固定点、取消、失败都不得留下隐藏 pending。
+        self.clear_col_ops();
+        self.last_spec = None;
+        outcome
     }
 
 

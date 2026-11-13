@@ -13,7 +13,7 @@ use super::{
     tmp_path_for, Backing, BigFile, ColOp, FilterSpec, SaveRamEvent, SaveRamPhase, Schema,
     RAM_COMMITTED_ERROR,
 };
-use crate::history::{Approval, HistoryStats};
+use crate::history::{Approval, FixedPointKind, HistoryStats};
 use crate::ram_load::{LoadFault, LoadOptions};
 use std::fs;
 use std::path::PathBuf;
@@ -836,39 +836,260 @@ fn materialization_commit_installs_body_reuses_index_and_rebuilds_filter() {
 }
 
 #[test]
-fn memory_columns_materialize_ram_without_touching_disk() {
-    let (path, mut bf) = edited_memory_document("columns-ram-only");
+fn memory_column_commit_changes_schema_without_materializing_ram() {
+    let (path, mut bf) = edited_memory_document("columns-schema-only");
     let disk_before = fs::read(&path).unwrap();
     let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
-    let old_ram = bf.backing_identity();
-    bf.push_col_op(ColOp::Insert { pos: 1, name: "empty".into() })
-        .unwrap();
-    let events = Mutex::new(Vec::new());
+    let identity = bf.backing_identity();
+    let key = bf.ram_content_key.clone();
+    let reserved = thread_reserved_bytes();
+    let generation = bf.history_generation;
+    let undo_before = bf.history_stats().undo_count;
+
     let outcome = bf
-        .apply_col_ops_observed(Approval::deny(), &|event| {
-            events.lock().unwrap().push(event)
-        })
+        .commit_col_ops(
+            vec![ColOp::Insert { pos: 1, name: "empty".into() }],
+            Approval::deny(),
+        )
         .unwrap();
-    assert!(outcome.changed && bf.modified() && bf.disk_body_dirty);
+    assert!(outcome.changed && outcome.fixed_point.is_none());
     assert!(bf.pending_cols.is_empty() && bf.pending_schema.is_none());
-    assert_ne!(bf.backing_identity(), old_ram);
     assert_eq!(bf.view_headers(), ["name", "empty", "age", "city"]);
     assert_eq!(bf.rows(0, 1)[0], ["Alice", "", "31", "NY"]);
+    // 列提交只动 Schema：正文身份/内容键/私有内存/磁盘必须全部不变。
+    assert_eq!(bf.backing_identity(), identity);
+    assert_eq!(bf.ram_content_key, key);
+    assert_eq!(thread_reserved_bytes(), reserved, "列提交不得预留新正文区域");
+    assert!(!bf.disk_body_dirty, "列提交不得标记正文待写盘");
+    assert!(bf.modified(), "Schema 变更必须进入撤销历史并标脏");
+    assert_eq!(bf.history_generation, generation + 1);
+    assert_eq!(bf.history_stats().undo_count, undo_before + 1);
     assert_eq!(fs::read(&path).unwrap(), disk_before);
     assert_eq!(
         fs::metadata(&path).unwrap().modified().unwrap(),
         mtime_before
     );
+
+    // 撤销/重做只改 Schema，正文身份与内容键保持不变。
+    assert!(bf.undo());
+    assert_eq!(bf.view_headers(), ["name", "age", "city"]);
+    assert_eq!(bf.backing_identity(), identity);
+    assert_eq!(bf.ram_content_key, key);
+    assert!(bf.redo());
+    assert_eq!(bf.view_headers(), ["name", "empty", "age", "city"]);
+    assert_eq!(bf.backing_identity(), identity);
+    assert_eq!(bf.ram_content_key, key);
+    drop(bf);
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn memory_column_commit_save_materializes_exactly_once() {
+    let (path, mut bf) = edited_memory_document("columns-save-once");
+    let disk_before = fs::read(&path).unwrap();
+    bf.commit_col_ops(
+        vec![ColOp::Insert { pos: 1, name: "empty".into() }],
+        Approval::deny(),
+    )
+    .unwrap();
+    assert_eq!(bf.backing.bytes(), disk_before.as_slice(), "提交列不得改动正文");
+    let expected = b"name,empty,age,city\r\nAlice,,31,NY\r\nBob,,40,SF\r\n";
+    let events = Mutex::new(Vec::new());
+    let first = bf
+        .save_to_observed(
+            &path,
+            false,
+            Approval::deny(),
+            LoadOptions::default(),
+            |_, _, _, _| {},
+            |event| events.lock().unwrap().push(event),
+        )
+        .unwrap();
+    assert!(first.saved);
+    assert_eq!(fs::read(&path).unwrap(), expected);
+    assert_eq!(bf.backing.bytes(), &expected[..]);
+    assert!(bf.persistent_ram_is_current());
+
+    // 第二次保存内容键已当前：不得再物化。
+    let second = bf
+        .save_to_observed(
+            &path,
+            false,
+            Approval::deny(),
+            LoadOptions::default(),
+            |_, _, _, _| {},
+            |event| events.lock().unwrap().push(event),
+        )
+        .unwrap();
+    assert!(second.saved);
     let events = events.into_inner().unwrap();
-    assert!(events.iter().any(|event| matches!(
-        event,
-        SaveRamEvent::Phase(SaveRamPhase::NewRamReady { .. })
-    )));
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        SaveRamEvent::Phase(SaveRamPhase::DiskWriteBegin { .. })
-            | SaveRamEvent::Phase(SaveRamPhase::DiskCommitted { .. })
-    )));
+    let ready = events
+        .iter()
+        .filter(|event| matches!(
+            event,
+            SaveRamEvent::Phase(SaveRamPhase::NewRamReady { .. })
+        ))
+        .count();
+    let released = events
+        .iter()
+        .filter(|event| matches!(
+            event,
+            SaveRamEvent::Phase(SaveRamPhase::OldRamReleased { .. })
+        ))
+        .count();
+    assert_eq!((ready, released), (1, 1), "{events:?}");
+    let ready_at = position_of(&events, |event| {
+        matches!(event, SaveRamEvent::Phase(SaveRamPhase::NewRamReady { .. }))
+    });
+    let released_at = position_of(&events, |event| {
+        matches!(
+            event,
+            SaveRamEvent::Phase(SaveRamPhase::OldRamReleased { .. })
+        )
+    });
+    let disk_at = position_of(&events, |event| {
+        matches!(event, SaveRamEvent::Phase(SaveRamPhase::DiskWriteBegin { .. }))
+    });
+    let committed_at = position_of(&events, |event| {
+        matches!(event, SaveRamEvent::Phase(SaveRamPhase::DiskCommitted { .. }))
+    });
+    assert!(
+        ready_at < released_at && released_at < disk_at && disk_at < committed_at,
+        "{events:?}"
+    );
+    drop(bf);
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn memory_column_commit_handles_delete_source_column_fixed_point() {
+    let path = fixture_path(
+        "columns-delete-source",
+        "csv",
+        b"name,age,city\r\nAlice,30,NY\r\nBob,40,SF\r\n",
+    );
+    let original = fs::read(&path).unwrap();
+    let mut bf = BigFile::open(&path).unwrap();
+    assert!(bf
+        .enter_memory_mode_for_test(&AtomicBool::new(false), |_| {})
+        .unwrap());
+    assert!(bf
+        .commit_col_ops(vec![ColOp::Delete { col: 1 }], Approval::deny())
+        .unwrap()
+        .changed);
+    let headers = bf.view_headers();
+    let rows = bf.rows(0, 2);
+    let first = bf.save(Approval::deny(), |_, _, _, _| {}).unwrap();
+    assert!(!first.saved);
+    let request = first
+        .fixed_point
+        .expect("删除 Source 列的保存必须请求固定点");
+    assert_eq!(request.kind, FixedPointKind::SaveTransform);
+    assert_eq!(fs::read(&path).unwrap(), original);
+    let done = bf
+        .save(Approval::allow(request.preflight_id), |_, _, _, _| {})
+        .unwrap();
+    assert!(done.saved);
+    assert!(!bf.modified());
+    let reopened = BigFile::open(&path).unwrap();
+    assert_eq!(reopened.meta().headers, headers);
+    assert_eq!(reopened.rows(0, 2), rows);
+    drop(bf);
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn memory_column_commit_rejects_non_memory_and_never_leaves_pending() {
+    // 非内存文档拒绝“立即提交”，保证普通模式仍走 pending 预览。
+    let plain_path = fixture_path("columns-plain-reject", "csv", b"a,b\r\n1,2\r\n");
+    let mut plain = BigFile::open(&plain_path).unwrap();
+    let error = plain
+        .commit_col_ops(vec![ColOp::Insert { pos: 1, name: "x".into() }], Approval::deny())
+        .unwrap_err();
+    assert!(error.contains("内存模式"), "{error}");
+    assert!(plain.pending_cols.is_empty());
+    assert_eq!(plain.view_headers(), ["a", "b"]);
+
+    // push 阶段失败：无列名模式重命名被拒，不留下隐藏 pending，Schema 不动。
+    let head_path = fixture_path("columns-invalid-push", "csv", b"only\r\n1\r\n");
+    let mut headless = BigFile::open(&head_path).unwrap();
+    assert!(headless
+        .enter_memory_mode_for_test(&AtomicBool::new(false), |_| {})
+        .unwrap());
+    assert!(headless
+        .set_headerless(true, Approval::deny())
+        .unwrap()
+        .changed);
+    let before = headless.materialization_snapshot();
+    let error = headless
+        .commit_col_ops(
+            vec![ColOp::Rename { col: 0, name: "x".into() }],
+            Approval::deny(),
+        )
+        .unwrap_err();
+    assert!(error.contains("不可重命名"), "{error}");
+    assert_eq!(headless.materialization_snapshot(), before);
+    assert!(headless.pending_cols.is_empty() && headless.pending_schema.is_none());
+
+    // apply 阶段失败：无列名模式删到零列必须原子回滚，不移动历史栈。
+    let headers = headless.view_headers();
+    let rows = headless.rows(0, 2);
+    let history = headless.history_stats();
+    let error = headless
+        .commit_col_ops(vec![ColOp::Delete { col: 0 }], Approval::deny())
+        .unwrap_err();
+    assert!(error.contains("至少保留一列"), "{error}");
+    assert!(headless.pending_cols.is_empty() && headless.pending_schema.is_none());
+    assert_eq!(headless.view_headers(), headers);
+    assert_eq!(headless.rows(0, 2), rows);
+    assert_eq!(headless.history_stats(), history);
+    drop((plain, headless));
+    fs::remove_file(plain_path).ok();
+    fs::remove_file(head_path).ok();
+}
+
+#[test]
+fn headerless_toggle_after_virtual_column_ops_keeps_visible_columns_aligned() {
+    let path = fixture_path(
+        "headerless-virtual-columns",
+        "csv",
+        b"name,age\r\nAlice,30\r\nBob,40\r\n",
+    );
+    let mut bf = BigFile::open(&path).unwrap();
+    assert!(bf
+        .enter_memory_mode_for_test(&AtomicBool::new(false), |_| {})
+        .unwrap());
+    // 插入虚拟列后开启无列名：顶部数据行长度必须等于可见列数。
+    assert!(bf
+        .commit_col_ops(
+            vec![ColOp::Insert { pos: 1, name: "empty".into() }],
+            Approval::deny(),
+        )
+        .unwrap()
+        .changed);
+    assert!(bf.set_headerless(true, Approval::deny()).unwrap().changed);
+    assert!(bf.meta().headerless);
+    assert_eq!(bf.view_headers().len(), 3);
+    assert_eq!(
+        bf.rows(0, 1)[0],
+        ["name", "", "age"],
+        "虚拟列在顶部数据行必须是空串，Source 列保留原表头"
+    );
+
+    // 关闭后列名回到可见数据行，再删除一个 Source 列，重新开启仍对齐。
+    assert!(bf.set_headerless(false, Approval::deny()).unwrap().changed);
+    assert_eq!(bf.view_headers(), ["name", "", "age"]);
+    assert!(bf
+        .commit_col_ops(vec![ColOp::Delete { col: 0 }], Approval::deny())
+        .unwrap()
+        .changed);
+    assert!(bf.set_headerless(true, Approval::deny()).unwrap().changed);
+    assert_eq!(bf.view_headers().len(), 2);
+    assert_eq!(
+        bf.rows(0, 1)[0],
+        ["", "age"],
+        "删除 Source 列后顶部行仍按可见列对齐"
+    );
     drop(bf);
     fs::remove_file(path).ok();
 }
@@ -900,39 +1121,26 @@ fn memory_columns_fault_preserves_live_schema_and_pending_preview() {
 #[test]
 fn non_memory_columns_keep_schema_only_behavior() {
     let fixture = b"name,age,city\r\nAlice,30,NY\r\nBob,40,SF\r\n";
-    let old_path = fixture_path("columns-old-entry", "csv", fixture);
-    let new_path = fixture_path("columns-observed-entry", "csv", fixture);
-    let mut expected = BigFile::open(&old_path).unwrap();
-    let mut actual = BigFile::open(&new_path).unwrap();
-    expected
-        .push_col_op(ColOp::Insert { pos: 1, name: "empty".into() })
-        .unwrap();
+    let path = fixture_path("columns-schema-only", "csv", fixture);
+    let mut actual = BigFile::open(&path).unwrap();
     actual
         .push_col_op(ColOp::Insert { pos: 1, name: "empty".into() })
         .unwrap();
     let original = actual.backing_identity();
-    let events = Mutex::new(Vec::new());
 
-    let expected_outcome = expected.apply_col_ops(Approval::deny()).unwrap();
-    let actual_outcome = actual
-        .apply_col_ops_observed(Approval::deny(), &|event| {
-            events.lock().unwrap().push(event)
-        })
-        .unwrap();
-    assert_eq!(actual_outcome, expected_outcome);
+    let outcome = actual.apply_col_ops(Approval::deny()).unwrap();
+    assert!(outcome.changed);
+    // 普通模式仍只提交 Schema：mmap 后备、视图与撤销历史都保持既有语义。
     assert!(matches!(actual.backing, Backing::Mmap(_)));
     assert_eq!(actual.backing_identity(), original);
-    assert_eq!(actual.view_headers(), expected.view_headers());
-    assert_eq!(actual.rows(0, 2), expected.rows(0, 2));
-    assert!(events.into_inner().unwrap().iter().all(|event| !matches!(
-        event,
-        SaveRamEvent::Phase(SaveRamPhase::NewRamReady { .. })
-            | SaveRamEvent::Phase(SaveRamPhase::DiskWriteBegin { .. })
-            | SaveRamEvent::Phase(SaveRamPhase::DiskCommitted { .. })
-    )));
-    drop((expected, actual));
-    fs::remove_file(old_path).ok();
-    fs::remove_file(new_path).ok();
+    assert!(!actual.disk_body_dirty);
+    assert!(actual.pending_cols.is_empty() && actual.pending_schema.is_none());
+    assert_eq!(actual.view_headers(), ["name", "empty", "age", "city"]);
+    assert_eq!(actual.rows(0, 1)[0], ["Alice", "", "30", "NY"]);
+    assert_eq!(fs::read(&path).unwrap(), fixture);
+    assert_eq!(actual.history_stats().undo_count, 1);
+    drop(actual);
+    fs::remove_file(path).ok();
 }
 
 #[test]
@@ -946,13 +1154,12 @@ fn general_single_empty_insert_preserves_raw_records_and_never_reloads_temp() {
     assert!(file
         .enter_memory_mode_for_test(&AtomicBool::new(false), |_| {})
         .unwrap());
-    file.push_col_op(ColOp::Insert { pos: 1, name: "memo".into() })
-        .unwrap();
     let events = Mutex::new(Vec::new());
     assert!(file
-        .apply_col_ops_observed(Approval::deny(), &|event| {
-            events.lock().unwrap().push(event)
-        })
+        .commit_col_ops(
+            vec![ColOp::Insert { pos: 1, name: "memo".into() }],
+            Approval::deny(),
+        )
         .unwrap()
         .changed);
     let expected: Vec<u8> = [
@@ -960,13 +1167,14 @@ fn general_single_empty_insert_preserves_raw_records_and_never_reloads_temp() {
         &b"name,memo,age,note\r\n\"Alice\",,30,\"x,y\"\r\n\"bob\nb\",,25,\"say \"\"hi\"\"\"\r\nCarol,,35,plain"[..],
     ]
     .concat();
+    // 方案 A：提交列只改 Schema，正文仍是源字节；保存时才按原始字段风格物化。
     assert_eq!(
         file.backing.bytes(),
-        expected,
-        "列操作后 RAM 必须保持原始字段风格"
+        source.as_slice(),
+        "列提交不得改动 RAM 正文"
     );
     assert_eq!(fs::read(&path).unwrap(), source, "列操作尚未写盘");
-    let ram_identity = file.backing_identity();
+    let source_identity = file.backing_identity();
     assert!(file
         .save_to_observed(
             &path,
@@ -982,7 +1190,12 @@ fn general_single_empty_insert_preserves_raw_records_and_never_reloads_temp() {
         )
         .unwrap()
         .saved);
-    assert_eq!(file.backing_identity(), ram_identity);
+    assert_ne!(file.backing_identity(), source_identity, "保存必须物化新正文");
+    assert_eq!(
+        file.backing.bytes(),
+        expected,
+        "物化后的 RAM 必须保持原始字段风格"
+    );
     assert_eq!(fs::read(&path).unwrap(), expected);
     let events = events.into_inner().unwrap();
     let ready = position_of(&events, |event| {
@@ -1006,7 +1219,8 @@ fn general_single_empty_insert_preserves_raw_records_and_never_reloads_temp() {
                 SaveRamEvent::Phase(SaveRamPhase::NewRamReady { .. })
             ))
             .count(),
-        1
+        1,
+        "保存必须恰好物化一次正文"
     );
     drop(file);
     fs::remove_file(path).ok();
@@ -1020,18 +1234,17 @@ fn general_insert_irregular_records_uses_same_serializer_without_temp_reload() {
     assert!(file
         .enter_memory_mode_for_test(&AtomicBool::new(false), |_| {})
         .unwrap());
-    file.push_col_op(ColOp::Insert { pos: 1, name: "x".into() })
-        .unwrap();
     let events = Mutex::new(Vec::new());
     assert!(file
-        .apply_col_ops_observed(Approval::deny(), &|event| {
-            events.lock().unwrap().push(event)
-        })
+        .commit_col_ops(
+            vec![ColOp::Insert { pos: 1, name: "x".into() }],
+            Approval::deny(),
+        )
         .unwrap()
         .changed);
-    assert_eq!(file.backing.bytes(), b"a,x,b\r\n1,,\r\n2,,3\r\n");
+    // 提交列不得改写正文；保存时才物化出规整的 x 空列。
+    assert_eq!(file.backing.bytes(), source.as_slice());
     assert_eq!(fs::read(&path).unwrap(), source);
-    let identity = file.backing_identity();
     assert!(file
         .save_to_observed(
             &path,
@@ -1047,12 +1260,17 @@ fn general_insert_irregular_records_uses_same_serializer_without_temp_reload() {
         )
         .unwrap()
         .saved);
-    assert_eq!(file.backing_identity(), identity);
     assert_eq!(fs::read(&path).unwrap(), b"a,x,b\r\n1,,\r\n2,,3\r\n");
+    let events = events.into_inner().unwrap();
+    let ready_at = position_of(&events, |event| {
+        matches!(event, SaveRamEvent::Phase(SaveRamPhase::NewRamReady { .. }))
+    });
+    let released_at = position_of(&events, |event| {
+        matches!(event, SaveRamEvent::Phase(SaveRamPhase::OldRamReleased { .. }))
+    });
+    assert!(ready_at < released_at, "{events:?}");
     assert_eq!(
         events
-            .into_inner()
-            .unwrap()
             .iter()
             .filter(|event| matches!(
                 event,
@@ -1060,7 +1278,7 @@ fn general_insert_irregular_records_uses_same_serializer_without_temp_reload() {
             ))
             .count(),
         1,
-        "保存必须复用列操作已经物化的 RAM"
+        "保存必须恰好物化一次正文"
     );
     drop(file);
     fs::remove_file(path).ok();
@@ -1095,12 +1313,12 @@ fn general_insert_second_pass_fault_preserves_pending_and_old_ram() {
 #[test]
 fn general_insert_rename_fault_keeps_materialized_ram_dirty() {
     let (path, mut bf) = edited_memory_document("general-insert-rename-fault");
-    bf.push_col_op(ColOp::Insert { pos: 1, name: "empty".into() })
-        .unwrap();
-    bf.apply_col_ops_observed(Approval::deny(), &|_| {})
-        .unwrap();
-    let identity = bf.backing_identity();
-    let history = bf.history_stats();
+    bf.commit_col_ops(
+        vec![ColOp::Insert { pos: 1, name: "empty".into() }],
+        Approval::deny(),
+    )
+    .unwrap();
+    let source_identity = bf.backing_identity();
     let fixed_point = bf.fixed_point;
     let row_count = u32::try_from(bf.seg.vrow_count()).unwrap();
     let rows = bf.rows(0, row_count);
@@ -1110,6 +1328,7 @@ fn general_insert_rename_fault_keeps_materialized_ram_dirty() {
         std::process::id()
     ));
     fs::create_dir(&target).unwrap();
+    // 另存目标不可替换：保存先物化正文，再在换名阶段失败。
     let error = bf
         .save_to_observed(
             &target,
@@ -1122,17 +1341,37 @@ fn general_insert_rename_fault_keeps_materialized_ram_dirty() {
         .unwrap_err();
     assert!(error.starts_with(RAM_COMMITTED_ERROR), "{error}");
     assert!(bf.disk_body_dirty && bf.modified());
-    assert_eq!(
+    assert_ne!(
         bf.backing_identity(),
-        identity,
-        "重试写盘不得重新物化或读临时文件"
+        source_identity,
+        "保存失败前必须已经物化出新正文"
     );
-    assert_eq!(bf.history_stats(), history);
+    let identity = bf.backing_identity();
     assert_eq!(bf.fixed_point, fixed_point);
     assert_eq!(bf.rows(0, row_count), rows);
     assert_eq!(bf.path, path);
     assert_eq!(bf.backing_path, path);
     assert_eq!(fs::read(&path).unwrap(), disk);
+
+    // 重试写盘直接复用已物化的正文，不得再次物化或读临时文件。
+    let events = Mutex::new(Vec::new());
+    assert!(bf
+        .save_to_observed(
+            &path,
+            false,
+            Approval::deny(),
+            LoadOptions::default(),
+            |_, _, _, _| {},
+            |event| events.lock().unwrap().push(event),
+        )
+        .unwrap()
+        .saved);
+    assert_eq!(bf.backing_identity(), identity);
+    assert!(!events.into_inner().unwrap().iter().any(|event| matches!(
+        event,
+        SaveRamEvent::Phase(SaveRamPhase::NewRamReady { .. })
+            | SaveRamEvent::Phase(SaveRamPhase::OldRamReleased { .. })
+    )));
     fs::remove_file(tmp_path_for(&target)).ok();
     fs::remove_dir(&target).ok();
     drop(bf);

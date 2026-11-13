@@ -70,29 +70,13 @@ impl DiagnosticDocument {
             .map(|_| ())
     }
 
-    /// 通过生产列操作入口插入一个空列并提交 Schema。
+    /// 通过生产列操作入口插入一个空列并提交 Schema（不物化正文）。
     pub fn insert_column(&mut self, pos: u32, name: String) -> Result<(), String> {
-        self.insert_column_with_ram_observer(pos, name, |_| {})
-    }
-
-    /// 插入空列并转发列操作期间真实的 RAM 物化阶段。
-    pub fn insert_column_with_ram_observer<O>(
-        &mut self,
-        pos: u32,
-        name: String,
-        observer: O,
-    ) -> Result<(), String>
-    where
-        O: Fn(SaveRamEvent) + Sync,
-    {
         self.inner.push_col_op(ColOp::Insert { pos, name })?;
-        let outcome = self.inner.apply_col_ops_observed(
-            Approval {
-                allow_fixed_point: false,
-                preflight_id: None,
-            },
-            &observer,
-        )?;
+        let outcome = self.inner.apply_col_ops(Approval {
+            allow_fixed_point: false,
+            preflight_id: None,
+        })?;
         if outcome.changed {
             Ok(())
         } else {

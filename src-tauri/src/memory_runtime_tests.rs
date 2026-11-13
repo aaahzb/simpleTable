@@ -74,48 +74,6 @@ fn enter_for_test(
 }
 
 #[test]
-fn save_ram_progress_covers_count_ram_disk_and_rename_phases() {
-    use engine::{SaveRamEvent, SaveRamPhase};
-
-    // 统一千分比刻度：阶段边界只前进不归零，整理 RAM 时进度条不会先到 100%。
-    let cases = vec![
-        (SaveRamPhase::CountBegin, (0, 1000, 0, 0)),
-        (
-            SaveRamPhase::CountFinished {
-                new_bytes: 10,
-                line_capacity: 4,
-                record_capacity: 3,
-            },
-            (100, 1000, 0, 0),
-        ),
-        (SaveRamPhase::HistoryPrepared, (100, 1000, 1, 0)),
-        (
-            SaveRamPhase::IndexPrepared {
-                line_capacity: 4,
-                record_capacity: 9,
-            },
-            (100, 1000, 1, 0),
-        ),
-        (SaveRamPhase::NewReserveBegin { new_bytes: 10 }, (100, 1000, 1, 0)),
-        (SaveRamPhase::NewRamReady { new_bytes: 10 }, (700, 1000, 1, 0)),
-        (SaveRamPhase::OldRamReleased { old_bytes: 8 }, (700, 1000, 1, 0)),
-        (SaveRamPhase::DiskWriteBegin { new_bytes: 10 }, (700, 1000, 2, 0)),
-        (
-            SaveRamPhase::DiskWriteFinished { new_bytes: 10 },
-            (990, 1000, 2, 0),
-        ),
-        (SaveRamPhase::DiskCommitted { new_bytes: 10 }, (1000, 1000, 3, 0)),
-    ];
-    let mut previous = 0;
-    for (phase, expected) in cases {
-        let mapped = save_ram_progress(SaveRamEvent::Phase(phase)).unwrap();
-        assert_eq!(mapped, expected);
-        assert!(mapped.0 >= previous, "阶段边界不得回退：{mapped:?}");
-        previous = mapped.0;
-    }
-}
-
-#[test]
 fn smoke_file_probe_returns_exact_metadata_and_bounded_prefix() {
     let bytes = vec![b'x'; 5000];
     let path = fixture("file-probe", &bytes);
@@ -481,6 +439,50 @@ fn memory_mode_command_progress_event_uses_current_owner_and_lease() {
 }
 
 #[test]
+fn memory_mode_exit_allows_schema_only_column_changes() {
+    let path = fixture("exit-schema-only", b"name,age\r\nAlice,30\r\n");
+    let mut file = BigFile::open(&path).unwrap();
+    assert!(file
+        .enter_memory_mode_with_options(
+            &AtomicBool::new(false),
+            1,
+            LoadOptions::default(),
+            |_| {},
+        )
+        .unwrap());
+    assert!(file
+        .commit_col_ops(
+            vec![ColOp::Insert { pos: 1, name: "empty".into() }],
+            Approval::deny(),
+        )
+        .unwrap()
+        .changed);
+    assert_eq!(file.meta().headers, ["name", "empty", "age"]);
+    assert!(!file.meta().pending_cols, "内存模式列提交不得留下 pending");
+    assert!(file.meta().modified);
+    // 仅 Schema 变更未物化正文：允许退出，磁盘与视图/历史保持不变。
+    let exit = file.exit_memory_mode(Approval::deny()).unwrap();
+    assert!(exit.exited, "{exit:?}");
+    assert!(!file.meta().memory_mode);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"name,age\r\nAlice,30\r\n",
+        "退出内存模式不得改写磁盘"
+    );
+    assert_eq!(file.meta().headers, ["name", "empty", "age"]);
+    // 退出后撤销/重做仍可用，普通保存路径写入新列。
+    assert!(file.undo());
+    assert_eq!(file.meta().headers, ["name", "age"]);
+    assert!(file.redo());
+    assert_eq!(file.meta().headers, ["name", "empty", "age"]);
+    assert!(file.save(Approval::deny(), |_, _, _, _| {}).unwrap().saved);
+    assert_eq!(fs::read(&path).unwrap(), b"name,empty,age\r\nAlice,,30\r\n");
+    assert!(!file.modified());
+    drop(file);
+    fs::remove_file(&path).ok();
+}
+
+#[test]
 fn memory_mode_exit_rejects_materialized_unsaved_ram_until_disk_commit() {
     let path = fixture("exit-unsaved-ram", b"name,age\r\nAlice,30\r\n");
     let mut file = BigFile::open(&path).unwrap();
@@ -492,9 +494,24 @@ fn memory_mode_exit_rejects_materialized_unsaved_ram_until_disk_commit() {
             |_| {},
         )
         .unwrap());
-    file.push_col_op(ColOp::Insert { pos: 1, name: "empty".into() })
-        .unwrap();
-    assert!(file.apply_col_ops(Approval::deny()).unwrap().changed);
+    assert!(file
+        .commit_col_ops(
+            vec![ColOp::Insert { pos: 1, name: "empty".into() }],
+            Approval::deny(),
+        )
+        .unwrap()
+        .changed);
+    // 另存为指向不存在目录：正文物化成功、写盘失败，正文只存在于 RAM。
+    let missing = std::env::temp_dir()
+        .join(format!("st_exit_missing_{}", std::process::id()))
+        .join("out.csv");
+    let error = file
+        .save_as(&missing, Approval::deny(), |_, _, _, _| {})
+        .unwrap_err();
+    assert!(
+        error.starts_with(crate::engine::RAM_COMMITTED_ERROR),
+        "{error}"
+    );
     let rows_before = file.rows(0, 1);
     let error = file.exit_memory_mode(Approval::deny()).unwrap_err();
     assert!(error.starts_with("UNSAVED_RAM:"), "{error}");

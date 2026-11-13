@@ -205,90 +205,72 @@ test("RAM 提交后磁盘失败保留 dirty 并同步筛选和行数", async () 
   assert.match(errors[0][1], /请重试/);
 });
 
-test("内存模式列操作复用进度通道并保留未保存提示", async () => {
-  const dialogSets = [];
+test("applyColOpsNow 不再读取 meta().memoryMode，也不创建进度对话框", async () => {
+  const dirty = [];
   const statuses = [];
-  const dirtySyncs = [];
-  let subscriptions = 0;
-  let unsubscriptions = 0;
-  let closes = 0;
-  let finishes = 0;
+  let dialogs = 0;
   const context = {
     model: {
       colOpsPending: () => true,
       indexing: () => false,
       meta: () => ({ memoryMode: true }),
-      onProgress: async (listener) => {
-        subscriptions += 1;
-        listener(5, 10, 1, 0);
-        return () => { unsubscriptions += 1; };
-      },
+      onProgress: async () => { throw new Error("不得订阅内存进度"); },
       applyColOps: async () => ({ changed: true, cancelled: false }),
     },
-    progressDialog: (title) => {
-      assert.equal(title, "整理内存正文…");
-      return {
-        set: (...args) => dialogSets.push(args),
-        finish: async () => { finishes += 1; },
-        close: () => { closes += 1; },
-      };
+    progressDialog: () => {
+      dialogs += 1;
+      return { set() {}, close() {}, finish: async () => {} };
     },
-    setDirty: (value) => dirtySyncs.push(value),
+    setDirty: (value) => dirty.push(value),
     statusMsg: (text) => statuses.push(text),
     errorDialog: async (title, message) => { throw new Error(`${title}:${message}`); },
+    refreshBigUi: () => {},
+  };
+  const source = extractFunction(app, "applyColOpsNow");
+  assert.doesNotMatch(source, /memoryMode/, "持久模式没有 pending，字段分支是死代码");
+  vm.runInNewContext(source + "\nglobalThis.apply = applyColOpsNow;", context);
+  await context.apply();
+  assert.equal(dialogs, 0, "列操作预览只提交 Schema，不再有整理进度");
+  assert.deepEqual(dirty, [true]);
+  assert.deepEqual(statuses, ["列操作已应用，可撤销"]);
+});
+
+test("applyColOpsNow 无 pending 时直接返回，不读元数据", async () => {
+  let metaCalls = 0;
+  const context = {
+    model: {
+      colOpsPending: () => false,
+      indexing: () => false,
+      meta: () => { metaCalls += 1; return {}; },
+      applyColOps: async () => { throw new Error("不得调用"); },
+    },
+    setDirty: () => { throw new Error("不得标脏"); },
+    statusMsg: () => {},
+    errorDialog: async () => {},
     refreshBigUi: () => {},
   };
   vm.runInNewContext(
     extractFunction(app, "applyColOpsNow") + "\nglobalThis.apply = applyColOpsNow;", context);
   await context.apply();
-  assert.equal(subscriptions, 1);
-  assert.equal(unsubscriptions, 1);
-  assert.equal(finishes, 1, "成功后必须走完成帧，不能停在整理阶段的进度");
-  assert.equal(closes, 0);
-  assert.deepEqual(dialogSets, [[5, 10, 1, 0]]);
-  assert.deepEqual(dirtySyncs, [true]);
-  assert.deepEqual(statuses, ["列操作已应用到内存，尚未保存"]);
+  assert.equal(metaCalls, 0);
 });
 
-test("内存模式列操作取消或未变更时关闭对话框且不显示完成帧", async () => {
-  for (const outcome of [{ changed: false, cancelled: true }, { changed: false, cancelled: false }]) {
-    let finishes = 0;
-    let closes = 0;
-    const context = {
-      model: {
-        colOpsPending: () => true,
-        indexing: () => false,
-        meta: () => ({ memoryMode: true }),
-        onProgress: async () => () => {},
-        applyColOps: async () => outcome,
-      },
-      progressDialog: () => ({
-        set: () => {},
-        finish: async () => { finishes += 1; },
-        close: () => { closes += 1; },
-      }),
-      setDirty: () => { throw new Error("取消/未变更不得标脏"); },
-      statusMsg: () => {},
-      errorDialog: async (title, message) => { throw new Error(`${title}:${message}`); },
-      refreshBigUi: () => {},
-    };
-    vm.runInNewContext(
-      extractFunction(app, "applyColOpsNow") + "\nglobalThis.apply = applyColOpsNow;", context);
-    await context.apply();
-    assert.equal(finishes, 0, "取消/未变更不得伪造 100%");
-    assert.equal(closes, 1);
-  }
-});
-
-test("列操作在途时保存必须等它落定再开始，避免保存成功后被重新标脏", async () => {
+test("列操作在途时保存等待旧任务与模型列任务，避免保存成功后被重新标脏", async () => {
   const events = [];
   let releaseApply;
+  let releaseColumns;
   const applyGate = new Promise((resolve) => { releaseApply = resolve; });
+  const columnGate = new Promise((resolve) => { releaseColumns = resolve; });
   const context = {
     model: {
       colOpsPending: () => true,
       indexing: () => false,
-      meta: () => ({ memoryMode: false }),
+      meta: () => ({}),
+      columnOpsBusy: () => true,
+      waitForColumnOps: async () => {
+        await columnGate;
+        events.push("column-ops");
+      },
     },
     applyColOpsNow: async () => {
       const outcome = await applyGate;
@@ -322,11 +304,53 @@ globalThis.save = saveFile;`,
   await new Promise((resolve) => setTimeout(resolve, 0));
   const saving = context.save();
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.deepEqual(events, [], "列操作未落定时保存不得开始，也不得提前标脏/清脏");
+  assert.deepEqual(events, [], "列任务未落定时保存不得开始，也不得提前标脏/清脏");
   releaseApply({ changed: true, cancelled: false });
   await applying;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(events, ["dirty:true"], "模型列任务未落定时仍不得保存");
+  releaseColumns();
   assert.equal(await saving, true);
-  assert.deepEqual(events, ["dirty:true", "save-start", "dirty:false"]);
+  assert.deepEqual(events, ["dirty:true", "column-ops", "save-start", "dirty:false"]);
+});
+
+test("columnOp：内存模式立即生效才标脏并提示，取消/失败不误标", async () => {
+  const run = async (input, memoryMode = true) => {
+    const dirty = [];
+    const statuses = [];
+    const errors = [];
+    const context = {
+      model: { memoryMode: () => memoryMode },
+      setDirty: (value) => dirty.push(value),
+      statusMsg: (text) => statuses.push(text),
+      errorDialog: async (title, message) => errors.push([title, message]),
+    };
+    vm.runInNewContext(
+      extractFunction(app, "columnOp") + "\nglobalThis.op = columnOp;", context);
+    context.op(input);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return { dirty, statuses, errors };
+  };
+  const changed = await run(Promise.resolve({ changed: true, cancelled: false }));
+  assert.deepEqual(changed.dirty, [true]);
+  assert.match(changed.statuses[0], /已生效/);
+  assert.match(changed.statuses[0], /保存时整理正文/);
+
+  const ordinary = await run(Promise.resolve({ changed: true, cancelled: false }), false);
+  assert.deepEqual(ordinary.dirty, [true]);
+  assert.deepEqual(ordinary.statuses, ["列操作已应用，可撤销"]);
+
+  const cancelled = await run(Promise.resolve({ changed: false, cancelled: true }));
+  assert.deepEqual(cancelled.dirty, []);
+  assert.match(cancelled.statuses[0], /取消/);
+
+  const unchanged = await run(Promise.resolve({ changed: false, cancelled: false }));
+  assert.deepEqual(unchanged.dirty, []);
+  assert.deepEqual(unchanged.statuses, []);
+
+  const failed = await run({ then(_resolve, reject) { reject(new Error("boom")); } });
+  assert.deepEqual(failed.dirty, []);
+  assert.deepEqual(failed.errors, [["操作失败", "boom"]]);
 });
 
 test("工具栏和状态栏区分持久内存与临时排序 RAM", () => {

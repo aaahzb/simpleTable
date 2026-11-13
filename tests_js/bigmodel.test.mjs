@@ -640,6 +640,97 @@ test("清空 pending 列操作后行缓存失效并回到原列映射", async ()
   assert.equal(model.displayData(0, 1), "r0c1", "清空后第 2 列应回到原第 2 列");
 });
 
+test("内存模式列手势立即提交，不经过 pending 预览", async () => {
+  const { model, calls } = makeFakeEngine({
+    rows: 5, cols: 3, memoryMode: true, hasPath: true,
+  });
+  await model.open("/x.csv");
+  assert.equal(model.memoryMode(), true);
+  const before = calls.length;
+  await model.insertColumns(0, 2);
+  const commits = calls.filter(([c]) => c === "big_col_commit");
+  assert.equal(commits.length, 1, "一次手势只提交一条 Schema 变更");
+  assert.deepEqual(commits[0][1].ops, [
+    { Insert: { pos: 0, name: "列4" } },
+    { Insert: { pos: 1, name: "列5" } },
+  ]);
+  assert.equal(calls.slice(before).some(([c]) => c === "big_col_push"), false,
+    "内存模式不得产生 pending");
+  assert.deepEqual(model.headers(), ["列4", "列5", "h0", "h1", "h2"]);
+  assert.equal(model.columnCount(), 5);
+  assert.equal(model.colOpsPending(), false);
+  assert.equal(model.meta().can_undo, true);
+  assert.equal(model.columnOpsBusy(), false);
+  await assert.rejects(() => model.applyColOps(), /立即生效/,
+    "内存模式没有待执行的列预览");
+});
+
+test("内存模式列手势返回 EditOutcome 供界面收尾提示", async () => {
+  const { model } = makeFakeEngine({
+    rows: 3, cols: 3, memoryMode: true, hasPath: true,
+  });
+  await model.open("/x.csv");
+  const inserted = await model.insertColumns(1, 1);
+  assert.equal(inserted?.changed, true, "插入列必须把引擎 outcome 交给界面");
+  const renamed = await model.renameColumn(0, "新列名");
+  assert.equal(renamed?.changed, true, "重命名列必须把引擎 outcome 交给界面");
+  const removed = await model.removeColumns([1]);
+  assert.equal(removed?.changed, true, "删除列必须把引擎 outcome 交给界面");
+  const appended = await model.appendColumn("末尾");
+  assert.equal(appended?.changed, true, "追加列必须把引擎 outcome 交给界面");
+});
+
+test("内存模式列手势按调用顺序串行提交", async () => {
+  const { model, calls } = makeFakeEngine({
+    rows: 5, cols: 2, memoryMode: true, hasPath: true,
+  });
+  await model.open("/x.csv");
+  const start = calls.length;
+  const insert = model.insertColumns(0, 1);
+  const rename = model.renameColumn(0, "主键");
+  await Promise.all([insert, rename]);
+  const seen = calls.slice(start).map(([cmd]) => cmd)
+    .filter((cmd) => cmd === "big_col_commit" || cmd === "big_meta");
+  assert.deepEqual(seen, ["big_col_commit", "big_meta", "big_col_commit", "big_meta"],
+    "后一手势必须基于前一手势刷新后的元数据构造");
+  assert.deepEqual(model.headers(), ["主键", "h0", "h1"]);
+});
+
+test("内存模式保存等待在途列提交且不丢列", async () => {
+  const backend = makeSharedBackend({
+    rows: 5, cols: 2, memoryMode: true, hasPath: true,
+  });
+  const baseInvoke = backend.invokeFor("main");
+  let releaseCommit;
+  const gate = new Promise((resolve) => { releaseCommit = resolve; });
+  const calls = [];
+  const model = new BigModel({
+    invoke: async (cmd, args = {}) => {
+      calls.push([cmd, args]);
+      if (cmd === "big_col_commit") await gate;
+      return baseInvoke(cmd, args);
+    },
+    listen: async () => () => {},
+  });
+  await model.open("/x.csv");
+  calls.length = 0;
+  const insert = model.insertColumns(0, 1);
+  const save = model.save();
+  await tick();
+  await tick();
+  assert.equal(calls.some(([cmd]) => cmd === "big_save"), false,
+    "保存必须等待在途列提交");
+  assert.equal(model.columnOpsBusy(), true);
+  releaseCommit();
+  await Promise.all([insert, save]);
+  const order = calls.map(([cmd]) => cmd);
+  assert.ok(order.indexOf("big_col_commit") < order.indexOf("big_save"),
+    "列提交必须先于保存落盘");
+  assert.deepEqual(model.headers(), ["列3", "h0", "h1"],
+    "在途保存不得丢掉列手势");
+  assert.equal(model.meta().modified, false);
+});
+
 function makeFixedPointColumnModel(confirm, first, retry) {
   const calls = [];
   let refreshes = 0;

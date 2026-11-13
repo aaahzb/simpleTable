@@ -1655,7 +1655,7 @@ memoryCancelButton.addEventListener("click", () => {
 
 const MEMORY_EXCLUSIVE_COMMANDS = new Set([
   "big_save", "big_save_as", "big_sort_load", "big_sort_apply", "big_sort_exit",
-  "big_col_apply", "big_col_clear",
+  "big_col_apply", "big_col_clear", "big_col_commit",
 ]);
 
 /** 当前文档是否有与纯后备转换互斥的引擎命令。 */
@@ -1697,7 +1697,8 @@ function refreshBigUi() {
   const memoryKind = memoryTaskRegistry.kind(model);
   const pending = model.colOpsPending?.() === true;
   const sorted = meta.sorted === true;
-  const persistent = meta.memory_mode === true;
+  const persistent = model.memoryMode?.() === true;
+  const columnBusy = model.columnOpsBusy?.() === true;
   const mutuallyBusy = hasMemoryExclusiveOperation(model);
   tb.sort.classList.remove("hidden");
   tb.sort.disabled = meta.indexing === true || memoryKind !== null;
@@ -1708,16 +1709,17 @@ function refreshBigUi() {
       ? "恢复排序前的行顺序，保留内存模式；未保存的单元格修改保留"
       : "恢复排序前的行顺序并释放排序内存；未保存的单元格修改保留";
   }
-  tb.execColOps.classList.toggle("hidden", !pending);
-  tb.cancelColOps.classList.toggle("hidden", !pending);
+  // 持久内存模式的列手势立即生效：没有 pending，也不提供执行/撤销按钮。
+  tb.execColOps.classList.toggle("hidden", persistent || !pending);
+  tb.cancelColOps.classList.toggle("hidden", persistent || !pending);
   const eligible = meta.has_path === true && Number(meta.total_bytes) >= BIG_THRESHOLD;
   tb.memoryMode.classList.toggle("hidden", !eligible);
   tb.memoryMode.textContent = persistent ? "退出内存模式" : "转为内存模式…";
   tb.memoryMode.title = persistent
     ? "退出持久内存模式，恢复普通撤销预算和磁盘映射后备"
     : "把当前大文件转换为连续私有 RAM，保存后继续保持内存模式";
-  tb.memoryMode.disabled = !eligible || meta.indexing === true || pending || mutuallyBusy
-    || memoryKind !== null || model._transferState !== "idle";
+  tb.memoryMode.disabled = !eligible || meta.indexing === true || pending || columnBusy
+    || mutuallyBusy || memoryKind !== null || model._transferState !== "idle";
   refreshTabMemoryUi(activeTab());
   refreshHeaderlessUi();
 }
@@ -1903,10 +1905,14 @@ let columnApplyTask = null;
  */
 async function waitForColumnApply() {
   const task = columnApplyTask;
-  if (!task) return;
+  // 内存模式列手势走模型级队列；保存必须等它进入历史并刷新元数据。
+  const columnTask = model.columnOpsBusy?.() === true
+    ? model.waitForColumnOps?.()
+    : null;
+  if (!task && !columnTask) return;
   statusMsg("正在完成列操作，稍后保存…", 2500);
   try {
-    await task;
+    await Promise.all([task, columnTask].filter(Boolean));
   } catch {
     // 列操作失败已由它自己的对话框报告；用户仍可保存当前可见数据。
   }
@@ -1927,19 +1933,13 @@ async function applyColOps() {
   }
 }
 
-/** 执行 pending 列操作；内存模式只物化 RAM，成功后仍保持未保存。 */
+/** 执行普通模式的 pending 列操作；只提交 Schema，成功后产生一条撤销记录。 */
 async function applyColOpsNow() {
   if (!model.colOpsPending()) return;
   if (model.indexing?.()) {
     statusMsg("文件仍在索引中，暂不支持列操作", 2500);
     return;
   }
-  const memoryMode = model.meta()?.memoryMode === true;
-  const dlg = memoryMode ? progressDialog("整理内存正文…") : null;
-  const un = memoryMode
-    ? await model.onProgress((done, total, phase, rows) => dlg.set(done, total, phase, rows))
-    : null;
-  let applied = false;
   try {
     const outcome = await model.applyColOps();
     if (outcome?.cancelled) {
@@ -1947,17 +1947,11 @@ async function applyColOpsNow() {
       return;
     }
     if (!outcome?.changed) return;
-    applied = true;
     setDirty(true);
-    statusMsg(memoryMode ? "列操作已应用到内存，尚未保存" : "列操作已应用，可撤销", 3000);
+    statusMsg("列操作已应用，可撤销", 3000);
   } catch (err) {
     await errorDialog("列操作失败", String(err?.message ?? err));
   } finally {
-    un?.();
-    // 成功走完成帧（进度映射只到整理阶段，不能停在中途直接消失）；
-    // 取消或失败不得伪造 100%。
-    if (applied) await dlg?.finish();
-    else dlg?.close();
     refreshBigUi();
   }
 }
@@ -2762,6 +2756,31 @@ function op(result) {
   });
 }
 
+/**
+ * 列手势统一收尾。
+ *
+ * 内存模式的列方法返回 EditOutcome（立即生效、只提交 Schema），成功后
+ * 必须标脏并提示“保存时整理正文”；普通模式返回 undefined（只是 pending
+ * 预览），保持原有“执行列操作”流程不变。
+ *
+ * @param {any} result - 模型列方法返回的 Promise 或同步值。
+ * @returns {void}
+ */
+function columnOp(result) {
+  Promise.resolve(result).then((outcome) => {
+    if (!outcome?.changed) {
+      if (outcome?.cancelled) statusMsg("已取消列操作", 2500);
+      return;
+    }
+    setDirty(true);
+    statusMsg(model.memoryMode?.() === true
+      ? "列操作已生效，可撤销；保存时整理正文"
+      : "列操作已应用，可撤销", 3000);
+  }).catch((err) => {
+    errorDialog("操作失败", String(err?.message ?? err));
+  });
+}
+
 /** 行头右键菜单：插入/添加/删除/清除行 */
 function showRowMenu(e) {
   const rows = fgrid().selectedRows();
@@ -2904,7 +2923,7 @@ async function clearRows(rows) {
  * @param {number[]} cols - 插入位置参考列号。
  */
 function insertColumnsAt(cols) {
-  op(model.insertColumns(Math.min(...cols), cols.length));
+  columnOp(model.insertColumns(Math.min(...cols), cols.length));
   fgrid().clearFilters({ anchor: false });
 }
 
@@ -2914,8 +2933,11 @@ function insertColumnsAt(cols) {
  * @param {number[]} cols - 列号列表。
  */
 async function deleteColumns(cols) {
-  if (cols.length && await confirmDialog(`确定删除选中的 ${cols.length} 列及其全部数据？（列操作将预览，需点「执行列操作」生效）`)) {
-    op(model.removeColumns(cols));
+  const hint = model.memoryMode?.() === true
+    ? "（立即生效，可撤销）"
+    : "（列操作将预览，需点「执行列操作」生效）";
+  if (cols.length && await confirmDialog(`确定删除选中的 ${cols.length} 列及其全部数据？${hint}`)) {
+    columnOp(model.removeColumns(cols));
     fgrid().clearFilters({ anchor: false });
   }
 }
@@ -2949,7 +2971,7 @@ async function renameColumn(col) {
     return;
   }
   const name = await columnDialog("重命名列", model.headers()[col]);
-  if (name) op(model.renameColumn(col, name));
+  if (name) columnOp(model.renameColumn(col, name));
 }
 
 // ============ 全局快捷键 ============
@@ -3259,7 +3281,7 @@ window.__app = {
   cancelMemoryModeLoad: () => model.cancelMemoryModeLoad(),
   settleMemoryOperation: () => settleMemoryOperation(model),
   memoryOperationKind: () => memoryTaskRegistry.kind(model),
-  applyColOps, cancelColOps, runBigFilter, gotoRow, gotoRowDialog,
+  applyColOps, cancelColOps, columnOp, runBigFilter, gotoRow, gotoRowDialog,
   isDirty: () => dirty, getPath: () => path,
   isBigMode: () => model.isBig === true,
   isHeaderless: () => model.isHeaderless?.() === true,

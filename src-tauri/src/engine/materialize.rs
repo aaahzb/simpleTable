@@ -55,6 +55,8 @@ pub(super) enum MaterializeFault {
 /// 保存当前逻辑文档，或以候选 Schema 执行列操作。
 enum MaterializationOperation {
     SaveCurrent,
+    /// 保留给物化机制测试与后续复用；生产列提交已改为 Schema-only。
+    #[allow(dead_code)]
     Columns {
         before: Arc<Schema>,
         after: Arc<Schema>,
@@ -174,6 +176,10 @@ impl<'a> MaterializationInput<'a> {
     }
 
     /// 只读取 pending 候选 Schema；物化失败前不改变 live Schema 或 pending 预览。
+    ///
+    /// 生产路径已改为保存时统一物化（方案 A），此入口仅由物化机制测试使用，
+    /// 保留以覆盖故障原子性与输出字节。
+    #[allow(dead_code)]
     pub(super) fn columns(document: &BigFile, approval: Approval) -> Result<Self, String> {
         if document.pending_cols.is_empty() {
             return Err("没有待执行的列操作".into());

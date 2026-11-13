@@ -248,6 +248,40 @@ function createEngine({
           return null;
         case "big_col_apply":
           return editOutcome({ changed: true });
+        case "big_col_commit": {
+          // 方案 A：内存模式一次手势提交一批 Schema 变更（不经过 pending）。
+          let changed = false;
+          for (const op of args.ops ?? []) {
+            if (op?.Insert) {
+              const pos = Math.max(0, Math.min(Number(op.Insert.pos), ncols));
+              baseHeaders.splice(pos, 0, String(op.Insert.name));
+              for (const row of data) row.splice(pos, 0, "");
+              ncols += 1;
+              changed = true;
+            } else if (op?.Delete) {
+              const col = Number(op.Delete.col);
+              if (!Number.isInteger(col) || col < 0 || col >= ncols) {
+                throw new Error("删除列越界");
+              }
+              if (ncols <= 1) throw new Error("至少保留一列");
+              baseHeaders.splice(col, 1);
+              for (const row of data) row.splice(col, 1);
+              ncols -= 1;
+              changed = true;
+            } else if (op?.Rename) {
+              const col = Number(op.Rename.col);
+              if (!Number.isInteger(col) || col < 0 || col >= ncols) {
+                throw new Error("重命名列越界");
+              }
+              if (headerless) throw new Error("无列名模式不可重命名列");
+              baseHeaders[col] = String(op.Rename.name);
+              changed = true;
+            } else {
+              throw new Error("未知列操作");
+            }
+          }
+          return editOutcome({ changed });
+        }
         case "big_memory_mode_estimate":
           return {
             file_bytes: totalBytes,
@@ -392,20 +426,20 @@ export function makeSharedBackend(options = {}) {
     "big_paste_import_finish", "big_paste_clipboard", "big_clear",
     "big_insert_rows", "big_remove_rows", "big_undo", "big_redo",
     "big_filter", "big_clear_filter", "big_col_push", "big_col_pop",
-    "big_col_clear", "big_col_apply", "big_save", "big_save_as",
+    "big_col_clear", "big_col_apply", "big_col_commit", "big_save", "big_save_as",
     "big_sort_load", "big_sort_cancel", "big_sort_apply", "big_sort_exit",
     "big_memory_mode_enter", "big_memory_mode_exit",
   ]);
   const historyCommands = new Set([
     "big_set_headerless", "big_set_cell", "big_set_cells", "big_paste",
     "big_paste_import_finish", "big_paste_clipboard", "big_clear",
-    "big_insert_rows", "big_remove_rows", "big_col_apply",
+    "big_insert_rows", "big_remove_rows", "big_col_apply", "big_col_commit",
     "big_sort_apply", "big_sort_exit",
   ]);
   const dirtyCommands = new Set([
     "big_set_cell", "big_set_cells", "big_paste", "big_paste_import_finish",
     "big_paste_clipboard", "big_clear", "big_insert_rows", "big_remove_rows",
-    "big_col_apply",
+    "big_col_apply", "big_col_commit",
   ]);
 
   function authorize(entry, owner, lease, access = "read") {

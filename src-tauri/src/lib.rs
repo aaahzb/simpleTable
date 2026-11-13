@@ -2102,30 +2102,7 @@ async fn big_col_clear(window: tauri::Window, state: tauri::State<'_, SharedRunt
     }).await
 }
 
-/// 将 RAM 保存阶段映射到统一的 `big-progress` 四阶段协议。
-///
-/// 所有边界共用千分比总量：计数 0-100、整理 RAM 100-990、写盘 700-990、
-/// 提交 1000。阶段只前进不归零，进度条不会在写盘前显示 100%。
-fn save_ram_progress(event: engine::SaveRamEvent) -> Option<(u64, u64, u8, u64)> {
-    use engine::{SaveRamEvent, SaveRamPhase};
-
-    let SaveRamEvent::Phase(phase) = event;
-    let mapped = match phase {
-        SaveRamPhase::CountBegin => (0, 1000, 0, 0),
-        SaveRamPhase::CountFinished { .. } => (100, 1000, 0, 0),
-        SaveRamPhase::HistoryPrepared => (100, 1000, 1, 0),
-        SaveRamPhase::IndexPrepared { .. } => (100, 1000, 1, 0),
-        SaveRamPhase::NewReserveBegin { .. } => (100, 1000, 1, 0),
-        SaveRamPhase::NewRamReady { .. } => (700, 1000, 1, 0),
-        SaveRamPhase::OldRamReleased { .. } => (700, 1000, 1, 0),
-        SaveRamPhase::DiskWriteBegin { .. } => (700, 1000, 2, 0),
-        SaveRamPhase::DiskWriteFinished { .. } => (990, 1000, 2, 0),
-        SaveRamPhase::DiskCommitted { .. } => (1000, 1000, 3, 0),
-    };
-    Some(mapped)
-}
-
-/// 执行待处理列操作；持久内存模式在后台线程原子物化 RAM，不写硬盘。
+/// 执行待处理列操作（普通模式 pending 预览）；只提交 Schema，不物化正文。
 #[tauri::command]
 async fn big_col_apply(
     window: tauri::Window,
@@ -2136,47 +2113,30 @@ async fn big_col_apply(
 ) -> Result<EditOutcome, String> {
     let runtime = state.inner().clone();
     let owner = window.label().to_string();
-    let app = window.app_handle().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let (tx, rx) = std::sync::mpsc::channel::<(u64, u64, u8, u64)>();
-        let emit_owner = owner.clone();
-        let emitter = std::thread::spawn(move || {
-            while let Ok((done, total, phase, rows)) = rx.recv() {
-                emit_big_event(
-                    &app,
-                    &emit_owner,
-                    session,
-                    lease,
-                    "big-progress",
-                    serde_json::json!({
-                        "session": session,
-                        "lease": lease,
-                        "done": done,
-                        "total": total,
-                        "phase": phase,
-                        "rows": rows,
-                    }),
-                );
-            }
-        });
-        let result = (|| {
-            let entry = authorize_big(&runtime, &owner, session, lease, Access::Write)?;
-            entry.bump_gate();
-            let mut file = entry.file.lock().map_err(|error| error.to_string())?;
-            // 文件锁可能与关闭或迁移竞争，取得后必须重新授权。
-            authorize_big(&runtime, &owner, session, lease, Access::Write)?;
-            file.apply_col_ops_observed(approval, &|event| {
-                if let Some(update) = save_ram_progress(event) {
-                    let _ = tx.send(update);
-                }
-            })
-        })();
-        drop(tx);
-        emitter.join().map_err(|error| format!("进度转发线程异常：{error:?}"))?;
-        result
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| {
+        bf.apply_col_ops(approval)
     })
     .await
-    .map_err(|error| format!("列操作任务被取消：{error}"))?
+}
+
+/// 内存模式列手势：一次调用原子提交一批列操作并进入撤销历史。
+///
+/// 只改 Schema，不物化正文；保存时由内容键不匹配自然触发一次物化。
+#[tauri::command]
+async fn big_col_commit(
+    window: tauri::Window,
+    state: tauri::State<'_, SharedRuntime>,
+    session: u64,
+    lease: u64,
+    ops: Vec<ColOp>,
+    approval: Approval,
+) -> Result<EditOutcome, String> {
+    let runtime = state.inner().clone();
+    let owner = window.label().to_string();
+    run_big_offthread(runtime, owner, session, lease, Access::Write, move |bf| {
+        bf.commit_col_ops(ops, approval)
+    })
+    .await
 }
 
 /// 截屏诊断模式：启动参数 `--park <mode>` 时返回 mode 字符串，否则 None。
@@ -3117,6 +3077,7 @@ pub fn run() {
             big_col_pop,
             big_col_clear,
             big_col_apply,
+            big_col_commit,
         ])
         .build(tauri::generate_context!())
         .expect("error while building simpleTable")

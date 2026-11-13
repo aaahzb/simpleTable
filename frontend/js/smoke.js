@@ -5156,36 +5156,61 @@ x,y
     }
   });
 
-  check("内存模式 64 MiB：列操作只物化 RAM，保存复用新正文", async () => {
+  check("内存模式 64 MiB：列操作立即生效，保存时才物化正文", async () => {
     let pending = null;
     try {
-      const { path, operationModel } = await openMemoryCsv("columns-ram-only");
+      const { path, operationModel } = await openMemoryCsv("columns-immediate");
       pending = window.__app.enterMemoryMode();
       await confirmMemoryEnterDialog();
       await awaitMemoryEntered(pending);
       pending = null;
       const diskBefore = await invoke("smoke_file_probe", { path });
 
-      await operationModel.insertColumns(1, 1);
+      // 走真实 UI 收尾路径（标脏 + 提示），列手势应立即提交 Schema。
+      const beforeHeaders = operationModel.headers().slice();
+      const inserting = operationModel.insertColumns(1, 1);
+      window.__app.columnOp(inserting);
+      await waitFor(() => operationModel.headers().length === beforeHeaders.length + 1,
+        "列手势立即生效");
       const insertedHeader = operationModel.headers()[1];
-      await window.__app.applyColOps();
-      await waitFor(() => !operationModel.colOpsPending()
-        && operationModel.headers()[1] === insertedHeader
-        && operationModel.rawData(0, 1) === "", "列操作后的新 RAM 视图");
-      assert(window.__app.isDirty() === true, "列物化后必须保持未保存");
-      assert(operationModel.meta()?.modified === true, "引擎也必须报告未保存");
-      assert(operationModel.meta()?.ram_backed === true, "列物化不得退回 mmap");
-      const diskAfterApply = await invoke("smoke_file_probe", { path });
-      assert(JSON.stringify(diskAfterApply) === JSON.stringify(diskBefore),
-        "列物化不得改变源文件大小、mtime 或前缀");
+      assert(insertedHeader === `列${beforeHeaders.length + 1}`,
+        `新列名 ${insertedHeader}`);
+      assert(operationModel.colOpsPending() === false,
+        "内存模式列手势必须立即生效，没有 pending 预览");
+      assert(operationModel.rawData(0, 1) === "", "新列应立即显示为空列");
+      assert(operationModel.canUndo() === true, "列手势必须进入撤销历史");
+      assert(window.__app.isDirty() === true, "列手势必须标脏");
+      assert(operationModel.meta()?.modified === true, "引擎必须报告未保存");
+      assert(operationModel.meta()?.ram_backed === true, "列手势不得退回 mmap");
+      const diskAfterInsert = await invoke("smoke_file_probe", { path });
+      assert(JSON.stringify(diskAfterInsert) === JSON.stringify(diskBefore),
+        "列手势不得改变源文件大小、mtime 或前缀");
+      assert(tbHidden("执行列操作"), "内存模式必须隐藏执行列操作");
+      assert(tbHidden("撤销列操作预览"), "内存模式必须隐藏撤销列操作预览");
 
-      assert(await window.__app.saveFile() === true, "新 RAM 应能直接保存");
+      assert(await window.__app.saveFile() === true, "列手势后应能直接保存");
       await waitFor(() => !window.__app.isDirty()
         && operationModel.meta()?.modified === false, "保存成功后的干净状态");
       const diskAfterSave = await invoke("smoke_file_probe", { path });
       assert(diskAfterSave.size > diskBefore.size, "插入空列后磁盘正文应增长");
       assert(new TextDecoder().decode(new Uint8Array(diskAfterSave.prefix))
         .includes(insertedHeader), "保存后的磁盘前缀必须包含新列表头");
+
+      // 在途保存竞态：再插一列后不等待手势，直接 Ctrl+S。
+      const secondHeader = `列${operationModel.columnCount() + 1}`;
+      const secondInsert = operationModel.insertColumns(2, 1);
+      window.__app.columnOp(secondInsert);
+      pending = window.__app.saveFile();
+      const [, secondSaved] = await Promise.all([secondInsert, pending]);
+      pending = null;
+      assert(secondSaved === true, "在途列手势下的保存应成功");
+      assert(operationModel.headers().includes(secondHeader),
+        "在途保存不得丢掉第二列手势");
+      await waitFor(() => !window.__app.isDirty()
+        && operationModel.meta()?.modified === false, "竞态保存后的干净状态");
+      const diskFinal = await invoke("smoke_file_probe", { path });
+      assert(new TextDecoder().decode(new Uint8Array(diskFinal.prefix))
+        .includes(secondHeader), "竞态保存后的磁盘前缀必须包含第二列");
     } finally {
       await cleanupMemoryScenario(pending);
     }

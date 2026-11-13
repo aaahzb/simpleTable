@@ -40,7 +40,7 @@ const TRANSFER_READ_COMMANDS = new Set([
 /** 这些命令在途时不进入 sealing，避免保存/重写与迁移屏障交叉。 */
 const TRANSFER_BLOCK_COMMANDS = new Set([
   "big_save", "big_save_as", "big_sort_load", "big_sort_apply", "big_sort_exit",
-  "big_col_apply", "big_paste_import_begin", "big_paste_import_chunk",
+  "big_col_apply", "big_col_commit", "big_paste_import_begin", "big_paste_import_chunk",
   "big_paste_import_finish", "big_paste_clipboard",
   "big_memory_mode_enter", "big_memory_mode_exit",
 ]);
@@ -53,7 +53,7 @@ const MEMORY_BUSY_BLOCK_COMMANDS = new Set([
   "big_paste_import_finish", "big_paste_clipboard", "big_clear",
   "big_insert_rows", "big_remove_rows", "big_undo", "big_redo",
   "big_filter", "big_clear_filter", "big_col_push", "big_col_pop",
-  "big_col_clear", "big_col_apply", "big_save", "big_save_as",
+  "big_col_clear", "big_col_apply", "big_col_commit", "big_save", "big_save_as",
   "big_sort_load", "big_sort_apply", "big_sort_exit", "big_clipboard_clear",
   "big_memory_mode_enter", "big_memory_mode_exit",
 ]);
@@ -129,6 +129,10 @@ export class BigModel {
     this._operations = new Map();
     /** @type {"enter" | "exit" | null} 当前文档的内存后备任务 */
     this._memoryOperationKind = null;
+    /** @type {Promise<void>} 模型级列手势队列尾；错误在入队时已消化 */
+    this._columnTask = Promise.resolve();
+    /** @type {number} 尚未落定的列手势数（工具栏忙碌态） */
+    this._columnPending = 0;
     /** @type {"idle" | "sealing" | "accepted"} 文档迁移状态 */
     this._transferState = "idle";
     /** 固定点确认等待期间禁止开始迁移 */
@@ -1643,7 +1647,47 @@ export class BigModel {
     return { applied: true, target };
   }
 
-  // ---- 列操作（pending 预览 → 执行物理重写） ----
+  // ---- 列操作（内存模式立即提交 Schema；普通模式 pending 预览） ----
+
+  /**
+   * @returns {boolean} 是否有内存模式列手势正在提交。
+   */
+  columnOpsBusy() {
+    return this._columnPending > 0;
+  }
+
+  /**
+   * 等待当前所有在途列手势落定；失败已在队列尾消化，不再抛出。
+   *
+   * @returns {Promise<void>}
+   */
+  async waitForColumnOps() {
+    await this._columnTask;
+  }
+
+  /**
+   * 内存模式列手势：在模型级队列内构造并提交一批列操作。
+   *
+   * ops 的构造放在队列内执行，保证列号/列名基于上一手势刷新后的元数据；
+   * 一次手势只产生一条可撤销的 SchemaChange，失败不阻断后续手势。
+   *
+   * @param {() => object[]} buildOps - 返回 ColOp 列表（serde 外部标签）。
+   * @returns {Promise<object>} 引擎 EditOutcome。
+   */
+  _commitColOps(buildOps) {
+    this._requireNotIndexing("文件仍在索引中，暂不支持列操作");
+    this._columnPending += 1;
+    const run = async () => {
+      const outcome = await this._invokeEdit("big_col_commit", { ops: buildOps() });
+      return this._afterEdit(outcome, "structure");
+    };
+    // 前一手势失败不能阻断后续手势；队列尾始终是已消化错误的安全 Promise。
+    const task = this._columnTask.then(run, run);
+    this._columnTask = task.catch(() => {});
+    return task.finally(() => {
+      this._columnPending -= 1;
+    });
+  }
 
   /** @returns {boolean} 有待执行的列操作。 */
   colOpsPending() {
@@ -1651,50 +1695,68 @@ export class BigModel {
   }
 
   /**
-   * 追加一列（pending）。
+   * 追加一列（内存模式立即提交，普通模式 pending）。
    *
    * @param {string} name - 列名。
-   * @returns {Promise<void>}
+   * @returns {Promise<object|undefined>} 内存模式的引擎 EditOutcome；普通模式为 undefined。
    */
   async appendColumn(name) {
+    if (this.memoryMode()) {
+      return this._commitColOps(() => [
+        { Insert: { pos: this.columnCount(), name } },
+      ]);
+    }
     await this._pushColOp({ Insert: { pos: this.columnCount(), name } });
   }
 
   /**
-   * 在指定列前插入列（pending）。
+   * 在指定列前插入列（内存模式立即提交，普通模式 pending）。
    *
    * @param {number} col - 视图列号。
    * @param {number} [count=1] - 列数（自动生成列名）。
-   * @returns {Promise<void>}
+   * @returns {Promise<object|undefined>} 内存模式的引擎 EditOutcome；普通模式为 undefined。
    */
   async insertColumns(col, count = 1) {
+    if (this.memoryMode()) {
+      return this._commitColOps(() => Array.from({ length: count }, (_, i) => ({
+        Insert: { pos: col + i, name: `列${this.columnCount() + 1 + i}` },
+      })));
+    }
     for (let i = 0; i < count; i += 1) {
       await this._pushColOp({ Insert: { pos: col + i, name: `列${this.columnCount() + 1 + i}` } });
     }
   }
 
   /**
-   * 删除列（pending）。
+   * 删除列（内存模式立即提交，普通模式 pending）。
    *
    * @param {number[]} cols - 视图列号列表（降序 push，避免位置互相位移）。
-   * @returns {Promise<void>}
+   * @returns {Promise<object|undefined>} 内存模式的引擎 EditOutcome；普通模式为 undefined。
    */
   async removeColumns(cols) {
+    if (this.memoryMode()) {
+      // 降序删除，避免同一批内位置互相位移。
+      return this._commitColOps(() => [...cols].sort((a, b) => b - a)
+        .map((c) => ({ Delete: { col: c } })));
+    }
     for (const c of [...cols].sort((a, b) => b - a)) {
       await this._pushColOp({ Delete: { col: c } });
     }
   }
 
   /**
-   * 重命名列（pending）。
+   * 重命名列（内存模式立即提交，普通模式 pending）。
    *
    * @param {number} col - 视图列号。
    * @param {string} name - 新列名。
-   * @returns {Promise<void>}
+   * @returns {Promise<object|undefined>} 内存模式的引擎 EditOutcome；普通模式为 undefined。
    */
   async renameColumn(col, name) {
     if (this.isHeaderless()) {
       throw new Error("无列名模式不可重命名列");
+    }
+    if (this.memoryMode()) {
+      return this._commitColOps(() => [{ Rename: { col, name } }]);
     }
     await this._pushColOp({ Rename: { col, name } });
   }
@@ -1746,6 +1808,9 @@ export class BigModel {
    * @returns {Promise<object>} 引擎 EditOutcome。
    */
   async applyColOps() {
+    if (this.memoryMode()) {
+      throw new Error("内存模式下没有待执行的列预览：列操作已立即生效");
+    }
     this._requireNotIndexing("文件仍在索引中，暂不支持列操作");
     const outcome = await this._invokeEdit("big_col_apply");
     return this._afterEdit(outcome, "structure");
@@ -1794,6 +1859,10 @@ export class BigModel {
    */
   async save() {
     this._requireNotIndexing("文件仍在索引中，请稍候再保存");
+    // 在途列手势必须先进入历史并刷新元数据，保存才不会漏掉新列。
+    // 空闲时不得额外 await，否则 big_save 的登记会晚一个微任务，
+    // runBigWrite 的同步 refreshBigUi 看不到互斥任务。
+    if (this.columnOpsBusy()) await this.waitForColumnOps();
     if (!(await this._invokeSave("big_save"))) return false;
     await this._afterWrite();
     return true;
@@ -1808,6 +1877,7 @@ export class BigModel {
    */
   async saveAs(target) {
     this._requireNotIndexing("文件仍在索引中，请稍候再另存为");
+    if (this.columnOpsBusy()) await this.waitForColumnOps();
     if (!(await this._invokeSave("big_save_as", { path: target }))) return false;
     await this._afterWrite();
     return true;
