@@ -30,6 +30,8 @@ cd .. && node scripts/verify-local.mjs
 
 推 `main` / PR 触发 CI（Windows：node + cargo test + 真实私有内存峰值硬门禁 + WebView2 冒烟；macOS arm64：编译 + cargo test + 经 `sudo -n` 的真实私有内存峰值硬门禁）；推 `v*` tag 先在 Windows 执行真实峰值发布硬门禁，再自动发 GitHub Release。Release 附件固定只有 Windows exe 与 macOS dmg 两项；峰值 JSON 仅上传为 Actions 构件，供排查时下载，不进入 Release。
 
+冒烟用例等待异步操作落定时只能依赖持久状态（引擎/模型元数据、按钮恢复、磁盘字节）；`statusMsg` 的瞬时状态栏提示只显示数秒且可能被常驻刷新覆盖，不得当作完成信号。`撤销内存：设置期间新开的文档也采用新预算` 曾因此在 CI 偶发超时，现统一用 `waitUndoBudgetApplied` 校验有效预算元数据与设置按钮状态；`setUndoSettingsThroughUi` 也改为等按钮恢复后用 `refreshStatus()` 校验常驻状态栏，不再匹配 `撤销/重做预算：…` 提示。
+
 ## 内存模式实现与真实峰值门禁
 
 - Windows 使用 `VirtualAlloc` 先 `MEM_RESERVE` 预留连续地址，再按 8 MiB 块 `MEM_COMMIT`；释放必须整段 `VirtualFree(base, 0, MEM_RELEASE)`。macOS 使用 `MAP_PRIVATE | MAP_ANON` 的匿名 `mmap/munmap`，不伪造 Windows commit。两阶段读取最多 4 个并行任务。

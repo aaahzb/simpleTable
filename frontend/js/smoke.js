@@ -3603,6 +3603,37 @@ x,y
   }
 
   /**
+   * 等待一次撤销预算下发在真实界面上落定。
+   *
+   * “撤销/重做预算：…”只是 3 秒瞬时提示，可能被常驻状态刷新或渲染
+   * 阻塞覆盖，不能当作完成信号。这里等两个持久事实同时成立：活动
+   * 文档已按新预算刷新过元数据，且设置按钮已从“下发中”恢复；再用
+   * refreshStatus 把状态栏还原成常驻文本，断言持久值确实生效。
+   *
+   * @param {number} expectedBytes - 期望的活动文档有效预算（字节）。
+   * @param {string} what - 等待场景说明。
+   * @param {number} [timeout=20000] - 超时毫秒数（CI 慢机余量）。
+   * @returns {Promise<void>}
+   */
+  async function waitUndoBudgetApplied(expectedBytes, what, timeout = 20000) {
+    const button = document.getElementById("btn-undo-budget");
+    try {
+      await waitFor(() => !button.disabled
+        && model.meta()?.effective_undo_budget_bytes === expectedBytes, what, timeout);
+    } catch (error) {
+      // 超时带上现场：是命令仍在发（按钮禁用），还是元数据没刷新。
+      const effective = model.meta()?.effective_undo_budget_bytes ?? "未知";
+      throw new Error(`${error.message}（按钮${button.disabled ? "仍在下发" : "已恢复"}，`
+        + `有效预算 ${effective}）`);
+    }
+    window.__app.refreshStatus();
+    const expectedMiB = expectedBytes / (1024 * 1024);
+    assert(document.getElementById("status-text").textContent
+      .includes(`撤销每文档 ${expectedMiB} MiB`),
+    `${what}：常驻状态应显示每文档 ${expectedMiB} MiB`);
+  }
+
+  /**
    * 通过可写的外层 core 引用拦截真实 IPC；不修改冻结的 core 或 internals。
    *
    * @param {(original: Function, cmd: string, args?: object,
@@ -3726,8 +3757,7 @@ x,y
       assert(window.__app.tabs().find((t) => t.path === pB)?.active,
         "A 下发等待期间 B 应完成打开并入签");
       delay.release();
-      await waitFor(() => document.getElementById("status-text").textContent
-        .includes("撤销/重做预算：每文档 1 MiB"), "竞态预算下发完成");
+      await waitUndoBudgetApplied(1024 * 1024, "竞态预算下发完成");
       configured = true;
 
       await model.setData(0, 0, "c".repeat(600 * 1024));
@@ -3744,8 +3774,7 @@ x,y
         const mask = document.querySelector(".modal-mask");
         mask.querySelector('input[type="number"]').value = "64";
         clickModalButton("确定");
-        await waitFor(() => document.getElementById("status-text").textContent
-          .includes("撤销/重做预算：每文档 64 MiB"), "竞态测试恢复默认预算");
+        await waitUndoBudgetApplied(64 * 1024 * 1024, "竞态测试恢复默认预算");
       }
     }
   });
@@ -3774,8 +3803,7 @@ x,y
       const mask = document.querySelector(".modal-mask");
       mask.querySelector('input[type="number"]').value = "1";
       clickModalButton("确定");
-      await waitFor(() => document.getElementById("status-text").textContent
-        .includes("撤销/重做预算：每文档 1 MiB"), "在途场景先完成 A 的预算设置");
+      await waitUndoBudgetApplied(1024 * 1024, "在途场景先完成 A 的预算设置");
       configured = true;
       delay.release();
       await opening;
@@ -3802,8 +3830,7 @@ x,y
         const mask = document.querySelector(".modal-mask");
         mask.querySelector('input[type="number"]').value = "64";
         clickModalButton("确定");
-        await waitFor(() => document.getElementById("status-text").textContent
-          .includes("撤销/重做预算：每文档 64 MiB"), "在途测试恢复默认预算");
+        await waitUndoBudgetApplied(64 * 1024 * 1024, "在途测试恢复默认预算");
       }
     }
   });
@@ -3825,8 +3852,7 @@ x,y
       button.click();
       assert(!document.querySelector(".modal-mask"), "下发期间不得打开第二个预算设置框");
       delay.release();
-      await waitFor(() => document.getElementById("status-text").textContent
-        .includes("撤销/重做预算：每文档 1 MiB") && !button.disabled, "首次预算设置完成");
+      await waitUndoBudgetApplied(1024 * 1024, "首次预算设置完成");
       assert(!button.disabled, "首次设置完成后必须恢复设置按钮");
 
       button.click();
@@ -3834,8 +3860,7 @@ x,y
       mask = document.querySelector(".modal-mask");
       mask.querySelector('input[type="number"]').value = "2";
       clickModalButton("确定");
-      await waitFor(() => document.getElementById("status-text").textContent
-        .includes("撤销/重做预算：每文档 2 MiB") && !button.disabled, "第二次预算设置完成");
+      await waitUndoBudgetApplied(2 * 1024 * 1024, "第二次预算设置完成");
       const latestPrefs = JSON.parse(window.localStorage.getItem("simpletable.undo_settings.v2"));
       assert(latestPrefs?.budgetMiB === 2 && latestPrefs?.residentPermille === 1000,
         `串行完成后的最新双值用户选择必须持久生效：${JSON.stringify(latestPrefs)}`);
@@ -3849,8 +3874,7 @@ x,y
         const mask = document.querySelector(".modal-mask");
         mask.querySelector('input[type="number"]').value = "64";
         clickModalButton("确定");
-        await waitFor(() => document.getElementById("status-text").textContent
-          .includes("撤销/重做预算：每文档 64 MiB"), "重复设置测试恢复默认预算");
+        await waitUndoBudgetApplied(64 * 1024 * 1024, "重复设置测试恢复默认预算");
       }
     }
   });
@@ -3876,8 +3900,7 @@ x,y
       mask = document.querySelector(".modal-mask");
       mask.querySelector('input[type="number"]').value = "1";
       assert(clickModalButton("确定"), "应用 1 MiB 预算");
-      await waitFor(() => document.getElementById("status-text").textContent
-        .includes("撤销/重做预算：每文档 1 MiB"), "1 MiB 预算下发完成");
+      await waitUndoBudgetApplied(1024 * 1024, "1 MiB 预算下发完成");
       configured = true;
       assert(budgetCalls.length === 1 && budgetCalls[0].budgetBytes === 1024 * 1024,
         "预算取消后只应下发一次 1 MiB");
@@ -3921,8 +3944,7 @@ x,y
         const mask = document.querySelector(".modal-mask");
         mask.querySelector('input[type="number"]').value = "64";
         clickModalButton("确定");
-        await waitFor(() => document.getElementById("status-text").textContent
-          .includes("撤销/重做预算：每文档 64 MiB"), "恢复 64 MiB");
+        await waitUndoBudgetApplied(64 * 1024 * 1024, "恢复 64 MiB");
       }
       restoreBudgetSpy();
     }
@@ -3958,8 +3980,7 @@ x,y
       let mask = document.querySelector(".modal-mask");
       mask.querySelector('input[type="number"]').value = "1";
       clickModalButton("确定");
-      await waitFor(() => document.getElementById("status-text").textContent
-        .includes("撤销/重做预算：每文档 1 MiB"), "双页签 1 MiB 下发完成");
+      await waitUndoBudgetApplied(1024 * 1024, "双页签 1 MiB 下发完成");
       configured = true;
       assert(budgetCalls.length === 1
         && budgetCalls[0].budgetBytes === 1024 * 1024
@@ -3983,8 +4004,7 @@ x,y
         const mask = document.querySelector(".modal-mask");
         mask.querySelector('input[type="number"]').value = "64";
         clickModalButton("确定");
-        await waitFor(() => document.getElementById("status-text").textContent
-          .includes("撤销/重做预算：每文档 64 MiB"), "双页签恢复 64 MiB 完成");
+        await waitUndoBudgetApplied(64 * 1024 * 1024, "双页签恢复 64 MiB 完成");
       }
       restoreBudgetSpy();
     }
@@ -4844,11 +4864,16 @@ x,y
     mask.querySelector("#undo-budget-mib").value = String(budgetMiB);
     mask.querySelector("#undo-resident-percent").value = residentPercent;
     assert(clickModalButton("确定"), "双值设置应可确定");
-    await waitFor(() => !button.disabled && !document.querySelector(".modal-mask")
-      && document.getElementById("status-text").textContent
-        .includes(`撤销/重做预算：每文档 ${budgetMiB} MiB`)
-      && document.getElementById("status-text").textContent
-        .includes(`驻留 ${Number(residentPercent)}%`), "双值设置生效");
+    // “撤销/重做预算：…”只是 3 秒瞬时提示，可能被常驻状态刷新覆盖，不能
+    // 当作完成信号；等设置按钮恢复且常驻状态栏（refreshStatus）显示新值。
+    const applied = () => {
+      window.__app.refreshStatus();
+      const text = document.getElementById("status-text").textContent;
+      return !button.disabled && !document.querySelector(".modal-mask")
+        && text.includes(`撤销每文档 ${budgetMiB} MiB`)
+        && text.includes(`驻留 ${Number(residentPercent)}%`);
+    };
+    await waitFor(applied, "双值设置生效");
   }
 
   check("内存模式 64 MiB：小档和无路径档隐藏入口，索引与互斥任务禁用", async () => {
