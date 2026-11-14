@@ -28,7 +28,7 @@ cd .. && node scripts/verify-local.mjs
 
 平台验收边界：Windows 默认打开方式、真实鼠标/RDP 拖放和最后一个窗口由用户关闭仍需在 release exe 上验收。macOS 需在新的 `.app` 上验证 Finder 冷启动/已运行双击、同路径激活、跨窗口真实拖放与拖出，并确认 TXT/LOG 默认打开其他程序不受影响；Windows 环境的配置检查和编译通过不等于 macOS 实机验收。
 
-推 `main` / PR 触发 CI（Windows：node + cargo test + 真实私有内存峰值硬门禁 + WebView2 冒烟；macOS arm64：编译 + cargo test + 经 `sudo -n` 的真实私有内存峰值硬门禁）；推 `v*` tag 先在 Windows 执行真实峰值发布硬门禁，再自动发 GitHub Release（Windows exe + macOS dmg），峰值 JSON 均上传为构件。
+推 `main` / PR 触发 CI（Windows：node + cargo test + 真实私有内存峰值硬门禁 + WebView2 冒烟；macOS arm64：编译 + cargo test + 经 `sudo -n` 的真实私有内存峰值硬门禁）；推 `v*` tag 先在 Windows 执行真实峰值发布硬门禁，再自动发 GitHub Release。Release 附件固定只有 Windows exe 与 macOS dmg 两项；峰值 JSON 仅上传为 Actions 构件，供排查时下载，不进入 Release。
 
 ## 内存模式实现与真实峰值门禁
 

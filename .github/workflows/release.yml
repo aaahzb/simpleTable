@@ -193,16 +193,27 @@ jobs:
             echo "NOTES_EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: 下载全部产物
+      # 只取两个安装包产物：memory-peak-release-windows 是测试诊断报告，
+      # 仅供 Actions 页面下载排查，绝不能进入 Release 附件。
+      - name: 下载 Windows 安装包
         uses: actions/download-artifact@v4
         with:
+          name: windows-x64
           path: release-assets
-          merge-multiple: true
+
+      - name: 下载 macOS 安装包
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64
+          path: release-assets
 
       - name: 创建 Release 并上传
         uses: softprops/action-gh-release@v2
         with:
           name: simpleTable ${{ github.ref_name }}
-          files: release-assets/*
+          # 显式白名单，避免将来新增诊断产物时又被通配符带进 Release。
+          files: |
+            release-assets/simpleTable-windows-x64.exe
+            release-assets/simpleTable-macos-arm64.dmg
           fail_on_unmatched_files: true
           body: ${{ steps.notes.outputs.body }}
